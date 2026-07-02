@@ -21,9 +21,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
-#[cfg(target_os = "macos")]
-use std::path::Path;
-use std::path::PathBuf;
+// Path is also used by the platform-neutral OAuth path (refresh_access_token,
+// write_creds_atomic) — only Command/BTreeSet are macOS-probe-only.
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::OnceLock;

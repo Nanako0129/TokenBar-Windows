@@ -59,13 +59,12 @@ fn subscription_label(provider: &str) -> String {
 }
 
 fn auth_path() -> Option<PathBuf> {
-    // Mirror the engine's XdgData resolution (clients.rs PathRoot::XdgData):
-    // XDG_DATA_HOME when set, else <home>/.local/share — the same layout
-    // opencode core hardcodes on every platform, including Windows, so the
-    // scanner and this auth probe agree on the opencode root.
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("opencode/auth.json"));
-    }
+    // Fixed <home>/.local/share, matching two things at once: opencode core
+    // hardcodes this layout on every platform (including Windows), and the
+    // engine scanner — which this crate invokes with use_env_roots=false —
+    // resolves the opencode root the same way (PathRoot::XdgData ignores
+    // XDG_DATA_HOME in that mode), so usage data and this auth probe always
+    // point at the same opencode installation.
     crate::home_dir().map(|home| home.join(".local/share/opencode/auth.json"))
 }
 
