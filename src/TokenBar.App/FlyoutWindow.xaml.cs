@@ -16,7 +16,7 @@ namespace TokenBar.App;
 public sealed partial class FlyoutWindow : Window
 {
     private const int FlyoutWidth = 400;
-    private const int FlyoutHeight = 520;
+    private const int FlyoutHeight = 640;
     private const int Margin = 12;
     private const int SlideDistance = 24;
 
@@ -217,45 +217,7 @@ public sealed partial class FlyoutWindow : Window
         return (resting, Toward(resting, edge, SlideDistance));
     }
 
-    /// <summary>Pull the latest snapshot into the placeholder dashboard (the
-    /// real cards arrive with plan Phase 5).</summary>
-    private void RenderSnapshot()
-    {
-        var snapshot = _model.Current;
-        if (snapshot is null)
-        {
-            FooterText.Text = "loading usage…";
-            return;
-        }
-
-        var graph = snapshot.Graph;
-        TodayValue.Text = Format.CompactTokens(Format.TodayTokens(graph));
-        TotalValue.Text = Format.CompactTokens(graph.Summary.TotalTokens);
-        RateValue.Text = Format.CompactTokens((long)snapshot.TokensPerMin);
-        CostLine.Text =
-            $"{Format.Usd(Format.TodayCost(graph))} today · {Format.Usd(graph.Summary.TotalCost)} all time · " +
-            $"{graph.Summary.ActiveDays} active days";
-
-        var lines = new List<string>();
-        foreach (var agent in snapshot.Quota?.Agents ?? [])
-        {
-            var name = ClientRegistry.ShortName(agent.ClientId);
-            if (agent.Error is { } error)
-            {
-                lines.Add($"{name}: {error}");
-                continue;
-            }
-
-            foreach (var window in agent.Windows)
-            {
-                var reset = window.ResetText is { } r ? $" · {r}" : "";
-                lines.Add($"{name} {window.Label}: {window.RemainingPercent:F0}% left{reset}");
-            }
-        }
-
-        QuotaList.ItemsSource = lines;
-        FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
-    }
+    private void RenderSnapshot() => Dashboard.Render(_model.Current);
 
     /// <summary>Popup chrome: strip every residual frame style down to
     /// WS_POPUP (the presenter's borderless mode leaves WS_DLGFRAME behind,

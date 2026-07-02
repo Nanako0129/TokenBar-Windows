@@ -35,6 +35,7 @@ public sealed class DashboardModel
 
     public sealed record Snapshot(
         UsagePayload Graph,
+        ModelReport? Models,
         AgentUsagePayload? Quota,
         double TokensPerMin,
         IReadOnlyList<TraceBucket> Trace,
@@ -80,6 +81,16 @@ public sealed class DashboardModel
             try
             {
                 var graph = TbCore.Graph();
+                ModelReport? models = null;
+                try
+                {
+                    models = TbCore.ModelReport();
+                }
+                catch (Exception ex)
+                {
+                    DevLog.Write($"modelReport failed: {ex.Message}");
+                }
+
                 AgentUsagePayload? quota = null;
                 try
                 {
@@ -90,7 +101,12 @@ public sealed class DashboardModel
                     DevLog.Write($"agentUsage failed: {ex.Message}");
                 }
 
-                Publish(s => s with { Graph = graph, Quota = quota ?? s.Quota }, graph);
+                Publish(s => s with
+                {
+                    Graph = graph,
+                    Models = models ?? s.Models,
+                    Quota = quota ?? s.Quota,
+                }, graph);
             }
             catch (Exception ex)
             {
@@ -146,7 +162,7 @@ public sealed class DashboardModel
                     return; // fast lane cannot seed the snapshot
                 }
 
-                baseline = new Snapshot(graph, null, 0, [], DateTimeOffset.Now);
+                baseline = new Snapshot(graph, null, null, 0, [], DateTimeOffset.Now);
             }
 
             Current = update(baseline) with { FetchedAt = DateTimeOffset.Now };

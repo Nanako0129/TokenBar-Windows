@@ -27,6 +27,23 @@ public sealed class TrayService : IDisposable
         };
         _icon.LeftClickCommand = new RelayCommand(flyout.ToggleFlyout);
         _icon.NoLeftClickDelay = true;
+
+        // Minimal context menu (Open/Quit) — the quota-source picker joins in
+        // plan Phase 7. Without Quit the only way out is Task Manager.
+        var menu = new Microsoft.UI.Xaml.Controls.MenuFlyout();
+        var open = new Microsoft.UI.Xaml.Controls.MenuFlyoutItem { Text = "Open TokenBar" };
+        open.Click += (_, _) => flyout.ShowFlyout();
+        var quit = new Microsoft.UI.Xaml.Controls.MenuFlyoutItem { Text = "Quit" };
+        quit.Click += (_, _) =>
+        {
+            Dispose();
+            Microsoft.UI.Xaml.Application.Current.Exit();
+        };
+        menu.Items.Add(open);
+        menu.Items.Add(quit);
+        _icon.ContextFlyout = menu;
+        _icon.ContextMenuMode = ContextMenuMode.SecondWindow;
+
         _icon.ForceCreate();
     }
 
