@@ -34,7 +34,7 @@ Prereqs: Rust (stable), .NET 10 SDK; on Windows the MSVC toolchain.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Repo bootstrap + P/Invoke smoke | ✅ 2026-07-02 — C# ↔ Rust cdylib seam verified on macOS (`tb_probe` → 84k messages), CI on windows-latest |
-| 1 | Rust Windows fixes (HOME→dirs, TLS, antigravity) | — |
+| 1 | Rust Windows fixes (HOME→dirs, TLS, antigravity) | 🔶 code complete + self-reviewed (2026-07-02); CI + real-session verification on the Windows boxes pending |
 | 2 | 3D contribution graph spike | — |
 | 3 | TokenBar.Core C# port + cross-check vs Swift | — |
 | 4 | Tray skeleton + flyout window | — |
