@@ -28,3 +28,20 @@ jobs:
         run: dotnet test src/TokenBar.slnx -c Release --no-build
       - name: P/Invoke smoke (tb_probe)
         run: dotnet run --project src/TokenBar.Smoke -c Release --no-build
+
+  # The ARM64 verification box is a Win11 ARM VM; cross-build the Rust core so
+  # arm64 breakage surfaces in CI. Non-blocking until tokscale-core drops
+  # vendored OpenSSL (plan Phase 1) — openssl-src cross-builds are fragile.
+  arm64-cross:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: arm64
+      - name: cargo build (aarch64 cdylib)
+        run: cargo build --release --target aarch64-pc-windows-msvc
