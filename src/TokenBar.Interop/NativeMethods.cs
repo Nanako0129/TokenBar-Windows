@@ -7,12 +7,40 @@ namespace TokenBar.Interop;
 // libtb_core_ffi.dylib on macOS (the macOS-side test loop) via default
 // runtime probing; the native binary is copied next to the assembly by
 // src/Directory.Build.targets.
+//
+// Every entry point returns a heap NUL-terminated JSON string that must be
+// released with tb_free exactly once — TbCore.TakeString is the single legal
+// consumer. `year` may be null (all time) or a 4-digit year string.
 internal static partial class NativeMethods
 {
     private const string Lib = "tb_core_ffi";
 
     [LibraryImport(Lib)]
     internal static partial nint tb_probe();
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint tb_graph(string? year);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint tb_refresh_graph(string? year);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint tb_model_report(string? year);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint tb_hourly_report(string? year);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint tb_agents_report(string? year);
+
+    [LibraryImport(Lib)]
+    internal static partial nint tb_usage_trace(long windowSecs);
+
+    [LibraryImport(Lib)]
+    internal static partial nint tb_tokens_per_min();
+
+    [LibraryImport(Lib)]
+    internal static partial nint tb_agent_usage();
 
     [LibraryImport(Lib)]
     internal static partial void tb_free(nint ptr);
