@@ -38,6 +38,11 @@ public partial class App : Application
             _tray = new TrayService(_flyout);
             DevLog.Write("launch: tray up");
 
+            if (Environment.GetCommandLineArgs().Contains("--dump-tray-icons"))
+            {
+                TrayIconGallery.Dump();
+            }
+
             // Debug flag, same convention as the macOS --open-popover: pop the
             // flyout right away so remote verification needs no tray click.
             if (Environment.GetCommandLineArgs().Contains("--open-flyout"))
