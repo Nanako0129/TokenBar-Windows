@@ -37,9 +37,9 @@ Prereqs: Rust (stable), .NET 10 SDK; on Windows the MSVC toolchain.
 | 1 | Rust Windows fixes (HOME→dirs, TLS, antigravity) | ✅ 2026-07-02 — all 10 entry points verified on a real x64 Windows box against real session data (271 msgs parsed, pricing fetched over rustls, quota windows decoded) |
 | 2 | 3D contribution graph spike | ✅ 2026-07-02 — GO (Vortice/D3D11 instancing verified on real hardware, ~0.2ms/frame; SwapChainPanel lifecycle rides with Phase 4). See `spike/RESULTS.md` |
 | 3 | TokenBar.Core C# port + cross-check vs Swift | 🔶 all 14 modules ported, 85 unit tests green (2026-07-02); fixture cross-check vs Swift pending |
-| 4 | Tray skeleton + flyout window | 🔶 4.1+4.2 done (2026-07-02): tray icon, borderless rounded Acrylic flyout (translucent while unfocused, topmost), show/hide slide, single instance, taskbar-edge placement, polling dashboard with live quota data. Remaining: tray context menu, DPI placement polish, SwapChainPanel lifecycle check, native-feel animation research |
-| 5 | Overview lens + polling engine | — |
-| 6 | Remaining five lenses | — |
+| 4 | Tray skeleton + flyout window | ✅ 2026-07-02 — tray icon + Open/Quit menu, borderless rounded Acrylic flyout (translucent while unfocused, topmost), PerMonitorV2 DPI, show/hide slide, single instance, taskbar-edge placement, polling engine. Deferred to polish backlog: SwapChainPanel lifecycle, compositor-native animation |
+| 5 | Overview lens + polling engine | ✅ 2026-07-02 — five cards (stacked chart + wrap legend, agent limits with live pace markers, trace, models, streaks), instant styled hover tooltips, WH_MOUSE_LL wheel path |
+| 6 | Remaining five lenses | ✅ 2026-07-02 — lens router with 160ms crossfade transitions; Models (full list + pricing hint), Daily (tap drill-down), Hourly (Timeline/Profile + show-more), Stats, Agents; lazy report loading. Verified by the user against the full synced history (5.6B tokens / 70 days). Cold first parse ~11s (adaptive rayon pool), warm start ~1-2s |
 | 7 | Settings + tray extras | — |
 | 8 | 3D integration | — |
 | 9 | Polish + parity + vendor re-sync | — |
