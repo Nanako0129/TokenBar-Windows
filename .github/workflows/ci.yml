@@ -1,9 +1,14 @@
 name: CI
 
+# Docs-only changes (markdown anywhere) don't touch anything CI builds.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
   pull_request:
+    paths-ignore:
+      - "**.md"
 
 jobs:
   build:
