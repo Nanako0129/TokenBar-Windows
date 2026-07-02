@@ -32,6 +32,16 @@ use std::time::{Duration, Instant};
 
 use usage_tail::UsageTailer;
 
+/// Home directory, delegated to the engine's resolver so both halves of the
+/// binary always agree on where "home" is (`HOME` first, then the platform
+/// home — on Windows `HOME` is normally unset and this resolves
+/// `%USERPROFILE%`).
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    tokscale_core::get_home_dir_string(&None)
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
 /// Serve `tb_graph` from cache when the last computation is at most this old;
 /// `tb_refresh_graph` always recomputes. Mirrors the Tauri app's oneshot cache.
 const ONESHOT_MAX_AGE_SECS: u64 = 30;

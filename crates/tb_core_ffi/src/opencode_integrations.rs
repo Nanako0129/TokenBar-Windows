@@ -59,8 +59,14 @@ fn subscription_label(provider: &str) -> String {
 }
 
 fn auth_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".local/share/opencode/auth.json"))
+    // Mirror the engine's XdgData resolution (clients.rs PathRoot::XdgData):
+    // XDG_DATA_HOME when set, else <home>/.local/share — the same layout
+    // opencode core hardcodes on every platform, including Windows, so the
+    // scanner and this auth probe agree on the opencode root.
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("opencode/auth.json"));
+    }
+    crate::home_dir().map(|home| home.join(".local/share/opencode/auth.json"))
 }
 
 /// The durable GitHub OAuth token opencode stored for its github-copilot login

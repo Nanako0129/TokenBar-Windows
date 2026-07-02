@@ -21,7 +21,7 @@ repo first, so future syncs are a plain rsync with zero reapply.
 
 | Patch | Files | Upstreamed to macOS repo? |
 |---|---|---|
-| (none yet) | | |
+| reqwest TLS: `native-tls-vendored` → `rustls-tls-native-roots` (drops vendored OpenSSL — Perl+NASM toolchain dependency and the slowest unit of a clean build; CI runners ship those tools, local Windows boxes often don't. Native roots keep installed OS trust-store CAs incl. corporate MITM roots; note rustls does no SChannel-style AIA chasing / AuthRoot auto-fetch, so servers with incomplete chains fail where SChannel would recover) | `vendor/tokscale-core/Cargo.toml`, `Cargo.lock` | ❌ pending — PR to TokenBar-Native planned (Phase 1 item 5) |
 
 Note: the macOS repo's own local-patch table vs junhoyeo/tokscale lives in
 `vendor/README.md` (copied along) — that provenance chain still applies.
