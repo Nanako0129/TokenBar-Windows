@@ -90,7 +90,7 @@ public sealed class TrayService : IDisposable
         _iconSignature = signature;
         using var bmp = mode != TrayMode.Hidden && title.Length > 0
             ? TrayIconRenderer.RenderTitle(
-                title,
+                TrayModes.IconTitle(title),
                 mode == TrayMode.QuotaLeft && remaining is { } q
                     ? TrayIconRenderer.GaugeColor(q) : null,
                 dark)

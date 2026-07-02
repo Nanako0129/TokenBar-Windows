@@ -39,6 +39,18 @@ public class TrayModeTests
         Assert.Equal("", TrayMode.TotalCost.Title(null, null));
     }
 
+    [Theory]
+    [InlineData("12.3K", "12.3K")] // fits: untouched
+    [InlineData("$5.20", "$5.20")]
+    [InlineData("$4637.49", "$4637")] // big cost: cents off
+    [InlineData("12.4K/m", "12K/m")] // rate: decimal out, unit kept
+    [InlineData("999.9K/m", "999K/m")]
+    [InlineData("1234567", "1234567")] // long but no decimal: untouched
+    public void IconTitleTruncatesPastSixChars(string title, string expected)
+    {
+        Assert.Equal(expected, TrayModes.IconTitle(title));
+    }
+
     [Fact]
     public void TokensPerMinWithoutRateShowsPlaceholder()
     {

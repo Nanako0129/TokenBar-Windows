@@ -75,6 +75,34 @@ public static class TrayModes
         _ => "TokenBar",
     };
 
+    /// <summary>The icon-sized short form of a title (parity table #1's
+    /// "truncated $5.20"): past six characters the icon drops precision —
+    /// cents off a big cost, the decimal out of a rate — while the tooltip
+    /// keeps the full string.</summary>
+    public static string IconTitle(string title)
+    {
+        if (title.Length <= 6)
+        {
+            return title;
+        }
+
+        var dot = title.IndexOf('.');
+        if (dot < 0)
+        {
+            return title;
+        }
+
+        var end = dot + 1;
+        while (end < title.Length && char.IsAsciiDigit(title[end]))
+        {
+            end++;
+        }
+
+        return title.StartsWith('$')
+            ? title[..dot] // $4637.49 → $4637
+            : title[..dot] + title[end..]; // 12.4K/m → 12K/m
+    }
+
     /// <summary>The tray title for this mode ("" = icon only). Faithful to
     /// macOS title(graph:tokensPerMin:quotaRemaining:), including Swift's
     /// away-from-zero rounding.</summary>
