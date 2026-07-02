@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="TokenBar.Core.Tests/TokenBar.Core.Tests.csproj" />
+  <Project Path="TokenBar.Core/TokenBar.Core.csproj" />
+  <Project Path="TokenBar.Interop/TokenBar.Interop.csproj" />
+  <Project Path="TokenBar.Smoke/TokenBar.Smoke.csproj" />
+</Solution>

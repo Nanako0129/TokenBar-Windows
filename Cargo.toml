@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/tb_core_ffi", "vendor/tokscale-core"]
+
+[profile.release]
+lto = true
+strip = "debuginfo"
+# This builds a cdylib called over a C ABI from C# (P/Invoke). A panic must not
+# unwind across that boundary — since Rust 1.81 an `extern "C"` fn that unwinds
+# is a defined process abort (not UB), but a whole-app abort throws away the
+# per-card resilience the shell is built for. So rather than `panic = "abort"`,
+# every FFI entry point wraps its body in `catch_unwind` (see `guarded` in
+# tb_core_ffi/src/lib.rs) and turns a panic into an error envelope: a panic
+# inside one report degrades that one card to an error and leaves the rest of
+# the app running. Unwinding also keeps the Mutex poison-recovery in lib.rs /
+# agent_usage.rs meaningful (a Mutex is only poisoned on unwind).

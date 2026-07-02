@@ -1,0 +1,19 @@
+<Project>
+  <!-- Copy the cargo-built native library next to every managed output so
+       default DllImport probing finds it (tb_core_ffi.dll / libtb_core_ffi.dylib).
+       Build the Rust side first with a cargo release build at the repo root. -->
+  <PropertyGroup>
+    <TbNativeDir>$(MSBuildThisFileDirectory)..\target\release\</TbNativeDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="$(TbNativeDir)tb_core_ffi.dll"
+          Condition="Exists('$(TbNativeDir)tb_core_ffi.dll')"
+          CopyToOutputDirectory="PreserveNewest" Link="tb_core_ffi.dll" Visible="false" />
+    <None Include="$(TbNativeDir)libtb_core_ffi.dylib"
+          Condition="Exists('$(TbNativeDir)libtb_core_ffi.dylib')"
+          CopyToOutputDirectory="PreserveNewest" Link="libtb_core_ffi.dylib" Visible="false" />
+    <None Include="$(TbNativeDir)libtb_core_ffi.so"
+          Condition="Exists('$(TbNativeDir)libtb_core_ffi.so')"
+          CopyToOutputDirectory="PreserveNewest" Link="libtb_core_ffi.so" Visible="false" />
+  </ItemGroup>
+</Project>

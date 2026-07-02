@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      # tokscale-core still pulls native-tls-vendored (vendored OpenSSL);
+      # windows-latest ships Perl + NASM so this builds, but slowly. The TLS
+      # switch to rustls (plan Phase 1) removes that dependency.
+      - name: cargo build (cdylib)
+        run: cargo build --release
+      - name: cargo test
+        run: cargo test --workspace --release
+      - name: dotnet build
+        run: dotnet build src/TokenBar.slnx -c Release
+      - name: dotnet test
+        run: dotnet test src/TokenBar.slnx -c Release --no-build
+      - name: P/Invoke smoke (tb_probe)
+        run: dotnet run --project src/TokenBar.Smoke -c Release --no-build

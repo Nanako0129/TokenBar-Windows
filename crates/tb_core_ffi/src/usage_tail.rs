@@ -1,0 +1,198 @@
+//! Live tokens/min + per-(client, agent, model) trace for the popover and the
+//! menu-bar cat animation.
+//!
+//! Each `tick()` re-parses only files whose mtime falls inside the event
+//! window plus a small margin (`modified_after`), so steady-state cost is a
+//! stat sweep plus parsing the handful of currently-active session files.
+//! The event window is replaced wholesale each tick — snapshot-replace rather
+//! than incremental append means tokscale's own dedup handles duplicates and
+//! cross-tick state never accumulates.
+
+use chrono::{Duration, Local};
+use parking_lot::Mutex;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Retain a generous window so any `rate_in_window` / `trace` query (max 10m in
+/// practice) is satisfiable, and so the window stays correct across midnight.
+const EVENT_WINDOW_SECS: i64 = 3600;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageEvent {
+    pub ts_ms: i64,
+    pub client: String,
+    pub agent: String,
+    pub model: String,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+impl UsageEvent {
+    fn total(&self) -> i64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceBucket {
+    pub client: String,
+    pub agent: String,
+    pub model: String,
+    pub tokens: i64,
+    pub messages: u32,
+    pub tokens_per_min: f32,
+}
+
+pub struct UsageTailer {
+    events: Mutex<Vec<UsageEvent>>,
+    /// `latest_source_mtime_ms` token from the last parse; when it hasn't
+    /// moved, the event window is still correct (rate queries re-filter by
+    /// timestamp on read) and the tick skips the parse entirely.
+    last_source_token: Mutex<Option<u64>>,
+}
+
+impl UsageTailer {
+    pub fn new() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            last_source_token: Mutex::new(None),
+        }
+    }
+
+    /// Re-parse recent local sessions via tokscale-core and replace the event
+    /// window. Returns the number of events now in the window (cheap to compute
+    /// and only used as a "did anything happen" hint by callers).
+    pub fn tick(&self) -> usize {
+        // `since` is date-granular; reach back one day so a sub-hour window that
+        // straddles midnight still sees yesterday's tail.
+        let since = (Local::now() - Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        // `modified_after` is what bounds the per-tick parse cost: a session
+        // log whose mtime predates the event window can't contain in-window
+        // events (logs are append-only, mtime >= last event's timestamp), so
+        // only files active within the window — plus a small margin for write
+        // latency and clock skew — are re-parsed each tick.
+        let window_reach_ms = (EVENT_WINDOW_SECS + 300) * 1000;
+        let options = tokscale_core::LocalParseOptions {
+            since: Some(since),
+            modified_after: Some((now_ms() - window_reach_ms) as u64),
+            ..Default::default()
+        };
+
+        // No source changed since the last parse → the window is already
+        // correct; skip the parse. Probe failure falls through to a parse.
+        let token = tokscale_core::latest_source_mtime_ms(&options).ok();
+        if token.is_some() && *self.last_source_token.lock() == token {
+            return self.events.lock().len();
+        }
+
+        let parsed = match tokscale_core::parse_local_clients(options) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.events.lock().len(),
+        };
+        *self.last_source_token.lock() = token;
+
+        let cutoff = now_ms() - EVENT_WINDOW_SECS * 1000;
+        let mut next: Vec<UsageEvent> = parsed
+            .messages
+            .into_iter()
+            // ParsedMessage.timestamp is unix milliseconds (see
+            // tokscale-core sessions::mod::timestamp_to_date, which feeds it to
+            // chrono's timestamp_millis_opt).
+            .filter(|m| m.timestamp >= cutoff)
+            .map(|m| {
+                let agent = m.agent.clone().unwrap_or_else(|| m.client.clone());
+                UsageEvent {
+                    ts_ms: m.timestamp,
+                    client: m.client,
+                    agent,
+                    model: m.model_id,
+                    input: m.input,
+                    output: m.output,
+                    cache_read: m.cache_read,
+                    cache_write: m.cache_write,
+                }
+            })
+            .collect();
+        next.sort_by_key(|e| e.ts_ms);
+
+        let len = next.len();
+        *self.events.lock() = next;
+        len
+    }
+
+    #[allow(dead_code)] // kept for API symmetry with rate_in_window
+    pub fn rate_per_min(&self) -> f32 {
+        self.window_total(60) as f32
+    }
+
+    pub fn rate_in_window(&self, window_secs: i64) -> f32 {
+        if window_secs <= 0 {
+            return 0.0;
+        }
+        let total = self.window_total(window_secs) as f32;
+        let window_min = window_secs as f32 / 60.0;
+        total / window_min
+    }
+
+    fn window_total(&self, secs: i64) -> i64 {
+        // saturating so a pathological `secs` can't overflow the cutoff.
+        let cutoff = now_ms().saturating_sub(secs.saturating_mul(1000));
+        let events = self.events.lock();
+        events
+            .iter()
+            .filter(|e| e.ts_ms >= cutoff)
+            .map(|e| e.total())
+            .sum()
+    }
+
+    /// Per-(client, agent, model) breakdown over `window_secs`. Frontend
+    /// decides whether to collapse rows by client based on the user's
+    /// "detailed trace" setting.
+    pub fn trace(&self, window_secs: i64) -> Vec<TraceBucket> {
+        // Mirror rate_in_window's contract: a non-positive window has no events.
+        // saturating_* so a garbage window_secs from the C side can't overflow
+        // the cutoff; window_secs itself is left intact for the window_min
+        // divisor below, so the per-minute rate is never distorted by a clamp.
+        if window_secs <= 0 {
+            return Vec::new();
+        }
+        let cutoff = now_ms().saturating_sub(window_secs.saturating_mul(1000));
+        let events = self.events.lock();
+        let mut groups: HashMap<(String, String, String), (i64, u32)> = HashMap::new();
+        for e in events.iter() {
+            if e.ts_ms < cutoff {
+                continue;
+            }
+            let key = (e.client.clone(), e.agent.clone(), e.model.clone());
+            let slot = groups.entry(key).or_insert((0, 0));
+            slot.0 += e.total();
+            slot.1 += 1;
+        }
+        let window_min = (window_secs as f32 / 60.0).max(1.0 / 60.0);
+        let mut out: Vec<TraceBucket> = groups
+            .into_iter()
+            .map(|((client, agent, model), (tokens, messages))| TraceBucket {
+                client,
+                agent,
+                model,
+                tokens,
+                messages,
+                tokens_per_min: tokens as f32 / window_min,
+            })
+            .collect();
+        out.sort_by_key(|b| std::cmp::Reverse(b.tokens));
+        out
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
