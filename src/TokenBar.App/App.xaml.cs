@@ -1,0 +1,43 @@
+using Microsoft.UI.Xaml;
+
+namespace TokenBar.App;
+
+public partial class App : Application
+{
+    private TrayService? _tray;
+    private FlyoutWindow? _flyout;
+
+    public App()
+    {
+        InitializeComponent();
+    }
+
+    protected override void OnLaunched(LaunchActivatedEventArgs args)
+    {
+        // Tray-resident app: no window shows at launch; the tray icon owns
+        // the flyout's lifetime (mirrors the macOS NSStatusItem shell).
+        try
+        {
+            DevLog.Write("launch: creating flyout");
+            _flyout = new FlyoutWindow();
+            DevLog.Write("launch: creating tray");
+            _tray = new TrayService(_flyout);
+            DevLog.Write("launch: tray up");
+
+            // Debug flag, same convention as the macOS --open-popover: pop the
+            // flyout right away so remote verification needs no tray click.
+            if (Environment.GetCommandLineArgs().Contains("--open-flyout"))
+            {
+                _flyout.ShowFlyout();
+                DevLog.Write($"launch: flyout shown, visible={_flyout.AppWindow.IsVisible}, " +
+                    $"pos={_flyout.AppWindow.Position.X},{_flyout.AppWindow.Position.Y} " +
+                    $"size={_flyout.AppWindow.Size.Width}x{_flyout.AppWindow.Size.Height}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DevLog.Write($"launch FAILED: {ex}");
+            throw;
+        }
+    }
+}
