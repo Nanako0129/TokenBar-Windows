@@ -19,6 +19,11 @@ public sealed class DashboardModel
     private DispatcherQueueTimer? _fastTimer;
     private bool _slowInFlight;
     private bool _fastInFlight;
+    private bool _quotaInFlight;
+    // Latest quota fetch, kept outside the snapshot so a fetch that lands
+    // before the first graph parse isn't lost — the first snapshot seeds
+    // from it (quota is usually done in ~1s, the cold parse in seconds).
+    private volatile AgentUsagePayload? _latestQuota;
 
     public DashboardModel(DispatcherQueue dispatcher)
     {
@@ -97,7 +102,11 @@ public sealed class DashboardModel
         {
             _slowTimer = _dispatcher.CreateTimer();
             _slowTimer.Interval = TimeSpan.FromSeconds(60);
-            _slowTimer.Tick += (_, _) => RefreshSlow();
+            _slowTimer.Tick += (_, _) =>
+            {
+                RefreshSlow();
+                RefreshQuota();
+            };
             _fastTimer = _dispatcher.CreateTimer();
             _fastTimer.Interval = TimeSpan.FromSeconds(10);
             _fastTimer.Tick += (_, _) => RefreshFast();
@@ -106,6 +115,7 @@ public sealed class DashboardModel
         _slowTimer.Start();
         _fastTimer!.Start();
         RefreshSlow();
+        RefreshQuota();
         RefreshFast();
     }
 
@@ -126,47 +136,94 @@ public sealed class DashboardModel
         _slowInFlight = true;
         _ = Task.Run(() =>
         {
-            using var boost = ProcessPower.Boost(); // EcoQoS off while parsing
             try
             {
                 // macOS parity: the model report runs concurrently with the
-                // graph parse, and agentUsage (network-bound) never gates the
-                // first paint — it merges into the snapshot when it lands.
+                // graph parse (the engine shares one pass), and neither the
+                // network nor the lazy lenses gate the first paint.
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var modelsTask = Task.Run(() =>
-                    TryFetch(() => TbCore.ModelReport(), "modelReport"));
-                var quotaTask = Task.Run(() =>
-                    TryFetch(() => TbCore.AgentUsage(), "agentUsage"));
-                var graph = TbCore.Graph();
-                var graphMs = sw.ElapsedMilliseconds;
-                var models = modelsTask.Result;
-                DevLog.Write($"slow lane: graph={graphMs}ms graph+models={sw.ElapsedMilliseconds}ms");
-                Publish(s => s with
+                UsagePayload? graph;
+                ModelReport? models;
+                using (ProcessPower.Boost()) // EcoQoS off while parsing
                 {
-                    Graph = graph,
-                    Models = models ?? s.Models,
-                }, graph);
+                    var modelsTask = Task.Run(() =>
+                        TryFetch(() => TbCore.ModelReport(), "modelReport"));
+                    graph = TryFetch(() => TbCore.Graph(), "graph");
+                    models = modelsTask.Result; // joined before the boost lifts
+                }
 
-                var quota = quotaTask.Result;
-                HourlyReport? hourly = _hourlyWanted
-                    ? TryFetch(() => TbCore.HourlyReport(), "hourly") : null;
-                AgentsReport? agentsReport = _agentsWanted
-                    ? TryFetch(() => TbCore.AgentsReport(), "agents") : null;
-                DevLog.Write($"slow lane: +quota/lenses={sw.ElapsedMilliseconds}ms");
-                Publish(s => s with
+                DevLog.Write($"slow lane: graph+models={sw.ElapsedMilliseconds}ms");
+                if (graph is not null)
                 {
-                    Quota = quota ?? s.Quota,
-                    Hourly = hourly ?? s.Hourly,
-                    Agents = agentsReport ?? s.Agents,
-                }, graph: null);
-            }
-            catch (Exception ex)
-            {
-                DevLog.Write($"graph refresh failed: {ex.Message}");
+                    var seeded = graph;
+                    Publish(s => s with
+                    {
+                        Graph = seeded ?? s.Graph,
+                        Models = models ?? s.Models,
+                    }, graph);
+                }
+                else if (models is not null)
+                {
+                    var m = models;
+                    Publish(s => s with { Models = m }, graph: null);
+                }
+
+                if (_hourlyWanted || _agentsWanted)
+                {
+                    HourlyReport? hourly;
+                    AgentsReport? agentsReport;
+                    using (ProcessPower.Boost())
+                    {
+                        hourly = _hourlyWanted
+                            ? TryFetch(() => TbCore.HourlyReport(), "hourly") : null;
+                        agentsReport = _agentsWanted
+                            ? TryFetch(() => TbCore.AgentsReport(), "agents") : null;
+                    }
+
+                    if (hourly is not null || agentsReport is not null)
+                    {
+                        Publish(s => s with
+                        {
+                            Hourly = hourly ?? s.Hourly,
+                            Agents = agentsReport ?? s.Agents,
+                        }, graph: null);
+                    }
+                }
             }
             finally
             {
                 _slowInFlight = false;
+            }
+        });
+    }
+
+    /// <summary>The OAuth quota lane, macOS pollAgentUsage parity: fully
+    /// independent of the parse lane so a slow provider (the fetch can hang
+    /// for ~30s per agent) never delays the first paint, never holds the
+    /// EcoQoS boost through a network wait, and never blocks the next
+    /// graph tick behind <c>_slowInFlight</c>.</summary>
+    private void RefreshQuota()
+    {
+        if (_quotaInFlight)
+        {
+            return;
+        }
+
+        _quotaInFlight = true;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var quota = TryFetch(() => TbCore.AgentUsage(), "agentUsage");
+                if (quota is not null)
+                {
+                    _latestQuota = quota;
+                    Publish(s => s with { Quota = quota }, graph: null);
+                }
+            }
+            finally
+            {
+                _quotaInFlight = false;
             }
         });
     }
@@ -194,6 +251,7 @@ public sealed class DashboardModel
         _fastInFlight = true;
         _ = Task.Run(() =>
         {
+            using var boost = ProcessPower.Boost(); // live-tail parse
             try
             {
                 var rate = TbCore.TokensPerMin();
@@ -227,7 +285,7 @@ public sealed class DashboardModel
                     return; // fast lane cannot seed the snapshot
                 }
 
-                baseline = new Snapshot(graph, null, null, 0, [], DateTimeOffset.Now);
+                baseline = new Snapshot(graph, null, _latestQuota, 0, [], DateTimeOffset.Now);
                 DevLog.Write("first snapshot ready"); // cold-parse timing anchor
             }
 

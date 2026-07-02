@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace TokenBar.App;
@@ -11,6 +12,12 @@ namespace TokenBar.App;
 /// </summary>
 internal static class ProcessPower
 {
+    // The depth transition and the SetProcessInformation call must be one
+    // atomic step: with bare Interlocked counters, a disposer preempted
+    // between "decrement to 0" and "throttle on" can re-throttle the process
+    // after a new scope already boosted it — the parse then runs slow with
+    // no trace. The syscall is microseconds, so a lock is fine.
+    private static readonly object Gate = new();
     private static int _boostDepth;
 
     /// <summary>Startup fixes, once per process: log the inherited power
@@ -28,14 +35,14 @@ internal static class ProcessPower
             var queried = GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
                 ref throttle, (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
 
-            var priority = GetPriorityClass(GetCurrentProcess());
-            DevLog.Write($"power: priority=0x{priority:X} throttling " +
+            using var process = Process.GetCurrentProcess();
+            DevLog.Write($"power: priority={process.PriorityClass} throttling " +
                 (queried ? $"control=0x{throttle.ControlMask:X} state=0x{throttle.StateMask:X}" : "query failed"));
 
-            if (priority is BELOW_NORMAL_PRIORITY_CLASS or IDLE_PRIORITY_CLASS)
+            if (process.PriorityClass is ProcessPriorityClass.BelowNormal or ProcessPriorityClass.Idle)
             {
-                var ok = SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-                DevLog.Write($"power: raised priority to normal, ok={ok}");
+                process.PriorityClass = ProcessPriorityClass.Normal;
+                DevLog.Write("power: raised priority to normal");
             }
         }
         catch (Exception ex)
@@ -45,13 +52,16 @@ internal static class ProcessPower
     }
 
     /// <summary>Opt out of EcoQoS for the duration of the returned scope.
-    /// Scopes nest (the slow lane and a lazy lens fetch can overlap); the
-    /// last one out restores system-managed throttling.</summary>
+    /// Scopes nest (the lanes overlap); the last one out restores
+    /// system-managed throttling.</summary>
     public static IDisposable Boost()
     {
-        if (Interlocked.Increment(ref _boostDepth) == 1)
+        lock (Gate)
         {
-            SetThrottling(optOut: true);
+            if (++_boostDepth == 1)
+            {
+                SetThrottling(optOut: true);
+            }
         }
 
         return new BoostScope();
@@ -59,14 +69,14 @@ internal static class ProcessPower
 
     private sealed class BoostScope : IDisposable
     {
-        private int _disposed;
-
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) == 0
-                && Interlocked.Decrement(ref _boostDepth) == 0)
+            lock (Gate)
             {
-                SetThrottling(optOut: false);
+                if (--_boostDepth == 0)
+                {
+                    SetThrottling(optOut: false);
+                }
             }
         }
     }
@@ -93,10 +103,6 @@ internal static class ProcessPower
     private const uint PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1;
     private const int ProcessPowerThrottling = 4; // PROCESS_INFORMATION_CLASS
 
-    private const uint NORMAL_PRIORITY_CLASS = 0x0020;
-    private const uint IDLE_PRIORITY_CLASS = 0x0040;
-    private const uint BELOW_NORMAL_PRIORITY_CLASS = 0x4000;
-
     [StructLayout(LayoutKind.Sequential)]
     private struct PROCESS_POWER_THROTTLING_STATE
     {
@@ -117,10 +123,4 @@ internal static class ProcessPower
     private static extern bool GetProcessInformation(
         nint process, int informationClass,
         ref PROCESS_POWER_THROTTLING_STATE information, uint size);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetPriorityClass(nint process, uint priorityClass);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint GetPriorityClass(nint process);
 }

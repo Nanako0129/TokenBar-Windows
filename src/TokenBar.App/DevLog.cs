@@ -8,12 +8,19 @@ public static class DevLog
     private static readonly string PathName =
         System.IO.Path.Combine(System.IO.Path.GetTempPath(), "tokenbar-app.log");
 
+    // AppendAllText opens the file exclusively; the dashboard lanes write
+    // concurrently, and a collision would silently drop the losing line.
+    private static readonly object Gate = new();
+
     public static void Write(string message)
     {
         try
         {
-            System.IO.File.AppendAllText(
-                PathName, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}");
+            lock (Gate)
+            {
+                System.IO.File.AppendAllText(
+                    PathName, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}");
+            }
         }
         catch
         {
