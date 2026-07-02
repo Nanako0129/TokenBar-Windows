@@ -17,7 +17,10 @@ public sealed class DashboardModel
     private readonly DispatcherQueue _dispatcher;
     private DispatcherQueueTimer? _slowTimer;
     private DispatcherQueueTimer? _fastTimer;
-    private bool _slowInFlight;
+    // 0/1 via Interlocked: the year-switch re-run enters from a lane thread,
+    // so this gate races the UI-thread timer tick (unlike the other flags,
+    // whose callers all live on the dispatcher).
+    private int _slowInFlight;
     private bool _fastInFlight;
     private bool _quotaInFlight;
     // Latest quota fetch, kept outside the snapshot so a fetch that lands
@@ -28,7 +31,9 @@ public sealed class DashboardModel
     // Year filter for every lens (macOS DashboardModel.year); null = all
     // time. Fetch lanes capture it per pass and drop slices fetched for a
     // stale filter, so a late old-year payload can never overwrite the new
-    // selection's data.
+    // selection's data. Writes go through _yearGate: the vanish-clear runs
+    // on a lane thread and must not clobber a pick the user made mid-flight.
+    private readonly object _yearGate = new();
     private volatile string? _year = ResolveYear();
     private volatile List<string> _knownYears = [];
 
@@ -54,19 +59,22 @@ public sealed class DashboardModel
     /// slice (served from the engine's per-year cache when fresh).</summary>
     public void SetYear(string? year)
     {
-        if (year == _year)
+        lock (_yearGate)
         {
-            return;
-        }
+            if (year == _year)
+            {
+                return;
+            }
 
-        _year = year;
-        if (year is null)
-        {
-            AppSettings.Store.Remove("tokenbar.dashboard.year");
-        }
-        else
-        {
-            AppSettings.Store.SetString("tokenbar.dashboard.year", year);
+            _year = year;
+            if (year is null)
+            {
+                AppSettings.Store.Remove("tokenbar.dashboard.year");
+            }
+            else
+            {
+                AppSettings.Store.SetString("tokenbar.dashboard.year", year);
+            }
         }
 
         RefreshSlow(); // an in-flight lane re-runs itself when the year flips
@@ -137,9 +145,9 @@ public sealed class DashboardModel
 
             Publish(s => s with
             {
-                Hourly = h ?? s.Hourly,
-                Agents = a ?? s.Agents,
-            }, graph: null);
+                Hourly = hourly ? h : s.Hourly,
+                Agents = agents ? a : s.Agents,
+            }, graph: null, stillValid: () => _year == year);
         }
         catch (Exception ex)
         {
@@ -181,12 +189,11 @@ public sealed class DashboardModel
 
     private void RefreshSlow()
     {
-        if (_slowInFlight)
+        if (Interlocked.Exchange(ref _slowInFlight, 1) == 1)
         {
             return;
         }
 
-        _slowInFlight = true;
         _ = Task.Run(() =>
         {
             var year = _year; // one slice per pass; a mid-flight switch re-runs below
@@ -212,9 +219,21 @@ public sealed class DashboardModel
                 {
                     // macOS apply() parity: the selected year's logs vanished —
                     // clear the filter instead of stranding the dashboard on an
-                    // empty slice. The finally below re-runs the lane unfiltered.
-                    _year = null;
-                    AppSettings.Store.Remove("tokenbar.dashboard.year");
+                    // empty slice. Only if it is still THIS pass's year, though:
+                    // a pick the user made mid-flight must survive. The finally
+                    // below re-runs the lane either way.
+                    lock (_yearGate)
+                    {
+                        if (_year == year)
+                        {
+                            _year = null;
+                            AppSettings.Store.Remove("tokenbar.dashboard.year");
+                        }
+                    }
+
+                    // No publish happens on this path, so nudge the UI to
+                    // resync the year picker with the cleared filter.
+                    _ = _dispatcher.TryEnqueue(() => Updated?.Invoke());
                     return;
                 }
 
@@ -231,39 +250,46 @@ public sealed class DashboardModel
                     {
                         Graph = seeded ?? s.Graph,
                         Models = models ?? s.Models,
-                    }, graph);
+                    }, graph, stillValid: () => _year == year);
                 }
                 else if (models is not null)
                 {
                     var m = models;
-                    Publish(s => s with { Models = m }, graph: null);
+                    Publish(s => s with { Models = m }, graph: null,
+                        stillValid: () => _year == year);
                 }
 
-                if (_hourlyWanted || _agentsWanted)
+                var wantHourly = _hourlyWanted;
+                var wantAgents = _agentsWanted;
+                if (wantHourly || wantAgents)
                 {
                     HourlyReport? hourly;
                     AgentsReport? agentsReport;
                     using (ProcessPower.Boost())
                     {
-                        hourly = _hourlyWanted
+                        hourly = wantHourly
                             ? TryFetch(() => TbCore.HourlyReport(year), "hourly") : null;
-                        agentsReport = _agentsWanted
+                        agentsReport = wantAgents
                             ? TryFetch(() => TbCore.AgentsReport(year), "agents") : null;
                     }
 
-                    if (_year == year && (hourly is not null || agentsReport is not null))
+                    if (_year == year)
                     {
+                        // Fetched lenses land as-is (macOS reload assigns the
+                        // result directly): a failed refetch blanks the lens
+                        // rather than leaving another year's rows under the
+                        // new filter.
                         Publish(s => s with
                         {
-                            Hourly = hourly ?? s.Hourly,
-                            Agents = agentsReport ?? s.Agents,
-                        }, graph: null);
+                            Hourly = wantHourly ? hourly : s.Hourly,
+                            Agents = wantAgents ? agentsReport : s.Agents,
+                        }, graph: null, stillValid: () => _year == year);
                     }
                 }
             }
             finally
             {
-                _slowInFlight = false;
+                Volatile.Write(ref _slowInFlight, 0);
                 if (_year != year)
                 {
                     RefreshSlow();
@@ -358,10 +384,19 @@ public sealed class DashboardModel
     /// The first slow refresh creates the snapshot; fast-lane results before
     /// that are parked on a placeholder graph-less state (dropped — the slow
     /// lane lands within a second on a warm cache).</summary>
-    private void Publish(Func<Snapshot, Snapshot> update, UsagePayload? graph)
+    private void Publish(
+        Func<Snapshot, Snapshot> update, UsagePayload? graph,
+        Func<bool>? stillValid = null)
     {
         _ = _dispatcher.TryEnqueue(() =>
         {
+            // Re-checked on the dispatcher: the year can flip between a
+            // lane's own staleness check and this callback running.
+            if (stillValid?.Invoke() == false)
+            {
+                return;
+            }
+
             var baseline = Current;
             if (baseline is null)
             {

@@ -153,10 +153,13 @@ public sealed partial class DashboardView : UserControl
     private void AddYearItem(
         MenuFlyout flyout, string label, string? value, DashboardModel model)
     {
-        var item = new ToggleMenuFlyoutItem
+        // Radio (not Toggle): re-clicking the checked item must not flip its
+        // checkmark off while the filter stays active.
+        var item = new RadioMenuFlyoutItem
         {
             Text = label,
             IsChecked = model.Year == value,
+            GroupName = "tokenbar.year",
         };
         item.Click += (_, _) =>
         {

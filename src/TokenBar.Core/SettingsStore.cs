@@ -17,6 +17,7 @@ public sealed class SettingsStore
     };
 
     private readonly string _path;
+    private readonly Action<string>? _log;
     private readonly object _gate = new();
     private readonly Dictionary<string, JsonElement> _values;
 
@@ -25,9 +26,10 @@ public sealed class SettingsStore
     /// side uses to avoid re-render loops). Raised on the writing thread.</summary>
     public event Action<string>? Changed;
 
-    public SettingsStore(string path)
+    public SettingsStore(string path, Action<string>? log = null)
     {
         _path = path;
+        _log = log;
         _values = Load(path);
     }
 
@@ -136,15 +138,25 @@ public sealed class SettingsStore
 
     private void Save()
     {
-        var dir = Path.GetDirectoryName(_path);
-        if (!string.IsNullOrEmpty(dir))
+        try
         {
-            Directory.CreateDirectory(dir);
-        }
+            var dir = Path.GetDirectoryName(_path);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
 
-        var tmp = _path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(
-            new SortedDictionary<string, JsonElement>(_values), WriteOptions));
-        File.Move(tmp, _path, overwrite: true);
+            var tmp = _path + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(
+                new SortedDictionary<string, JsonElement>(_values), WriteOptions));
+            File.Move(tmp, _path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            // Disk trouble (AV scan or a sync tool holding the file) must
+            // not crash the caller: memory keeps the new value and the next
+            // successful save heals the file.
+            _log?.Invoke($"settings save failed: {ex.Message}");
+        }
     }
 }
