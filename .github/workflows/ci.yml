@@ -28,8 +28,12 @@ jobs:
         run: dotnet build src/TokenBar.slnx -c Release
       - name: dotnet test
         run: dotnet test src/TokenBar.slnx -c Release --no-build
-      - name: P/Invoke smoke (tb_probe)
+      - name: P/Invoke smoke (all entry points)
         run: dotnet run --project src/TokenBar.Smoke -c Release --no-build
+        env:
+          # No credentials on the runner; skip the network-bound entry for
+          # deterministic CI (its decode path is covered on dev machines).
+          TB_SMOKE_SKIP_NETWORK: "1"
       # Hermetic runtime check: point HOME at a synthetic ~/.claude/projects
       # tree and assert the engine actually parses messages on Windows —
       # "compiles + doesn't crash" alone can't tell a dead parser from an
@@ -45,7 +49,17 @@ jobs:
           '@ | Set-Content -Path "$fx\.claude\projects\ci\session.jsonl" -Encoding utf8
           $env:HOME = $fx
           $env:TB_SMOKE_MIN_MESSAGES = "2"
+          $env:TB_SMOKE_SKIP_NETWORK = "1"
           dotnet run --project src/TokenBar.Smoke -c Release --no-build
+      # Self-contained smoke bundle (runtime + native dll included): lets a
+      # bare Windows verification box run the full entry-point sweep with
+      # nothing installed.
+      - name: publish smoke bundle (win-x64 self-contained)
+        run: dotnet publish src/TokenBar.Smoke -c Release -r win-x64 --self-contained -o out/smoke-win-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-win-x64
+          path: out/smoke-win-x64
 
   # The ARM64 verification box is a Win11 ARM VM; cross-build the Rust core so
   # arm64 breakage surfaces in CI. Non-blocking until tokscale-core drops
