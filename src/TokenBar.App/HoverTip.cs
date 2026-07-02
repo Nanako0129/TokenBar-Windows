@@ -11,17 +11,26 @@ namespace TokenBar.App;
 /// Instant, styled hover tooltip — the native ToolTip's fixed ~1s delay and
 /// plain chrome are nowhere near the macOS onContinuousHover cards, and WinUI
 /// exposes no delay knob. One shared Popup follows the pointer with a small
-/// offset and flips to stay inside the root bounds.
+/// offset and flips to stay inside the root bounds. Content is arbitrary UI
+/// (the macOS tooltips carry colored discs and metric rows, not just text).
 /// </summary>
 public static class HoverTip
 {
     private static Popup? _popup;
-    private static TextBlock? _text;
     private static Border? _card;
 
-    public static void Attach(FrameworkElement target, Func<string> content)
+    public static void Attach(FrameworkElement target, Func<string> content) =>
+        AttachRich(target, () => new TextBlock
+        {
+            Text = content(),
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = new SolidColorBrush(Color.FromArgb(255, 240, 240, 245)),
+        });
+
+    public static void AttachRich(FrameworkElement target, Func<UIElement> build)
     {
-        target.PointerEntered += (_, e) => Show(target, content(), e);
+        target.PointerEntered += (_, e) => Show(target, build(), e);
         target.PointerMoved += (_, e) => Move(target, e);
         target.PointerExited += (_, _) => Hide();
         target.Unloaded += (_, _) => Hide();
@@ -35,21 +44,14 @@ public static class HoverTip
             return;
         }
 
-        _text = new TextBlock
-        {
-            FontSize = 11,
-            TextWrapping = TextWrapping.Wrap,
-            Foreground = new SolidColorBrush(Color.FromArgb(255, 240, 240, 245)),
-        };
         _card = new Border
         {
-            Background = new SolidColorBrush(Color.FromArgb(235, 32, 32, 38)),
+            Background = new SolidColorBrush(Color.FromArgb(238, 30, 30, 36)),
             BorderBrush = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255)),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(6),
-            Padding = new Thickness(10, 7, 10, 7),
-            MaxWidth = 280,
-            Child = _text,
+            Padding = new Thickness(10, 8, 10, 8),
+            MaxWidth = 300,
             IsHitTestVisible = false,
         };
         _popup = new Popup
@@ -60,15 +62,15 @@ public static class HoverTip
         };
     }
 
-    private static void Show(FrameworkElement target, string content, PointerRoutedEventArgs e)
+    private static void Show(FrameworkElement target, UIElement content, PointerRoutedEventArgs e)
     {
-        if (target.XamlRoot is not { } root || string.IsNullOrEmpty(content))
+        if (target.XamlRoot is not { } root)
         {
             return;
         }
 
         EnsurePopup(root);
-        _text!.Text = content;
+        _card!.Child = content;
         Position(root, e);
         _popup!.IsOpen = true;
     }
@@ -84,7 +86,7 @@ public static class HoverTip
     private static void Position(XamlRoot root, PointerRoutedEventArgs e)
     {
         var p = e.GetCurrentPoint(root.Content).Position;
-        _card!.Measure(new Windows.Foundation.Size(280, double.PositiveInfinity));
+        _card!.Measure(new Windows.Foundation.Size(300, double.PositiveInfinity));
         var size = _card.DesiredSize;
         var x = p.X + 14;
         var y = p.Y + 18;

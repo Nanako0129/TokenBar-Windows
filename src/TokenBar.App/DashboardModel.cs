@@ -229,6 +229,7 @@ public sealed class DashboardModel
                 }
 
                 baseline = new Snapshot(graph, null, null, 0, [], DateTimeOffset.Now);
+                DevLog.Write("first snapshot ready"); // cold-parse timing anchor
             }
 
             Current = update(baseline) with { FetchedAt = DateTimeOffset.Now };

@@ -35,6 +35,10 @@ public sealed partial class DashboardView : UserControl
     private string? _expandedDay; // Daily drill-down state
     private bool _hourlyProfileMode;
     private int _hourlyWindow = 48; // Timeline rows shown; +48 per "Show more"
+    // Chart toggles (persistence lands with the Phase 7 settings store;
+    // keys tokenbar.chart.stackBy / tokenbar.chart.metric).
+    private StackBy _chartStackBy = StackBy.Model;
+    private ChartMetric _chartMetric = ChartMetric.Tokens;
 
     public DashboardView()
     {
@@ -201,16 +205,39 @@ public sealed partial class DashboardView : UserControl
         var bars = DayBars.Build(
             snapshot.Graph,
             [.. snapshot.Graph.Summary.Clients],
-            StackBy.Model,
+            _chartStackBy,
             colors,
             Format.TodayKey());
 
         var holder = new StackPanel();
         var canvas = new Canvas { Height = 120 };
         holder.Children.Add(canvas);
+
+        // Stack-by + metric pills, the macOS UsageChartCard secondary row.
+        var toggles = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 4,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Thickness(0, 6, 0, 0),
+        };
+        var byModel = LensPill("Model", _chartStackBy == StackBy.Model);
+        var byAgent = LensPill("Agent", _chartStackBy == StackBy.Agent);
+        byModel.Click += (_, _) => { _chartStackBy = StackBy.Model; RenderContent(false); };
+        byAgent.Click += (_, _) => { _chartStackBy = StackBy.Agent; RenderContent(false); };
+        var byTokens = LensPill("Tokens", _chartMetric == ChartMetric.Tokens);
+        var byCost = LensPill("Price", _chartMetric == ChartMetric.Cost);
+        byTokens.Click += (_, _) => { _chartMetric = ChartMetric.Tokens; RenderContent(false); };
+        byCost.Click += (_, _) => { _chartMetric = ChartMetric.Cost; RenderContent(false); };
+        toggles.Children.Add(byModel);
+        toggles.Children.Add(byAgent);
+        toggles.Children.Add(new Border { Width = 8 });
+        toggles.Children.Add(byTokens);
+        toggles.Children.Add(byCost);
+        holder.Children.Add(toggles);
         // Wrapping legend, capped like the macOS FlowLayout (12 + "+N").
         var legend = new WrapRow { Margin = new Thickness(0, 8, 0, 0) };
-        var allSegments = DayBars.Legend(bars, ChartMetric.Tokens);
+        var allSegments = DayBars.Legend(bars, _chartMetric);
         foreach (var seg in allSegments.Take(12))
         {
             var item = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
@@ -236,7 +263,12 @@ public sealed partial class DashboardView : UserControl
                 return;
             }
 
-            var maxTokens = Math.Max(1, bars.Max(b => b.TotalTokens));
+            // Bar length follows the metric toggle (tokens or spend).
+            double SegValue(DaySegment s) =>
+                _chartMetric == ChartMetric.Cost ? s.Cost : s.Tokens;
+            double BarValue(DayBar b) =>
+                _chartMetric == ChartMetric.Cost ? b.TotalCost : b.TotalTokens;
+            var maxValue = Math.Max(bars.Max(BarValue), 1e-9);
             const double gap = 3;
             var barWidth = Math.Max(2, (width - gap * (bars.Count - 1)) / bars.Count);
             for (var i = 0; i < bars.Count; i++)
@@ -246,7 +278,7 @@ public sealed partial class DashboardView : UserControl
                 var y = height;
                 foreach (var seg in bar.Segments)
                 {
-                    var segHeight = height * seg.Tokens / (double)maxTokens;
+                    var segHeight = height * SegValue(seg) / maxValue;
                     if (segHeight < 0.5)
                     {
                         continue;
@@ -263,10 +295,6 @@ public sealed partial class DashboardView : UserControl
                     };
                     Canvas.SetLeft(rect, x);
                     Canvas.SetTop(rect, y);
-                    var (date, label, tokens, cost) = (bar.Date, seg.Label, seg.Tokens, seg.Cost);
-                    HoverTip.Attach(rect, () =>
-                        $"{Format.MonthDay(date)} · {label}\n" +
-                        $"{Format.ExactTokens(tokens)} tokens · {Format.Usd(cost)}");
                     canvas.Children.Add(rect);
                 }
 
@@ -281,6 +309,23 @@ public sealed partial class DashboardView : UserControl
                     Canvas.SetLeft(tick, x);
                     Canvas.SetTop(tick, height - 2);
                     canvas.Children.Add(tick);
+                }
+                else
+                {
+                    // Full-height hover column: ONE tooltip per day listing
+                    // every segment with its color dot (the macOS layout),
+                    // instead of sliver-sized per-segment targets.
+                    var overlay = new Rectangle
+                    {
+                        Width = barWidth + gap,
+                        Height = height,
+                        Fill = new SolidColorBrush(Colors.Transparent),
+                    };
+                    Canvas.SetLeft(overlay, x - gap / 2);
+                    Canvas.SetTop(overlay, 0);
+                    var capturedBar = bar;
+                    HoverTip.AttachRich(overlay, () => DayTip(capturedBar));
+                    canvas.Children.Add(overlay);
                 }
             }
         }
@@ -378,10 +423,47 @@ public sealed partial class DashboardView : UserControl
     private UIElement BuildModels(DashboardModel.Snapshot snapshot)
     {
         var stack = new StackPanel { Spacing = 10 };
-        var subtitle = snapshot.Models?.PricingUpdatedAt is { } ts
-            ? $"Prices updated {Format.RelativeTime(ts)}"
-            : null;
-        stack.Children.Add(Ui.Card("Models by cost", BuildModelRows(snapshot, maxRows: null), subtitle));
+        var report = snapshot.Models;
+        var subtitleParts = new List<string>();
+        if (report is not null)
+        {
+            subtitleParts.Add($"{report.Entries.Count} models · {Format.Usd(report.TotalCost)}");
+            if (report.PricingUpdatedAt is { } ts)
+            {
+                subtitleParts.Add($"Prices updated {Format.RelativeTime(ts)}");
+            }
+        }
+
+        // Token-kind legend header, the macOS Models card top row.
+        var content = new StackPanel { Spacing = 10 };
+        var legend = new WrapRow();
+        (string Label, string Color)[] kinds =
+        [
+            ("Input", Ui.TokenKinds[0].Color),
+            ("Output", Ui.TokenKinds[1].Color),
+            ("Cache read", Ui.TokenKinds[2].Color),
+            ("Cache write", Ui.TokenKinds[3].Color),
+            ("Reasoning", Ui.TokenKinds[4].Color),
+        ];
+        foreach (var (label, color) in kinds)
+        {
+            var item = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+            item.Children.Add(new Microsoft.UI.Xaml.Shapes.Rectangle
+            {
+                Width = 8,
+                Height = 8,
+                RadiusX = 2,
+                RadiusY = 2,
+                Fill = Ui.BrushFromHex(color),
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+            item.Children.Add(Ui.Text(label, 10, 0.75));
+            legend.Children.Add(item);
+        }
+
+        content.Children.Add(legend);
+        content.Children.Add(BuildModelRows(snapshot, maxRows: null));
+        stack.Children.Add(Ui.Card("Models", content, string.Join(" · ", subtitleParts)));
         return stack;
     }
 
@@ -409,10 +491,18 @@ public sealed partial class DashboardView : UserControl
             var name = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
             name.Children.Add(Ui.Disc(colors.Color(entry.Provider, entry.Model)));
             name.Children.Add(Ui.Text(entry.Model, 11));
-            block.Children.Add(Ui.Row(name, Ui.Text(Format.Usd(entry.Cost), 11, 0.85)));
+            // Right column, macOS style: tokens over cost.
+            var trailing = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
+            var tokensText = Ui.Text(Format.CompactTokens(entry.Total), 11, 0.9);
+            tokensText.HorizontalAlignment = HorizontalAlignment.Right;
+            var costText = Ui.Text(Format.Usd(entry.Cost), 10, 0.65);
+            costText.HorizontalAlignment = HorizontalAlignment.Right;
+            trailing.Children.Add(tokensText);
+            trailing.Children.Add(costText);
+            block.Children.Add(Ui.Row(name, trailing));
             block.Children.Add(TokenKindBar(entry));
             var captured = entry;
-            HoverTip.Attach(block, () => ModelTooltip(captured));
+            HoverTip.AttachRich(block, () => ModelTip(captured, colors));
             panel.Children.Add(block);
         }
 
@@ -678,26 +768,116 @@ public sealed partial class DashboardView : UserControl
             : Microsoft.UI.Text.FontWeights.Normal,
     };
 
-    private static string ModelTooltip(ModelReportEntry entry)
+    // ── rich tooltips (macOS hover-card layouts; explicit light foreground
+    //    because the tip card is always dark) ─────────────────────────────
+
+    private static TextBlock TipText(string text, double size = 11, double opacity = 1.0,
+        bool bold = false) => new()
+    {
+        Text = text,
+        FontSize = size,
+        Opacity = opacity,
+        FontWeight = bold ? Microsoft.UI.Text.FontWeights.SemiBold
+            : Microsoft.UI.Text.FontWeights.Normal,
+        Foreground = new SolidColorBrush(Color.FromArgb(255, 240, 240, 245)),
+    };
+
+    private static Grid TipRow(UIElement left, string right, double opacity = 0.75)
+    {
+        var grid = new Grid { ColumnSpacing = 16 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.Children.Add(left);
+        var value = TipText(right, 11, opacity);
+        value.HorizontalAlignment = HorizontalAlignment.Right;
+        Grid.SetColumn(value, 1);
+        grid.Children.Add(value);
+        return grid;
+    }
+
+    private static StackPanel TipLabel(string hex, string text, bool square = false)
+    {
+        var label = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        if (square)
+        {
+            label.Children.Add(new Rectangle
+            {
+                Width = 8,
+                Height = 8,
+                RadiusX = 2,
+                RadiusY = 2,
+                Fill = Ui.BrushFromHex(hex),
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+        }
+        else
+        {
+            label.Children.Add(Ui.Disc(hex, 7));
+        }
+
+        label.Children.Add(TipText(text, 11, 0.95));
+        return label;
+    }
+
+    /// <summary>Whole-day chart tooltip: date, totals row, then one dotted
+    /// line per segment — the macOS bar tooltip.</summary>
+    private UIElement DayTip(DayBar bar)
+    {
+        var panel = new StackPanel { Spacing = 5, MinWidth = 200 };
+        panel.Children.Add(TipText(Format.MonthDay(bar.Date), 12, bold: true));
+        panel.Children.Add(TipRow(
+            TipText($"{Format.ExactTokens(bar.TotalTokens)} tokens", 11, 0.9),
+            Format.Usd(bar.TotalCost), 0.9));
+        var ordered = _chartMetric == ChartMetric.Cost
+            ? bar.Segments.OrderByDescending(s => s.Cost)
+            : bar.Segments.OrderByDescending(s => s.Tokens);
+        foreach (var seg in ordered)
+        {
+            panel.Children.Add(TipRow(
+                TipLabel(seg.Color, seg.Label),
+                $"{Format.CompactTokens(seg.Tokens)} · {Format.Usd(seg.Cost)}"));
+        }
+
+        return panel;
+    }
+
+    /// <summary>Model-row tooltip: header disc + name, source line, totals,
+    /// then per-kind colored rows with share percentages — the macOS
+    /// ModelBreakdownCard hover.</summary>
+    private static UIElement ModelTip(ModelReportEntry entry, ModelColorMap colors)
     {
         long[] values =
             [entry.Input, entry.Output, entry.CacheRead, entry.CacheWrite, entry.Reasoning];
         var total = Math.Max(1, values.Sum());
-        var lines = new List<string>
-        {
-            $"{entry.Model} · {entry.Provider}",
-            $"{Format.ExactTokens(entry.Total)} tokens · {Format.Usd(entry.Cost)} · {entry.MessageCount} msgs",
-        };
+        var panel = new StackPanel { Spacing = 5, MinWidth = 200 };
+        var head = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        head.Children.Add(Ui.Disc(colors.Color(entry.Provider, entry.Model), 7));
+        head.Children.Add(TipText(entry.Model, 12, bold: true));
+        panel.Children.Add(head);
+        panel.Children.Add(TipText(
+            $"{ClientRegistry.ShortName(entry.Client)} · {entry.Provider}", 10, 0.6));
+        panel.Children.Add(TipRow(
+            TipText($"{Format.CompactTokens(entry.Total)} tokens", 11, 0.9),
+            Format.Usd(entry.Cost), 0.9));
+        (string Label, string Color)[] kinds =
+        [
+            ("Input", Ui.TokenKinds[0].Color),
+            ("Output", Ui.TokenKinds[1].Color),
+            ("Cache read", Ui.TokenKinds[2].Color),
+            ("Cache write", Ui.TokenKinds[3].Color),
+            ("Reasoning", Ui.TokenKinds[4].Color),
+        ];
         for (var i = 0; i < values.Length; i++)
         {
             if (values[i] > 0)
             {
-                lines.Add(
-                    $"{Ui.TokenKinds[i].Label}: {Format.ExactTokens(values[i])} ({100.0 * values[i] / total:F1}%)");
+                panel.Children.Add(TipRow(
+                    TipLabel(kinds[i].Color, kinds[i].Label, square: true),
+                    $"{Format.CompactTokens(values[i])} · {100.0 * values[i] / total:F0}%"));
             }
         }
 
-        return string.Join('\n', lines);
+        return panel;
     }
 
     private static Grid TokenKindBar(ModelReportEntry entry)

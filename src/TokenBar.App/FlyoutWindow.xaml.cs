@@ -303,7 +303,14 @@ public sealed partial class FlyoutWindow : Window
             IsInputActive = true,
             Theme = SystemBackdropTheme.Default,
         };
-        _acrylic = new DesktopAcrylicController();
+        _acrylic = new DesktopAcrylicController
+        {
+            // Default acrylic reads nearly opaque-black; thin it out so the
+            // desktop shows through (closer to the macOS popover glass).
+            TintColor = Windows.UI.Color.FromArgb(255, 28, 28, 34),
+            TintOpacity = 0.25f,
+            LuminosityOpacity = 0.55f,
+        };
         _acrylic.AddSystemBackdropTarget(
             WinRT.CastExtensions.As<Microsoft.UI.Composition.ICompositionSupportsSystemBackdrop>(this));
         _acrylic.SetSystemBackdropConfiguration(_acrylicConfig);
