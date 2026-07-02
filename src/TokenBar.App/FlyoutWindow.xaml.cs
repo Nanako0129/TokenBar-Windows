@@ -84,6 +84,7 @@ public sealed partial class FlyoutWindow : Window
     public void ShowFlyout()
     {
         _hiding = false;
+        InstallWheelHook();
         var (resting, start) = PositionNearTray();
         // Start offset toward the taskbar edge so the WINDOW (backdrop
         // included) slides in as one surface — the native taskbar-flyout
@@ -94,6 +95,11 @@ public sealed partial class FlyoutWindow : Window
         // Show can rebuild frame state; re-assert the chrome afterwards.
         ApplyPopupChrome();
         Activate();
+        // Activate() can silently fail to take real keyboard focus when the
+        // process lacks foreground rights (schtasks/tray launches) — and
+        // WM_MOUSEWHEEL is delivered to the FOCUSED window, so a focusless
+        // flyout scrolls by scrollbar drag but ignores the wheel.
+        _ = SetForegroundWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
         _ = SlideWindowAsync(start, resting, durationMs: 180, decelerate: true);
         FadeContent(from: 0f, to: 1f, durationMs: 180);
         _model.Start();
@@ -108,6 +114,7 @@ public sealed partial class FlyoutWindow : Window
         }
 
         _hiding = true;
+        RemoveWheelHook();
         _model.Stop();
         var resting = AppWindow.Position;
         var sink = Toward(resting, TaskbarEdge(), 16);
@@ -199,7 +206,9 @@ public sealed partial class FlyoutWindow : Window
     {
         var display = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary);
         var work = display.WorkArea;
-        var scale = Content.XamlRoot?.RasterizationScale ?? 1.0;
+        // GetDpiForWindow works before the first Show, unlike XamlRoot's
+        // RasterizationScale (null until shown → windows sized for 100%).
+        var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
         var width = (int)(FlyoutWidth * scale);
         var height = (int)(FlyoutHeight * scale);
         AppWindow.Resize(new SizeInt32(width, height));
@@ -330,4 +339,93 @@ public sealed partial class FlyoutWindow : Window
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool SetWindowPos(
         nint hwnd, nint hwndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(nint hwnd);
+
+    private delegate nint LowLevelMouseProc(int code, nint wParam, nint lParam);
+
+    private LowLevelMouseProc? _mouseProc; // kept alive while the hook is set
+    private nint _mouseHook;
+
+    /// <summary>Last resort for wheel input: the system never delivers wheel
+    /// messages to this focusless popup (verified at every hwnd of the
+    /// process), so while the flyout is visible a WH_MOUSE_LL hook watches
+    /// for wheel events inside the flyout rect, scrolls the dashboard, and
+    /// swallows the event so the focused app doesn't also scroll. Installed
+    /// only while visible; the tray-flyout standard (EarTrumpet et al.).</summary>
+    private void InstallWheelHook()
+    {
+        if (_mouseHook != 0)
+        {
+            return;
+        }
+
+        _mouseProc = (code, wParam, lParam) =>
+        {
+            if (code >= 0 && wParam == 0x020A /* WM_MOUSEWHEEL */)
+            {
+                var data = System.Runtime.InteropServices.Marshal
+                    .PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                var pos = AppWindow.Position;
+                var size = AppWindow.Size;
+                var inside = AppWindow.IsVisible &&
+                    data.pt.X >= pos.X && data.pt.X < pos.X + size.Width &&
+                    data.pt.Y >= pos.Y && data.pt.Y < pos.Y + size.Height;
+                if (inside)
+                {
+                    var delta = unchecked((short)(data.mouseData >> 16));
+                    _ = DispatcherQueue.TryEnqueue(() => Dashboard.ScrollBy(-delta));
+                    return 1; // consumed: don't let the focused app scroll too
+                }
+            }
+
+            return CallNextHookEx(0, code, wParam, lParam);
+        };
+        _mouseHook = SetWindowsHookExW(
+            14 /* WH_MOUSE_LL */, _mouseProc, GetModuleHandleW(null), 0);
+    }
+
+    private void RemoveWheelHook()
+    {
+        if (_mouseHook != 0)
+        {
+            _ = UnhookWindowsHookEx(_mouseHook);
+            _mouseHook = 0;
+            _mouseProc = null;
+        }
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public PointL pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public nuint dwExtraInfo;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct PointL
+    {
+        public int X;
+        public int Y;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern nint SetWindowsHookExW(
+        int hookId, LowLevelMouseProc proc, nint module, uint threadId);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(nint hook);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern nint CallNextHookEx(nint hook, int code, nint wParam, nint lParam);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern nint GetModuleHandleW(string? moduleName);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint hwnd);
 }

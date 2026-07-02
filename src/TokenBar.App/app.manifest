@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="TokenBar.App" />
+
+  <!-- Without this the process runs DPI-virtualized: AppWindow coordinates
+       live in a scaled-down space while the screen (and the low-level mouse
+       hook) speak physical pixels — the wheel hit-test could never match.
+       PerMonitorV2 puts the whole app in physical coordinates. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

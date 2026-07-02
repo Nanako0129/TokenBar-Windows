@@ -42,7 +42,9 @@ public sealed class TrayService : IDisposable
         menu.Items.Add(open);
         menu.Items.Add(quit);
         _icon.ContextFlyout = menu;
-        _icon.ContextMenuMode = ContextMenuMode.SecondWindow;
+        // NOT SecondWindow: that mode parks a transparent helper window over
+        // the desktop, which swallowed hover/wheel input meant for the flyout.
+        _icon.ContextMenuMode = ContextMenuMode.PopupMenu;
 
         _icon.ForceCreate();
     }

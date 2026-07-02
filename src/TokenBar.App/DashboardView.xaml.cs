@@ -36,7 +36,30 @@ public sealed partial class DashboardView : UserControl
     public DashboardView()
     {
         InitializeComponent();
+
+        // Mouse-wheel routing is flaky in borderless popup windows (the bar
+        // drags fine, the wheel does nothing) — drive the ScrollViewer by
+        // hand from the root so wheel input works wherever the pointer is.
+        // AddHandler with handledEventsToo so child elements can't eat it.
+        AddHandler(
+            PointerWheelChangedEvent,
+            new Microsoft.UI.Xaml.Input.PointerEventHandler(OnWheel),
+            handledEventsToo: true);
     }
+
+    private void OnWheel(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        var delta = e.GetCurrentPoint(this).Properties.MouseWheelDelta;
+        DevLog.Write($"wheel delta={delta} offset={CardsScroll.VerticalOffset}");
+        ScrollBy(-delta);
+        e.Handled = true;
+    }
+
+    /// <summary>Wheel entry point for the window-level WM_MOUSEWHEEL hook
+    /// (XAML never sees the wheel in this borderless popup).</summary>
+    public void ScrollBy(double delta) =>
+        CardsScroll.ChangeView(
+            null, CardsScroll.VerticalOffset + delta, null, disableAnimation: false);
 
     public void Render(DashboardModel.Snapshot? snapshot)
     {
@@ -116,9 +139,10 @@ public sealed partial class DashboardView : UserControl
                 };
                 Canvas.SetLeft(rect, x);
                 Canvas.SetTop(rect, y);
-                ToolTipService.SetToolTip(rect,
-                    $"{Format.MonthDay(bar.Date)} · {seg.Label}\n" +
-                    $"{Format.ExactTokens(seg.Tokens)} tokens · {Format.Usd(seg.Cost)}");
+                var (date, label, tokens, cost) = (bar.Date, seg.Label, seg.Tokens, seg.Cost);
+                HoverTip.Attach(rect, () =>
+                    $"{Format.MonthDay(date)} · {label}\n" +
+                    $"{Format.ExactTokens(tokens)} tokens · {Format.Usd(cost)}");
                 ChartCanvas.Children.Add(rect);
             }
 
@@ -282,6 +306,10 @@ public sealed partial class DashboardView : UserControl
             head.Children.Add(cost);
             block.Children.Add(head);
             block.Children.Add(TokenKindBar(entry));
+            // Rich tooltip on the WHOLE row: a 4px bar is an unhittable hover
+            // target — the exact lesson the macOS ModelBreakdownCard learned.
+            var captured = entry;
+            HoverTip.Attach(block, () => ModelTooltip(captured));
             ModelsPanel.Children.Add(block);
         }
     }
@@ -293,6 +321,27 @@ public sealed partial class DashboardView : UserControl
         CurrentStreak.Text = $"{stats.Streaks.Current}d";
         LongestStreak.Text = $"{stats.Streaks.Longest}d";
         BestDay.Text = stats.BestDay is { } best ? Format.MonthDay(best.Date) : "—";
+    }
+
+    private static string ModelTooltip(ModelReportEntry entry)
+    {
+        long[] values =
+            [entry.Input, entry.Output, entry.CacheRead, entry.CacheWrite, entry.Reasoning];
+        var total = Math.Max(1, values.Sum());
+        var lines = new List<string>
+        {
+            $"{entry.Model} · {entry.Provider}",
+            $"{Format.ExactTokens(entry.Total)} tokens · {Format.Usd(entry.Cost)} · {entry.MessageCount} msgs",
+        };
+        for (var i = 0; i < values.Length; i++)
+        {
+            if (values[i] > 0)
+            {
+                lines.Add($"{TokenKinds[i].Label}: {Format.ExactTokens(values[i])} ({100.0 * values[i] / total:F1}%)");
+            }
+        }
+
+        return string.Join('\n', lines);
     }
 
     /// <summary>Thin stacked bar of token kinds, sqrt-scaled so cache-read
@@ -327,9 +376,6 @@ public sealed partial class DashboardView : UserControl
                 RadiusY = 1,
             };
             Grid.SetColumn(seg, bar.ColumnDefinitions.Count - 1);
-            ToolTipService.SetToolTip(seg,
-                $"{TokenKinds[i].Label}: {Format.ExactTokens(values[i])} " +
-                $"({100.0 * values[i] / Math.Max(1, values.Sum()):F1}%)");
             bar.Children.Add(seg);
         }
 

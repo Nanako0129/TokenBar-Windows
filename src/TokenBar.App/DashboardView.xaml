@@ -44,7 +44,12 @@
         </StackPanel>
 
         <!-- Cards -->
-        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Hidden">
+        <ScrollViewer
+            x:Name="CardsScroll"
+            Grid.Row="1"
+            VerticalScrollBarVisibility="Auto"
+            VerticalScrollMode="Enabled"
+            IsVerticalScrollChainingEnabled="False">
             <StackPanel Spacing="10">
                 <Border Style="{StaticResource Card}">
                     <StackPanel>
