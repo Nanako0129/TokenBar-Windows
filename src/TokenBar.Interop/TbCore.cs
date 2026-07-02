@@ -16,7 +16,15 @@ public sealed class TbCoreException(string message) : Exception(message);
 /// </summary>
 public static class TbCore
 {
-    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
+    // Required-parameter enforcement mirrors Swift Decodable's strictness:
+    // a wire payload missing a non-optional field fails the decode loudly
+    // instead of silently binding 0/null (nullable DTO params carry `= null`
+    // defaults, so omitted optionals still decode like Swift optionals).
+    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
+    {
+        RespectRequiredConstructorParameters = true,
+        RespectNullableAnnotations = true,
+    };
 
     public static ProbeResult Probe()
     {
@@ -134,5 +142,6 @@ public static class TbCore
 
 public sealed record ProbeResult(
     [property: JsonPropertyName("ok")] bool Ok,
-    [property: JsonPropertyName("messages")] long Messages,
+    // The legacy error shape {"ok":false,"err":…} carries no messages field.
+    [property: JsonPropertyName("messages")] long Messages = 0,
     [property: JsonPropertyName("err")] string? Err = null);

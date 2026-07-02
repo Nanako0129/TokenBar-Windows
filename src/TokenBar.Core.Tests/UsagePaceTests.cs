@@ -14,7 +14,8 @@ public class UsagePaceTests
         double? historical = null, double? runOut = null) =>
         new(
             Label: "Session", UsedPercent: used, RemainingPercent: 100 - used,
-            ResetsAt: Now.AddSeconds(untilReset).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+            ResetsAt: Now.AddSeconds(untilReset).UtcDateTime.ToString(
+                "yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture),
             ResetText: null, WindowMinutes: minutes,
             HistoricalExpectedPercent: historical, RunOutProbability: runOut);
 
@@ -113,7 +114,8 @@ public class UsagePaceTests
     {
         var window = Window(used: 50) with
         {
-            ResetsAt = Now.AddSeconds(1800).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.123'Z'"),
+            ResetsAt = Now.AddSeconds(1800).UtcDateTime.ToString(
+                "yyyy-MM-dd'T'HH:mm:ss.123'Z'", System.Globalization.CultureInfo.InvariantCulture),
         };
         Assert.NotNull(UsagePace.Compute(window, Now));
     }

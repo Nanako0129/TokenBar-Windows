@@ -18,7 +18,7 @@ public sealed record ModelReportEntry(
     long Total,
     int MessageCount,
     double Cost,
-    double? MsPer1kTokens);
+    double? MsPer1kTokens = null);
 
 public sealed record ModelReport(
     IReadOnlyList<ModelReportEntry> Entries,
@@ -30,4 +30,4 @@ public sealed record ModelReport(
     double TotalCost,
     // Unix-seconds time the LiteLLM pricing dataset was last fetched
     // (drives the "Prices updated …" hint). Absent before the first fetch.
-    ulong? PricingUpdatedAt);
+    ulong? PricingUpdatedAt = null);

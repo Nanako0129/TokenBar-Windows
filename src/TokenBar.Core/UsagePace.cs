@@ -208,12 +208,20 @@ public sealed record UsagePace(
         return delta >= 0 ? PaceStage.FarAhead : PaceStage.FarBehind;
     }
 
+    private static readonly string[] Rfc3339Formats =
+    [
+        "yyyy-MM-dd'T'HH:mm:ssK",
+        "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK",
+    ];
+
     /// <summary>RFC3339 parser tolerating fractional seconds (the backend
-    /// emits both).</summary>
+    /// emits both). TryParseExact keeps Swift ISO8601DateFormatter's
+    /// strictness — a lenient TryParse would accept non-RFC3339 strings and
+    /// show a pace the macOS app would suppress.</summary>
     internal static DateTimeOffset? ParseRfc3339(string s) =>
-        DateTimeOffset.TryParse(
-            s, CultureInfo.InvariantCulture,
-            DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var parsed)
+        DateTimeOffset.TryParseExact(
+            s, Rfc3339Formats, CultureInfo.InvariantCulture,
+            DateTimeStyles.AdjustToUniversal, out var parsed)
             ? parsed
             : null;
 

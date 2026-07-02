@@ -20,9 +20,12 @@ public static class Format
         else if (value >= 1_000) { (scaled, suffix) = (value / 1_000, "K"); }
         else { return count.ToString(CultureInfo.InvariantCulture); }
 
+        // Pre-round half-to-even: Swift's %.1f/%.0f is printf semantics
+        // (round-half-even on exact binary halves, e.g. 1.25M → "1.2M"),
+        // while .NET's F formats round midpoints away from zero.
         var text = scaled >= 100
-            ? scaled.ToString("F0", CultureInfo.InvariantCulture)
-            : scaled.ToString("F1", CultureInfo.InvariantCulture);
+            ? Math.Round(scaled, MidpointRounding.ToEven).ToString("F0", CultureInfo.InvariantCulture)
+            : Math.Round(scaled, 1, MidpointRounding.ToEven).ToString("F1", CultureInfo.InvariantCulture);
         if (text.EndsWith(".0", StringComparison.Ordinal))
         {
             text = text[..^2];
@@ -31,8 +34,12 @@ public static class Format
         return text + suffix;
     }
 
+    // "$" prepended outside the numeric format so a negative amount renders
+    // "$-1.50" like Swift's "$%.2f", not .NET's "-$1.50"; ToEven matches
+    // printf midpoint rounding.
     public static string Usd(double amount) =>
-        amount.ToString("$0.00", CultureInfo.InvariantCulture);
+        "$" + Math.Round(amount, 2, MidpointRounding.ToEven)
+            .ToString("0.00", CultureInfo.InvariantCulture);
 
     /// <summary>Today's contribution-graph day key. tokscale-core buckets days
     /// in the local timezone as %Y-%m-%d, so this must match exactly.</summary>
@@ -60,13 +67,15 @@ public static class Format
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
 
-    /// <summary>"2026-06-10" → "Jun 10".</summary>
+    /// <summary>"2026-06-10" → "Jun 10". RemoveEmptyEntries + all-three-parsed
+    /// mirrors Swift's `split(separator:)` + `compactMap { Int($0) }`.</summary>
     public static string MonthDay(string iso)
     {
-        var parts = iso.Split('-');
+        var parts = iso.Split('-', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length != 3 ||
-            !int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var month) ||
-            !int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var day) ||
+            !int.TryParse(parts[0], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _) ||
+            !int.TryParse(parts[1], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var month) ||
+            !int.TryParse(parts[2], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var day) ||
             month is < 1 or > 12)
         {
             return iso;
@@ -78,7 +87,7 @@ public static class Format
     /// <summary>"2026-06-10" → "06/10".</summary>
     public static string Mmdd(string iso)
     {
-        var parts = iso.Split('-');
+        var parts = iso.Split('-', StringSplitOptions.RemoveEmptyEntries);
         return parts.Length == 3 ? $"{parts[1]}/{parts[2]}" : iso;
     }
 

@@ -20,12 +20,16 @@ public enum ChartMetric
     Cost,
 }
 
-public sealed record DaySegment(
-    string Key,
-    string Label,
-    // Hex color (provider shade for model stacking, brand color for agent).
-    string Color)
+// Deliberately a class, not a record: the builder and legend accumulate into
+// Tokens/Cost, and a mutable record's synthesized value equality/hash would be
+// a trap the moment one lands in a set or gets diffed.
+public sealed class DaySegment(string key, string label, string color)
 {
+    public string Key { get; } = key;
+    public string Label { get; } = label;
+    /// <summary>Hex color (provider shade for model stacking, brand color for
+    /// agent).</summary>
+    public string Color { get; } = color;
     public long Tokens { get; set; }
     public double Cost { get; set; }
 }
@@ -139,8 +143,11 @@ public static class DayBars
             slot.Cost += seg.Cost;
         }
 
+        // Key tiebreak: the Swift original inherits Dictionary iteration order
+        // on metric ties (random per process); a deterministic order is a
+        // strict improvement and worth upstreaming.
         return metric == ChartMetric.Cost
-            ? [.. agg.Values.OrderByDescending(s => s.Cost)]
-            : [.. agg.Values.OrderByDescending(s => s.Tokens)];
+            ? [.. agg.Values.OrderByDescending(s => s.Cost).ThenBy(s => s.Key, StringComparer.Ordinal)]
+            : [.. agg.Values.OrderByDescending(s => s.Tokens).ThenBy(s => s.Key, StringComparer.Ordinal)];
     }
 }

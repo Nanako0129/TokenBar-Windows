@@ -13,11 +13,18 @@ public readonly record struct ISODay(int Number)
 {
     public static ISODay? Parse(string iso)
     {
-        var parts = iso.Split('-');
+        // RemoveEmptyEntries + AllowLeadingSign + invariant matches Swift's
+        // `split(separator:)` (omits empty subsequences) + `Int(_:)` (sign ok,
+        // no whitespace). Out-of-range months normalize via the civil math,
+        // same as the Swift original.
+        var parts = iso.Split('-', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length != 3 ||
-            !int.TryParse(parts[0], out var y) ||
-            !int.TryParse(parts[1], out var m) ||
-            !int.TryParse(parts[2], out var d))
+            !int.TryParse(parts[0], System.Globalization.NumberStyles.AllowLeadingSign,
+                System.Globalization.CultureInfo.InvariantCulture, out var y) ||
+            !int.TryParse(parts[1], System.Globalization.NumberStyles.AllowLeadingSign,
+                System.Globalization.CultureInfo.InvariantCulture, out var m) ||
+            !int.TryParse(parts[2], System.Globalization.NumberStyles.AllowLeadingSign,
+                System.Globalization.CultureInfo.InvariantCulture, out var d))
         {
             return null;
         }

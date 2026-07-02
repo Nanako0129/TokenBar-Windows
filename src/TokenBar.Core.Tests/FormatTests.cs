@@ -14,6 +14,7 @@ public class FormatTests
     [InlineData(100_000, "100K")]
     [InlineData(999_950, "1000K")] // matches Swift: <1M stays in the K band
     [InlineData(1_234_567, "1.2M")]
+    [InlineData(1_250_000, "1.2M")] // exact binary half → round-half-even, like printf
     [InlineData(1_000_000_000, "1B")]
     [InlineData(1_500_000_000, "1.5B")]
     public void CompactTokensMatchesSwift(long count, string expected) =>
@@ -21,7 +22,8 @@ public class FormatTests
 
     [Theory]
     [InlineData(0.0, "$0.00")]
-    [InlineData(5.205, "$5.21")]
+    [InlineData(5.205, "$5.20")] // binary 5.205 ≈ 5.20499…, printf semantics
+    [InlineData(-1.5, "$-1.50")] // sign inside, matching Swift's "$%.2f"
     [InlineData(4845.174, "$4845.17")]
     public void UsdMatchesSwift(double amount, string expected) =>
         Assert.Equal(expected, Format.Usd(amount));

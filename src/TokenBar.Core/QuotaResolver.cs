@@ -40,8 +40,10 @@ public static class QuotaResolver
             return best;
         }
 
+        // Empty-segment check mirrors Swift split's omittingEmptySubsequences:
+        // "claude|" / "|label" resolve to nothing there and must here too.
         var parts = selection.Split('|', 2);
-        if (parts.Length != 2)
+        if (parts.Length != 2 || parts[0].Length == 0 || parts[1].Length == 0)
         {
             return null;
         }
