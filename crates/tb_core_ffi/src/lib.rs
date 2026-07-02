@@ -61,15 +61,26 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("build tokio runtime for tb_core_ffi")
 });
 
-/// Cap rayon's global thread pool to 2 workers. tokscale-core uses rayon for
-/// parallel log parsing (55+ par_iter sites); the default pool size is num_cpus
-/// which is fine for a one-shot CLI but ruinous for a resident menu-bar daemon:
-/// each idle worker busy-waits before parking, and every 10s poll wakes the
-/// entire pool for trivial mtime-check work. 2 threads keep I/O parallelism
-/// while cutting idle spinning overhead by ~80%.
+/// Cap rayon's global thread pool. tokscale-core uses rayon for parallel log
+/// parsing (55+ par_iter sites); the default pool size is num_cpus which is
+/// fine for a one-shot CLI but ruinous for a resident menu-bar daemon: each
+/// idle worker busy-waits before parking, and every 10s poll wakes the entire
+/// pool for trivial mtime-check work.
+///
+/// macOS keeps the post-CPU-bug cap of 2. Windows scales with the machine
+/// (cores/4, clamped 2..=8) — the cold first parse of a large history was
+/// taking 20-30s pinned to 2 threads on a 16-thread desktop, and the visible
+/// first-run stall costs more than the extra parked workers. (Divergence to
+/// discuss when upstreaming to the macOS repo.)
 static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
+    #[cfg(windows)]
+    let threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 4).clamp(2, 8))
+        .unwrap_or(2);
+    #[cfg(not(windows))]
+    let threads = 2;
     rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
+        .num_threads(threads)
         .build_global()
         .ok();
 });

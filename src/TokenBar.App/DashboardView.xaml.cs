@@ -208,18 +208,20 @@ public sealed partial class DashboardView : UserControl
         var holder = new StackPanel();
         var canvas = new Canvas { Height = 120 };
         holder.Children.Add(canvas);
-        var legend = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 10,
-            Margin = new Thickness(0, 8, 0, 0),
-        };
-        foreach (var seg in DayBars.Legend(bars, ChartMetric.Tokens).Take(5))
+        // Wrapping legend, capped like the macOS FlowLayout (12 + "+N").
+        var legend = new WrapRow { Margin = new Thickness(0, 8, 0, 0) };
+        var allSegments = DayBars.Legend(bars, ChartMetric.Tokens);
+        foreach (var seg in allSegments.Take(12))
         {
             var item = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
             item.Children.Add(Ui.Disc(seg.Color));
             item.Children.Add(Ui.Text(seg.Label, 10, 0.75));
             legend.Children.Add(item);
+        }
+
+        if (allSegments.Count > 12)
+        {
+            legend.Children.Add(Ui.Text($"+{allSegments.Count - 12}", 10, 0.6));
         }
 
         holder.Children.Add(legend);
@@ -595,7 +597,6 @@ public sealed partial class DashboardView : UserControl
             ($"{stats.ActiveDays}", "active days"),
             (Format.Usd(stats.AveragePerDay), "avg/day"),
             (stats.BestDay is { } b ? Format.MonthDay(b.Date) : "—", "best day"),
-            (favorite?.Model ?? "—", "favorite model"),
         ];
         for (var i = 0; i < metrics.Length; i++)
         {
@@ -604,6 +605,14 @@ public sealed partial class DashboardView : UserControl
             Grid.SetRow(cell, i / 3);
             grid.Children.Add(cell);
         }
+
+        // Favorite model gets a full-width row — long model ids don't fit a
+        // third of the card.
+        grid.RowDefinitions.Add(new RowDefinition());
+        var favoriteCell = Metric(favorite?.Model ?? "—", "favorite model");
+        Grid.SetRow(favoriteCell, 2);
+        Grid.SetColumnSpan(favoriteCell, 3);
+        grid.Children.Add(favoriteCell);
 
         stack.Children.Add(Ui.Card("Stats", grid));
         stack.Children.Add(Ui.Card("Streaks", BuildStreaks(snapshot)));
