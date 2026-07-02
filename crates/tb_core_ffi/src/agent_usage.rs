@@ -1279,8 +1279,17 @@ pub(crate) fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
 }
 
 fn claude_user_agent() -> String {
-    std::process::Command::new("claude")
-        .arg("--version")
+    let mut command = std::process::Command::new("claude");
+    command.arg("--version");
+    // Console children flash a visible window on Windows by default —
+    // tb_agent_usage runs on every quota refresh, so each flyout open would
+    // blink a terminal without CREATE_NO_WINDOW.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
         .output()
         .ok()
         .and_then(|output| {
