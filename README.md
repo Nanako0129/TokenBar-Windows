@@ -15,7 +15,7 @@ a native WinUI 3 shell.
 | C ABI contract | `include/ctb.h` | 10 entry points, `{"ok":true,"data":…}` / `{"ok":false,"err":…}` |
 | Interop | `src/TokenBar.Interop` | `net10.0`, platform-neutral — P/Invoke facade + envelope decode |
 | Logic | `src/TokenBar.Core` | `net10.0`, platform-neutral — C# port of the macOS `TokenBarCore` (in progress) |
-| Shell | `src/TokenBar.App` | WinUI 3, unpackaged (arrives in Phase 4) |
+| Shell | `src/TokenBar.App` | WinUI 3, unpackaged. Windows-only build (not in the slnx): `dotnet build src/TokenBar.App -c Release -p:Platform=x64` |
 
 ## Build
 
@@ -37,7 +37,7 @@ Prereqs: Rust (stable), .NET 10 SDK; on Windows the MSVC toolchain.
 | 1 | Rust Windows fixes (HOME→dirs, TLS, antigravity) | ✅ 2026-07-02 — all 10 entry points verified on a real x64 Windows box against real session data (271 msgs parsed, pricing fetched over rustls, quota windows decoded) |
 | 2 | 3D contribution graph spike | ✅ 2026-07-02 — GO (Vortice/D3D11 instancing verified on real hardware, ~0.2ms/frame; SwapChainPanel lifecycle rides with Phase 4). See `spike/RESULTS.md` |
 | 3 | TokenBar.Core C# port + cross-check vs Swift | 🔶 all 14 modules ported, 85 unit tests green (2026-07-02); fixture cross-check vs Swift pending |
-| 4 | Tray skeleton + flyout window | — |
+| 4 | Tray skeleton + flyout window | 🔶 4.1+4.2 done (2026-07-02): tray icon, borderless rounded Acrylic flyout (translucent while unfocused, topmost), show/hide slide, single instance, taskbar-edge placement, polling dashboard with live quota data. Remaining: tray context menu, DPI placement polish, SwapChainPanel lifecycle check, native-feel animation research |
 | 5 | Overview lens + polling engine | — |
 | 6 | Remaining five lenses | — |
 | 7 | Settings + tray extras | — |
