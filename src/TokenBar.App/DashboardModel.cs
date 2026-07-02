@@ -72,6 +72,7 @@ public sealed class DashboardModel
 
     private void FetchLazy(bool hourly, bool agents)
     {
+        using var boost = ProcessPower.Boost();
         try
         {
             HourlyReport? h = hourly ? TbCore.HourlyReport() : null;
@@ -125,41 +126,39 @@ public sealed class DashboardModel
         _slowInFlight = true;
         _ = Task.Run(() =>
         {
+            using var boost = ProcessPower.Boost(); // EcoQoS off while parsing
             try
             {
+                // macOS parity: the model report runs concurrently with the
+                // graph parse, and agentUsage (network-bound) never gates the
+                // first paint — it merges into the snapshot when it lands.
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var modelsTask = Task.Run(() =>
+                    TryFetch(() => TbCore.ModelReport(), "modelReport"));
+                var quotaTask = Task.Run(() =>
+                    TryFetch(() => TbCore.AgentUsage(), "agentUsage"));
                 var graph = TbCore.Graph();
-                ModelReport? models = null;
-                try
-                {
-                    models = TbCore.ModelReport();
-                }
-                catch (Exception ex)
-                {
-                    DevLog.Write($"modelReport failed: {ex.Message}");
-                }
-
-                AgentUsagePayload? quota = null;
-                try
-                {
-                    quota = TbCore.AgentUsage(); // network-bound; per-agent errors ride inside
-                }
-                catch (Exception ex)
-                {
-                    DevLog.Write($"agentUsage failed: {ex.Message}");
-                }
-
-                HourlyReport? hourly = _hourlyWanted
-                    ? TryFetch(() => TbCore.HourlyReport(), "hourly") : null;
-                AgentsReport? agentsReport = _agentsWanted
-                    ? TryFetch(() => TbCore.AgentsReport(), "agents") : null;
+                var graphMs = sw.ElapsedMilliseconds;
+                var models = modelsTask.Result;
+                DevLog.Write($"slow lane: graph={graphMs}ms graph+models={sw.ElapsedMilliseconds}ms");
                 Publish(s => s with
                 {
                     Graph = graph,
                     Models = models ?? s.Models,
+                }, graph);
+
+                var quota = quotaTask.Result;
+                HourlyReport? hourly = _hourlyWanted
+                    ? TryFetch(() => TbCore.HourlyReport(), "hourly") : null;
+                AgentsReport? agentsReport = _agentsWanted
+                    ? TryFetch(() => TbCore.AgentsReport(), "agents") : null;
+                DevLog.Write($"slow lane: +quota/lenses={sw.ElapsedMilliseconds}ms");
+                Publish(s => s with
+                {
                     Quota = quota ?? s.Quota,
                     Hourly = hourly ?? s.Hourly,
                     Agents = agentsReport ?? s.Agents,
-                }, graph);
+                }, graph: null);
             }
             catch (Exception ex)
             {

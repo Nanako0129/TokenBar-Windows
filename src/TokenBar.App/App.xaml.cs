@@ -28,6 +28,8 @@ public partial class App : Application
             return;
         }
 
+        ProcessPower.EnsureNormalPriority();
+
         try
         {
             DevLog.Write("launch: creating flyout");
