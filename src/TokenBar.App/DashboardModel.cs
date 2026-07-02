@@ -25,6 +25,53 @@ public sealed class DashboardModel
     // from it (quota is usually done in ~1s, the cold parse in seconds).
     private volatile AgentUsagePayload? _latestQuota;
 
+    // Year filter for every lens (macOS DashboardModel.year); null = all
+    // time. Fetch lanes capture it per pass and drop slices fetched for a
+    // stale filter, so a late old-year payload can never overwrite the new
+    // selection's data.
+    private volatile string? _year = ResolveYear();
+    private volatile List<string> _knownYears = [];
+
+    public string? Year => _year;
+
+    /// <summary>Union of the payload's years across loads — a year-filtered
+    /// payload only reports the selected year, so the picker remembers the
+    /// rest (macOS knownYears).</summary>
+    public IReadOnlyList<string> KnownYears => _knownYears;
+
+    /// <summary>The `--year=` debug flag wins over the persisted selection
+    /// (and is itself never persisted), macOS resolveYear parity.</summary>
+    private static string? ResolveYear()
+    {
+        var flag = Environment.GetCommandLineArgs()
+            .FirstOrDefault(a => a.StartsWith("--year=", StringComparison.Ordinal));
+        return flag is not null
+            ? (flag["--year=".Length..] is { Length: > 0 } y ? y : null)
+            : AppSettings.Store.GetString("tokenbar.dashboard.year");
+    }
+
+    /// <summary>Switch the year filter and re-fetch every lens for the new
+    /// slice (served from the engine's per-year cache when fresh).</summary>
+    public void SetYear(string? year)
+    {
+        if (year == _year)
+        {
+            return;
+        }
+
+        _year = year;
+        if (year is null)
+        {
+            AppSettings.Store.Remove("tokenbar.dashboard.year");
+        }
+        else
+        {
+            AppSettings.Store.SetString("tokenbar.dashboard.year", year);
+        }
+
+        RefreshSlow(); // an in-flight lane re-runs itself when the year flips
+    }
+
     public DashboardModel(DispatcherQueue dispatcher)
     {
         _dispatcher = dispatcher;
@@ -78,10 +125,16 @@ public sealed class DashboardModel
     private void FetchLazy(bool hourly, bool agents)
     {
         using var boost = ProcessPower.Boost();
+        var year = _year;
         try
         {
-            HourlyReport? h = hourly ? TbCore.HourlyReport() : null;
-            AgentsReport? a = agents ? TbCore.AgentsReport() : null;
+            HourlyReport? h = hourly ? TbCore.HourlyReport(year) : null;
+            AgentsReport? a = agents ? TbCore.AgentsReport(year) : null;
+            if (_year != year)
+            {
+                return; // stale slice; the slow lane re-fetches for the new year
+            }
+
             Publish(s => s with
             {
                 Hourly = h ?? s.Hourly,
@@ -136,6 +189,7 @@ public sealed class DashboardModel
         _slowInFlight = true;
         _ = Task.Run(() =>
         {
+            var year = _year; // one slice per pass; a mid-flight switch re-runs below
             try
             {
                 // macOS parity: the model report runs concurrently with the
@@ -147,14 +201,31 @@ public sealed class DashboardModel
                 using (ProcessPower.Boost()) // EcoQoS off while parsing
                 {
                     var modelsTask = Task.Run(() =>
-                        TryFetch(() => TbCore.ModelReport(), "modelReport"));
-                    graph = TryFetch(() => TbCore.Graph(), "graph");
+                        TryFetch(() => TbCore.ModelReport(year), "modelReport"));
+                    graph = TryFetch(() => TbCore.Graph(year), "graph");
                     models = modelsTask.Result; // joined before the boost lifts
                 }
 
-                DevLog.Write($"slow lane: graph+models={sw.ElapsedMilliseconds}ms");
+                DevLog.Write($"slow lane: graph+models={sw.ElapsedMilliseconds}ms year={year ?? "all"}");
+                if (graph is not null && year is not null
+                    && !graph.Years.Any(y => y.Year == year))
+                {
+                    // macOS apply() parity: the selected year's logs vanished —
+                    // clear the filter instead of stranding the dashboard on an
+                    // empty slice. The finally below re-runs the lane unfiltered.
+                    _year = null;
+                    AppSettings.Store.Remove("tokenbar.dashboard.year");
+                    return;
+                }
+
+                if (_year != year)
+                {
+                    return; // stale slice; the finally re-runs with the new year
+                }
+
                 if (graph is not null)
                 {
+                    RememberYears(graph);
                     var seeded = graph;
                     Publish(s => s with
                     {
@@ -175,12 +246,12 @@ public sealed class DashboardModel
                     using (ProcessPower.Boost())
                     {
                         hourly = _hourlyWanted
-                            ? TryFetch(() => TbCore.HourlyReport(), "hourly") : null;
+                            ? TryFetch(() => TbCore.HourlyReport(year), "hourly") : null;
                         agentsReport = _agentsWanted
-                            ? TryFetch(() => TbCore.AgentsReport(), "agents") : null;
+                            ? TryFetch(() => TbCore.AgentsReport(year), "agents") : null;
                     }
 
-                    if (hourly is not null || agentsReport is not null)
+                    if (_year == year && (hourly is not null || agentsReport is not null))
                     {
                         Publish(s => s with
                         {
@@ -193,8 +264,22 @@ public sealed class DashboardModel
             finally
             {
                 _slowInFlight = false;
+                if (_year != year)
+                {
+                    RefreshSlow();
+                }
             }
         });
+    }
+
+    private void RememberYears(UsagePayload graph)
+    {
+        var merged = _knownYears.Union(graph.Years.Select(y => y.Year))
+            .OrderByDescending(y => y, StringComparer.Ordinal).ToList();
+        if (!merged.SequenceEqual(_knownYears))
+        {
+            _knownYears = merged;
+        }
     }
 
     /// <summary>The OAuth quota lane, macOS pollAgentUsage parity: fully

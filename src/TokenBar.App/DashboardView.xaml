@@ -13,7 +13,22 @@
 
         <!-- Header -->
         <StackPanel Grid.Row="0" Spacing="6">
-            <TextBlock FontSize="15" FontWeight="SemiBold" Text="TokenBar" />
+            <Grid>
+                <TextBlock
+                    FontSize="15"
+                    FontWeight="SemiBold"
+                    VerticalAlignment="Center"
+                    Text="TokenBar" />
+                <!-- Year filter, macOS PopoverView yearMenu parity: hidden
+                     until the first payload reports which years exist. -->
+                <DropDownButton
+                    x:Name="YearButton"
+                    HorizontalAlignment="Right"
+                    Visibility="Collapsed"
+                    FontSize="11"
+                    Padding="9,3,9,4"
+                    Content="All" />
+            </Grid>
             <StackPanel Orientation="Horizontal" Spacing="18">
                 <StackPanel>
                     <TextBlock x:Name="TodayValue" FontSize="20" FontWeight="SemiBold" Text="—" />

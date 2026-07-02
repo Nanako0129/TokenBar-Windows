@@ -112,7 +112,58 @@ public sealed partial class DashboardView : UserControl
             $"{Format.Usd(Format.TodayCost(graph))} today · {Format.Usd(graph.Summary.TotalCost)} all time · " +
             $"{graph.Summary.ActiveDays} active days";
         FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
+        UpdateYearPicker();
         RenderContent(animated: false);
+    }
+
+    private string _yearPickerSignature = "";
+
+    /// <summary>Rebuilds the year menu only when the selection or the known
+    /// years actually change, so the 10s fast lane's re-render never closes
+    /// a menu the user has open.</summary>
+    private void UpdateYearPicker()
+    {
+        var model = _model;
+        var years = model?.KnownYears ?? [];
+        if (model is null || years.Count == 0)
+        {
+            YearButton.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        YearButton.Visibility = Visibility.Visible;
+        var signature = $"{model.Year}|{string.Join(',', years)}";
+        if (signature == _yearPickerSignature)
+        {
+            return;
+        }
+
+        _yearPickerSignature = signature;
+        YearButton.Content = model.Year ?? "All";
+        var flyout = new MenuFlyout();
+        AddYearItem(flyout, "All years", null, model);
+        foreach (var year in years)
+        {
+            AddYearItem(flyout, year, year, model);
+        }
+
+        YearButton.Flyout = flyout;
+    }
+
+    private void AddYearItem(
+        MenuFlyout flyout, string label, string? value, DashboardModel model)
+    {
+        var item = new ToggleMenuFlyoutItem
+        {
+            Text = label,
+            IsChecked = model.Year == value,
+        };
+        item.Click += (_, _) =>
+        {
+            model.SetYear(value);
+            UpdateYearPicker(); // reflect the pick before the new slice lands
+        };
+        flyout.Items.Add(item);
     }
 
     public void ScrollBy(double delta) =>
