@@ -369,10 +369,17 @@ public sealed partial class DashboardView : UserControl
                 var pace = UsagePace.Compute(window, PaceMode.Historical, now);
                 var paceText = pace is null ? ""
                     : pace.EtaText is { } eta ? $"{pace.Label} · {eta}" : pace.Label;
+                var paceLabel = Ui.Text(paceText, 10,
+                    pace?.Stage.IsDeficit() == true ? 1.0 : 0.7);
+                if (pace?.Stage.IsDeficit() == true)
+                {
+                    paceLabel.Foreground = Ui.BrushFromHex(PaceOrange);
+                }
+
                 section.Children.Add(Ui.Row(
                     Ui.Text($"{window.Label} · {window.RemainingPercent:F0}% left", 11),
-                    Ui.Text(paceText, 10, 0.7)));
-                section.Children.Add(GaugeBar(window.RemainingPercent));
+                    paceLabel));
+                section.Children.Add(GaugeBar(window.RemainingPercent, pace));
                 if (window.ResetText is { } reset)
                 {
                     section.Children.Add(Ui.Dim(reset, 10));
@@ -916,7 +923,9 @@ public sealed partial class DashboardView : UserControl
         return bar;
     }
 
-    private static Grid GaugeBar(double remainingPercent)
+    private const string PaceOrange = "#ff9500"; // macOS Color.orange
+
+    private static FrameworkElement GaugeBar(double remainingPercent, UsagePace? pace = null)
     {
         var remaining = Math.Clamp(remainingPercent, 0, 100);
         var color = remaining < 10 ? "#ef4444" : remaining < 25 ? "#f59e0b" : "#22c55e";
@@ -939,6 +948,41 @@ public sealed partial class DashboardView : UserControl
             Background = Ui.BrushFromHex(color),
             CornerRadius = new CornerRadius(2.5),
         });
-        return track;
+        if (pace is null)
+        {
+            return track;
+        }
+
+        // macOS-parity pace marker: a slim tick at the expected-remaining
+        // position, taller than the bar; orange in deficit, dim otherwise.
+        // The bar fills by remaining, so the marker rides the same axis.
+        var paceLeft = Math.Clamp(100 - pace.ExpectedUsedPercent, 0, 100);
+        var holder = new Grid { Height = 9 };
+        track.VerticalAlignment = VerticalAlignment.Center;
+        holder.Children.Add(track);
+        var lanes = new Grid();
+        lanes.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(paceLeft, GridUnitType.Star),
+        });
+        lanes.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(100 - paceLeft, GridUnitType.Star),
+        });
+        var marker = new Rectangle
+        {
+            Width = 1.5,
+            RadiusX = 0.75,
+            RadiusY = 0.75,
+            Fill = pace.Stage.IsDeficit() ? Ui.BrushFromHex(PaceOrange)
+                : new SolidColorBrush(Color.FromArgb(150, 160, 160, 160)),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Thickness(0, 0, -0.75, 0),
+        };
+        Grid.SetColumn(marker, 0);
+        lanes.Children.Add(marker);
+        holder.Children.Add(lanes);
+        HoverTip.Attach(marker, () => $"Expected {100 - paceLeft:F0}% used by now");
+        return holder;
     }
 }
