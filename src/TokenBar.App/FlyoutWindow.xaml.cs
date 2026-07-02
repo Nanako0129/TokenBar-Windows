@@ -28,6 +28,17 @@ public sealed partial class FlyoutWindow : Window
 
         _model = new DashboardModel(DispatcherQueue);
         _model.Updated += RenderSnapshot;
+        Dashboard.Bind(_model);
+
+        // --view=<lens> debug flag (the macOS `defaults write tokenbar.view`
+        // counterpart) so remote lens screenshots need no clicking.
+        var viewArg = Environment.GetCommandLineArgs()
+            .FirstOrDefault(a => a.StartsWith("--view=", StringComparison.Ordinal));
+        if (viewArg is not null &&
+            Enum.TryParse<AppView>(viewArg["--view=".Length..], ignoreCase: true, out var lens))
+        {
+            Dashboard.SwitchTo(lens);
+        }
 
         // Transient surface → Acrylic, via the manual controller so the
         // backdrop stays translucent while unfocused: the flyout is a

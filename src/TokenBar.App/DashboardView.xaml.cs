@@ -1,65 +1,92 @@
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
-// TokenBar.Core.Grid (the contribution-grid builder) collides with the XAML
-// Grid — same clash the macOS port hit with SwiftUI's GridLayout.
-using Grid = Microsoft.UI.Xaml.Controls.Grid;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
 using TokenBar.Core;
 using TokenBar.Interop;
 using Windows.UI;
+// TokenBar.Core.Grid (the contribution-grid builder) collides with the XAML
+// Grid — same clash the macOS port hit with SwiftUI's GridLayout.
+using Grid = Microsoft.UI.Xaml.Controls.Grid;
 
 namespace TokenBar.App;
 
+public enum AppView
+{
+    Overview,
+    Models,
+    Daily,
+    Hourly,
+    Stats,
+    Agents,
+}
+
 /// <summary>
-/// The overview lens: the macOS OverviewView's card stack (chart, agent
-/// limits with pace, live trace, model breakdown, streaks), rendered from a
-/// DashboardModel snapshot. XAML shapes instead of Win2D for now — 30 bars ×
-/// a handful of segments is trivial, and per-segment native tooltips come
-/// free. Win2D enters with the gauges/3D later.
+/// The dashboard shell: global header, lens switch, and the six lenses from
+/// the macOS AppView router, each built in code from the current snapshot.
 /// </summary>
 public sealed partial class DashboardView : UserControl
 {
-    private static readonly (string Key, string Label, string Color)[] TokenKinds =
-    [
-        ("input", "In", "#3b82f6"),
-        ("output", "Out", "#22c55e"),
-        ("cacheRead", "CR", "#f59e0b"),
-        ("cacheWrite", "CW", "#a855f7"),
-        ("reasoning", "R", "#ec4899"),
-    ];
-
     private DashboardModel.Snapshot? _snapshot;
-    private IReadOnlyList<DayBar> _bars = [];
+    private DashboardModel? _model;
+    private AppView _view = AppView.Overview;
+    private readonly Dictionary<AppView, Button> _tabs = [];
+    private string? _expandedDay; // Daily drill-down state
+    private bool _hourlyProfileMode;
+    private int _hourlyWindow = 48; // Timeline rows shown; +48 per "Show more"
 
     public DashboardView()
     {
         InitializeComponent();
 
-        // Mouse-wheel routing is flaky in borderless popup windows (the bar
-        // drags fine, the wheel does nothing) — drive the ScrollViewer by
-        // hand from the root so wheel input works wherever the pointer is.
-        // AddHandler with handledEventsToo so child elements can't eat it.
+        foreach (var view in Enum.GetValues<AppView>())
+        {
+            var button = new Button
+            {
+                Content = view.ToString(),
+                FontSize = 11,
+                Padding = new Thickness(8, 4, 8, 4),
+                Background = new SolidColorBrush(Colors.Transparent),
+                BorderThickness = new Thickness(0),
+            };
+            button.Click += (_, _) => SwitchTo(view);
+            _tabs[view] = button;
+            TabsPanel.Children.Add(button);
+        }
+
+        UpdateTabChrome();
+
         AddHandler(
             PointerWheelChangedEvent,
             new Microsoft.UI.Xaml.Input.PointerEventHandler(OnWheel),
             handledEventsToo: true);
     }
 
-    private void OnWheel(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
-    {
-        var delta = e.GetCurrentPoint(this).Properties.MouseWheelDelta;
-        DevLog.Write($"wheel delta={delta} offset={CardsScroll.VerticalOffset}");
-        ScrollBy(-delta);
-        e.Handled = true;
-    }
+    /// <summary>The model powers lazy lens loading (hourly/agents).</summary>
+    public void Bind(DashboardModel model) => _model = model;
 
-    /// <summary>Wheel entry point for the window-level WM_MOUSEWHEEL hook
-    /// (XAML never sees the wheel in this borderless popup).</summary>
-    public void ScrollBy(double delta) =>
-        CardsScroll.ChangeView(
-            null, CardsScroll.VerticalOffset + delta, null, disableAnimation: false);
+    public void SwitchTo(AppView view)
+    {
+        if (_view == view)
+        {
+            return;
+        }
+
+        _view = view;
+        if (view == AppView.Hourly)
+        {
+            _model?.EnsureHourly();
+        }
+
+        if (view == AppView.Agents)
+        {
+            _model?.EnsureAgents();
+        }
+
+        UpdateTabChrome();
+        RenderContent(animated: true);
+    }
 
     public void Render(DashboardModel.Snapshot? snapshot)
     {
@@ -77,105 +104,197 @@ public sealed partial class DashboardView : UserControl
         CostLine.Text =
             $"{Format.Usd(Format.TodayCost(graph))} today · {Format.Usd(graph.Summary.TotalCost)} all time · " +
             $"{graph.Summary.ActiveDays} active days";
-
-        RenderChart(snapshot);
-        RenderLimits(snapshot);
-        RenderTrace(snapshot);
-        RenderModels(snapshot);
-        RenderStreaks(snapshot);
         FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
+        RenderContent(animated: false);
     }
 
-    private void OnChartSizeChanged(object sender, SizeChangedEventArgs e)
+    public void ScrollBy(double delta) =>
+        CardsScroll.ChangeView(
+            null, CardsScroll.VerticalOffset + delta, null, disableAnimation: false);
+
+    private void OnWheel(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
-        if (_snapshot is not null)
+        ScrollBy(-e.GetCurrentPoint(this).Properties.MouseWheelDelta);
+        e.Handled = true;
+    }
+
+    private void UpdateTabChrome()
+    {
+        foreach (var (view, button) in _tabs)
         {
-            RenderChart(_snapshot);
+            var active = view == _view;
+            button.FontWeight = active
+                ? Microsoft.UI.Text.FontWeights.SemiBold
+                : Microsoft.UI.Text.FontWeights.Normal;
+            button.Opacity = active ? 1.0 : 0.6;
+            button.Background = active
+                ? (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"]
+                : new SolidColorBrush(Colors.Transparent);
         }
     }
 
-    private void RenderChart(DashboardModel.Snapshot snapshot)
+    private void RenderContent(bool animated)
+    {
+        if (_snapshot is null)
+        {
+            return;
+        }
+
+        UIElement content = _view switch
+        {
+            AppView.Models => BuildModels(_snapshot),
+            AppView.Daily => BuildDaily(_snapshot),
+            AppView.Hourly => BuildHourly(_snapshot),
+            AppView.Stats => BuildStats(_snapshot),
+            AppView.Agents => BuildAgents(_snapshot),
+            _ => BuildOverview(_snapshot),
+        };
+        ContentHost.Content = content;
+        if (animated)
+        {
+            CardsScroll.ChangeView(null, 0, null, disableAnimation: true);
+            AnimateLensIn(content);
+        }
+    }
+
+    /// <summary>Lens-switch transition, macOS parity: crossfade + subtle
+    /// scale from the top (0.16s).</summary>
+    private static void AnimateLensIn(UIElement element)
+    {
+        var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(element);
+        var compositor = visual.Compositor;
+        visual.Opacity = 0f;
+        visual.Scale = new System.Numerics.Vector3(0.985f, 0.985f, 1f);
+        var easing = compositor.CreateCubicBezierEasingFunction(
+            new System.Numerics.Vector2(0.2f, 0.8f), new System.Numerics.Vector2(0.2f, 1f));
+        var fade = compositor.CreateScalarKeyFrameAnimation();
+        fade.InsertKeyFrame(1f, 1f, easing);
+        fade.Duration = TimeSpan.FromMilliseconds(160);
+        var scale = compositor.CreateVector3KeyFrameAnimation();
+        scale.InsertKeyFrame(1f, System.Numerics.Vector3.One, easing);
+        scale.Duration = TimeSpan.FromMilliseconds(160);
+        visual.StartAnimation("Opacity", fade);
+        visual.StartAnimation("Scale", scale);
+    }
+
+    // ── Overview ─────────────────────────────────────────────────────────
+
+    private UIElement BuildOverview(DashboardModel.Snapshot snapshot)
+    {
+        var stack = new StackPanel { Spacing = 10 };
+        stack.Children.Add(Ui.Card("Token Usage", BuildChart(snapshot), "30 days"));
+        stack.Children.Add(Ui.Card("Agent limits", BuildLimits(snapshot)));
+        var trace = BuildTrace(snapshot);
+        if (trace is not null)
+        {
+            stack.Children.Add(Ui.Card("Live session", trace));
+        }
+
+        stack.Children.Add(Ui.Card("Models", BuildModelRows(snapshot, maxRows: 8)));
+        stack.Children.Add(Ui.Card("Streaks", BuildStreaks(snapshot)));
+        return stack;
+    }
+
+    private FrameworkElement BuildChart(DashboardModel.Snapshot snapshot)
     {
         var colors = new ModelColorMap(snapshot.Models);
-        _bars = DayBars.Build(
+        var bars = DayBars.Build(
             snapshot.Graph,
             [.. snapshot.Graph.Summary.Clients],
             StackBy.Model,
             colors,
             Format.TodayKey());
 
-        ChartCanvas.Children.Clear();
-        var width = ChartCanvas.ActualWidth;
-        var height = ChartCanvas.Height;
-        if (width <= 0 || _bars.Count == 0)
+        var holder = new StackPanel();
+        var canvas = new Canvas { Height = 120 };
+        holder.Children.Add(canvas);
+        var legend = new StackPanel
         {
-            return;
+            Orientation = Orientation.Horizontal,
+            Spacing = 10,
+            Margin = new Thickness(0, 8, 0, 0),
+        };
+        foreach (var seg in DayBars.Legend(bars, ChartMetric.Tokens).Take(5))
+        {
+            var item = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+            item.Children.Add(Ui.Disc(seg.Color));
+            item.Children.Add(Ui.Text(seg.Label, 10, 0.75));
+            legend.Children.Add(item);
         }
 
-        var maxTokens = Math.Max(1, _bars.Max(b => b.TotalTokens));
-        const double gap = 3;
-        var barWidth = Math.Max(2, (width - gap * (_bars.Count - 1)) / _bars.Count);
-        for (var i = 0; i < _bars.Count; i++)
+        holder.Children.Add(legend);
+
+        void Draw()
         {
-            var bar = _bars[i];
-            var x = i * (barWidth + gap);
-            var y = height;
-            foreach (var seg in bar.Segments)
+            canvas.Children.Clear();
+            var width = canvas.ActualWidth;
+            var height = canvas.Height;
+            if (width <= 0 || bars.Count == 0)
             {
-                var segHeight = height * seg.Tokens / (double)maxTokens;
-                if (segHeight < 0.5)
+                return;
+            }
+
+            var maxTokens = Math.Max(1, bars.Max(b => b.TotalTokens));
+            const double gap = 3;
+            var barWidth = Math.Max(2, (width - gap * (bars.Count - 1)) / bars.Count);
+            for (var i = 0; i < bars.Count; i++)
+            {
+                var bar = bars[i];
+                var x = i * (barWidth + gap);
+                var y = height;
+                foreach (var seg in bar.Segments)
                 {
-                    continue;
+                    var segHeight = height * seg.Tokens / (double)maxTokens;
+                    if (segHeight < 0.5)
+                    {
+                        continue;
+                    }
+
+                    y -= segHeight;
+                    var rect = new Rectangle
+                    {
+                        Width = barWidth,
+                        Height = segHeight,
+                        Fill = Ui.BrushFromHex(seg.Color),
+                        RadiusX = 1,
+                        RadiusY = 1,
+                    };
+                    Canvas.SetLeft(rect, x);
+                    Canvas.SetTop(rect, y);
+                    var (date, label, tokens, cost) = (bar.Date, seg.Label, seg.Tokens, seg.Cost);
+                    HoverTip.Attach(rect, () =>
+                        $"{Format.MonthDay(date)} · {label}\n" +
+                        $"{Format.ExactTokens(tokens)} tokens · {Format.Usd(cost)}");
+                    canvas.Children.Add(rect);
                 }
 
-                y -= segHeight;
-                var rect = new Rectangle
+                if (bar.IsEmpty)
                 {
-                    Width = barWidth,
-                    Height = segHeight,
-                    Fill = BrushFromHex(seg.Color),
-                    RadiusX = 1,
-                    RadiusY = 1,
-                };
-                Canvas.SetLeft(rect, x);
-                Canvas.SetTop(rect, y);
-                var (date, label, tokens, cost) = (bar.Date, seg.Label, seg.Tokens, seg.Cost);
-                HoverTip.Attach(rect, () =>
-                    $"{Format.MonthDay(date)} · {label}\n" +
-                    $"{Format.ExactTokens(tokens)} tokens · {Format.Usd(cost)}");
-                ChartCanvas.Children.Add(rect);
-            }
-
-            if (bar.IsEmpty)
-            {
-                // Empty-day baseline tick so gaps read as "no usage", not "no data".
-                var tick = new Rectangle
-                {
-                    Width = barWidth,
-                    Height = 2,
-                    Fill = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128)),
-                };
-                Canvas.SetLeft(tick, x);
-                Canvas.SetTop(tick, height - 2);
-                ChartCanvas.Children.Add(tick);
+                    var tick = new Rectangle
+                    {
+                        Width = barWidth,
+                        Height = 2,
+                        Fill = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128)),
+                    };
+                    Canvas.SetLeft(tick, x);
+                    Canvas.SetTop(tick, height - 2);
+                    canvas.Children.Add(tick);
+                }
             }
         }
 
-        LegendPanel.Items.Clear();
-        foreach (var seg in DayBars.Legend(_bars, ChartMetric.Tokens).Take(5))
-        {
-            LegendPanel.Items.Add(LegendItem(seg.Color, seg.Label));
-        }
+        canvas.SizeChanged += (_, _) => Draw();
+        return holder;
     }
 
-    private void RenderLimits(DashboardModel.Snapshot snapshot)
+    private static FrameworkElement BuildLimits(DashboardModel.Snapshot snapshot)
     {
-        LimitsPanel.Children.Clear();
+        var panel = new StackPanel { Spacing = 10 };
         var agents = snapshot.Quota?.Agents ?? [];
         if (agents.Count == 0)
         {
-            LimitsPanel.Children.Add(Dim("No quota data yet."));
-            return;
+            panel.Children.Add(Ui.Dim("No quota data yet."));
+            return panel;
         }
 
         var now = DateTimeOffset.Now;
@@ -183,145 +302,372 @@ public sealed partial class DashboardView : UserControl
         {
             var section = new StackPanel { Spacing = 5 };
             var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            header.Children.Add(Disc(ClientRegistry.Style(agent.ClientId).Color));
-            header.Children.Add(new TextBlock
-            {
-                Text = ClientRegistry.ShortName(agent.ClientId),
-                FontSize = 12,
-                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            });
+            header.Children.Add(Ui.Disc(ClientRegistry.Style(agent.ClientId).Color));
+            header.Children.Add(Ui.Text(ClientRegistry.ShortName(agent.ClientId), 12, bold: true));
             if (agent.Identity?.Plan is { } plan)
             {
-                header.Children.Add(Dim(plan, 10));
+                header.Children.Add(Ui.Dim(plan, 10));
             }
 
             section.Children.Add(header);
-
             if (agent.Error is { } error)
             {
-                section.Children.Add(Dim(error, 11));
-                LimitsPanel.Children.Add(section);
+                section.Children.Add(Ui.Dim(error, 11));
+                panel.Children.Add(section);
                 continue;
             }
 
             foreach (var window in agent.Windows)
             {
-                var row = new Grid { ColumnSpacing = 8 };
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                var label = new TextBlock
-                {
-                    Text = $"{window.Label} · {window.RemainingPercent:F0}% left",
-                    FontSize = 11,
-                };
-                row.Children.Add(label);
                 var pace = UsagePace.Compute(window, PaceMode.Historical, now);
-                if (pace is not null)
-                {
-                    var paceText = new TextBlock
-                    {
-                        Text = pace.EtaText is { } eta ? $"{pace.Label} · {eta}" : pace.Label,
-                        FontSize = 10,
-                        Opacity = 0.7,
-                        HorizontalAlignment = HorizontalAlignment.Right,
-                    };
-                    Grid.SetColumn(paceText, 1);
-                    row.Children.Add(paceText);
-                }
-
-                section.Children.Add(row);
+                var paceText = pace is null ? ""
+                    : pace.EtaText is { } eta ? $"{pace.Label} · {eta}" : pace.Label;
+                section.Children.Add(Ui.Row(
+                    Ui.Text($"{window.Label} · {window.RemainingPercent:F0}% left", 11),
+                    Ui.Text(paceText, 10, 0.7)));
                 section.Children.Add(GaugeBar(window.RemainingPercent));
                 if (window.ResetText is { } reset)
                 {
-                    section.Children.Add(Dim(reset, 10));
+                    section.Children.Add(Ui.Dim(reset, 10));
                 }
             }
 
-            LimitsPanel.Children.Add(section);
+            panel.Children.Add(section);
         }
+
+        return panel;
     }
 
-    private void RenderTrace(DashboardModel.Snapshot snapshot)
+    private static FrameworkElement? BuildTrace(DashboardModel.Snapshot snapshot)
     {
-        TracePanel.Children.Clear();
         var rows = TraceCollapse.CollapseByClient(snapshot.Trace).Take(5).ToList();
-        TraceCard.Visibility = rows.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+        if (rows.Count == 0)
+        {
+            return null;
+        }
+
+        var panel = new StackPanel { Spacing = 6 };
         foreach (var row in rows)
         {
-            var line = new Grid { ColumnSpacing = 8 };
-            line.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            line.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var name = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            name.Children.Add(Disc(ClientRegistry.Style(row.Client).Color));
-            name.Children.Add(new TextBlock
-            {
-                Text = $"{ClientRegistry.ShortName(row.Client)} · {row.Model}",
-                FontSize = 11,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-            });
-            line.Children.Add(name);
-            var rate = new TextBlock
-            {
-                Text = $"{Format.CompactTokens((long)row.TokensPerMin)}/min",
-                FontSize = 11,
-                Opacity = 0.75,
-            };
-            Grid.SetColumn(rate, 1);
-            line.Children.Add(rate);
-            TracePanel.Children.Add(line);
+            name.Children.Add(Ui.Disc(ClientRegistry.Style(row.Client).Color));
+            name.Children.Add(Ui.Text($"{ClientRegistry.ShortName(row.Client)} · {row.Model}", 11));
+            panel.Children.Add(Ui.Row(
+                name, Ui.Text($"{Format.CompactTokens((long)row.TokensPerMin)}/min", 11, 0.75)));
         }
+
+        return panel;
     }
 
-    private void RenderModels(DashboardModel.Snapshot snapshot)
+    private static FrameworkElement BuildStreaks(DashboardModel.Snapshot snapshot)
     {
-        ModelsPanel.Children.Clear();
+        var stats = new UsageStats(
+            snapshot.Graph, new HashSet<string>(snapshot.Graph.Summary.Clients));
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 24 };
+        row.Children.Add(Metric($"{stats.Streaks.Current}d", "current"));
+        row.Children.Add(Metric($"{stats.Streaks.Longest}d", "longest"));
+        row.Children.Add(Metric(
+            stats.BestDay is { } best ? Format.MonthDay(best.Date) : "—", "best day"));
+        return row;
+    }
+
+    // ── Models lens ──────────────────────────────────────────────────────
+
+    private UIElement BuildModels(DashboardModel.Snapshot snapshot)
+    {
+        var stack = new StackPanel { Spacing = 10 };
+        var subtitle = snapshot.Models?.PricingUpdatedAt is { } ts
+            ? $"Prices updated {Format.RelativeTime(ts)}"
+            : null;
+        stack.Children.Add(Ui.Card("Models by cost", BuildModelRows(snapshot, maxRows: null), subtitle));
+        return stack;
+    }
+
+    private FrameworkElement BuildModelRows(DashboardModel.Snapshot snapshot, int? maxRows)
+    {
+        var panel = new StackPanel { Spacing = 8 };
         var entries = (snapshot.Models?.Entries ?? [])
             .OrderByDescending(e => e.Cost)
-            .Take(8)
             .ToList();
+        if (maxRows is { } cap)
+        {
+            entries = entries.Take(cap).ToList();
+        }
+
         if (entries.Count == 0)
         {
-            ModelsPanel.Children.Add(Dim("No model data yet."));
-            return;
+            panel.Children.Add(Ui.Dim("No model data yet."));
+            return panel;
         }
 
         var colors = new ModelColorMap(snapshot.Models);
         foreach (var entry in entries)
         {
             var block = new StackPanel { Spacing = 3 };
-            var head = new Grid { ColumnSpacing = 8 };
-            head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var name = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            name.Children.Add(Disc(colors.Color(entry.Provider, entry.Model)));
-            name.Children.Add(new TextBlock
-            {
-                Text = entry.Model,
-                FontSize = 11,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-            });
-            head.Children.Add(name);
-            var cost = new TextBlock { Text = Format.Usd(entry.Cost), FontSize = 11, Opacity = 0.85 };
-            Grid.SetColumn(cost, 1);
-            head.Children.Add(cost);
-            block.Children.Add(head);
+            name.Children.Add(Ui.Disc(colors.Color(entry.Provider, entry.Model)));
+            name.Children.Add(Ui.Text(entry.Model, 11));
+            block.Children.Add(Ui.Row(name, Ui.Text(Format.Usd(entry.Cost), 11, 0.85)));
             block.Children.Add(TokenKindBar(entry));
-            // Rich tooltip on the WHOLE row: a 4px bar is an unhittable hover
-            // target — the exact lesson the macOS ModelBreakdownCard learned.
             var captured = entry;
             HoverTip.Attach(block, () => ModelTooltip(captured));
-            ModelsPanel.Children.Add(block);
+            panel.Children.Add(block);
         }
+
+        return panel;
     }
 
-    private void RenderStreaks(DashboardModel.Snapshot snapshot)
+    // ── Daily lens ───────────────────────────────────────────────────────
+
+    private UIElement BuildDaily(DashboardModel.Snapshot snapshot)
     {
+        var panel = new StackPanel { Spacing = 6 };
+        var colors = new ModelColorMap(snapshot.Models);
+        var days = snapshot.Graph.Contributions
+            .Where(c => c.Totals.Tokens > 0 || c.Totals.Cost > 0)
+            .Reverse()
+            .ToList();
+        if (days.Count == 0)
+        {
+            panel.Children.Add(Ui.Dim("No active days."));
+        }
+
+        foreach (var day in days)
+        {
+            var block = new StackPanel { Spacing = 4 };
+            var head = Ui.Row(
+                Ui.Text(Format.MonthDay(day.Date), 12, bold: true),
+                Ui.Text(
+                    $"{day.Totals.Messages} msgs · {Format.CompactTokens(day.Totals.Tokens)} · {Format.Usd(day.Totals.Cost)}",
+                    11, 0.8));
+            block.Children.Add(head);
+
+            if (_expandedDay == day.Date)
+            {
+                foreach (var client in day.Clients.OrderByDescending(c => c.Cost))
+                {
+                    var t = client.Tokens;
+                    var tokens = t.Input + t.Output + t.CacheRead + t.CacheWrite + t.Reasoning;
+                    var name = new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 6,
+                        Margin = new Thickness(12, 0, 0, 0),
+                    };
+                    name.Children.Add(Ui.Disc(colors.Color(client.ProviderId, client.ModelId), 6));
+                    name.Children.Add(Ui.Text(
+                        $"{client.ModelId} · {ClientRegistry.ShortName(client.Client)}", 10, 0.85));
+                    block.Children.Add(Ui.Row(
+                        name,
+                        Ui.Text($"{Format.CompactTokens(tokens)} · {Format.Usd(client.Cost)}", 10, 0.7)));
+                }
+            }
+
+            var card = new Border
+            {
+                Background = (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(10, 8, 10, 8),
+                Child = block,
+            };
+            var date = day.Date;
+            card.Tapped += (_, _) =>
+            {
+                _expandedDay = _expandedDay == date ? null : date;
+                RenderContent(animated: false);
+            };
+            panel.Children.Add(card);
+        }
+
+        return panel;
+    }
+
+    // ── Hourly lens ──────────────────────────────────────────────────────
+
+    private UIElement BuildHourly(DashboardModel.Snapshot snapshot)
+    {
+        var stack = new StackPanel { Spacing = 10 };
+        if (snapshot.Hourly is not { } hourly)
+        {
+            stack.Children.Add(Ui.Card("Hourly", Ui.Dim("Loading hourly data…")));
+            return stack;
+        }
+
+        var toggle = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        var timelineBtn = LensPill("Timeline", !_hourlyProfileMode);
+        var profileBtn = LensPill("Profile", _hourlyProfileMode);
+        timelineBtn.Click += (_, _) => { _hourlyProfileMode = false; RenderContent(false); };
+        profileBtn.Click += (_, _) => { _hourlyProfileMode = true; RenderContent(false); };
+        toggle.Children.Add(timelineBtn);
+        toggle.Children.Add(profileBtn);
+        stack.Children.Add(toggle);
+
+        if (_hourlyProfileMode)
+        {
+            // 24-hour rhythm profile.
+            var byHour = new long[24];
+            foreach (var entry in hourly.Entries)
+            {
+                // "YYYY-MM-DD HH:00" local slots.
+                if (entry.Hour.Length >= 13 &&
+                    int.TryParse(entry.Hour.AsSpan(11, 2), out var h) && h is >= 0 and < 24)
+                {
+                    byHour[h] += entry.Total;
+                }
+            }
+
+            var max = Math.Max(1, byHour.Max());
+            var panel = new StackPanel { Spacing = 3 };
+            for (var h = 0; h < 24; h++)
+            {
+                var row = new Grid { ColumnSpacing = 8 };
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                row.Children.Add(Ui.Text($"{h:D2}:00", 10, 0.7));
+                var bar = Ui.ShareBar(byHour[h] / (double)max, h == DateTime.Now.Hour ? "#22c55e" : "#3b82f6");
+                bar.VerticalAlignment = VerticalAlignment.Center;
+                Grid.SetColumn(bar, 1);
+                row.Children.Add(bar);
+                var count = Ui.Text(Format.CompactTokens(byHour[h]), 10, 0.7);
+                Grid.SetColumn(count, 2);
+                row.Children.Add(count);
+                panel.Children.Add(row);
+            }
+
+            stack.Children.Add(Ui.Card("24h profile", panel));
+        }
+        else
+        {
+            var entries = hourly.Entries.AsEnumerable().Reverse().ToList(); // newest first
+            var currentSlot = DateTime.Now.ToString("yyyy-MM-dd HH:00");
+            var panel = new StackPanel { Spacing = 5 };
+            foreach (var entry in entries.Take(_hourlyWindow))
+            {
+                var label = Ui.Text(entry.Hour, 11, entry.Hour == currentSlot ? 1.0 : 0.8);
+                if (entry.Hour == currentSlot)
+                {
+                    label.Foreground = Ui.BrushFromHex("#22c55e");
+                }
+
+                panel.Children.Add(Ui.Row(
+                    label,
+                    Ui.Text(
+                        $"{Format.CompactTokens(entry.Total)} · {Format.Usd(entry.Cost)}", 11, 0.75)));
+            }
+
+            if (entries.Count > _hourlyWindow)
+            {
+                var more = LensPill($"Show more ({entries.Count - _hourlyWindow} left)", false);
+                more.HorizontalAlignment = HorizontalAlignment.Center;
+                more.Click += (_, _) => { _hourlyWindow += 48; RenderContent(false); };
+                panel.Children.Add(more);
+            }
+
+            stack.Children.Add(Ui.Card("Timeline", panel, $"{hourly.Entries.Count} slots"));
+        }
+
+        return stack;
+    }
+
+    // ── Stats lens ───────────────────────────────────────────────────────
+
+    private UIElement BuildStats(DashboardModel.Snapshot snapshot)
+    {
+        var stack = new StackPanel { Spacing = 10 };
+        stack.Children.Add(Ui.Card("Token Usage", BuildChart(snapshot), "30 days"));
+
         var stats = new UsageStats(
             snapshot.Graph, new HashSet<string>(snapshot.Graph.Summary.Clients));
-        CurrentStreak.Text = $"{stats.Streaks.Current}d";
-        LongestStreak.Text = $"{stats.Streaks.Longest}d";
-        BestDay.Text = stats.BestDay is { } best ? Format.MonthDay(best.Date) : "—";
+        var grid = new Grid { ColumnSpacing = 16, RowSpacing = 12 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.RowDefinitions.Add(new RowDefinition());
+        grid.RowDefinitions.Add(new RowDefinition());
+        var favorite = (snapshot.Models?.Entries ?? [])
+            .OrderByDescending(e => e.Cost)
+            .FirstOrDefault();
+        (string Value, string Label)[] metrics =
+        [
+            (Format.Usd(stats.TotalCost), "total spend"),
+            (Format.CompactTokens(stats.TotalTokens), "tokens"),
+            ($"{stats.ActiveDays}", "active days"),
+            (Format.Usd(stats.AveragePerDay), "avg/day"),
+            (stats.BestDay is { } b ? Format.MonthDay(b.Date) : "—", "best day"),
+            (favorite?.Model ?? "—", "favorite model"),
+        ];
+        for (var i = 0; i < metrics.Length; i++)
+        {
+            var cell = Metric(metrics[i].Value, metrics[i].Label);
+            Grid.SetColumn(cell, i % 3);
+            Grid.SetRow(cell, i / 3);
+            grid.Children.Add(cell);
+        }
+
+        stack.Children.Add(Ui.Card("Stats", grid));
+        stack.Children.Add(Ui.Card("Streaks", BuildStreaks(snapshot)));
+        return stack;
     }
+
+    // ── Agents lens ──────────────────────────────────────────────────────
+
+    private UIElement BuildAgents(DashboardModel.Snapshot snapshot)
+    {
+        var stack = new StackPanel { Spacing = 10 };
+        if (snapshot.Agents is not { } agents)
+        {
+            stack.Children.Add(Ui.Card("Agents", Ui.Dim("Loading agent data…")));
+            return stack;
+        }
+
+        var panel = new StackPanel { Spacing = 8 };
+        var entries = agents.Entries.OrderByDescending(e => e.Cost).ToList();
+        var maxCost = Math.Max(entries.FirstOrDefault()?.Cost ?? 0, 0.0001);
+        foreach (var entry in entries)
+        {
+            var block = new StackPanel { Spacing = 3 };
+            block.Children.Add(Ui.Row(
+                Ui.Text(entry.Agent, 11, bold: true),
+                Ui.Text(
+                    $"{entry.Messages} msgs · {Format.CompactTokens(entry.Total)} · {Format.Usd(entry.Cost)}",
+                    10, 0.75)));
+            block.Children.Add(Ui.ShareBar(entry.Cost / maxCost, "#3b82f6"));
+            block.Children.Add(Ui.Dim(string.Join(", ",
+                entry.Clients.Select(ClientRegistry.ShortName)), 9));
+            panel.Children.Add(block);
+        }
+
+        if (entries.Count == 0)
+        {
+            panel.Children.Add(Ui.Dim("No sub-agent usage recorded."));
+        }
+
+        stack.Children.Add(Ui.Card(
+            "Agents by cost", panel, $"{agents.TotalMessages} messages"));
+        return stack;
+    }
+
+    // ── shared pieces ────────────────────────────────────────────────────
+
+    private static StackPanel Metric(string value, string label)
+    {
+        var cell = new StackPanel();
+        cell.Children.Add(Ui.Text(value, 16, bold: true));
+        cell.Children.Add(Ui.Dim(label, 10));
+        return cell;
+    }
+
+    private static Button LensPill(string text, bool active) => new()
+    {
+        Content = text,
+        FontSize = 10,
+        Padding = new Thickness(8, 3, 8, 3),
+        Opacity = active ? 1.0 : 0.6,
+        FontWeight = active
+            ? Microsoft.UI.Text.FontWeights.SemiBold
+            : Microsoft.UI.Text.FontWeights.Normal,
+    };
 
     private static string ModelTooltip(ModelReportEntry entry)
     {
@@ -337,15 +683,14 @@ public sealed partial class DashboardView : UserControl
         {
             if (values[i] > 0)
             {
-                lines.Add($"{TokenKinds[i].Label}: {Format.ExactTokens(values[i])} ({100.0 * values[i] / total:F1}%)");
+                lines.Add(
+                    $"{Ui.TokenKinds[i].Label}: {Format.ExactTokens(values[i])} ({100.0 * values[i] / total:F1}%)");
             }
         }
 
         return string.Join('\n', lines);
     }
 
-    /// <summary>Thin stacked bar of token kinds, sqrt-scaled so cache-read
-    /// doesn't drown everything (the macOS/web Wave 5 lesson).</summary>
     private static Grid TokenKindBar(ModelReportEntry entry)
     {
         long[] values =
@@ -371,7 +716,7 @@ public sealed partial class DashboardView : UserControl
             });
             var seg = new Rectangle
             {
-                Fill = BrushFromHex(TokenKinds[i].Color),
+                Fill = Ui.BrushFromHex(Ui.TokenKinds[i].Color),
                 RadiusX = 1,
                 RadiusY = 1,
             };
@@ -382,8 +727,6 @@ public sealed partial class DashboardView : UserControl
         return bar;
     }
 
-    /// <summary>Quota bar with the shared gauge palette: green, amber under
-    /// 25 % remaining, red under 10.</summary>
     private static Grid GaugeBar(double remainingPercent)
     {
         var remaining = Math.Clamp(remainingPercent, 0, 100);
@@ -402,46 +745,11 @@ public sealed partial class DashboardView : UserControl
         {
             Width = new GridLength(100 - remaining, GridUnitType.Star),
         });
-        var fill = new Border
+        track.Children.Add(new Border
         {
-            Background = BrushFromHex(color),
+            Background = Ui.BrushFromHex(color),
             CornerRadius = new CornerRadius(2.5),
-        };
-        track.Children.Add(fill);
+        });
         return track;
-    }
-
-    private static StackPanel LegendItem(string hex, string label)
-    {
-        var item = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
-        item.Children.Add(Disc(hex));
-        item.Children.Add(new TextBlock { Text = label, FontSize = 10, Opacity = 0.75 });
-        return item;
-    }
-
-    private static Ellipse Disc(string hex) => new()
-    {
-        Width = 8,
-        Height = 8,
-        Fill = BrushFromHex(hex),
-        VerticalAlignment = VerticalAlignment.Center,
-    };
-
-    private static TextBlock Dim(string text, double size = 11) => new()
-    {
-        Text = text,
-        FontSize = size,
-        Opacity = 0.6,
-        TextWrapping = TextWrapping.Wrap,
-    };
-
-    private static SolidColorBrush BrushFromHex(string hex)
-    {
-        var h = hex.TrimStart('#');
-        return new SolidColorBrush(Color.FromArgb(
-            255,
-            Convert.ToByte(h[..2], 16),
-            Convert.ToByte(h[2..4], 16),
-            Convert.ToByte(h[4..6], 16)));
     }
 }

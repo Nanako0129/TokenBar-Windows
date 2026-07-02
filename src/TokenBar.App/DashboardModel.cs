@@ -39,7 +39,54 @@ public sealed class DashboardModel
         AgentUsagePayload? Quota,
         double TokensPerMin,
         IReadOnlyList<TraceBucket> Trace,
-        DateTimeOffset FetchedAt);
+        DateTimeOffset FetchedAt)
+    {
+        // Lazily-loaded lenses (macOS ensureData parity): fetched on first
+        // visit, then refreshed by the slow lane like everything else.
+        public HourlyReport? Hourly { get; init; }
+        public AgentsReport? Agents { get; init; }
+    }
+
+    private bool _hourlyWanted;
+    private bool _agentsWanted;
+
+    /// <summary>Marks a lazy lens as needed and fetches it once; later slow
+    /// refreshes keep it current.</summary>
+    public void EnsureHourly()
+    {
+        if (!_hourlyWanted)
+        {
+            _hourlyWanted = true;
+            _ = Task.Run(() => FetchLazy(hourly: true, agents: false));
+        }
+    }
+
+    public void EnsureAgents()
+    {
+        if (!_agentsWanted)
+        {
+            _agentsWanted = true;
+            _ = Task.Run(() => FetchLazy(hourly: false, agents: true));
+        }
+    }
+
+    private void FetchLazy(bool hourly, bool agents)
+    {
+        try
+        {
+            HourlyReport? h = hourly ? TbCore.HourlyReport() : null;
+            AgentsReport? a = agents ? TbCore.AgentsReport() : null;
+            Publish(s => s with
+            {
+                Hourly = h ?? s.Hourly,
+                Agents = a ?? s.Agents,
+            }, graph: null);
+        }
+        catch (Exception ex)
+        {
+            DevLog.Write($"lazy lens fetch failed: {ex.Message}");
+        }
+    }
 
     /// <summary>Begin polling (flyout opened). Fires an immediate refresh of
     /// both cadences, then 60s / 10s timers.</summary>
@@ -101,11 +148,17 @@ public sealed class DashboardModel
                     DevLog.Write($"agentUsage failed: {ex.Message}");
                 }
 
+                HourlyReport? hourly = _hourlyWanted
+                    ? TryFetch(() => TbCore.HourlyReport(), "hourly") : null;
+                AgentsReport? agentsReport = _agentsWanted
+                    ? TryFetch(() => TbCore.AgentsReport(), "agents") : null;
                 Publish(s => s with
                 {
                     Graph = graph,
                     Models = models ?? s.Models,
                     Quota = quota ?? s.Quota,
+                    Hourly = hourly ?? s.Hourly,
+                    Agents = agentsReport ?? s.Agents,
                 }, graph);
             }
             catch (Exception ex)
@@ -117,6 +170,19 @@ public sealed class DashboardModel
                 _slowInFlight = false;
             }
         });
+    }
+
+    private static T? TryFetch<T>(Func<T> fetch, string label) where T : class
+    {
+        try
+        {
+            return fetch();
+        }
+        catch (Exception ex)
+        {
+            DevLog.Write($"{label} refresh failed: {ex.Message}");
+            return null;
+        }
     }
 
     private void RefreshFast()
