@@ -4,6 +4,8 @@ namespace TokenBar.App;
 
 public partial class App : Application
 {
+    private static Mutex? _singleInstance;
+
     private TrayService? _tray;
     private FlyoutWindow? _flyout;
 
@@ -16,6 +18,16 @@ public partial class App : Application
     {
         // Tray-resident app: no window shows at launch; the tray icon owns
         // the flyout's lifetime (mirrors the macOS NSStatusItem shell).
+        // Single instance: a second launch (autostart + manual, say) exits
+        // quietly; the mutex lives for the process lifetime.
+        _singleInstance = new Mutex(true, @"Local\TokenBar.App.SingleInstance", out var isFirst);
+        if (!isFirst)
+        {
+            DevLog.Write("launch: another instance is running, exiting");
+            Current.Exit();
+            return;
+        }
+
         try
         {
             DevLog.Write("launch: creating flyout");

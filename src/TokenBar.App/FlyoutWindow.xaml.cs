@@ -1,26 +1,33 @@
-using Microsoft.UI;
 using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
-using Windows.Graphics;
+using TokenBar.Core;
 using TokenBar.Interop;
+using Windows.Graphics;
 
 namespace TokenBar.App;
 
 /// <summary>
 /// The tray flyout: borderless, Acrylic-backed, hides on deactivate, and
-/// positions itself against the taskbar corner — the NSPopover counterpart.
+/// positions itself against the taskbar edge — the NSPopover counterpart.
 /// Created once at launch; the tray icon toggles visibility.
 /// </summary>
 public sealed partial class FlyoutWindow : Window
 {
     private const int FlyoutWidth = 400;
     private const int FlyoutHeight = 520;
+    private const int Margin = 12;
+    private const int SlideDistance = 24;
+
+    private readonly DashboardModel _model;
 
     public FlyoutWindow()
     {
         InitializeComponent();
+
+        _model = new DashboardModel(DispatcherQueue);
+        _model.Updated += RenderSnapshot;
 
         // Transient surface → Acrylic, via the manual controller so the
         // backdrop stays translucent while unfocused: the flyout is a
@@ -44,6 +51,7 @@ public sealed partial class FlyoutWindow : Window
             e.Cancel = true;
             HideFlyout();
         };
+
         // --keep-open: verification hook — screen-capture helpers steal focus,
         // which would correctly dismiss the flyout right before the shot.
         var keepOpen = Environment.GetCommandLineArgs().Contains("--keep-open");
@@ -76,28 +84,53 @@ public sealed partial class FlyoutWindow : Window
     public void ShowFlyout()
     {
         _hiding = false;
-        var target = PositionNearTray();
-        // Start below the resting spot so the WINDOW (backdrop included)
-        // slides up as one surface — the native taskbar-flyout motion. A
-        // content-visual offset alone reads as text sliding over a static
-        // acrylic slab.
-        const int rise = 24;
-        AppWindow.Move(new PointInt32(target.X, target.Y + rise));
+        var (resting, start) = PositionNearTray();
+        // Start offset toward the taskbar edge so the WINDOW (backdrop
+        // included) slides in as one surface — the native taskbar-flyout
+        // motion. A content-visual offset alone reads as text sliding over a
+        // static acrylic slab.
+        AppWindow.Move(start);
         AppWindow.Show();
         // Show can rebuild frame state; re-assert the chrome afterwards.
         ApplyPopupChrome();
         Activate();
-        _ = SlideWindowAsync(target.Y + rise, target.Y, durationMs: 180, decelerate: true);
+        _ = SlideWindowAsync(start, resting, durationMs: 180, decelerate: true);
         FadeContent(from: 0f, to: 1f, durationMs: 180);
-        RefreshProbe();
+        _model.Start();
+        RenderSnapshot();
+    }
+
+    public void HideFlyout()
+    {
+        if (_hiding || !AppWindow.IsVisible)
+        {
+            return;
+        }
+
+        _hiding = true;
+        _model.Stop();
+        var resting = AppWindow.Position;
+        var sink = Toward(resting, TaskbarEdge(), 16);
+        FadeContent(from: 1f, to: 0f, durationMs: 120);
+        _ = FinishHideAsync(resting, sink);
+    }
+
+    private async Task FinishHideAsync(PointInt32 from, PointInt32 to)
+    {
+        await SlideWindowAsync(from, to, durationMs: 120, decelerate: false);
+        AppWindow.Hide();
+        _hiding = false;
+        var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview
+            .GetElementVisual(Content);
+        visual.Opacity = 1f;
     }
 
     /// <summary>Move the top-level window each frame; DWM re-blurs the
-    /// acrylic live, so the whole surface travels together.</summary>
-    private async Task SlideWindowAsync(int fromY, int toY, int durationMs, bool decelerate)
+    /// acrylic live, so the whole surface travels together. (Known gap: not
+    /// compositor-synced — the native-feel research item tracks this.)</summary>
+    private async Task SlideWindowAsync(PointInt32 from, PointInt32 to, int durationMs, bool decelerate)
     {
         var token = ++_slideToken;
-        var x = AppWindow.Position.X;
         var watch = System.Diagnostics.Stopwatch.StartNew();
         while (watch.ElapsedMilliseconds < durationMs)
         {
@@ -108,13 +141,15 @@ public sealed partial class FlyoutWindow : Window
 
             var t = Math.Clamp(watch.ElapsedMilliseconds / (double)durationMs, 0, 1);
             var eased = decelerate ? 1 - Math.Pow(1 - t, 3) : Math.Pow(t, 2);
-            AppWindow.Move(new PointInt32(x, (int)Math.Round(fromY + (toY - fromY) * eased)));
+            AppWindow.Move(new PointInt32(
+                (int)Math.Round(from.X + (to.X - from.X) * eased),
+                (int)Math.Round(from.Y + (to.Y - from.Y) * eased)));
             await Task.Delay(8); // ~120Hz pacing; DWM coalesces to refresh rate
         }
 
         if (token == _slideToken)
         {
-            AppWindow.Move(new PointInt32(x, toY));
+            AppWindow.Move(to);
         }
     }
 
@@ -130,23 +165,102 @@ public sealed partial class FlyoutWindow : Window
         visual.StartAnimation("Opacity", fade);
     }
 
-    /// <summary>Exit: the window sinks while the content fades, then the real
-    /// hide.</summary>
-    private async void AnimateOut(Action completed)
+    private enum Edge
     {
-        var y = AppWindow.Position.Y;
-        FadeContent(from: 1f, to: 0f, durationMs: 120);
-        await SlideWindowAsync(y, y + 16, durationMs: 120, decelerate: false);
-        completed();
-        // Reset for the next entrance.
-        var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview
-            .GetElementVisual(Content);
-        visual.Opacity = 1f;
+        Left = 0,
+        Top = 1,
+        Right = 2,
+        Bottom = 3,
+    }
+
+    /// <summary>Which screen edge the taskbar sits on (ABM_GETTASKBARPOS);
+    /// bottom when the shell won't say.</summary>
+    private static Edge TaskbarEdge()
+    {
+        var data = new APPBARDATA { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<APPBARDATA>() };
+        return SHAppBarMessage(0x0005 /* ABM_GETTASKBARPOS */, ref data) != 0
+            ? (Edge)data.uEdge
+            : Edge.Bottom;
+    }
+
+    /// <summary>Offset a point toward a taskbar edge (the hide direction).</summary>
+    private static PointInt32 Toward(PointInt32 p, Edge edge, int distance) => edge switch
+    {
+        Edge.Left => new PointInt32(p.X - distance, p.Y),
+        Edge.Top => new PointInt32(p.X, p.Y - distance),
+        Edge.Right => new PointInt32(p.X + distance, p.Y),
+        _ => new PointInt32(p.X, p.Y + distance),
+    };
+
+    /// <summary>Anchor against the taskbar corner of the work area, on
+    /// whichever edge the taskbar occupies. Sizes the window and returns the
+    /// resting position plus the slide start (offset toward the taskbar).</summary>
+    private (PointInt32 Resting, PointInt32 Start) PositionNearTray()
+    {
+        var display = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary);
+        var work = display.WorkArea;
+        var scale = Content.XamlRoot?.RasterizationScale ?? 1.0;
+        var width = (int)(FlyoutWidth * scale);
+        var height = (int)(FlyoutHeight * scale);
+        AppWindow.Resize(new SizeInt32(width, height));
+
+        var edge = TaskbarEdge();
+        var resting = edge switch
+        {
+            // Tray lives at the taskbar's far end: bottom/top → right corner,
+            // left/right → bottom corner.
+            Edge.Left => new PointInt32(work.X + Margin, work.Y + work.Height - height - Margin),
+            Edge.Top => new PointInt32(work.X + work.Width - width - Margin, work.Y + Margin),
+            Edge.Right => new PointInt32(work.X + work.Width - width - Margin, work.Y + work.Height - height - Margin),
+            _ => new PointInt32(work.X + work.Width - width - Margin, work.Y + work.Height - height - Margin),
+        };
+        return (resting, Toward(resting, edge, SlideDistance));
+    }
+
+    /// <summary>Pull the latest snapshot into the placeholder dashboard (the
+    /// real cards arrive with plan Phase 5).</summary>
+    private void RenderSnapshot()
+    {
+        var snapshot = _model.Current;
+        if (snapshot is null)
+        {
+            FooterText.Text = "loading usage…";
+            return;
+        }
+
+        var graph = snapshot.Graph;
+        TodayValue.Text = Format.CompactTokens(Format.TodayTokens(graph));
+        TotalValue.Text = Format.CompactTokens(graph.Summary.TotalTokens);
+        RateValue.Text = Format.CompactTokens((long)snapshot.TokensPerMin);
+        CostLine.Text =
+            $"{Format.Usd(Format.TodayCost(graph))} today · {Format.Usd(graph.Summary.TotalCost)} all time · " +
+            $"{graph.Summary.ActiveDays} active days";
+
+        var lines = new List<string>();
+        foreach (var agent in snapshot.Quota?.Agents ?? [])
+        {
+            var name = ClientRegistry.ShortName(agent.ClientId);
+            if (agent.Error is { } error)
+            {
+                lines.Add($"{name}: {error}");
+                continue;
+            }
+
+            foreach (var window in agent.Windows)
+            {
+                var reset = window.ResetText is { } r ? $" · {r}" : "";
+                lines.Add($"{name} {window.Label}: {window.RemainingPercent:F0}% left{reset}");
+            }
+        }
+
+        QuotaList.ItemsSource = lines;
+        FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
     }
 
     /// <summary>Popup chrome: strip every residual frame style down to
-    /// WS_POPUP (the presenter's borderless mode leaves bits that draw a 1px
-    /// outline), then round the corners and erase the DWM border color.</summary>
+    /// WS_POPUP (the presenter's borderless mode leaves WS_DLGFRAME behind,
+    /// which draws a 1px outline DWMWA_BORDER_COLOR cannot remove), then
+    /// round the corners and erase the DWM border color.</summary>
     private void ApplyPopupChrome()
     {
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
@@ -156,82 +270,36 @@ public sealed partial class FlyoutWindow : Window
         const long WS_VISIBLE = 0x10000000L;
         const long WS_CLIPCHILDREN = 0x02000000L;
         var oldStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        var newStyle = (nint)(WS_POPUP | WS_CLIPCHILDREN |
-            ((long)oldStyle & WS_VISIBLE));
+        var newStyle = (nint)(WS_POPUP | WS_CLIPCHILDREN | ((long)oldStyle & WS_VISIBLE));
         _ = SetWindowLongPtrW(hwnd, GWL_STYLE, newStyle);
 
         var corner = 2; // DWMWCP_ROUND
-        var hrCorner = DwmSetWindowAttribute(
-            hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, ref corner, sizeof(int));
+        _ = DwmSetWindowAttribute(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, ref corner, sizeof(int));
         var borderColor = unchecked((int)0xFFFFFFFE); // DWMWA_COLOR_NONE
-        var hrBorder = DwmSetWindowAttribute(
-            hwnd, 34 /* DWMWA_BORDER_COLOR */, ref borderColor, sizeof(int));
+        _ = DwmSetWindowAttribute(hwnd, 34 /* DWMWA_BORDER_COLOR */, ref borderColor, sizeof(int));
 
+        // HWND_TOPMOST directly: the presenter's IsAlwaysOnTop doesn't
+        // survive the WS_POPUP style stomp, so the flyout sank under normal
+        // windows whenever anything else was open. Re-assert through the
+        // presenter as well (toggle forces a reapply of the z-band).
         const uint SWP_FRAMECHANGED = 0x0020;
         const uint SWP_NOMOVE = 0x0002;
         const uint SWP_NOSIZE = 0x0001;
-        const uint SWP_NOZORDER = 0x0004;
         const uint SWP_NOACTIVATE = 0x0010;
-        _ = SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        var HWND_TOPMOST = new nint(-1);
+        var posOk = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
-        DevLog.Write(
-            $"chrome: style 0x{(long)oldStyle:x8}->0x{(long)newStyle:x8} " +
-            $"corner=0x{hrCorner:x} border=0x{hrBorder:x}");
-    }
-
-    public void HideFlyout()
-    {
-        if (_hiding || !AppWindow.IsVisible)
+        if (AppWindow.Presenter is OverlappedPresenter p)
         {
-            return;
+            p.IsAlwaysOnTop = false;
+            p.IsAlwaysOnTop = true;
         }
 
-        _hiding = true;
-        AnimateOut(() =>
-        {
-            AppWindow.Hide();
-            _hiding = false;
-        });
-    }
-
-    /// <summary>Bottom-right of the work area on the tray's display —
-    /// covers the default bottom taskbar; edge-aware placement for
-    /// left/top taskbars lands with the DPI pass (plan Phase 4 item 2).
-    /// Sizes the window and returns the resting position (the slide-in
-    /// animates toward it).</summary>
-    private PointInt32 PositionNearTray()
-    {
-        var display = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary);
-        var work = display.WorkArea;
-        var scale = Content.XamlRoot?.RasterizationScale ?? 1.0;
-        var width = (int)(FlyoutWidth * scale);
-        var height = (int)(FlyoutHeight * scale);
-        const int margin = 12;
-        AppWindow.Resize(new SizeInt32(width, height));
-        return new PointInt32(
-            work.X + work.Width - width - margin,
-            work.Y + work.Height - height - margin);
-    }
-
-    /// <summary>Skeleton data hookup: prove the FFI seam from inside the
-    /// WinUI process (the real DashboardModel arrives in plan Phase 4 item 4).</summary>
-    private void RefreshProbe()
-    {
-        _ = DispatcherQueue.TryEnqueue(async () =>
-        {
-            try
-            {
-                var probe = await Task.Run(TbCore.Probe);
-                ProbeText.Text = $"tb_probe: {probe.Messages:N0} messages parsed";
-                DevLog.Write($"probe ok: {probe.Messages}");
-            }
-            catch (Exception ex)
-            {
-                ProbeText.Text = $"tb_probe failed: {ex.Message}";
-                DevLog.Write($"probe failed: {ex.Message}");
-            }
-        });
+        const int GWL_EXSTYLE = -20;
+        var exStyle = (long)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        DevLog.Write(
+            $"chrome: topmost posOk={posOk} exTopmost={(exStyle & 0x8) != 0} ex=0x{exStyle:x8}");
     }
 
     private DesktopAcrylicController? _acrylic;
@@ -263,6 +331,29 @@ public sealed partial class FlyoutWindow : Window
             _acrylic = null;
         };
     }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct APPBARDATA
+    {
+        public int cbSize;
+        public nint hWnd;
+        public uint uCallbackMessage;
+        public uint uEdge;
+        public RECT rc;
+        public nint lParam;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [System.Runtime.InteropServices.DllImport("shell32.dll")]
+    private static extern nuint SHAppBarMessage(uint dwMessage, ref APPBARDATA pData);
 
     [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(
