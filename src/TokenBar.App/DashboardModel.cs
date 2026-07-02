@@ -77,7 +77,32 @@ public sealed class DashboardModel
             }
         }
 
+        _refreshing = true; // macOS setYear spins the header control too
+        Updated?.Invoke();
         RefreshSlow(); // an in-flight lane re-runs itself when the year flips
+    }
+
+    // Manual-refresh state: _forceRequested makes the next slow pass bypass
+    // the engine cache (tb_refresh_graph); _refreshing drives the header
+    // spinner and holds until the pass that serves the request completes.
+    private int _forceRequested;
+    private volatile bool _refreshing;
+
+    public bool Refreshing => _refreshing;
+
+    /// <summary>Manual refresh (the header button; macOS refresh()): forces
+    /// a full log re-read. No-op while one is already running.</summary>
+    public void RefreshForce()
+    {
+        if (_refreshing)
+        {
+            return;
+        }
+
+        _refreshing = true;
+        Volatile.Write(ref _forceRequested, 1);
+        Updated?.Invoke();
+        RefreshSlow();
     }
 
     public DashboardModel(DispatcherQueue dispatcher)
@@ -197,6 +222,7 @@ public sealed class DashboardModel
         _ = Task.Run(() =>
         {
             var year = _year; // one slice per pass; a mid-flight switch re-runs below
+            var force = Interlocked.Exchange(ref _forceRequested, 0) == 1;
             try
             {
                 // macOS parity: the model report runs concurrently with the
@@ -209,11 +235,13 @@ public sealed class DashboardModel
                 {
                     var modelsTask = Task.Run(() =>
                         TryFetch(() => TbCore.ModelReport(year), "modelReport"));
-                    graph = TryFetch(() => TbCore.Graph(year), "graph");
+                    graph = TryFetch(() => force
+                        ? TbCore.RefreshGraph(year) : TbCore.Graph(year), "graph");
                     models = modelsTask.Result; // joined before the boost lifts
                 }
 
-                DevLog.Write($"slow lane: graph+models={sw.ElapsedMilliseconds}ms year={year ?? "all"}");
+                DevLog.Write($"slow lane: graph+models={sw.ElapsedMilliseconds}ms " +
+                    $"year={year ?? "all"}{(force ? " force" : "")}");
                 if (graph is not null && year is not null
                     && !graph.Years.Any(y => y.Year == year))
                 {
@@ -290,9 +318,16 @@ public sealed class DashboardModel
             finally
             {
                 Volatile.Write(ref _slowInFlight, 0);
-                if (_year != year)
+                if (_year != year || Volatile.Read(ref _forceRequested) == 1)
                 {
-                    RefreshSlow();
+                    RefreshSlow(); // stale year or a force queued mid-pass
+                }
+                else if (_refreshing)
+                {
+                    // This pass served the manual refresh / year switch; the
+                    // publishes carry no spinner state, so nudge the UI off.
+                    _refreshing = false;
+                    _ = _dispatcher.TryEnqueue(() => Updated?.Invoke());
                 }
             }
         });

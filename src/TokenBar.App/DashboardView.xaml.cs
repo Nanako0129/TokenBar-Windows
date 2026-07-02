@@ -68,6 +68,23 @@ public sealed partial class DashboardView : UserControl
             PointerWheelChangedEvent,
             new Microsoft.UI.Xaml.Input.PointerEventHandler(OnWheel),
             handledEventsToo: true);
+
+        RefreshButton.Click += (_, _) =>
+        {
+            _model?.RefreshForce();
+            UpdateRefreshControl();
+        };
+        HoverTip.Attach(RefreshButton, () => "Refresh usage data");
+    }
+
+    /// <summary>One control, two states (macOS refreshButton): the glyph
+    /// while idle, a spinner while a forced re-read or the initial load runs.</summary>
+    private void UpdateRefreshControl(bool loading = false)
+    {
+        var spinning = loading || _model?.Refreshing == true;
+        RefreshButton.Visibility = spinning ? Visibility.Collapsed : Visibility.Visible;
+        RefreshSpinner.Visibility = spinning ? Visibility.Visible : Visibility.Collapsed;
+        RefreshSpinner.IsActive = spinning;
     }
 
     /// <summary>The model powers lazy lens loading (hourly/agents).</summary>
@@ -98,6 +115,7 @@ public sealed partial class DashboardView : UserControl
     public void Render(DashboardModel.Snapshot? snapshot)
     {
         _snapshot = snapshot;
+        UpdateRefreshControl(loading: snapshot is null);
         if (snapshot is null)
         {
             FooterText.Text = "loading usage…";

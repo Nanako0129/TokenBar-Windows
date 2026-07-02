@@ -19,15 +19,39 @@
                     FontWeight="SemiBold"
                     VerticalAlignment="Center"
                     Text="TokenBar" />
-                <!-- Year filter, macOS PopoverView yearMenu parity: hidden
-                     until the first payload reports which years exist. -->
-                <DropDownButton
-                    x:Name="YearButton"
-                    HorizontalAlignment="Right"
-                    Visibility="Collapsed"
-                    FontSize="11"
-                    Padding="9,3,9,4"
-                    Content="All" />
+                <StackPanel
+                    Orientation="Horizontal"
+                    Spacing="6"
+                    HorizontalAlignment="Right">
+                    <!-- Year filter, macOS PopoverView yearMenu parity: hidden
+                         until the first payload reports which years exist. -->
+                    <DropDownButton
+                        x:Name="YearButton"
+                        Visibility="Collapsed"
+                        FontSize="11"
+                        Padding="9,3,9,4"
+                        Content="All" />
+                    <!-- Manual refresh; swaps to a spinner while a forced
+                         re-read (or the initial load) runs — one control,
+                         macOS refreshButton parity. -->
+                    <Grid VerticalAlignment="Center" Width="26" Height="26">
+                        <Button
+                            x:Name="RefreshButton"
+                            Padding="0"
+                            Width="26"
+                            Height="26"
+                            Background="Transparent"
+                            BorderThickness="0">
+                            <FontIcon Glyph="&#xE72C;" FontSize="11" Opacity="0.75" />
+                        </Button>
+                        <ProgressRing
+                            x:Name="RefreshSpinner"
+                            Width="15"
+                            Height="15"
+                            IsActive="False"
+                            Visibility="Collapsed" />
+                    </Grid>
+                </StackPanel>
             </Grid>
             <StackPanel Orientation="Horizontal" Spacing="18">
                 <StackPanel>
