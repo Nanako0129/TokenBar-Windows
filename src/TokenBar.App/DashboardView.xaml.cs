@@ -35,10 +35,13 @@ public sealed partial class DashboardView : UserControl
     private string? _expandedDay; // Daily drill-down state
     private bool _hourlyProfileMode;
     private int _hourlyWindow = 48; // Timeline rows shown; +48 per "Show more"
-    // Chart toggles (persistence lands with the Phase 7 settings store;
-    // keys tokenbar.chart.stackBy / tokenbar.chart.metric).
-    private StackBy _chartStackBy = StackBy.Model;
-    private ChartMetric _chartMetric = ChartMetric.Tokens;
+    // Chart toggles, persisted with the macOS rawValue strings.
+    private StackBy _chartStackBy =
+        AppSettings.Store.GetString("tokenbar.chart.stackBy") == "agent"
+            ? StackBy.Agent : StackBy.Model;
+    private ChartMetric _chartMetric =
+        AppSettings.Store.GetString("tokenbar.chart.metric") == "cost"
+            ? ChartMetric.Cost : ChartMetric.Tokens;
 
     public DashboardView()
     {
@@ -223,17 +226,33 @@ public sealed partial class DashboardView : UserControl
         };
         var byModel = LensPill("Model", _chartStackBy == StackBy.Model);
         var byAgent = LensPill("Agent", _chartStackBy == StackBy.Agent);
-        byModel.Click += (_, _) => { _chartStackBy = StackBy.Model; RenderContent(false); };
-        byAgent.Click += (_, _) => { _chartStackBy = StackBy.Agent; RenderContent(false); };
+        byModel.Click += (_, _) => SetStackBy(StackBy.Model);
+        byAgent.Click += (_, _) => SetStackBy(StackBy.Agent);
         var byTokens = LensPill("Tokens", _chartMetric == ChartMetric.Tokens);
         var byCost = LensPill("Price", _chartMetric == ChartMetric.Cost);
-        byTokens.Click += (_, _) => { _chartMetric = ChartMetric.Tokens; RenderContent(false); };
-        byCost.Click += (_, _) => { _chartMetric = ChartMetric.Cost; RenderContent(false); };
+        byTokens.Click += (_, _) => SetMetric(ChartMetric.Tokens);
+        byCost.Click += (_, _) => SetMetric(ChartMetric.Cost);
         toggles.Children.Add(byModel);
         toggles.Children.Add(byAgent);
         toggles.Children.Add(new Border { Width = 8 });
         toggles.Children.Add(byTokens);
         toggles.Children.Add(byCost);
+
+        void SetStackBy(StackBy value)
+        {
+            _chartStackBy = value;
+            AppSettings.Store.SetString("tokenbar.chart.stackBy",
+                value == StackBy.Agent ? "agent" : "model");
+            RenderContent(false);
+        }
+
+        void SetMetric(ChartMetric value)
+        {
+            _chartMetric = value;
+            AppSettings.Store.SetString("tokenbar.chart.metric",
+                value == ChartMetric.Cost ? "cost" : "tokens");
+            RenderContent(false);
+        }
         holder.Children.Add(toggles);
         // Wrapping legend, capped like the macOS FlowLayout (12 + "+N").
         var legend = new WrapRow { Margin = new Thickness(0, 8, 0, 0) };
