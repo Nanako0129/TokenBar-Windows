@@ -29,4 +29,11 @@
     <ProjectReference Include="..\TokenBar.Interop\TokenBar.Interop.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Tray animation frames, copied verbatim from the macOS repo's
+         Resources (anim-cat2 48x48 ×5, anim-parrot 48x36 ×10, plus -light
+         variants for a light taskbar). -->
+    <Content Include="Assets\**\*.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

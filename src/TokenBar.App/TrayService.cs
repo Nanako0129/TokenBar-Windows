@@ -20,10 +20,12 @@ public sealed class TrayService : IDisposable
     [
         TrayModes.StorageKey, "tokenbar.tray.animationStyle",
         "tokenbar.icon.coloring", "tokenbar.quota.source",
+        "tokenbar.tray.animate",
     ];
 
     private readonly TaskbarIcon _icon;
     private readonly TrayFeed _feed;
+    private readonly TrayAnimator _animator;
     private string _iconSignature = "";
     private nint _hicon;
 
@@ -55,6 +57,8 @@ public sealed class TrayService : IDisposable
         _icon.ContextMenuMode = ContextMenuMode.PopupMenu;
 
         _feed = new TrayFeed(DispatcherQueue.GetForCurrentThread());
+        _animator = new TrayAnimator(
+            DispatcherQueue.GetForCurrentThread(), () => _feed.TokensPerMin, ApplyCachedIcon);
         _feed.Changed += UpdateIcon;
         AppSettings.Store.Changed += key =>
         {
@@ -88,6 +92,20 @@ public sealed class TrayService : IDisposable
         }
 
         _iconSignature = signature;
+        _icon.ToolTipText = title.Length == 0
+            ? "TokenBar"
+            : $"TokenBar — {mode.ShortLabel()}: {title}";
+
+        // Hidden mode with an animation style hands the icon to the
+        // animator; every other state renders one static frame here.
+        if (mode == TrayMode.Hidden && styleRaw is "cat" or "parrot")
+        {
+            _animator.Start(styleRaw, dark,
+                animate: AppSettings.Store.GetBool("tokenbar.tray.animate", true));
+            return;
+        }
+
+        _animator.Stop();
         using var bmp = mode != TrayMode.Hidden && title.Length > 0
             ? TrayIconRenderer.RenderTitle(
                 TrayModes.IconTitle(title),
@@ -95,10 +113,15 @@ public sealed class TrayService : IDisposable
                     ? TrayIconRenderer.GaugeColor(q) : null,
                 dark)
             : TrayIconRenderer.RenderGauge(
-                // cat/parrot render as bars until the tray animator lands.
                 TrayIconRenderer.ParseGaugeStyle(styleRaw) ?? QuotaIconStyle.Bars,
                 remaining, dark, coloring);
+        ApplyIcon(bmp);
+    }
 
+    /// <summary>One-shot render: the service owns the HICON and destroys it
+    /// when the next owned one replaces it.</summary>
+    private void ApplyIcon(System.Drawing.Bitmap bmp)
+    {
         var hicon = bmp.GetHicon();
         _icon.Icon = System.Drawing.Icon.FromHandle(hicon);
         if (_hicon != 0)
@@ -107,9 +130,19 @@ public sealed class TrayService : IDisposable
         }
 
         _hicon = hicon;
-        _icon.ToolTipText = title.Length == 0
-            ? "TokenBar"
-            : $"TokenBar — {mode.ShortLabel()}: {title}";
+    }
+
+    /// <summary>Animator frames: cached icons the animator owns — never
+    /// destroyed here, but a previously owned one-shot HICON is released
+    /// once it is off screen.</summary>
+    private void ApplyCachedIcon(System.Drawing.Icon icon)
+    {
+        _icon.Icon = icon;
+        if (_hicon != 0)
+        {
+            _ = DestroyIcon(_hicon);
+            _hicon = 0;
+        }
     }
 
     /// <summary>Taskbar theme; missing value = dark (the Windows default).</summary>
