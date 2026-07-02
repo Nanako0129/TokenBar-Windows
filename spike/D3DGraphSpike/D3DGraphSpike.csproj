@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Phase 2 spike: throwaway PoC, not product code. Renders the 53x7
+       contribution grid as instanced D3D11 boxes offscreen so the whole
+       render path (device, shaders, instancing, orbit camera) can be
+       verified over SSH on a bare Windows box — no window, no GPU tools. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct3D11" Version="3.*" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.*" />
+  </ItemGroup>
+
+</Project>

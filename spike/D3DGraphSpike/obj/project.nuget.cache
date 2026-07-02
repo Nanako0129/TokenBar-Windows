@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "dgSpecHash": "PgznsEiV3ig=",
+  "success": true,
+  "projectFilePath": "/Users/nanako/side-project/TokenBar-Windows/spike/D3DGraphSpike/D3DGraphSpike.csproj",
+  "expectedPackageFiles": [
+    "/Users/nanako/.nuget/packages/sharpgen.runtime/2.4.2-beta/sharpgen.runtime.2.4.2-beta.nupkg.sha512",
+    "/Users/nanako/.nuget/packages/sharpgen.runtime.com/2.4.2-beta/sharpgen.runtime.com.2.4.2-beta.nupkg.sha512",
+    "/Users/nanako/.nuget/packages/vortice.d3dcompiler/3.8.3/vortice.d3dcompiler.3.8.3.nupkg.sha512",
+    "/Users/nanako/.nuget/packages/vortice.direct3d11/3.8.3/vortice.direct3d11.3.8.3.nupkg.sha512",
+    "/Users/nanako/.nuget/packages/vortice.directx/3.8.3/vortice.directx.3.8.3.nupkg.sha512",
+    "/Users/nanako/.nuget/packages/vortice.dxgi/3.8.3/vortice.dxgi.3.8.3.nupkg.sha512",
+    "/Users/nanako/.nuget/packages/vortice.mathematics/2.1.0/vortice.mathematics.2.1.0.nupkg.sha512"
+  ],
+  "logs": []
+}
