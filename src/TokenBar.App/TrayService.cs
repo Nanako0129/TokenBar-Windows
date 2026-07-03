@@ -42,9 +42,9 @@ public sealed class TrayService : IDisposable
         // the desktop, which swallowed hover/wheel input meant for the flyout.
         _icon.ContextMenuMode = ContextMenuMode.PopupMenu;
 
-        _feed = new TrayFeed(DispatcherQueue.GetForCurrentThread());
-        _animator = new TrayAnimator(
-            DispatcherQueue.GetForCurrentThread(), () => _feed.TokensPerMin, ApplyCachedIcon);
+        var dispatcher = DispatcherQueue.GetForCurrentThread();
+        _feed = new TrayFeed(dispatcher);
+        _animator = new TrayAnimator(dispatcher, () => _feed.TokensPerMin, ApplyCachedIcon);
         OpenSettings = ShowSettings;
         _feed.Changed += () =>
         {
@@ -55,8 +55,14 @@ public sealed class TrayService : IDisposable
         {
             if (IconKeys.Contains(key))
             {
-                UpdateIcon(); // settings writes happen on the UI thread
-                RebuildMenu();
+                // Changed fires on the writing thread; today's writers are
+                // all UI-thread, but the XAML objects here must never bet
+                // on that staying true.
+                _ = dispatcher.TryEnqueue(() =>
+                {
+                    UpdateIcon();
+                    RebuildMenu();
+                });
             }
         };
 
@@ -80,10 +86,17 @@ public sealed class TrayService : IDisposable
     /// flyout is closed at that moment, so a rebuild is invisible.</summary>
     private void RebuildMenu()
     {
+        // PopupMenu mode converts this MenuFlyout to a NATIVE Win32 menu:
+        // only Command fires (Click never does), and only
+        // ToggleMenuFlyoutItem's IsChecked survives the conversion — so
+        // every actionable item is Command-wired, and "radios" are toggles
+        // whose exclusivity comes from rebuilding off the store.
         var menu = new Microsoft.UI.Xaml.Controls.MenuFlyout();
-        var open = new Microsoft.UI.Xaml.Controls.MenuFlyoutItem { Text = "Open TokenBar" };
-        open.Click += (_, _) => _flyout.ShowFlyout();
-        menu.Items.Add(open);
+        menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
+        {
+            Text = "Open TokenBar",
+            Command = new RelayCommand(_flyout.ShowFlyout),
+        });
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
 
         // Menu bar shows — the seven TrayModes as a radio group.
@@ -91,16 +104,14 @@ public sealed class TrayService : IDisposable
         var current = TrayModes.Parse(AppSettings.Store.GetString(TrayModes.StorageKey));
         foreach (var mode in TrayModes.All)
         {
-            var item = new Microsoft.UI.Xaml.Controls.RadioMenuFlyoutItem
+            var picked = mode;
+            modes.Items.Add(new Microsoft.UI.Xaml.Controls.ToggleMenuFlyoutItem
             {
                 Text = mode.Label(),
-                GroupName = "tray.mode",
                 IsChecked = mode == current,
-            };
-            var picked = mode;
-            item.Click += (_, _) =>
-                AppSettings.Store.SetString(TrayModes.StorageKey, picked.RawValue());
-            modes.Items.Add(item);
+                Command = new RelayCommand(() =>
+                    AppSettings.Store.SetString(TrayModes.StorageKey, picked.RawValue())),
+            });
         }
 
         menu.Items.Add(modes);
@@ -145,16 +156,20 @@ public sealed class TrayService : IDisposable
 
         menu.Items.Add(source);
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
-        var settings = new Microsoft.UI.Xaml.Controls.MenuFlyoutItem { Text = "Settings" };
-        settings.Click += (_, _) => ShowSettings();
-        menu.Items.Add(settings);
-        var quit = new Microsoft.UI.Xaml.Controls.MenuFlyoutItem { Text = "Quit" };
-        quit.Click += (_, _) =>
+        menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
         {
-            Dispose();
-            Microsoft.UI.Xaml.Application.Current.Exit();
-        };
-        menu.Items.Add(quit);
+            Text = "Settings",
+            Command = new RelayCommand(ShowSettings),
+        });
+        menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
+        {
+            Text = "Quit",
+            Command = new RelayCommand(() =>
+            {
+                Dispose();
+                Microsoft.UI.Xaml.Application.Current.Exit();
+            }),
+        });
         _icon.ContextFlyout = menu;
     }
 
@@ -162,15 +177,13 @@ public sealed class TrayService : IDisposable
         Microsoft.UI.Xaml.Controls.MenuFlyoutSubItem parent,
         string label, string value, string selection)
     {
-        var item = new Microsoft.UI.Xaml.Controls.RadioMenuFlyoutItem
+        parent.Items.Add(new Microsoft.UI.Xaml.Controls.ToggleMenuFlyoutItem
         {
             Text = label,
-            GroupName = "quota.source",
             IsChecked = selection == value,
-        };
-        item.Click += (_, _) =>
-            AppSettings.Store.SetString("tokenbar.quota.source", value);
-        parent.Items.Add(item);
+            Command = new RelayCommand(() =>
+                AppSettings.Store.SetString("tokenbar.quota.source", value)),
+        });
     }
 
     private void UpdateIcon()
@@ -186,7 +199,8 @@ public sealed class TrayService : IDisposable
         // Re-render only when the drawn state actually changed (macOS
         // iconSettingsSignature): the feed ticks far more often than the
         // numbers move.
-        var signature = $"{mode}|{styleRaw}|{coloring}|{dark}|{title}|{remaining:F1}";
+        var animate = AppSettings.Store.GetBool("tokenbar.tray.animate", true);
+        var signature = $"{mode}|{styleRaw}|{coloring}|{dark}|{title}|{remaining:F1}|{animate}";
         if (signature == _iconSignature)
         {
             return;
@@ -202,7 +216,7 @@ public sealed class TrayService : IDisposable
         if (mode == TrayMode.Hidden && styleRaw is "cat" or "parrot")
         {
             _animator.Start(styleRaw, dark,
-                animate: AppSettings.Store.GetBool("tokenbar.tray.animate", true));
+                animate: animate);
             return;
         }
 

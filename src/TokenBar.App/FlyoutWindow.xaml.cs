@@ -30,6 +30,7 @@ public sealed partial class FlyoutWindow : Window
         _model.Updated += RenderSnapshot;
         Dashboard.Bind(_model);
         Dashboard.HideRequested += HideFlyout;
+        WireResizeGrip();
 
         // --view=<lens> debug flag (the macOS `defaults write tokenbar.view`
         // counterpart) so remote lens screenshots need no clicking.
@@ -249,6 +250,84 @@ public sealed partial class FlyoutWindow : Window
 
     private void RenderSnapshot() => Dashboard.Render(_model.Current);
 
+    // ── Top-edge resize (the macOS footer drag handle, grown upward) ────
+
+    private bool _resizing;
+    private int _resizeStartCursorY;
+    private int _resizeStartHeight;
+    private int _resizeBottom;
+
+    /// <summary>Drag the flyout's top edge to set its height; the bottom
+    /// stays pinned at the taskbar. Global (physical) cursor coordinates
+    /// keep the drag stable while the window itself moves, and the height
+    /// key persists only on release — mid-drag writes churn the settings
+    /// file and rebuild whoever listens.</summary>
+    private void WireResizeGrip()
+    {
+        ResizeGrip.PointerEntered += (_, _) => ResizeGripHint.Opacity = 1;
+        ResizeGrip.PointerExited += (_, _) =>
+        {
+            if (!_resizing)
+            {
+                ResizeGripHint.Opacity = 0;
+            }
+        };
+        ResizeGrip.PointerPressed += (_, e) =>
+        {
+            if (!GetCursorPos(out var pt))
+            {
+                return;
+            }
+
+            _resizing = true;
+            _resizeStartCursorY = pt.Y;
+            _resizeStartHeight = AppWindow.Size.Height;
+            _resizeBottom = AppWindow.Position.Y + AppWindow.Size.Height;
+            _ = ResizeGrip.CapturePointer(e.Pointer);
+        };
+        ResizeGrip.PointerMoved += (_, _) =>
+        {
+            if (!_resizing || !GetCursorPos(out var pt))
+            {
+                return;
+            }
+
+            var work = DisplayArea.GetFromWindowId(
+                AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+            var scale = GetDpiForWindow(
+                WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+            var ceiling = Math.Min(
+                _resizeBottom - work.Y, work.Height - (int)(24 * scale));
+            var floor = Math.Min((int)(480 * scale), ceiling);
+            var height = Math.Clamp(
+                _resizeStartHeight + (_resizeStartCursorY - pt.Y), floor, ceiling);
+            AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(
+                AppWindow.Position.X, _resizeBottom - height,
+                AppWindow.Size.Width, height));
+        };
+        ResizeGrip.PointerReleased += (_, e) =>
+        {
+            ResizeGrip.ReleasePointerCapture(e.Pointer);
+            EndResize();
+        };
+        ResizeGrip.PointerCaptureLost += (_, _) => EndResize();
+    }
+
+    private void EndResize()
+    {
+        if (!_resizing)
+        {
+            return;
+        }
+
+        _resizing = false;
+        ResizeGripHint.Opacity = 0;
+        var scale = GetDpiForWindow(
+            WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+        AppSettings.Store.SetDouble(
+            "tokenbar.popover.height", AppWindow.Size.Height / scale);
+    }
+
     /// <summary>Popup chrome: strip every residual frame style down to
     /// WS_POPUP (the presenter's borderless mode leaves WS_DLGFRAME behind,
     /// which draws a 1px outline DWMWA_BORDER_COLOR cannot remove), then
@@ -370,6 +449,17 @@ public sealed partial class FlyoutWindow : Window
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(nint hwnd);
+
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct CURSORPOINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out CURSORPOINT pt);
 
     private delegate nint LowLevelMouseProc(int code, nint wParam, nint lParam);
 

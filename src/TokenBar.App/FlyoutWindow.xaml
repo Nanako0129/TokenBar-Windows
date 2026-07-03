@@ -4,5 +4,23 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:TokenBar.App">
 
-    <local:DashboardView x:Name="Dashboard" />
+    <Grid>
+        <local:DashboardView x:Name="Dashboard" />
+        <!-- Top-edge resize grabber (the macOS footer drag handle, flipped:
+             this flyout hangs from the taskbar so it grows upward). -->
+        <Border
+            x:Name="ResizeGrip"
+            VerticalAlignment="Top"
+            Height="8"
+            Background="Transparent">
+            <Border
+                x:Name="ResizeGripHint"
+                Width="36"
+                Height="3"
+                CornerRadius="1.5"
+                VerticalAlignment="Center"
+                Opacity="0"
+                Background="{ThemeResource TextFillColorTertiaryBrush}" />
+        </Border>
+    </Grid>
 </Window>

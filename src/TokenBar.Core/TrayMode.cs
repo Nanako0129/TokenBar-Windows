@@ -76,16 +76,11 @@ public static class TrayModes
     };
 
     /// <summary>The icon-sized short form of a title (parity table #1's
-    /// "truncated $5.20"): past six characters the icon drops precision —
-    /// cents off a big cost, the decimal out of a rate — while the tooltip
-    /// keeps the full string.</summary>
+    /// "truncated $5.20"): the icon always drops the decimal run — 12.3K
+    /// draws as 12K, $5.20 as $5 — because every glyph halves the font the
+    /// 16px square can afford. The tooltip keeps the full string.</summary>
     public static string IconTitle(string title)
     {
-        if (title.Length <= 6)
-        {
-            return title;
-        }
-
         var dot = title.IndexOf('.');
         if (dot < 0)
         {
@@ -98,9 +93,7 @@ public static class TrayModes
             end++;
         }
 
-        return title.StartsWith('$')
-            ? title[..dot] // $4637.49 → $4637
-            : title[..dot] + title[end..]; // 12.4K/m → 12K/m
+        return title[..dot] + title[end..];
     }
 
     /// <summary>The tray title for this mode ("" = icon only). Faithful to

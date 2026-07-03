@@ -52,8 +52,11 @@ public sealed class TrayFeed
         {
             if (key == "tokenbar.quota.source")
             {
-                ResolveRemaining(); // re-pick the window from the cached payload
-                Changed?.Invoke();
+                _ = _dispatcher.TryEnqueue(() =>
+                {
+                    ResolveRemaining(); // re-pick from the cached payload
+                    Changed?.Invoke();
+                });
             }
         };
     }
@@ -68,9 +71,9 @@ public sealed class TrayFeed
         _fastInFlight = true;
         _ = Task.Run(() =>
         {
-            using var boost = ProcessPower.Boost(); // live-tail parse
             try
             {
+                using var boost = ProcessPower.Boost(); // live-tail parse
                 var rate = TbCore.TokensPerMin();
                 _ = _dispatcher.TryEnqueue(() =>
                 {

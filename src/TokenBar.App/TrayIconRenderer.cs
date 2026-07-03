@@ -144,7 +144,7 @@ internal static class TrayIconRenderer
     /// the string is long enough that the digits win real size from it.</summary>
     private static string[] SplitForIcon(string title)
     {
-        if (title.Length < 4)
+        if (title.Length < 3)
         {
             return [title];
         }
@@ -287,6 +287,11 @@ internal static class TrayIconRenderer
             if (gTop > gBottom + 0.8)
             {
                 var state = g.Save();
+                // SourceCopy replaces coverage-scaled pixels outright, so an
+                // antialiased edge of this ~1px slot would end far more
+                // transparent than macOS's destinationOut; crisp edges keep
+                // the groove width honest.
+                g.SmoothingMode = SmoothingMode.None;
                 g.CompositingMode = CompositingMode.SourceCopy;
                 var alpha = (int)(255 * (1 - 0.85 * presence));
                 using var groove = new SolidBrush(Color.FromArgb(alpha, ice));
@@ -297,6 +302,7 @@ internal static class TrayIconRenderer
                 }
 
                 g.Restore(state);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.CompositingMode = CompositingMode.SourceOver;
             }
         }
