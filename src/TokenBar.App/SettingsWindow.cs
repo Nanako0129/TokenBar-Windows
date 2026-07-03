@@ -25,7 +25,18 @@ public sealed class SettingsWindow : Window
     private readonly ScrollViewer _scroll = new()
     {
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-        Padding = new Thickness(20, 12, 20, 20),
+        Padding = new Thickness(20, 12, 16, 20),
+    };
+
+    // The macOS panel's right column: a live preview that tracks every
+    // settings write, so picking an icon style or pace mode shows its
+    // effect immediately.
+    private readonly StackPanel _preview = new()
+    {
+        Spacing = 12,
+        Width = 280,
+        Margin = new Thickness(4, 12, 20, 20),
+        VerticalAlignment = VerticalAlignment.Top,
     };
 
     public static void Present(Func<AgentUsagePayload?> quota)
@@ -53,7 +64,16 @@ public sealed class SettingsWindow : Window
         _quota = quota;
         Title = "TokenBar Settings";
         SystemBackdrop = new MicaBackdrop();
-        Content = _scroll;
+        var root = new Grid();
+        root.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        root.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        root.Children.Add(_scroll);
+        Grid.SetColumn(_preview, 1);
+        root.Children.Add(_preview);
+        Content = root;
 
         var presenter = (OverlappedPresenter)AppWindow.Presenter;
         presenter.IsResizable = false;
@@ -74,6 +94,14 @@ public sealed class SettingsWindow : Window
         // the click's event stack unwinds.
         AppSettings.Store.Changed += key =>
         {
+            // No rebuild for: the quota cache (writes on the tray's 300s
+            // tick) and the height slider's own key — replacing a slider
+            // mid-drag kills the drag after one step.
+            if (key is "tokenbar.quota.lastRemaining" or "tokenbar.popover.height")
+            {
+                return;
+            }
+
             if (AppWindow.IsVisible)
             {
                 _ = DispatcherQueue.TryEnqueue(Rebuild);
@@ -84,7 +112,7 @@ public sealed class SettingsWindow : Window
     private void ApplySize()
     {
         var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
-        var size = new Windows.Graphics.SizeInt32((int)(420 * scale), (int)(640 * scale));
+        var size = new Windows.Graphics.SizeInt32((int)(732 * scale), (int)(640 * scale));
         if (AppWindow.Size == size)
         {
             return;
@@ -246,6 +274,14 @@ public sealed class SettingsWindow : Window
         var height = store.GetDouble("tokenbar.popover.height", 0);
         var sizeRow = new StackPanel { Spacing = 8 };
         var sizeLabel = Ui.Text(height <= 0 ? "Height · Auto" : $"Height · {height:F0}px", 12);
+        var auto = new Button
+        {
+            Content = "Auto",
+            FontSize = 11,
+            Padding = new Thickness(8, 2, 8, 3),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Visibility = height > 0 ? Visibility.Visible : Visibility.Collapsed,
+        };
         var slider = new Slider
         {
             Minimum = 480,
@@ -253,24 +289,26 @@ public sealed class SettingsWindow : Window
             StepFrequency = 10,
             Value = height <= 0 ? Math.Min(800, area.Height * 0.6) : height,
         };
+        // The height key skips the panel rebuild (see the Changed filter),
+        // so the label and reset button update in place instead.
         slider.ValueChanged += (_, e) =>
         {
             if (e.NewValue > 0)
             {
                 store.SetDouble("tokenbar.popover.height", e.NewValue);
                 sizeLabel.Text = $"Height · {e.NewValue:F0}px";
+                auto.Visibility = Visibility.Visible;
             }
         };
-        var auto = new Button { Content = "Auto", FontSize = 11, Padding = new Thickness(8, 2, 8, 3) };
-        auto.Click += (_, _) => store.SetDouble("tokenbar.popover.height", 0);
+        auto.Click += (_, _) =>
+        {
+            store.SetDouble("tokenbar.popover.height", 0);
+            sizeLabel.Text = "Height · Auto";
+            auto.Visibility = Visibility.Collapsed;
+        };
         var labelRow = new Grid();
         labelRow.Children.Add(sizeLabel);
-        if (height > 0)
-        {
-            auto.HorizontalAlignment = HorizontalAlignment.Right;
-            labelRow.Children.Add(auto);
-        }
-
+        labelRow.Children.Add(auto);
         sizeRow.Children.Add(labelRow);
         sizeRow.Children.Add(slider);
         panel.Children.Add(Section("Flyout size", sizeRow));
@@ -302,6 +340,134 @@ public sealed class SettingsWindow : Window
         panel.Children.Add(Section("About", about));
 
         _scroll.Content = panel;
+        RebuildPreview();
+    }
+
+    /// <summary>Sample titles for the tray preview — the macOS mock menubar
+    /// strips; quota_left uses the live reading when one exists.</summary>
+    private static string SampleTitle(TrayMode mode, double? remaining) => mode switch
+    {
+        TrayMode.TodayTokens => "50M",
+        TrayMode.TodayCost => "$5.20",
+        TrayMode.TotalTokens => "1.5B",
+        TrayMode.TotalCost => "$889.13",
+        TrayMode.TokensPerMin => "12.4K/m",
+        TrayMode.QuotaLeft => mode.Title(null, null, remaining ?? 57),
+        _ => "",
+    };
+
+    private void RebuildPreview()
+    {
+        var store = AppSettings.Store;
+        _preview.Children.Clear();
+        _preview.Children.Add(Ui.Text("PREVIEW", 10, 0.55, bold: true));
+
+        var mode = TrayModes.Parse(store.GetString(TrayModes.StorageKey));
+        var styleRaw = store.GetString("tokenbar.tray.animationStyle", "cat") ?? "cat";
+        var coloring = TrayIconRenderer.ParseColoring(
+            store.GetString("tokenbar.icon.coloring"));
+        var selection = store.GetString("tokenbar.quota.source", "auto") ?? "auto";
+        double? remaining = QuotaResolver.Resolve(_quota(), selection) is { } pick
+            ? Math.Clamp(pick.Window.RemainingPercent, 0, 100) : null;
+        var title = SampleTitle(mode, remaining);
+
+        System.Drawing.Color? titleColor = mode == TrayMode.QuotaLeft
+            ? TrayIconRenderer.GaugeColor(remaining ?? 57) : null;
+        foreach (var dark in new[] { true, false })
+        {
+            using var bmp = mode != TrayMode.Hidden && title.Length > 0
+                ? TrayIconRenderer.RenderTitle(
+                    TrayModes.IconTitle(title), titleColor, dark)
+                : TrayIconRenderer.RenderGauge(
+                    TrayIconRenderer.ParseGaugeStyle(styleRaw) ?? QuotaIconStyle.Bars,
+                    remaining ?? 57, dark, coloring);
+            var strip = new Border
+            {
+                Background = new SolidColorBrush(dark
+                    ? Windows.UI.Color.FromArgb(255, 30, 30, 30)
+                    : Windows.UI.Color.FromArgb(255, 240, 240, 240)),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(12, 6, 12, 6),
+            };
+            var row = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 10,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            var image = new Image { Width = 32, Height = 32, Source = ToImage(bmp) };
+            row.Children.Add(image);
+            var clock = Ui.Text(dark ? "下午 9:41" : "上午 9:41", 11, 0.7);
+            clock.Foreground = new SolidColorBrush(dark
+                ? Windows.UI.Color.FromArgb(255, 235, 235, 235)
+                : Windows.UI.Color.FromArgb(255, 30, 30, 30));
+            clock.VerticalAlignment = VerticalAlignment.Center;
+            row.Children.Add(clock);
+            strip.Child = row;
+            _preview.Children.Add(strip);
+        }
+
+        // Agent limits preview: mock windows through the real bar pipeline,
+        // so asUsed/layout/paceMode picks show their effect immediately.
+        _preview.Children.Add(Ui.Text("AGENT LIMITS", 10, 0.55, bold: true));
+        var asUsed = store.GetBool("tokenbar.limits.asUsed", false);
+        var classic = store.GetString("tokenbar.limits.layout", "full") == "classic";
+        var paceMode = store.GetString("tokenbar.limits.paceMode", "historical") switch
+        {
+            "linear" => PaceMode.Linear,
+            "off" => PaceMode.Off,
+            _ => PaceMode.Historical,
+        };
+        var now = DateTimeOffset.Now;
+        var card = new StackPanel { Spacing = 5 };
+        UsageWindow[] mocks =
+        [
+            new(
+                Label: "Session", UsedPercent: 62, RemainingPercent: 38,
+                ResetsAt: now.AddMinutes(95).UtcDateTime.ToString(
+                    "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                    System.Globalization.CultureInfo.InvariantCulture),
+                ResetText: "Resets in 1h 35m", WindowMinutes: 300,
+                HistoricalExpectedPercent: 48, RunOutProbability: 0.35),
+            new(
+                Label: "Weekly", UsedPercent: 31, RemainingPercent: 69,
+                ResetsAt: now.AddDays(4).UtcDateTime.ToString(
+                    "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                    System.Globalization.CultureInfo.InvariantCulture),
+                ResetText: "Resets in 4d", WindowMinutes: 10080,
+                HistoricalExpectedPercent: 45, RunOutProbability: 0.02),
+        ];
+        foreach (var window in mocks)
+        {
+            var fill = asUsed ? window.UsedPercent : window.RemainingPercent;
+            var amount = asUsed
+                ? $"{window.UsedPercent:F0}% used" : $"{window.RemainingPercent:F0}% left";
+            var pace = classic ? null : UsagePace.Compute(window, paceMode, now);
+            var paceText = pace is null ? ""
+                : pace.EtaText is { } eta ? $"{pace.Label} · {eta}" : pace.Label;
+            card.Children.Add(Ui.Row(
+                Ui.Text($"{window.Label} · {amount}", 11),
+                Ui.Text(paceText, 10, 0.7)));
+            card.Children.Add(DashboardView.GaugeBar(
+                fill, window.RemainingPercent, pace, asUsed));
+            if (!classic)
+            {
+                card.Children.Add(Ui.Dim(window.ResetText!, 10));
+            }
+        }
+
+        _preview.Children.Add(card);
+    }
+
+    private static Microsoft.UI.Xaml.Media.Imaging.BitmapImage ToImage(
+        System.Drawing.Bitmap bmp)
+    {
+        var stream = new MemoryStream();
+        bmp.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+        stream.Position = 0;
+        var image = new Microsoft.UI.Xaml.Media.Imaging.BitmapImage();
+        image.SetSource(stream.AsRandomAccessStream());
+        return image;
     }
 
     // ── Control primitives (macOS SettingsPanel's four) ────────────────

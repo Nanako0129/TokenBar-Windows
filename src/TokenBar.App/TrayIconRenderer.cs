@@ -104,7 +104,10 @@ internal static class TrayIconRenderer
 
     /// <summary>The mode's short value drawn as the icon itself (57%, 12.3K,
     /// $5.20) — the CPU-meter convention the parity table picked, since the
-    /// notification area has no text. Shrinks the font until the string fits.</summary>
+    /// notification area has no text. A trailing unit wraps to its own line
+    /// so the digits get the full width, and typographic measurement drops
+    /// DrawString's side bearings; both buy the font size the 16px square
+    /// desperately needs.</summary>
     public static Bitmap RenderTitle(string title, Color? color, bool dark)
     {
         var bmp = new Bitmap(Size, Size, PixelFormat.Format32bppArgb);
@@ -112,20 +115,48 @@ internal static class TrayIconRenderer
         g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
         var ink = color ?? (dark ? Color.White : Color.Black);
         using var brush = new SolidBrush(ink);
-        for (var pt = 22f; pt >= 8f; pt -= 1f)
+        var format = StringFormat.GenericTypographic;
+        var lines = SplitForIcon(title);
+        for (var pt = 30f; pt >= 8f; pt -= 1f)
         {
             using var font = new Font("Segoe UI", pt, FontStyle.Bold, GraphicsUnit.Pixel);
-            var measured = g.MeasureString(title, font);
-            if (measured.Width <= Size + 2 || pt <= 8f)
+            var widest = lines.Max(l =>
+                g.MeasureString(l, font, int.MaxValue, format).Width);
+            var lineHeight = font.GetHeight(g);
+            if ((widest <= Size && lineHeight * lines.Length <= Size + 4) || pt <= 8f)
             {
-                var x = (Size - measured.Width) / 2;
-                var y = (Size - measured.Height) / 2;
-                g.DrawString(title, font, brush, x, y);
+                var y = (Size - lineHeight * lines.Length) / 2;
+                foreach (var line in lines)
+                {
+                    var w = g.MeasureString(line, font, int.MaxValue, format).Width;
+                    g.DrawString(line, font, brush, (Size - w) / 2, y, format);
+                    y += lineHeight;
+                }
+
                 break;
             }
         }
 
         return bmp;
+    }
+
+    /// <summary>Wrap a trailing unit (K/M/B/%, /m) onto its own line when
+    /// the string is long enough that the digits win real size from it.</summary>
+    private static string[] SplitForIcon(string title)
+    {
+        if (title.Length < 4)
+        {
+            return [title];
+        }
+
+        if (title.EndsWith("/m", StringComparison.Ordinal) && title.Length > 4)
+        {
+            return [title[..^2], "/m"];
+        }
+
+        return title[^1] is 'K' or 'M' or 'B' or '%'
+            ? [title[..^1], title[^1..]]
+            : [title];
     }
 
     // ── macOS TrayIcons geometry, 16-grid ───────────────────────────────

@@ -1112,8 +1112,9 @@ public sealed partial class DashboardView : UserControl
 
     /// <summary>The quota bar: fills by used or remaining per the setting,
     /// colors by remaining either way (macOS gaugeColor), and carries the
-    /// pace marker on the same axis so it lines up with the fill.</summary>
-    private static FrameworkElement GaugeBar(
+    /// pace marker on the same axis so it lines up with the fill. Internal:
+    /// the settings window's preview column renders through the same bar.</summary>
+    internal static FrameworkElement GaugeBar(
         double fillPercent, double remainingForColor, UsagePace? pace = null,
         bool asUsed = false)
     {
