@@ -90,6 +90,64 @@ public sealed partial class DashboardView : UserControl
                 _ = DispatcherQueue.TryEnqueue(() => RenderContent(animated: false));
             }
         };
+
+        // In-flyout shortcuts, the macOS ⌘ set on Ctrl: Esc/Ctrl+W close,
+        // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..6 lenses,
+        // Ctrl+[ / Ctrl+] cycle.
+        AddAccel(Windows.System.VirtualKey.Escape, Windows.System.VirtualKeyModifiers.None,
+            () => HideRequested?.Invoke());
+        AddAccel(Windows.System.VirtualKey.W, Windows.System.VirtualKeyModifiers.Control,
+            () => HideRequested?.Invoke());
+        AddAccel(Windows.System.VirtualKey.R, Windows.System.VirtualKeyModifiers.Control,
+            () =>
+            {
+                _model?.RefreshForce();
+                UpdateRefreshControl();
+            });
+        AddAccel((Windows.System.VirtualKey)0xBC /* comma */,
+            Windows.System.VirtualKeyModifiers.Control,
+            () => TrayService.OpenSettings?.Invoke());
+        AddAccel(Windows.System.VirtualKey.Q, Windows.System.VirtualKeyModifiers.Control,
+            () => Application.Current.Exit());
+        var lenses = Enum.GetValues<AppView>();
+        for (var i = 0; i < lenses.Length && i < 9; i++)
+        {
+            var view = lenses[i];
+            AddAccel(Windows.System.VirtualKey.Number1 + i,
+                Windows.System.VirtualKeyModifiers.Control, () => SwitchTo(view));
+        }
+
+        AddAccel((Windows.System.VirtualKey)0xDB /* [ */,
+            Windows.System.VirtualKeyModifiers.Control, () => CycleLens(-1));
+        AddAccel((Windows.System.VirtualKey)0xDD /* ] */,
+            Windows.System.VirtualKeyModifiers.Control, () => CycleLens(1));
+    }
+
+    /// <summary>The flyout owns hiding (Esc/Ctrl+W land here).</summary>
+    public event Action? HideRequested;
+
+    private void AddAccel(
+        Windows.System.VirtualKey key, Windows.System.VirtualKeyModifiers mods,
+        Action action)
+    {
+        var accel = new Microsoft.UI.Xaml.Input.KeyboardAccelerator
+        {
+            Key = key,
+            Modifiers = mods,
+        };
+        accel.Invoked += (_, e) =>
+        {
+            action();
+            e.Handled = true;
+        };
+        KeyboardAccelerators.Add(accel);
+    }
+
+    private void CycleLens(int step)
+    {
+        var lenses = Enum.GetValues<AppView>();
+        var index = Array.IndexOf(lenses, _view);
+        SwitchTo(lenses[(index + step + lenses.Length) % lenses.Length]);
     }
 
     /// <summary>One control, two states (macOS refreshButton): the glyph

@@ -29,6 +29,7 @@ public sealed partial class FlyoutWindow : Window
         _model = new DashboardModel(DispatcherQueue);
         _model.Updated += RenderSnapshot;
         Dashboard.Bind(_model);
+        Dashboard.HideRequested += HideFlyout;
 
         // --view=<lens> debug flag (the macOS `defaults write tokenbar.view`
         // counterpart) so remote lens screenshots need no clicking.
