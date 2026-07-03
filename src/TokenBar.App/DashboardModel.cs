@@ -77,6 +77,15 @@ public sealed class DashboardModel
             }
         }
 
+        // Drop the old year's lazy lenses now: the graph publishes for the
+        // new year before the lens refetch lands, and a lingering Hourly/
+        // Agents report would render the old year's rows under the new
+        // filter until then.
+        if (_hourlyWanted || _agentsWanted)
+        {
+            Publish(s => s with { Hourly = null, Agents = null }, graph: null);
+        }
+
         _refreshing = true; // macOS setYear spins the header control too
         Updated?.Invoke();
         RefreshSlow(); // an in-flight lane re-runs itself when the year flips

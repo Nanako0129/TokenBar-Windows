@@ -94,24 +94,36 @@ public sealed class SettingsWindow : Window
         // the click's event stack unwinds.
         AppSettings.Store.Changed += key =>
         {
-            if (!AppWindow.IsVisible || !key.StartsWith("tokenbar.", StringComparison.Ordinal)
+            if (!key.StartsWith("tokenbar.", StringComparison.Ordinal)
                 || key is "tokenbar.quota.lastRemaining" or "tokenbar.popover.height")
             {
                 return;
             }
 
-            // Only the two keys that change which sub-controls exist rebuild
-            // the whole panel — a full rebuild drops keyboard focus and the
-            // scroll position, which breaks arrow-key radio navigation.
-            // Everything else refreshes the preview column in place.
-            if (key is "tokenbar.tray.animationStyle" or "tokenbar.limits.layout")
+            // Changed fires on the writing thread — and a vanished-year clear
+            // runs Store.Remove on a background parse lane — so hop to the UI
+            // thread BEFORE touching AppWindow or any XAML. Only the two keys
+            // that change which sub-controls exist rebuild the whole panel (a
+            // full rebuild drops keyboard focus and scroll position, breaking
+            // arrow-key radio navigation); everything else refreshes the
+            // preview column in place.
+            var rebuildAll = key is "tokenbar.tray.animationStyle" or "tokenbar.limits.layout";
+            _ = DispatcherQueue.TryEnqueue(() =>
             {
-                _ = DispatcherQueue.TryEnqueue(Rebuild);
-            }
-            else
-            {
-                _ = DispatcherQueue.TryEnqueue(RebuildPreview);
-            }
+                if (!AppWindow.IsVisible)
+                {
+                    return;
+                }
+
+                if (rebuildAll)
+                {
+                    Rebuild();
+                }
+                else
+                {
+                    RebuildPreview();
+                }
+            });
         };
     }
 

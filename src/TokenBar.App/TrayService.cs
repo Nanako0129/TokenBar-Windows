@@ -66,6 +66,12 @@ public sealed class TrayService : IDisposable
             }
         };
 
+        QuitApp = () =>
+        {
+            Dispose();
+            Microsoft.UI.Xaml.Application.Current.Exit();
+        };
+
         UpdateIcon();
         RebuildMenu();
         _icon.ForceCreate();
@@ -164,11 +170,7 @@ public sealed class TrayService : IDisposable
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
         {
             Text = "Quit",
-            Command = new RelayCommand(() =>
-            {
-                Dispose();
-                Microsoft.UI.Xaml.Application.Current.Exit();
-            }),
+            Command = new RelayCommand(() => QuitApp?.Invoke()),
         });
         _icon.ContextFlyout = menu;
     }
@@ -310,7 +312,23 @@ public sealed class TrayService : IDisposable
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool DestroyIcon(nint hIcon);
 
-    public void Dispose() => _icon.Dispose();
+    /// <summary>The single shutdown path. Every Quit entry (tray menu,
+    /// flyout footer button, Ctrl+Q) routes here so the icon, timers, and
+    /// GDI handles are always released before the process exits — no entry
+    /// bypasses cleanup by calling Application.Exit() directly.</summary>
+    public static Action? QuitApp { get; private set; }
+
+    public void Dispose()
+    {
+        _animator.Stop();
+        _animator.Dispose();
+        _icon.Dispose();
+        if (_hicon != 0)
+        {
+            _ = DestroyIcon(_hicon);
+            _hicon = 0;
+        }
+    }
 }
 
 /// <summary>Minimal ICommand so the skeleton avoids an MVVM package pull.</summary>

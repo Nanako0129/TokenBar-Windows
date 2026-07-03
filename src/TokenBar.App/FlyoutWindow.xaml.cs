@@ -138,6 +138,13 @@ public sealed partial class FlyoutWindow : Window
     private async Task FinishHideAsync(PointInt32 from, PointInt32 to)
     {
         await SlideWindowAsync(from, to, durationMs: 120, decelerate: false);
+        if (!_hiding)
+        {
+            // A ShowFlyout during the slide cleared _hiding and started its
+            // own slide; hiding now would yank the freshly shown flyout.
+            return;
+        }
+
         AppWindow.Hide();
         _hiding = false;
         var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview
@@ -230,9 +237,10 @@ public sealed partial class FlyoutWindow : Window
         var picked = AppSettings.Store.GetDouble("tokenbar.popover.height", 0);
         var ceiling = work.Height - (int)(24 * scale);
         var floor = Math.Min((int)(480 * scale), ceiling);
-        var height = picked > 0
-            ? (int)Math.Clamp(picked * scale, floor, ceiling)
-            : (int)(FlyoutHeight * scale);
+        // The default is clamped too: a short work area (small screen, high
+        // DPI) below the scaled default would otherwise push Y off-screen.
+        var wanted = picked > 0 ? picked * scale : FlyoutHeight * scale;
+        var height = (int)Math.Clamp(wanted, floor, ceiling);
         AppWindow.Resize(new SizeInt32(width, height));
 
         var edge = TaskbarEdge();

@@ -9,7 +9,7 @@ namespace TokenBar.App;
 /// Hidden ("icon only") mode with an animation style; every other state
 /// stops the timer cold so the resident process stays quiet.
 /// </summary>
-internal sealed class TrayAnimator
+internal sealed class TrayAnimator : IDisposable
 {
     private readonly DispatcherQueueTimer _timer;
     private readonly Func<double?> _rate;
@@ -32,6 +32,22 @@ internal sealed class TrayAnimator
     }
 
     public bool Running => _timer.IsRunning;
+
+    public void Dispose()
+    {
+        _timer.Stop();
+        foreach (var icon in _frames.Values.SelectMany(f => f))
+        {
+            var handle = icon.Handle; // the raw HICON Icon.FromHandle wraps
+            icon.Dispose();
+            _ = DestroyIcon(handle);
+        }
+
+        _frames.Clear();
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool DestroyIcon(nint hIcon);
 
     /// <summary>Show the style's frames; animate=false parks on frame 0
     /// (the tokenbar.tray.animate toggle).</summary>

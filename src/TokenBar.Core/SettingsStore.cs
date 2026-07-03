@@ -84,8 +84,10 @@ public sealed class SettingsStore
     {
         lock (_gate)
         {
+            // TryGetDouble, not GetDouble: a hand-edited out-of-range literal
+            // (1e9999) parses into the store but throws on GetDouble.
             return _values.TryGetValue(key, out var v) && v.ValueKind == JsonValueKind.Number
-                ? v.GetDouble() : fallback;
+                && v.TryGetDouble(out var d) ? d : fallback;
         }
     }
 

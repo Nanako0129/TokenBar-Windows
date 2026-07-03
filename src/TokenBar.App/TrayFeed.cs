@@ -157,6 +157,14 @@ public sealed class TrayFeed
             // (the store no-ops when the value hasn't changed).
             AppSettings.Store.SetDouble("tokenbar.quota.lastRemaining", resolved);
         }
+        else if (Quota is not null)
+        {
+            // A payload arrived but the selected window is gone (auth failed,
+            // no windows): drop the reading so the tray doesn't keep showing
+            // a stale percentage. lastRemaining stays only as a cold-boot
+            // seed, used before the first payload — not now.
+            QuotaRemaining = null;
+        }
     }
 
     private static T? TryFetch<T>(Func<T> fetch, string label) where T : class

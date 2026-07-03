@@ -78,7 +78,7 @@ public sealed partial class DashboardView : UserControl
 
         SettingsButton.Click += (_, _) => TrayService.OpenSettings?.Invoke();
         HoverTip.Attach(SettingsButton, () => "Settings");
-        QuitButton.Click += (_, _) => Application.Current.Exit();
+        QuitButton.Click += (_, _) => TrayService.QuitApp?.Invoke();
 
         // Limits/trace settings re-render the open flyout live (the macOS
         // panel's right-column preview equivalent is the flyout itself).
@@ -124,7 +124,7 @@ public sealed partial class DashboardView : UserControl
             Windows.System.VirtualKeyModifiers.Control,
             () => TrayService.OpenSettings?.Invoke());
         AddAccel(Windows.System.VirtualKey.Q, Windows.System.VirtualKeyModifiers.Control,
-            () => Application.Current.Exit());
+            () => TrayService.QuitApp?.Invoke());
         var lenses = Enum.GetValues<AppView>();
         for (var i = 0; i < lenses.Length && i < 9; i++)
         {
