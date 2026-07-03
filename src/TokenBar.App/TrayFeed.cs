@@ -18,8 +18,9 @@ public sealed class TrayFeed : IDisposable
     private readonly DispatcherQueueTimer _fast;
     private readonly DispatcherQueueTimer _slow;
     private readonly Action<string> _onStoreChanged;
-    private bool _fastInFlight;
-    private bool _slowInFlight;
+    private int _fastInFlight; // Interlocked: reset in a background finally
+    private int _slowInFlight;
+    private bool _disposed;
 
     public UsagePayload? Graph { get; private set; }
 
@@ -69,6 +70,7 @@ public sealed class TrayFeed : IDisposable
     /// into a disposed tray icon after shutdown.</summary>
     public void Dispose()
     {
+        _disposed = true; // fences any in-flight lane's enqueued callback
         _fast.Stop();
         _slow.Stop();
         AppSettings.Store.Changed -= _onStoreChanged;
@@ -76,12 +78,11 @@ public sealed class TrayFeed : IDisposable
 
     private void RefreshFast()
     {
-        if (_fastInFlight)
+        if (Interlocked.Exchange(ref _fastInFlight, 1) == 1)
         {
             return;
         }
 
-        _fastInFlight = true;
         _ = Task.Run(() =>
         {
             try
@@ -90,6 +91,11 @@ public sealed class TrayFeed : IDisposable
                 var rate = TbCore.TokensPerMin();
                 _ = _dispatcher.TryEnqueue(() =>
                 {
+                    if (_disposed)
+                    {
+                        return; // don't touch the tray icon after shutdown
+                    }
+
                     TokensPerMin = rate;
                     Changed?.Invoke();
                 });
@@ -100,7 +106,7 @@ public sealed class TrayFeed : IDisposable
             }
             finally
             {
-                _fastInFlight = false;
+                Volatile.Write(ref _fastInFlight, 0);
             }
         });
     }
@@ -113,14 +119,13 @@ public sealed class TrayFeed : IDisposable
 
     private void RefreshSlow()
     {
-        if (_slowInFlight)
+        if (Interlocked.Exchange(ref _slowInFlight, 1) == 1)
         {
             return;
         }
 
         var intervalMin = Math.Max(1, AppSettings.Store.GetInt("tokenbar.refresh.intervalMin", 30));
         var force = DateTimeOffset.Now - _lastFullRefresh >= TimeSpan.FromMinutes(intervalMin);
-        _slowInFlight = true;
         _ = Task.Run(() =>
         {
             try
@@ -140,6 +145,11 @@ public sealed class TrayFeed : IDisposable
                 var quota = TryFetch(() => TbCore.AgentUsage(), "tray quota");
                 _ = _dispatcher.TryEnqueue(() =>
                 {
+                    if (_disposed)
+                    {
+                        return; // don't touch the tray icon after shutdown
+                    }
+
                     Graph = graph ?? Graph;
                     Quota = quota ?? Quota;
                     ResolveRemaining();
@@ -148,7 +158,7 @@ public sealed class TrayFeed : IDisposable
             }
             finally
             {
-                _slowInFlight = false;
+                Volatile.Write(ref _slowInFlight, 0);
             }
         });
     }

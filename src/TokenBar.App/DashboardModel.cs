@@ -17,12 +17,13 @@ public sealed class DashboardModel
     private readonly DispatcherQueue _dispatcher;
     private DispatcherQueueTimer? _slowTimer;
     private DispatcherQueueTimer? _fastTimer;
-    // 0/1 via Interlocked: the year-switch re-run enters from a lane thread,
-    // so this gate races the UI-thread timer tick (unlike the other flags,
-    // whose callers all live on the dispatcher).
+    // 0/1 via Interlocked throughout: every gate is entered on the UI thread
+    // (timer tick) but reset in a background Task.Run's finally, so a plain
+    // bool's reset isn't guaranteed visible back on the dispatcher — on ARM64
+    // (a CI/test target) that can wedge a lane permanently "in flight".
     private int _slowInFlight;
-    private bool _fastInFlight;
-    private bool _quotaInFlight;
+    private int _fastInFlight;
+    private int _quotaInFlight;
     // Latest quota fetch, kept outside the snapshot so a fetch that lands
     // before the first graph parse isn't lost — the first snapshot seeds
     // from it (quota is usually done in ~1s, the cold parse in seconds).
@@ -359,12 +360,11 @@ public sealed class DashboardModel
     /// graph tick behind <c>_slowInFlight</c>.</summary>
     private void RefreshQuota()
     {
-        if (_quotaInFlight)
+        if (Interlocked.Exchange(ref _quotaInFlight, 1) == 1)
         {
             return;
         }
 
-        _quotaInFlight = true;
         _ = Task.Run(() =>
         {
             try
@@ -378,7 +378,7 @@ public sealed class DashboardModel
             }
             finally
             {
-                _quotaInFlight = false;
+                Volatile.Write(ref _quotaInFlight, 0);
             }
         });
     }
@@ -398,12 +398,11 @@ public sealed class DashboardModel
 
     private void RefreshFast()
     {
-        if (_fastInFlight)
+        if (Interlocked.Exchange(ref _fastInFlight, 1) == 1)
         {
             return;
         }
 
-        _fastInFlight = true;
         _ = Task.Run(() =>
         {
             using var boost = ProcessPower.Boost(); // live-tail parse
@@ -419,7 +418,7 @@ public sealed class DashboardModel
             }
             finally
             {
-                _fastInFlight = false;
+                Volatile.Write(ref _fastInFlight, 0);
             }
         });
     }
