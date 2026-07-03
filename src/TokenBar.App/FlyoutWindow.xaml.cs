@@ -93,6 +93,7 @@ public sealed partial class FlyoutWindow : Window
 
     private bool _hiding;
     private long _slideToken;
+    private long _hideGeneration;
 
     public void ShowFlyout()
     {
@@ -127,21 +128,24 @@ public sealed partial class FlyoutWindow : Window
         }
 
         _hiding = true;
+        var generation = ++_hideGeneration;
         RemoveWheelHook();
         _model.Stop();
         var resting = AppWindow.Position;
         var sink = Toward(resting, TaskbarEdge(), 16);
         FadeContent(from: 1f, to: 0f, durationMs: 120);
-        _ = FinishHideAsync(resting, sink);
+        _ = FinishHideAsync(resting, sink, generation);
     }
 
-    private async Task FinishHideAsync(PointInt32 from, PointInt32 to)
+    private async Task FinishHideAsync(PointInt32 from, PointInt32 to, long generation)
     {
         await SlideWindowAsync(from, to, durationMs: 120, decelerate: false);
-        if (!_hiding)
+        if (!_hiding || generation != _hideGeneration)
         {
-            // A ShowFlyout during the slide cleared _hiding and started its
-            // own slide; hiding now would yank the freshly shown flyout.
+            // Superseded — either a ShowFlyout cleared _hiding, or a newer
+            // hide bumped the generation (hide → show → hide). Only the
+            // current hide's continuation may finish the job; an old one
+            // finishing here would skip the newer hide's animation.
             return;
         }
 

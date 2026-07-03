@@ -12,9 +12,12 @@ namespace TokenBar.App;
 /// same as macOS. The tokenbar.refresh.intervalMin forced re-read joins
 /// with the settings panel.
 /// </summary>
-public sealed class TrayFeed
+public sealed class TrayFeed : IDisposable
 {
     private readonly DispatcherQueue _dispatcher;
+    private readonly DispatcherQueueTimer _fast;
+    private readonly DispatcherQueueTimer _slow;
+    private readonly Action<string> _onStoreChanged;
     private bool _fastInFlight;
     private bool _slowInFlight;
 
@@ -37,18 +40,18 @@ public sealed class TrayFeed
         var persisted = AppSettings.Store.GetDouble("tokenbar.quota.lastRemaining", double.NaN);
         QuotaRemaining = double.IsNaN(persisted) ? null : persisted;
 
-        var fast = dispatcher.CreateTimer();
-        fast.Interval = TimeSpan.FromSeconds(30);
-        fast.Tick += (_, _) => RefreshFast();
-        fast.Start();
-        var slow = dispatcher.CreateTimer();
-        slow.Interval = TimeSpan.FromSeconds(300);
-        slow.Tick += (_, _) => RefreshSlow();
-        slow.Start();
+        _fast = dispatcher.CreateTimer();
+        _fast.Interval = TimeSpan.FromSeconds(30);
+        _fast.Tick += (_, _) => RefreshFast();
+        _fast.Start();
+        _slow = dispatcher.CreateTimer();
+        _slow.Interval = TimeSpan.FromSeconds(300);
+        _slow.Tick += (_, _) => RefreshSlow();
+        _slow.Start();
         RefreshFast();
         RefreshSlow();
 
-        AppSettings.Store.Changed += key =>
+        _onStoreChanged = key =>
         {
             if (key == "tokenbar.quota.source")
             {
@@ -59,6 +62,16 @@ public sealed class TrayFeed
                 });
             }
         };
+        AppSettings.Store.Changed += _onStoreChanged;
+    }
+
+    /// <summary>Stop polling and unsubscribe so the feed can't raise Changed
+    /// into a disposed tray icon after shutdown.</summary>
+    public void Dispose()
+    {
+        _fast.Stop();
+        _slow.Stop();
+        AppSettings.Store.Changed -= _onStoreChanged;
     }
 
     private void RefreshFast()

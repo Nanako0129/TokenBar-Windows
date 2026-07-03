@@ -26,8 +26,10 @@ public sealed class TrayService : IDisposable
     private readonly TaskbarIcon _icon;
     private readonly TrayFeed _feed;
     private readonly TrayAnimator _animator;
+    private readonly Action<string> _onStoreChanged;
     private string _iconSignature = "";
     private nint _hicon;
+    private bool _disposed;
 
     public TrayService(FlyoutWindow flyout)
     {
@@ -51,7 +53,7 @@ public sealed class TrayService : IDisposable
             UpdateIcon();
             RebuildMenu(); // quota percentages in the source picker move
         };
-        AppSettings.Store.Changed += key =>
+        _onStoreChanged = key =>
         {
             if (IconKeys.Contains(key))
             {
@@ -65,6 +67,7 @@ public sealed class TrayService : IDisposable
                 });
             }
         };
+        AppSettings.Store.Changed += _onStoreChanged;
 
         QuitApp = () =>
         {
@@ -320,9 +323,20 @@ public sealed class TrayService : IDisposable
 
     public void Dispose()
     {
+        if (_disposed)
+        {
+            return; // every Quit entry routes here; make it safe to call twice
+        }
+
+        _disposed = true;
+        AppSettings.Store.Changed -= _onStoreChanged;
+        _feed.Dispose(); // stop polling before the icon it feeds goes away
         _animator.Stop();
-        _animator.Dispose();
+        // Remove the shell icon FIRST: in animation mode _icon.Icon points at
+        // one of the animator's cached HICONs, so destroying those before the
+        // TaskbarIcon lets go would hand it an invalid handle.
         _icon.Dispose();
+        _animator.Dispose();
         if (_hicon != 0)
         {
             _ = DestroyIcon(_hicon);
