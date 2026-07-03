@@ -112,32 +112,61 @@ internal static class TrayIconRenderer
     {
         var bmp = new Bitmap(Size, Size, PixelFormat.Format32bppArgb);
         using var g = Graphics.FromImage(bmp);
-        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
         var ink = color ?? (dark ? Color.White : Color.Black);
         using var brush = new SolidBrush(ink);
-        var format = StringFormat.GenericTypographic;
         var lines = SplitForIcon(title);
-        for (var pt = 30f; pt >= 8f; pt -= 1f)
+        const float pad = 0.5f;
+        if (lines.Length == 1)
         {
-            using var font = new Font("Segoe UI", pt, FontStyle.Bold, GraphicsUnit.Pixel);
-            var widest = lines.Max(l =>
-                g.MeasureString(l, font, int.MaxValue, format).Width);
-            var lineHeight = font.GetHeight(g);
-            if ((widest <= Size && lineHeight * lines.Length <= Size + 4) || pt <= 8f)
-            {
-                var y = (Size - lineHeight * lines.Length) / 2;
-                foreach (var line in lines)
-                {
-                    var w = g.MeasureString(line, font, int.MaxValue, format).Width;
-                    g.DrawString(line, font, brush, (Size - w) / 2, y, format);
-                    y += lineHeight;
-                }
-
-                break;
-            }
+            DrawFitted(g, lines[0], brush,
+                new RectangleF(pad, pad, Size - 2 * pad, Size - 2 * pad));
+        }
+        else
+        {
+            // The digits own the top ~64%; the "$"/unit line takes the rest
+            // (they overlap a hair so there's no dead gap between them).
+            var bodyH = Size * 0.64f;
+            DrawFitted(g, lines[0], brush,
+                new RectangleF(pad, 0, Size - 2 * pad, bodyH));
+            DrawFitted(g, lines[1], brush,
+                new RectangleF(pad, bodyH - 1, Size - 2 * pad, Size - bodyH + 1 - pad));
         }
 
         return bmp;
+    }
+
+    /// <summary>Draw text as large as a box allows: convert to a path,
+    /// measure the true glyph bounds (no line-gap/descent slack that
+    /// GetHeight would waste), and scale it to fill.</summary>
+    private static void DrawFitted(Graphics g, string text, Brush brush, RectangleF box)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        using var family = new FontFamily("Segoe UI");
+        using var path = new GraphicsPath();
+        // A large nominal em; the path is scaled to the box afterward, so
+        // the absolute size only sets measurement precision.
+        path.AddString(text, family, (int)FontStyle.Bold, 100f,
+            PointF.Empty, StringFormat.GenericTypographic);
+        var bounds = path.GetBounds();
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            return;
+        }
+
+        var scale = Math.Min(box.Width / bounds.Width, box.Height / bounds.Height);
+        using var m = new Matrix();
+        m.Translate(
+            box.X + (box.Width - bounds.Width * scale) / 2,
+            box.Y + (box.Height - bounds.Height * scale) / 2);
+        m.Scale(scale, scale);
+        m.Translate(-bounds.X, -bounds.Y);
+        path.Transform(m);
+        g.FillPath(brush, path);
     }
 
     /// <summary>Give the digits a whole line to themselves: the "$" prefix
