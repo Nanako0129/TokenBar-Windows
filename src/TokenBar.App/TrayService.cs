@@ -186,6 +186,35 @@ public sealed class TrayService : IDisposable
         });
     }
 
+    /// <summary>The full summary the tray tooltip shows in every mode
+    /// (Windows has no menu-bar text, so this is where the exact figures
+    /// live): today and all-time tokens and cost, plus the selected quota
+    /// window. Kept well under the ~127-char Shell_NotifyIcon tip limit.</summary>
+    private string BuildTooltip()
+    {
+        var graph = _feed.Graph;
+        if (graph is null)
+        {
+            return "TokenBar — loading…";
+        }
+
+        var lines = new List<string>
+        {
+            "TokenBar",
+            $"Today {Format.CompactTokens(Format.TodayTokens(graph))} · {Format.Usd(Format.TodayCost(graph))}",
+            $"All time {Format.CompactTokens(graph.Summary.TotalTokens)} · {Format.Usd(graph.Summary.TotalCost)}",
+        };
+        var selection = AppSettings.Store.GetString("tokenbar.quota.source", "auto")
+            ?? QuotaResolver.Auto;
+        if (QuotaResolver.Resolve(_feed.Quota, selection) is { } pick)
+        {
+            var left = Math.Clamp(pick.Window.RemainingPercent, 0, 100);
+            lines.Add($"{ClientRegistry.ShortName(pick.ClientId)} {pick.Window.Label} {left:F0}% left");
+        }
+
+        return string.Join("\n", lines);
+    }
+
     private void UpdateIcon()
     {
         var mode = TrayModes.Parse(AppSettings.Store.GetString(TrayModes.StorageKey));
@@ -195,6 +224,12 @@ public sealed class TrayService : IDisposable
         var dark = IsSystemDark();
         var remaining = _feed.QuotaRemaining;
         var title = mode.Title(_feed.Graph, _feed.TokensPerMin, remaining);
+
+        // The tooltip is the summary layer (parity table #1): it carries the
+        // full figures whatever the icon shows — including the icon-only
+        // gauge/animation modes, which draw no value at all. Cheap, so it
+        // refreshes every tick, ahead of the icon-repaint short-circuit.
+        _icon.ToolTipText = BuildTooltip();
 
         // Re-render only when the drawn state actually changed (macOS
         // iconSettingsSignature): the feed ticks far more often than the
@@ -207,9 +242,6 @@ public sealed class TrayService : IDisposable
         }
 
         _iconSignature = signature;
-        _icon.ToolTipText = title.Length == 0
-            ? "TokenBar"
-            : $"TokenBar — {mode.ShortLabel()}: {title}";
 
         // Hidden mode with an animation style hands the icon to the
         // animator; every other state renders one static frame here.
