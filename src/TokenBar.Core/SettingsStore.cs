@@ -20,6 +20,7 @@ public sealed class SettingsStore
     private readonly Action<string>? _log;
     private readonly object _gate = new();
     private readonly Dictionary<string, JsonElement> _values;
+    private readonly bool _loadFailed;
 
     /// <summary>Fires after a key's value actually changes (set to the same
     /// value is a no-op, mirroring the signature-gated observers the macOS
@@ -30,11 +31,12 @@ public sealed class SettingsStore
     {
         _path = path;
         _log = log;
-        _values = Load(path);
+        _values = Load(path, out _loadFailed);
     }
 
-    private static Dictionary<string, JsonElement> Load(string path)
+    private static Dictionary<string, JsonElement> Load(string path, out bool loadFailed)
     {
+        loadFailed = false;
         try
         {
             if (File.Exists(path))
@@ -43,13 +45,37 @@ public sealed class SettingsStore
                     File.ReadAllText(path)) ?? [];
             }
         }
+        catch (JsonException)
+        {
+            // Genuine corruption: quarantine the unreadable file so it isn't
+            // silently overwritten (it may be hand-recoverable), then rebuild
+            // from defaults on the next write.
+            Quarantine(path);
+        }
         catch
         {
-            // A corrupt store must not take the app down; settings reset to
-            // defaults and the next write rebuilds the file.
+            // Transient read failure (an AV scan or sync tool holding the file
+            // with a deny-read lock): the on-disk store is probably intact, so
+            // DON'T let the next Save() clobber it with defaults — refuse to
+            // persist for this session instead of destroying good settings.
+            loadFailed = true;
         }
 
         return [];
+    }
+
+    private static void Quarantine(string path)
+    {
+        try
+        {
+            var corrupt = path + ".corrupt";
+            File.Delete(corrupt); // no-op if absent; File.Move won't overwrite
+            File.Move(path, corrupt);
+        }
+        catch
+        {
+            // Best effort; a later Save() overwrites the bad file if this fails.
+        }
     }
 
     public string? GetString(string key, string? fallback = null)
@@ -140,6 +166,14 @@ public sealed class SettingsStore
 
     private void Save()
     {
+        if (_loadFailed)
+        {
+            // The existing store couldn't be read at startup; writing now would
+            // replace possibly-good on-disk settings with in-memory defaults.
+            _log?.Invoke("settings save skipped: initial load failed, not clobbering the file");
+            return;
+        }
+
         try
         {
             var dir = Path.GetDirectoryName(_path);

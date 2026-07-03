@@ -67,7 +67,9 @@ public static class DayBars
         }
 
         var end = payload.Meta.DateRange.End.Length == 0 ? endFallback : payload.Meta.DateRange.End;
-        var endDay = ISODay.Parse(end);
+        // A malformed (non-empty but unparseable) range end shouldn't blank the
+        // whole chart — fall back to today's key, which is always parseable.
+        var endDay = ISODay.Parse(end) ?? ISODay.Parse(endFallback);
         if (endDay is null)
         {
             return [];

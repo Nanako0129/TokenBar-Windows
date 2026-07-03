@@ -8,6 +8,7 @@ public partial class App : Application
 
     private TrayService? _tray;
     private FlyoutWindow? _flyout;
+    private bool _started;
 
     public App()
     {
@@ -16,6 +17,11 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
+        // A stray UI-thread exception (a render / hover / animation callback)
+        // shouldn't take the whole tray-resident app down once it's up; during
+        // startup we let it propagate so a broken launch stays visible.
+        UnhandledException += OnUnhandledException;
+
         // Tray-resident app: no window shows at launch; the tray icon owns
         // the flyout's lifetime (mirrors the macOS NSStatusItem shell).
         // Single instance: a second launch (autostart + manual, say) exits
@@ -58,11 +64,26 @@ public partial class App : Application
                     $"pos={_flyout.AppWindow.Position.X},{_flyout.AppWindow.Position.Y} " +
                     $"size={_flyout.AppWindow.Size.Width}x{_flyout.AppWindow.Size.Height}");
             }
+
+            _started = true;
         }
         catch (Exception ex)
         {
             DevLog.Write($"launch FAILED: {ex}");
             throw;
+        }
+    }
+
+    private void OnUnhandledException(
+        object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs e)
+    {
+        DevLog.Write($"UNHANDLED: {e.Message}\n{e.Exception}");
+
+        // Keep the tray alive for steady-state faults (a stray render / hover /
+        // animation throw); let startup faults surface by leaving them unhandled.
+        if (_started)
+        {
+            e.Handled = true;
         }
     }
 }

@@ -10,14 +10,21 @@ namespace TokenBar.App;
 /// <summary>
 /// Instant, styled hover tooltip — the native ToolTip's fixed ~1s delay and
 /// plain chrome are nowhere near the macOS onContinuousHover cards, and WinUI
-/// exposes no delay knob. One shared Popup follows the pointer with a small
-/// offset and flips to stay inside the root bounds. Content is arbitrary UI
-/// (the macOS tooltips carry colored discs and metric rows, not just text).
+/// exposes no delay knob. A Popup follows the pointer with a small offset and
+/// flips to stay inside the root bounds. Content is arbitrary UI (the macOS
+/// tooltips carry colored discs and metric rows, not just text).
+///
+/// One host (Popup + Border) is kept PER XamlRoot. A single shared Popup cannot
+/// be re-pointed across the flyout's and the settings window's XamlRoots — WinUI
+/// forbids reassigning a rooted Popup's XamlRoot, which threw inside the pointer
+/// handler and (with no global handler) crashed the app — so each window's root
+/// gets its own host.
 /// </summary>
 public static class HoverTip
 {
-    private static Popup? _popup;
-    private static Border? _card;
+    private sealed record Host(Popup Popup, Border Card);
+
+    private static readonly Dictionary<XamlRoot, Host> _hosts = [];
 
     public static void Attach(FrameworkElement target, Func<string> content) =>
         AttachRich(target, () => new TextBlock
@@ -32,19 +39,18 @@ public static class HoverTip
     {
         target.PointerEntered += (_, e) => Show(target, build(), e);
         target.PointerMoved += (_, e) => Move(target, e);
-        target.PointerExited += (_, _) => Hide();
-        target.Unloaded += (_, _) => Hide();
+        target.PointerExited += (_, _) => Hide(target);
+        target.Unloaded += (_, _) => Hide(target);
     }
 
-    private static void EnsurePopup(XamlRoot root)
+    private static Host EnsureHost(XamlRoot root)
     {
-        if (_popup is not null)
+        if (_hosts.TryGetValue(root, out var existing))
         {
-            _popup.XamlRoot = root;
-            return;
+            return existing;
         }
 
-        _card = new Border
+        var card = new Border
         {
             Background = new SolidColorBrush(Color.FromArgb(238, 30, 30, 36)),
             BorderBrush = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255)),
@@ -54,12 +60,16 @@ public static class HoverTip
             MaxWidth = 300,
             IsHitTestVisible = false,
         };
-        _popup = new Popup
-        {
-            Child = _card,
-            IsHitTestVisible = false,
-            XamlRoot = root,
-        };
+        var host = new Host(
+            new Popup
+            {
+                Child = card,
+                IsHitTestVisible = false,
+                XamlRoot = root,
+            },
+            card);
+        _hosts[root] = host;
+        return host;
     }
 
     private static void Show(FrameworkElement target, UIElement content, PointerRoutedEventArgs e)
@@ -69,25 +79,27 @@ public static class HoverTip
             return;
         }
 
-        EnsurePopup(root);
-        _card!.Child = content;
-        Position(root, e);
-        _popup!.IsOpen = true;
+        var host = EnsureHost(root);
+        host.Card.Child = content;
+        Position(host, root, e);
+        host.Popup.IsOpen = true;
     }
 
     private static void Move(FrameworkElement target, PointerRoutedEventArgs e)
     {
-        if (_popup is { IsOpen: true } && target.XamlRoot is { } root)
+        if (target.XamlRoot is { } root
+            && _hosts.TryGetValue(root, out var host)
+            && host.Popup.IsOpen)
         {
-            Position(root, e);
+            Position(host, root, e);
         }
     }
 
-    private static void Position(XamlRoot root, PointerRoutedEventArgs e)
+    private static void Position(Host host, XamlRoot root, PointerRoutedEventArgs e)
     {
         var p = e.GetCurrentPoint(root.Content).Position;
-        _card!.Measure(new Windows.Foundation.Size(300, double.PositiveInfinity));
-        var size = _card.DesiredSize;
+        host.Card.Measure(new Windows.Foundation.Size(300, double.PositiveInfinity));
+        var size = host.Card.DesiredSize;
         var x = p.X + 14;
         var y = p.Y + 18;
         if (x + size.Width > root.Size.Width - 4)
@@ -100,15 +112,39 @@ public static class HoverTip
             y = p.Y - size.Height - 10;
         }
 
-        _popup!.HorizontalOffset = Math.Max(4, x);
-        _popup.VerticalOffset = Math.Max(4, y);
+        host.Popup.HorizontalOffset = Math.Max(4, x);
+        host.Popup.VerticalOffset = Math.Max(4, y);
     }
 
-    private static void Hide()
+    private static void Hide(FrameworkElement target)
     {
-        if (_popup is not null)
+        if (target.XamlRoot is { } root && _hosts.TryGetValue(root, out var host))
         {
-            _popup.IsOpen = false;
+            host.Popup.IsOpen = false;
+            return;
         }
+
+        // XamlRoot already gone (e.g. Unloaded): close any open tooltip so a
+        // stray card can't linger.
+        foreach (var h in _hosts.Values)
+        {
+            h.Popup.IsOpen = false;
+        }
+    }
+
+    /// <summary>True when <paramref name="popup"/> is one of HoverTip's tooltip
+    /// popups, so light-dismiss logic (e.g. the flyout's Esc handler) can ignore
+    /// it and only yield to a real transient such as a MenuFlyout.</summary>
+    public static bool IsHoverPopup(Popup popup)
+    {
+        foreach (var host in _hosts.Values)
+        {
+            if (ReferenceEquals(host.Popup, popup))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

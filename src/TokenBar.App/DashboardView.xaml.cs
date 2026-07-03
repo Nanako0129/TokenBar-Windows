@@ -102,10 +102,14 @@ public sealed partial class DashboardView : UserControl
         };
         escape.Invoked += (_, e) =>
         {
+            // Yield only to a REAL transient (the year MenuFlyout). The HoverTip
+            // tooltip is also an open popup for this XamlRoot but must not
+            // swallow Esc, or Esc silently fails to close the flyout whenever a
+            // tooltip happens to be showing.
             if (Microsoft.UI.Xaml.Media.VisualTreeHelper
-                .GetOpenPopupsForXamlRoot(XamlRoot).Count > 0)
+                .GetOpenPopupsForXamlRoot(XamlRoot).Any(p => !HoverTip.IsHoverPopup(p)))
             {
-                return; // unhandled: the popup takes it
+                return; // unhandled: the real popup takes it
             }
 
             HideRequested?.Invoke();
@@ -840,7 +844,12 @@ public sealed partial class DashboardView : UserControl
         else
         {
             var entries = hourly.Entries.AsEnumerable().Reverse().ToList(); // newest first
-            var currentSlot = DateTime.Now.ToString("yyyy-MM-dd HH:00");
+            // Invariant: the engine's entry.Hour keys are Gregorian "yyyy-MM-dd
+            // HH:00"; a non-Gregorian ambient calendar (th-TH Buddhist, etc.)
+            // would render a different year here and the current-hour highlight
+            // would never match.
+            var currentSlot = DateTime.Now.ToString(
+                "yyyy-MM-dd HH:00", System.Globalization.CultureInfo.InvariantCulture);
             var panel = new StackPanel { Spacing = 5 };
             foreach (var entry in entries.Take(_hourlyWindow))
             {

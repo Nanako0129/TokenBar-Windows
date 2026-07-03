@@ -48,8 +48,13 @@ public static class QuotaResolver
             return null;
         }
 
-        var picked = payload.Agents.FirstOrDefault(a => a.ClientId == parts[0]);
-        var pickedWindow = picked?.Windows.FirstOrDefault(w => w.Label == parts[1]);
+        // Same health filter as the auto path: an errored agent, or a window
+        // with a non-finite RemainingPercent, is not a usable source even when
+        // the user pinned it explicitly — otherwise the tray surfaces a stale
+        // or NaN window that auto mode would have skipped.
+        var picked = payload.Agents.FirstOrDefault(a => a.ClientId == parts[0] && a.Error is null);
+        var pickedWindow = picked?.Windows.FirstOrDefault(
+            w => w.Label == parts[1] && double.IsFinite(w.RemainingPercent));
         return pickedWindow is null ? null : new QuotaPick(picked!.ClientId, pickedWindow);
     }
 }

@@ -16,10 +16,14 @@ public static class DevLog
     {
         try
         {
+            // InvariantCulture: in a custom time format ':' is the culture's
+            // time-separator placeholder, so some locales would render '.' here.
+            var ts = DateTime.Now.ToString(
+                "HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture);
             lock (Gate)
             {
                 System.IO.File.AppendAllText(
-                    PathName, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}");
+                    PathName, $"{ts} {message}{Environment.NewLine}");
             }
         }
         catch
