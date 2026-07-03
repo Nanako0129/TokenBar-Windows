@@ -26,7 +26,8 @@ internal static class TrayIconGallery
             }
         }
 
-        string[] titles = ["12.3K", "$5.20", "1.5B", "57%", "8%", "—/m", "999"];
+        string[] titles =
+            ["12.3K", "$5.20", "$889.13", "$4637.49", "1.5B", "57%", "8%", "—/m", "999"];
         for (var i = 0; i < titles.Length; i++)
         {
             var color = titles[i].EndsWith('%')

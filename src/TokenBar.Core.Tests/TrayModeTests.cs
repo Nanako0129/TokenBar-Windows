@@ -41,14 +41,23 @@ public class TrayModeTests
 
     [Theory]
     [InlineData("12.3K", "12K")] // ≥2 integer digits: decimal goes
-    [InlineData("$4637.49", "$4637")]
     [InlineData("12.4K/m", "12K/m")]
     [InlineData("999.9K/m", "999K/m")]
     [InlineData("1.5B", "1.5B")] // one digit: the fraction is the value
-    [InlineData("$5.20", "$5.20")]
     [InlineData("57%", "57%")] // no decimal: untouched
     [InlineData("—/m", "—/m")]
     public void IconTitleDropsTheDecimalRunPastTwoDigits(string title, string expected)
+    {
+        Assert.Equal(expected, TrayModes.IconTitle(title));
+    }
+
+    [Theory]
+    [InlineData("$889.13", "$889")] // ≥$100: compact, cents gone
+    [InlineData("$4637.49", "$4.6K")]
+    [InlineData("$150.00", "$150")]
+    [InlineData("$5.20", "$5.20")] // <$100: cents kept
+    [InlineData("$0.00", "$0.00")]
+    public void IconTitleCompactsBigMoney(string title, string expected)
     {
         Assert.Equal(expected, TrayModes.IconTitle(title));
     }

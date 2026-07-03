@@ -140,8 +140,10 @@ internal static class TrayIconRenderer
         return bmp;
     }
 
-    /// <summary>Wrap a trailing unit (K/M/B/%, /m) onto its own line when
-    /// the string is long enough that the digits win real size from it.</summary>
+    /// <summary>Give the digits a whole line to themselves: the "$" prefix
+    /// and any trailing unit (K/M/B/%, /m) drop to a second line, where
+    /// small text still reads. "$889" becomes 889 over $; "$4.6K" becomes
+    /// 4.6 over $K; "12K" becomes 12 over K. A pure number stays one line.</summary>
     private static string[] SplitForIcon(string title)
     {
         if (title.Length < 3)
@@ -149,14 +151,29 @@ internal static class TrayIconRenderer
             return [title];
         }
 
-        if (title.EndsWith("/m", StringComparison.Ordinal) && title.Length > 4)
+        var prefix = "";
+        var body = title;
+        if (body.StartsWith('$'))
         {
-            return [title[..^2], "/m"];
+            prefix = "$";
+            body = body[1..];
         }
 
-        return title[^1] is 'K' or 'M' or 'B' or '%'
-            ? [title[..^1], title[^1..]]
-            : [title];
+        // Trailing run of non-digits (unit letters, %, /m).
+        var suffixLen = 0;
+        while (suffixLen < body.Length && !char.IsAsciiDigit(body[^(suffixLen + 1)]))
+        {
+            suffixLen++;
+        }
+
+        var suffix = body[(body.Length - suffixLen)..];
+        body = body[..(body.Length - suffixLen)];
+        if (body.Length == 0 || (prefix.Length == 0 && suffix.Length == 0))
+        {
+            return [title]; // no digits to isolate, or nothing to peel off
+        }
+
+        return [body, prefix + suffix];
     }
 
     // ── macOS TrayIcons geometry, 16-grid ───────────────────────────────

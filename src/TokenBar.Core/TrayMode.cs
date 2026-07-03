@@ -1,3 +1,4 @@
+using System.Globalization;
 using TokenBar.Interop;
 
 namespace TokenBar.Core;
@@ -76,12 +77,22 @@ public static class TrayModes
     };
 
     /// <summary>The icon-sized short form of a title (parity table #1's
-    /// "truncated $5.20"): with two or more integer digits the decimal run
-    /// goes — 12.3K draws as 12K (2% error for a big font win) — while 1.5B
-    /// and $5.20 keep theirs, where the fraction is a third of the value.
-    /// The tooltip keeps the full string.</summary>
+    /// "truncated $5.20"). Money past $100 goes compact ($4637.49 → $4.6K,
+    /// $889.13 → $889) so a wide "$" plus four digits don't crush into a
+    /// 16px square; smaller amounts keep their cents. Token counts drop the
+    /// decimal run once there are two integer digits (12.3K → 12K, 2% error
+    /// for a big font win), keeping 1.5B where the fraction is the value.
+    /// The tooltip always carries the exact string.</summary>
     public static string IconTitle(string title)
     {
+        if (title.StartsWith('$') && double.TryParse(
+            title.AsSpan(1), NumberStyles.Number, CultureInfo.InvariantCulture, out var usd))
+        {
+            return Math.Abs(usd) >= 100
+                ? "$" + Format.CompactTokens((long)Math.Round(usd))
+                : title;
+        }
+
         var dot = title.IndexOf('.');
         if (dot < 0)
         {
