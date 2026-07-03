@@ -94,8 +94,24 @@ public sealed partial class DashboardView : UserControl
         // In-flyout shortcuts, the macOS ⌘ set on Ctrl: Esc/Ctrl+W close,
         // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..6 lenses,
         // Ctrl+[ / Ctrl+] cycle.
-        AddAccel(Windows.System.VirtualKey.Escape, Windows.System.VirtualKeyModifiers.None,
-            () => HideRequested?.Invoke());
+        // Esc yields to an open transient (the year menu): light-dismiss
+        // should collapse the popup, not slide the whole flyout away.
+        var escape = new Microsoft.UI.Xaml.Input.KeyboardAccelerator
+        {
+            Key = Windows.System.VirtualKey.Escape,
+        };
+        escape.Invoked += (_, e) =>
+        {
+            if (Microsoft.UI.Xaml.Media.VisualTreeHelper
+                .GetOpenPopupsForXamlRoot(XamlRoot).Count > 0)
+            {
+                return; // unhandled: the popup takes it
+            }
+
+            HideRequested?.Invoke();
+            e.Handled = true;
+        };
+        KeyboardAccelerators.Add(escape);
         AddAccel(Windows.System.VirtualKey.W, Windows.System.VirtualKeyModifiers.Control,
             () => HideRequested?.Invoke());
         AddAccel(Windows.System.VirtualKey.R, Windows.System.VirtualKeyModifiers.Control,
@@ -1118,9 +1134,11 @@ public sealed partial class DashboardView : UserControl
         double fillPercent, double remainingForColor, UsagePace? pace = null,
         bool asUsed = false)
     {
-        var remaining = Math.Clamp(fillPercent, 0, 100);
-        var color = remainingForColor < 10 ? "#ef4444"
-            : remainingForColor < 25 ? "#f59e0b" : "#22c55e";
+        var fill = Math.Clamp(fillPercent, 0, 100);
+        var remaining = double.IsFinite(remainingForColor)
+            ? Math.Clamp(remainingForColor, 0, 100) : 100;
+        var color = remaining < 10 ? "#ef4444"
+            : remaining < 25 ? "#f59e0b" : "#22c55e";
         var track = new Grid
         {
             Height = 5,
@@ -1129,11 +1147,11 @@ public sealed partial class DashboardView : UserControl
         };
         track.ColumnDefinitions.Add(new ColumnDefinition
         {
-            Width = new GridLength(remaining, GridUnitType.Star),
+            Width = new GridLength(fill, GridUnitType.Star),
         });
         track.ColumnDefinitions.Add(new ColumnDefinition
         {
-            Width = new GridLength(100 - remaining, GridUnitType.Star),
+            Width = new GridLength(100 - fill, GridUnitType.Star),
         });
         track.Children.Add(new Border
         {

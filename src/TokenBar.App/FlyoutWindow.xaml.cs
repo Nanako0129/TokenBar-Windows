@@ -222,11 +222,15 @@ public sealed partial class FlyoutWindow : Window
         // RasterizationScale (null until shown → windows sized for 100%).
         var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
         var width = (int)(FlyoutWidth * scale);
-        // tokenbar.popover.height (settings panel slider): 0 = the built-in
-        // default; a user pick is clamped into the work area.
+        // tokenbar.popover.height (settings panel slider, stored in DIPs):
+        // 0 = the built-in default; a pick is clamped into the work area.
+        // Bounds are ordered explicitly — on a short work area at high DPI
+        // the 480-DIP floor can exceed the ceiling and Math.Clamp throws.
         var picked = AppSettings.Store.GetDouble("tokenbar.popover.height", 0);
+        var ceiling = work.Height - (int)(24 * scale);
+        var floor = Math.Min((int)(480 * scale), ceiling);
         var height = picked > 0
-            ? (int)Math.Clamp(picked * scale, 480 * scale, work.Height - 24 * scale)
+            ? (int)Math.Clamp(picked * scale, floor, ceiling)
             : (int)(FlyoutHeight * scale);
         AppWindow.Resize(new SizeInt32(width, height));
 

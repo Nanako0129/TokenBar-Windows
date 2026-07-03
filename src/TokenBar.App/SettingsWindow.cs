@@ -94,17 +94,23 @@ public sealed class SettingsWindow : Window
         // the click's event stack unwinds.
         AppSettings.Store.Changed += key =>
         {
-            // No rebuild for: the quota cache (writes on the tray's 300s
-            // tick) and the height slider's own key — replacing a slider
-            // mid-drag kills the drag after one step.
-            if (key is "tokenbar.quota.lastRemaining" or "tokenbar.popover.height")
+            if (!AppWindow.IsVisible || !key.StartsWith("tokenbar.", StringComparison.Ordinal)
+                || key is "tokenbar.quota.lastRemaining" or "tokenbar.popover.height")
             {
                 return;
             }
 
-            if (AppWindow.IsVisible)
+            // Only the two keys that change which sub-controls exist rebuild
+            // the whole panel — a full rebuild drops keyboard focus and the
+            // scroll position, which breaks arrow-key radio navigation.
+            // Everything else refreshes the preview column in place.
+            if (key is "tokenbar.tray.animationStyle" or "tokenbar.limits.layout")
             {
                 _ = DispatcherQueue.TryEnqueue(Rebuild);
+            }
+            else
+            {
+                _ = DispatcherQueue.TryEnqueue(RebuildPreview);
             }
         };
     }
@@ -271,6 +277,10 @@ public sealed class SettingsWindow : Window
 
         // ── Flyout size ────────────────────────────────────────────────
         var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        // Stored in DIPs (the flyout multiplies by its own monitor's scale);
+        // WorkArea is physical, so divide before offering it as the range.
+        var dipScale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+        var workDips = area.Height / dipScale;
         var height = store.GetDouble("tokenbar.popover.height", 0);
         var sizeRow = new StackPanel { Spacing = 8 };
         var sizeLabel = Ui.Text(height <= 0 ? "Height · Auto" : $"Height · {height:F0}px", 12);
@@ -285,9 +295,9 @@ public sealed class SettingsWindow : Window
         var slider = new Slider
         {
             Minimum = 480,
-            Maximum = Math.Max(600, area.Height - 24),
+            Maximum = Math.Max(600, workDips - 24),
             StepFrequency = 10,
-            Value = height <= 0 ? Math.Min(800, area.Height * 0.6) : height,
+            Value = height <= 0 ? Math.Min(640, workDips * 0.6) : height,
         };
         // The height key skips the panel rebuild (see the Changed filter),
         // so the label and reset button update in place instead.
@@ -373,14 +383,17 @@ public sealed class SettingsWindow : Window
 
         System.Drawing.Color? titleColor = mode == TrayMode.QuotaLeft
             ? TrayIconRenderer.GaugeColor(remaining ?? 57) : null;
+        var gaugeStyle = TrayIconRenderer.ParseGaugeStyle(styleRaw);
         foreach (var dark in new[] { true, false })
         {
+            // Hidden + cat/parrot really shows the animator, so the preview
+            // uses the animation's first frame, not a gauge stand-in.
             using var bmp = mode != TrayMode.Hidden && title.Length > 0
                 ? TrayIconRenderer.RenderTitle(
                     TrayModes.IconTitle(title), titleColor, dark)
-                : TrayIconRenderer.RenderGauge(
-                    TrayIconRenderer.ParseGaugeStyle(styleRaw) ?? QuotaIconStyle.Bars,
-                    remaining ?? 57, dark, coloring);
+                : gaugeStyle is { } style
+                    ? TrayIconRenderer.RenderGauge(style, remaining ?? 57, dark, coloring)
+                    : AnimationFrame(styleRaw, dark);
             var strip = new Border
             {
                 Background = new SolidColorBrush(dark
@@ -457,6 +470,32 @@ public sealed class SettingsWindow : Window
         }
 
         _preview.Children.Add(card);
+    }
+
+    /// <summary>frame-00 of the cat/parrot set, letterboxed like the
+    /// animator does (kept tiny — the animator itself caches HICONs).</summary>
+    private static System.Drawing.Bitmap AnimationFrame(string styleRaw, bool dark)
+    {
+        var canvas = new System.Drawing.Bitmap(32, 32);
+        try
+        {
+            var dir = Path.Combine(
+                AppContext.BaseDirectory, "Assets",
+                $"anim-{(styleRaw == "parrot" ? "parrot" : "cat2")}{(dark ? "" : "-light")}");
+            using var raw = new System.Drawing.Bitmap(Path.Combine(dir, "frame-00.png"));
+            using var g = System.Drawing.Graphics.FromImage(canvas);
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            var scale = Math.Min(32.0 / raw.Width, 32.0 / raw.Height);
+            var w = (float)(raw.Width * scale);
+            var h = (float)(raw.Height * scale);
+            g.DrawImage(raw, (32 - w) / 2, (32 - h) / 2, w, h);
+        }
+        catch
+        {
+            // missing asset: an empty square beats a crash in a preview
+        }
+
+        return canvas;
     }
 
     private static Microsoft.UI.Xaml.Media.Imaging.BitmapImage ToImage(
