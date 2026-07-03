@@ -76,13 +76,25 @@ public static class TrayModes
     };
 
     /// <summary>The icon-sized short form of a title (parity table #1's
-    /// "truncated $5.20"): the icon always drops the decimal run — 12.3K
-    /// draws as 12K, $5.20 as $5 — because every glyph halves the font the
-    /// 16px square can afford. The tooltip keeps the full string.</summary>
+    /// "truncated $5.20"): with two or more integer digits the decimal run
+    /// goes — 12.3K draws as 12K (2% error for a big font win) — while 1.5B
+    /// and $5.20 keep theirs, where the fraction is a third of the value.
+    /// The tooltip keeps the full string.</summary>
     public static string IconTitle(string title)
     {
         var dot = title.IndexOf('.');
         if (dot < 0)
+        {
+            return title;
+        }
+
+        var intDigits = 0;
+        for (var i = dot - 1; i >= 0 && char.IsAsciiDigit(title[i]); i--)
+        {
+            intDigits++;
+        }
+
+        if (intDigits < 2)
         {
             return title;
         }

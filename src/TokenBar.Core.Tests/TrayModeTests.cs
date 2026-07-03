@@ -40,14 +40,15 @@ public class TrayModeTests
     }
 
     [Theory]
-    [InlineData("12.3K", "12K")] // decimals always dropped in the icon
-    [InlineData("$5.20", "$5")]
+    [InlineData("12.3K", "12K")] // ≥2 integer digits: decimal goes
     [InlineData("$4637.49", "$4637")]
     [InlineData("12.4K/m", "12K/m")]
     [InlineData("999.9K/m", "999K/m")]
+    [InlineData("1.5B", "1.5B")] // one digit: the fraction is the value
+    [InlineData("$5.20", "$5.20")]
     [InlineData("57%", "57%")] // no decimal: untouched
     [InlineData("—/m", "—/m")]
-    public void IconTitleDropsTheDecimalRun(string title, string expected)
+    public void IconTitleDropsTheDecimalRunPastTwoDigits(string title, string expected)
     {
         Assert.Equal(expected, TrayModes.IconTitle(title));
     }
