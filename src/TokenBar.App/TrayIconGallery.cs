@@ -32,7 +32,9 @@ internal static class TrayIconGallery
             var color = titles[i].EndsWith('%')
                 ? TrayIconRenderer.GaugeColor(double.Parse(titles[i].TrimEnd('%')))
                 : (System.Drawing.Color?)null;
-            using var bmp = TrayIconRenderer.RenderTitle(titles[i], color, dark: true);
+            // Through IconTitle, same as the live tray path.
+            using var bmp = TrayIconRenderer.RenderTitle(
+                TokenBar.Core.TrayModes.IconTitle(titles[i]), color, dark: true);
             bmp.Save(Path.Combine(dir, $"title-{i}.png"));
         }
 
