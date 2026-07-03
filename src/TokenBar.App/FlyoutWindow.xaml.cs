@@ -221,7 +221,12 @@ public sealed partial class FlyoutWindow : Window
         // RasterizationScale (null until shown → windows sized for 100%).
         var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
         var width = (int)(FlyoutWidth * scale);
-        var height = (int)(FlyoutHeight * scale);
+        // tokenbar.popover.height (settings panel slider): 0 = the built-in
+        // default; a user pick is clamped into the work area.
+        var picked = AppSettings.Store.GetDouble("tokenbar.popover.height", 0);
+        var height = picked > 0
+            ? (int)Math.Clamp(picked * scale, 480 * scale, work.Height - 24 * scale)
+            : (int)(FlyoutHeight * scale);
         AppWindow.Resize(new SizeInt32(width, height));
 
         var edge = TaskbarEdge();

@@ -43,6 +43,12 @@ public partial class App : Application
                 TrayIconGallery.Dump();
             }
 
+            // Debug flag, macOS --settings parity.
+            if (Environment.GetCommandLineArgs().Contains("--settings"))
+            {
+                _tray.ShowSettings();
+            }
+
             // Debug flag, same convention as the macOS --open-popover: pop the
             // flyout right away so remote verification needs no tray click.
             if (Environment.GetCommandLineArgs().Contains("--open-flyout"))

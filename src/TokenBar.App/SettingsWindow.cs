@@ -1,0 +1,364 @@
+using Microsoft.UI.Windowing;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using TokenBar.Core;
+using TokenBar.Interop;
+// TokenBar.Core.Grid (the contribution-grid builder) collides with the XAML
+// Grid — same clash DashboardView notes.
+using Grid = Microsoft.UI.Xaml.Controls.Grid;
+
+namespace TokenBar.App;
+
+/// <summary>
+/// The settings window (macOS SettingsWindowController + SettingsPanel):
+/// single instance, Mica backdrop, fixed size, closing hides so position
+/// survives. Content rebuilds on every Show — and, deferred, on every
+/// settings write — so the panel always reflects live state (autostart is
+/// re-read from the registry, quota windows from the tray feed). Every
+/// control binds the same tokenbar.* keys the cards and tray read.
+/// </summary>
+public sealed class SettingsWindow : Window
+{
+    private static SettingsWindow? _shared;
+    private readonly Func<AgentUsagePayload?> _quota;
+    private readonly ScrollViewer _scroll = new()
+    {
+        VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+        Padding = new Thickness(20, 12, 20, 20),
+    };
+
+    public static void Present(Func<AgentUsagePayload?> quota)
+    {
+        _shared ??= new SettingsWindow(quota);
+        _shared.Rebuild();
+        _shared.AppWindow.Show();
+        // Activate() alone cannot bring the window forward when the opener
+        // has no foreground rights (tray/schtasks context, the flyout's old
+        // lesson) — hoist it in z-order explicitly.
+        _shared.AppWindow.MoveInZOrderAtTop();
+        _shared.Activate();
+        DevLog.Write($"settings: shown visible={_shared.AppWindow.IsVisible} " +
+            $"pos={_shared.AppWindow.Position.X},{_shared.AppWindow.Position.Y} " +
+            $"size={_shared.AppWindow.Size.Width}x{_shared.AppWindow.Size.Height}");
+        _ = _shared.DispatcherQueue.TryEnqueue(
+            Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
+            DevLog.Write($"settings layout: scroll={_shared._scroll.ActualWidth:F0}x" +
+                $"{_shared._scroll.ActualHeight:F0} children=" +
+                $"{(_shared._scroll.Content as StackPanel)?.Children.Count ?? -1}"));
+    }
+
+    private SettingsWindow(Func<AgentUsagePayload?> quota)
+    {
+        _quota = quota;
+        Title = "TokenBar Settings";
+        SystemBackdrop = new MicaBackdrop();
+        Content = _scroll;
+
+        var presenter = (OverlappedPresenter)AppWindow.Presenter;
+        presenter.IsResizable = false;
+        presenter.IsMaximizable = false;
+        ApplySize();
+        // Something in the show path renormalizes the size on a non-96-DPI
+        // monitor (observed 525x800 → 420x640 at 125%); re-apply once the
+        // window actually has focus and its final DPI.
+        Activated += (_, _) => ApplySize();
+        AppWindow.Closing += (_, e) =>
+        {
+            e.Cancel = true; // hide, macOS isReleasedWhenClosed=false parity
+            AppWindow.Hide();
+        };
+
+        // A write from any control may change which sub-controls apply
+        // (animate vs coloring, paceMode hidden in classic) — rebuild after
+        // the click's event stack unwinds.
+        AppSettings.Store.Changed += key =>
+        {
+            if (AppWindow.IsVisible)
+            {
+                _ = DispatcherQueue.TryEnqueue(Rebuild);
+            }
+        };
+    }
+
+    private void ApplySize()
+    {
+        var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+        var size = new Windows.Graphics.SizeInt32((int)(420 * scale), (int)(640 * scale));
+        if (AppWindow.Size == size)
+        {
+            return;
+        }
+
+        AppWindow.Resize(size);
+        var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        AppWindow.Move(new Windows.Graphics.PointInt32(
+            area.X + (area.Width - AppWindow.Size.Width) / 2,
+            area.Y + (area.Height - AppWindow.Size.Height) / 3));
+    }
+
+    private void Rebuild()
+    {
+        var store = AppSettings.Store;
+        var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
+
+        // ── Menubar title (tray value) ─────────────────────────────────
+        panel.Children.Add(Section("Tray shows", RadioGroup(
+            "tray.mode",
+            TrayModes.All.Select(m => (m.RawValue(), m.Label())),
+            TrayModes.Parse(store.GetString(TrayModes.StorageKey)).RawValue(),
+            raw => store.SetString(TrayModes.StorageKey, raw))));
+
+        // ── Startup ────────────────────────────────────────────────────
+        var autostart = new ToggleSwitch
+        {
+            IsOn = AutostartService.IsEnabled,
+            OnContent = null,
+            OffContent = null,
+        };
+        autostart.Toggled += (_, _) =>
+        {
+            if (!AutostartService.SetEnabled(autostart.IsOn))
+            {
+                autostart.IsOn = AutostartService.IsEnabled; // stay honest
+            }
+        };
+        panel.Children.Add(Section("Startup", ToggleRow("Launch at login", autostart)));
+
+        // ── Tray icon ──────────────────────────────────────────────────
+        var styleRaw = store.GetString("tokenbar.tray.animationStyle", "cat") ?? "cat";
+        var icon = new StackPanel { Spacing = 8 };
+        icon.Children.Add(RadioGroup(
+            "tray.style",
+            [
+                ("cat", "Cat"), ("parrot", "Parrot"), ("bars", "Signal bars"),
+                ("ring", "Ring gauge"), ("popsicle", "Melting popsicle"),
+            ],
+            styleRaw,
+            raw => store.SetString("tokenbar.tray.animationStyle", raw)));
+        if (styleRaw is "cat" or "parrot")
+        {
+            var animate = new ToggleSwitch
+            {
+                IsOn = store.GetBool("tokenbar.tray.animate", true),
+                OnContent = null,
+                OffContent = null,
+            };
+            animate.Toggled += (_, _) =>
+                store.SetBool("tokenbar.tray.animate", animate.IsOn);
+            icon.Children.Add(ToggleRow("Animate with token rate", animate));
+            icon.Children.Add(Hint(
+                "Idle purrs at 2 fps; a heavy session sprints. Shown only in " +
+                "the icon-only tray mode."));
+        }
+        else
+        {
+            icon.Children.Add(RadioGroup(
+                "icon.coloring",
+                [
+                    ("warning", "Color on warning only"),
+                    ("always", "Always colored"),
+                    ("never", "Never colored"),
+                ],
+                store.GetString("tokenbar.icon.coloring", "warning") ?? "warning",
+                raw => store.SetString("tokenbar.icon.coloring", raw)));
+            icon.Children.Add(Hint(
+                "Battery-icon behavior: the gauge picks up color under 25% left."));
+        }
+
+        panel.Children.Add(Section("Tray icon", icon));
+
+        // ── Quota source ───────────────────────────────────────────────
+        var selection = store.GetString("tokenbar.quota.source", "auto") ?? "auto";
+        var choices = new List<(string, string)> { (QuotaResolver.Auto, "Auto (tightest window)") };
+        if (_quota() is { } payload)
+        {
+            foreach (var agent in payload.Agents.Where(a => a.Error is null))
+            {
+                foreach (var window in agent.Windows)
+                {
+                    choices.Add((
+                        QuotaResolver.Selection(agent.ClientId, window.Label),
+                        $"{ClientRegistry.ShortName(agent.ClientId)} · {window.Label}"));
+                }
+            }
+        }
+
+        var quotaGroup = new StackPanel { Spacing = 8 };
+        quotaGroup.Children.Add(RadioGroup(
+            "quota.source", choices, selection,
+            raw => store.SetString("tokenbar.quota.source", raw)));
+        quotaGroup.Children.Add(Hint(
+            "Feeds the gauge icon and the Quota left tray mode."));
+        panel.Children.Add(Section("Quota source", quotaGroup));
+
+        // ── Agent limits ───────────────────────────────────────────────
+        var limits = new StackPanel { Spacing = 8 };
+        var asUsed = new ToggleSwitch
+        {
+            IsOn = store.GetBool("tokenbar.limits.asUsed", false),
+            OnContent = null,
+            OffContent = null,
+        };
+        asUsed.Toggled += (_, _) => store.SetBool("tokenbar.limits.asUsed", asUsed.IsOn);
+        limits.Children.Add(ToggleRow("Show as used", asUsed));
+        limits.Children.Add(Hint("Bars count up (used) instead of down (left)."));
+        var layoutRaw = store.GetString("tokenbar.limits.layout", "full") ?? "full";
+        limits.Children.Add(RadioGroup(
+            "limits.layout",
+            [("full", "Full (pace + run-out)"), ("classic", "Classic (compact)")],
+            layoutRaw,
+            raw => store.SetString("tokenbar.limits.layout", raw)));
+        if (layoutRaw != "classic")
+        {
+            limits.Children.Add(RadioGroup(
+                "limits.paceMode",
+                [
+                    ("historical", "Historical pace"),
+                    ("linear", "Linear pace"),
+                    ("off", "Pace off"),
+                ],
+                store.GetString("tokenbar.limits.paceMode", "historical") ?? "historical",
+                raw => store.SetString("tokenbar.limits.paceMode", raw)));
+            limits.Children.Add(Hint(
+                "The deficit/reserve marker. Historical learns your weekly " +
+                "usage curve; Linear paces evenly by the clock; Off hides it."));
+        }
+
+        panel.Children.Add(Section("Agent limits", limits));
+
+        // ── Live trace ─────────────────────────────────────────────────
+        var detailed = new ToggleSwitch
+        {
+            IsOn = store.GetBool("tokenbar.trace.detailed", false),
+            OnContent = null,
+            OffContent = null,
+        };
+        detailed.Toggled += (_, _) =>
+            store.SetBool("tokenbar.trace.detailed", detailed.IsOn);
+        var trace = new StackPanel { Spacing = 8 };
+        trace.Children.Add(ToggleRow("Detailed rows", detailed));
+        trace.Children.Add(Hint("One row per agent and model instead of per app."));
+        panel.Children.Add(Section("Live trace", trace));
+
+        // ── Flyout size ────────────────────────────────────────────────
+        var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        var height = store.GetDouble("tokenbar.popover.height", 0);
+        var sizeRow = new StackPanel { Spacing = 8 };
+        var sizeLabel = Ui.Text(height <= 0 ? "Height · Auto" : $"Height · {height:F0}px", 12);
+        var slider = new Slider
+        {
+            Minimum = 480,
+            Maximum = Math.Max(600, area.Height - 24),
+            StepFrequency = 10,
+            Value = height <= 0 ? Math.Min(800, area.Height * 0.6) : height,
+        };
+        slider.ValueChanged += (_, e) =>
+        {
+            if (e.NewValue > 0)
+            {
+                store.SetDouble("tokenbar.popover.height", e.NewValue);
+                sizeLabel.Text = $"Height · {e.NewValue:F0}px";
+            }
+        };
+        var auto = new Button { Content = "Auto", FontSize = 11, Padding = new Thickness(8, 2, 8, 3) };
+        auto.Click += (_, _) => store.SetDouble("tokenbar.popover.height", 0);
+        var labelRow = new Grid();
+        labelRow.Children.Add(sizeLabel);
+        if (height > 0)
+        {
+            auto.HorizontalAlignment = HorizontalAlignment.Right;
+            labelRow.Children.Add(auto);
+        }
+
+        sizeRow.Children.Add(labelRow);
+        sizeRow.Children.Add(slider);
+        panel.Children.Add(Section("Flyout size", sizeRow));
+
+        // ── Data refresh ───────────────────────────────────────────────
+        var refresh = new StackPanel { Spacing = 8 };
+        refresh.Children.Add(RadioGroup(
+            "refresh.interval",
+            [
+                ("1", "Every minute"), ("5", "Every 5 minutes"),
+                ("15", "Every 15 minutes"), ("30", "Every 30 minutes"),
+                ("60", "Every hour"),
+            ],
+            Math.Max(1, store.GetInt("tokenbar.refresh.intervalMin", 30)).ToString(),
+            raw => store.SetInt("tokenbar.refresh.intervalMin", int.Parse(raw))));
+        refresh.Children.Add(Hint(
+            "How often the tray forces a full log re-read; cached reads stay " +
+            "continuous either way."));
+        panel.Children.Add(Section("Data refresh", refresh));
+
+        // ── About ──────────────────────────────────────────────────────
+        var about = new StackPanel { Spacing = 4 };
+        about.Children.Add(Ui.Row(
+            Ui.Text("Version", 12),
+            Ui.Dim(typeof(SettingsWindow).Assembly.GetName().Version?.ToString(3) ?? "dev", 12)));
+        about.Children.Add(Hint(
+            "Parsing engine vendored from tokscale by junhoyeo; menu-bar " +
+            "concept from handlecusion's tokcat."));
+        panel.Children.Add(Section("About", about));
+
+        _scroll.Content = panel;
+    }
+
+    // ── Control primitives (macOS SettingsPanel's four) ────────────────
+
+    private static StackPanel Section(string title, UIElement content)
+    {
+        var section = new StackPanel { Spacing = 6 };
+        var header = Ui.Text(title.ToUpperInvariant(), 10, 0.55, bold: true);
+        section.Children.Add(header);
+        section.Children.Add(content);
+        return section;
+    }
+
+    private static StackPanel RadioGroup(
+        string group, IEnumerable<(string Raw, string Label)> options,
+        string current, Action<string> pick)
+    {
+        var stack = new StackPanel { Spacing = 2 };
+        foreach (var (raw, label) in options)
+        {
+            var radio = new RadioButton
+            {
+                Content = label,
+                GroupName = group,
+                IsChecked = raw == current,
+                FontSize = 12,
+                MinHeight = 28,
+                Padding = new Thickness(6, 0, 0, 0),
+            };
+            var value = raw;
+            radio.Checked += (_, _) => pick(value);
+            stack.Children.Add(radio);
+        }
+
+        return stack;
+    }
+
+    private static Grid ToggleRow(string label, ToggleSwitch toggle)
+    {
+        var row = new Grid();
+        var text = Ui.Text(label, 12);
+        text.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(text);
+        toggle.HorizontalAlignment = HorizontalAlignment.Right;
+        toggle.MinWidth = 0; // drop the content-label reserve
+        toggle.Margin = new Thickness(0, -4, 0, -4);
+        row.Children.Add(toggle);
+        return row;
+    }
+
+    private static TextBlock Hint(string text)
+    {
+        var hint = Ui.Dim(text, 11);
+        hint.Opacity = 0.55;
+        return hint;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint hwnd);
+}

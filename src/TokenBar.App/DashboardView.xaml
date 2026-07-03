@@ -87,6 +87,36 @@
             <ContentPresenter x:Name="ContentHost" />
         </ScrollViewer>
 
-        <TextBlock Grid.Row="3" x:Name="FooterText" Opacity="0.5" FontSize="10" Text="" />
+        <!-- Footer, macOS parity: status text left, gear + Quit hugging the
+             right edge. -->
+        <Grid Grid.Row="3">
+            <TextBlock
+                x:Name="FooterText"
+                VerticalAlignment="Center"
+                Opacity="0.5"
+                FontSize="10"
+                Text="" />
+            <StackPanel
+                Orientation="Horizontal"
+                Spacing="2"
+                HorizontalAlignment="Right">
+                <Button
+                    x:Name="SettingsButton"
+                    Padding="0"
+                    Width="24"
+                    Height="24"
+                    Background="Transparent"
+                    BorderThickness="0">
+                    <FontIcon Glyph="&#xE713;" FontSize="12" Opacity="0.7" />
+                </Button>
+                <Button
+                    x:Name="QuitButton"
+                    Padding="7,2,7,3"
+                    FontSize="11"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Content="Quit" />
+            </StackPanel>
+        </Grid>
     </Grid>
 </UserControl>

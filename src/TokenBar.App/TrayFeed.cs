@@ -89,6 +89,12 @@ public sealed class TrayFeed
         });
     }
 
+    // Forced full re-read cadence (tokenbar.refresh.intervalMin, default 30):
+    // the cached path keeps data fresh continuously; this is the macOS title
+    // loop's belt against anything the incremental scan misses. An instance
+    // field, so restarting timers never triggers an immediate re-read.
+    private DateTimeOffset _lastFullRefresh = DateTimeOffset.Now;
+
     private void RefreshSlow()
     {
         if (_slowInFlight)
@@ -96,6 +102,8 @@ public sealed class TrayFeed
             return;
         }
 
+        var intervalMin = Math.Max(1, AppSettings.Store.GetInt("tokenbar.refresh.intervalMin", 30));
+        var force = DateTimeOffset.Now - _lastFullRefresh >= TimeSpan.FromMinutes(intervalMin);
         _slowInFlight = true;
         _ = Task.Run(() =>
         {
@@ -104,7 +112,13 @@ public sealed class TrayFeed
                 UsagePayload? graph;
                 using (ProcessPower.Boost())
                 {
-                    graph = TryFetch(() => TbCore.Graph(), "tray graph");
+                    graph = TryFetch(() => force
+                        ? TbCore.RefreshGraph() : TbCore.Graph(), "tray graph");
+                }
+
+                if (force && graph is not null)
+                {
+                    _lastFullRefresh = DateTimeOffset.Now;
                 }
 
                 var quota = TryFetch(() => TbCore.AgentUsage(), "tray quota");

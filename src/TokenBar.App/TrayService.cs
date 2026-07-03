@@ -45,6 +45,7 @@ public sealed class TrayService : IDisposable
         _feed = new TrayFeed(DispatcherQueue.GetForCurrentThread());
         _animator = new TrayAnimator(
             DispatcherQueue.GetForCurrentThread(), () => _feed.TokensPerMin, ApplyCachedIcon);
+        OpenSettings = ShowSettings;
         _feed.Changed += () =>
         {
             UpdateIcon();
@@ -65,6 +66,12 @@ public sealed class TrayService : IDisposable
     }
 
     private readonly FlyoutWindow _flyout;
+
+    /// <summary>The flyout footer's gear reaches settings through here —
+    /// the view layer never sees the tray feed.</summary>
+    public static Action? OpenSettings { get; private set; }
+
+    public void ShowSettings() => SettingsWindow.Present(() => _feed.Quota);
 
     /// <summary>The full context menu (macOS splits this between the
     /// status-item right-click quota menu and the settings panel; Windows
@@ -138,6 +145,9 @@ public sealed class TrayService : IDisposable
 
         menu.Items.Add(source);
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
+        var settings = new Microsoft.UI.Xaml.Controls.MenuFlyoutItem { Text = "Settings" };
+        settings.Click += (_, _) => ShowSettings();
+        menu.Items.Add(settings);
         var quit = new Microsoft.UI.Xaml.Controls.MenuFlyoutItem { Text = "Quit" };
         quit.Click += (_, _) =>
         {

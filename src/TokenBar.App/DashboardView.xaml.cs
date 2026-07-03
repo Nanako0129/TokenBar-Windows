@@ -75,6 +75,21 @@ public sealed partial class DashboardView : UserControl
             UpdateRefreshControl();
         };
         HoverTip.Attach(RefreshButton, () => "Refresh usage data");
+
+        SettingsButton.Click += (_, _) => TrayService.OpenSettings?.Invoke();
+        HoverTip.Attach(SettingsButton, () => "Settings");
+        QuitButton.Click += (_, _) => Application.Current.Exit();
+
+        // Limits/trace settings re-render the open flyout live (the macOS
+        // panel's right-column preview equivalent is the flyout itself).
+        AppSettings.Store.Changed += key =>
+        {
+            if (key.StartsWith("tokenbar.limits.", StringComparison.Ordinal)
+                || key == "tokenbar.trace.detailed")
+            {
+                _ = DispatcherQueue.TryEnqueue(() => RenderContent(animated: false));
+            }
+        };
     }
 
     /// <summary>One control, two states (macOS refreshButton): the glyph
@@ -435,6 +450,16 @@ public sealed partial class DashboardView : UserControl
             return panel;
         }
 
+        // macOS windowRow settings: fill direction, density, pace policy.
+        var asUsed = AppSettings.Store.GetBool("tokenbar.limits.asUsed", false);
+        var classic = AppSettings.Store.GetString("tokenbar.limits.layout", "full") == "classic";
+        var paceMode = AppSettings.Store.GetString("tokenbar.limits.paceMode", "historical") switch
+        {
+            "linear" => PaceMode.Linear,
+            "off" => PaceMode.Off,
+            _ => PaceMode.Historical,
+        };
+
         var now = DateTimeOffset.Now;
         foreach (var agent in agents)
         {
@@ -457,7 +482,11 @@ public sealed partial class DashboardView : UserControl
 
             foreach (var window in agent.Windows)
             {
-                var pace = UsagePace.Compute(window, PaceMode.Historical, now);
+                var remaining = Math.Clamp(window.RemainingPercent, 0, 100);
+                var used = Math.Clamp(window.UsedPercent, 0, 100);
+                var fill = asUsed ? used : remaining;
+                var amount = asUsed ? $"{used:F0}% used" : $"{remaining:F0}% left";
+                var pace = classic ? null : UsagePace.Compute(window, paceMode, now);
                 var paceText = pace is null ? ""
                     : pace.EtaText is { } eta ? $"{pace.Label} · {eta}" : pace.Label;
                 var paceLabel = Ui.Text(paceText, 10,
@@ -468,10 +497,10 @@ public sealed partial class DashboardView : UserControl
                 }
 
                 section.Children.Add(Ui.Row(
-                    Ui.Text($"{window.Label} · {window.RemainingPercent:F0}% left", 11),
+                    Ui.Text($"{window.Label} · {amount}", 11),
                     paceLabel));
-                section.Children.Add(GaugeBar(window.RemainingPercent, pace));
-                if (window.ResetText is { } reset)
+                section.Children.Add(GaugeBar(fill, remaining, pace, asUsed));
+                if (!classic && window.ResetText is { } reset)
                 {
                     section.Children.Add(Ui.Dim(reset, 10));
                 }
@@ -485,7 +514,14 @@ public sealed partial class DashboardView : UserControl
 
     private static FrameworkElement? BuildTrace(DashboardModel.Snapshot snapshot)
     {
-        var rows = TraceCollapse.CollapseByClient(snapshot.Trace).Take(5).ToList();
+        // tokenbar.trace.detailed (macOS UsageTraceCard): one row per
+        // agent-and-model bucket instead of one collapsed row per app.
+        var detailed = AppSettings.Store.GetBool("tokenbar.trace.detailed", false);
+        var rows = detailed
+            ? snapshot.Trace
+                .Select(b => (b.Client, b.Model, b.TokensPerMin)).Take(5).ToList()
+            : TraceCollapse.CollapseByClient(snapshot.Trace)
+                .Select(r => (r.Client, r.Model, r.TokensPerMin)).Take(5).ToList();
         if (rows.Count == 0)
         {
             return null;
@@ -1016,10 +1052,16 @@ public sealed partial class DashboardView : UserControl
 
     private const string PaceOrange = "#ff9500"; // macOS Color.orange
 
-    private static FrameworkElement GaugeBar(double remainingPercent, UsagePace? pace = null)
+    /// <summary>The quota bar: fills by used or remaining per the setting,
+    /// colors by remaining either way (macOS gaugeColor), and carries the
+    /// pace marker on the same axis so it lines up with the fill.</summary>
+    private static FrameworkElement GaugeBar(
+        double fillPercent, double remainingForColor, UsagePace? pace = null,
+        bool asUsed = false)
     {
-        var remaining = Math.Clamp(remainingPercent, 0, 100);
-        var color = remaining < 10 ? "#ef4444" : remaining < 25 ? "#f59e0b" : "#22c55e";
+        var remaining = Math.Clamp(fillPercent, 0, 100);
+        var color = remainingForColor < 10 ? "#ef4444"
+            : remainingForColor < 25 ? "#f59e0b" : "#22c55e";
         var track = new Grid
         {
             Height = 5,
@@ -1044,10 +1086,11 @@ public sealed partial class DashboardView : UserControl
             return track;
         }
 
-        // macOS-parity pace marker: a slim tick at the expected-remaining
-        // position, taller than the bar; orange in deficit, dim otherwise.
-        // The bar fills by remaining, so the marker rides the same axis.
-        var paceLeft = Math.Clamp(100 - pace.ExpectedUsedPercent, 0, 100);
+        // macOS-parity pace marker: a slim tick at the expected position,
+        // taller than the bar; orange in deficit, dim otherwise. It rides
+        // whichever axis the fill uses.
+        var paceLeft = Math.Clamp(
+            asUsed ? pace.ExpectedUsedPercent : 100 - pace.ExpectedUsedPercent, 0, 100);
         var holder = new Grid { Height = 9 };
         track.VerticalAlignment = VerticalAlignment.Center;
         holder.Children.Add(track);
@@ -1073,7 +1116,8 @@ public sealed partial class DashboardView : UserControl
         Grid.SetColumn(marker, 0);
         lanes.Children.Add(marker);
         holder.Children.Add(lanes);
-        HoverTip.Attach(marker, () => $"Expected {100 - paceLeft:F0}% used by now");
+        var expectedUsed = asUsed ? paceLeft : 100 - paceLeft;
+        HoverTip.Attach(marker, () => $"Expected {expectedUsed:F0}% used by now");
         return holder;
     }
 }
