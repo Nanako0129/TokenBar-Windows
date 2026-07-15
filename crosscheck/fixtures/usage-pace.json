@@ -1,0 +1,256 @@
+{
+  "cases": [
+    {
+      "name": "null-no-resets-at",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "windowMinutes": 100 },
+      "note": "resetsAt absent -> null"
+    },
+    {
+      "name": "null-no-window-minutes",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10T12:50:00Z" },
+      "note": "windowMinutes absent -> null"
+    },
+    {
+      "name": "null-zero-window-minutes",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 0 },
+      "note": "windowMinutes <= 0 -> null"
+    },
+    {
+      "name": "null-negative-window-minutes",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": -60 },
+      "note": "negative -> null"
+    },
+    {
+      "name": "null-unparseable-resets-at",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "next Tuesday", "windowMinutes": 100 },
+      "note": "strict RFC3339 parse fails -> null"
+    },
+    {
+      "name": "null-date-only-resets-at",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10", "windowMinutes": 100 },
+      "note": "date-only is not RFC3339 datetime; a lenient parser would accept it -> null"
+    },
+    {
+      "name": "null-reset-in-past",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10T11:59:59Z", "windowMinutes": 100 },
+      "note": "timeUntilReset <= 0 -> null"
+    },
+    {
+      "name": "null-reset-exactly-now",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10T12:00:00Z", "windowMinutes": 100 },
+      "note": "timeUntilReset == 0 -> null"
+    },
+    {
+      "name": "null-reset-beyond-window",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10T14:00:01Z", "windowMinutes": 120 },
+      "note": "timeUntilReset > duration -> null"
+    },
+    {
+      "name": "null-window-start-with-usage",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 5, "remainingPercent": 95, "resetsAt": "2026-07-10T13:40:00Z", "windowMinutes": 100 },
+      "note": "elapsed == 0 but actual > 0 -> null"
+    },
+    {
+      "name": "null-mode-off",
+      "kind": "compute", "mode": "off", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 55, "remainingPercent": 45, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "mode off -> null regardless of window"
+    },
+    {
+      "name": "window-start-zero-usage",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 0, "remainingPercent": 100, "resetsAt": "2026-07-10T13:40:00Z", "windowMinutes": 100 },
+      "note": "elapsed == 0, actual == 0: proceeds; onTrack, no eta, willLast false"
+    },
+    {
+      "name": "on-track-exact",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta 0; candidate == timeUntilReset -> lasts"
+    },
+    {
+      "name": "on-track-upper-edge",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 52, "remainingPercent": 48, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta exactly 2 -> still onTrack; eta present"
+    },
+    {
+      "name": "slightly-ahead-min",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 52.5, "remainingPercent": 47.5, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta 2.5 -> slightlyAhead; label rounds AwayFromZero to '3% in deficit'"
+    },
+    {
+      "name": "slightly-ahead-max",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 56, "remainingPercent": 44, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta exactly 6 -> slightlyAhead"
+    },
+    {
+      "name": "ahead-min",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 56.5, "remainingPercent": 43.5, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta 6.5 -> ahead"
+    },
+    {
+      "name": "ahead-max",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 62, "remainingPercent": 38, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta exactly 12 -> ahead"
+    },
+    {
+      "name": "far-ahead",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 62.5, "remainingPercent": 37.5, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta 12.5 -> farAhead"
+    },
+    {
+      "name": "slightly-behind",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 47.5, "remainingPercent": 52.5, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta -2.5 -> slightlyBehind, '3% in reserve'; candidate > timeUntilReset -> lasts"
+    },
+    {
+      "name": "behind",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 40, "remainingPercent": 60, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta -10 -> behind"
+    },
+    {
+      "name": "far-behind",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 30, "remainingPercent": 70, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "delta -20 -> farBehind"
+    },
+    {
+      "name": "clamp-used-over-100",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 250, "remainingPercent": 0, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "actual clamps to 100; remaining 0 -> etaSeconds 0 -> 'Projected empty now'"
+    },
+    {
+      "name": "clamp-used-negative",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": -5, "remainingPercent": 100, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "actual clamps to 0 with elapsed > 0 -> willLastToReset true; farBehind"
+    },
+    {
+      "name": "fractional-seconds-resets-at",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "resetsAt": "2026-07-10T12:50:00.500Z", "windowMinutes": 100 },
+      "note": "fractional-seconds RFC3339 must parse; elapsed 2999.5"
+    },
+    {
+      "name": "offset-timezone-resets-at",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "resetsAt": "2026-07-10T20:50:00+08:00", "windowMinutes": 100 },
+      "note": "+08:00 offset, same instant as 12:50Z -> identical to on-track-exact"
+    },
+    {
+      "name": "historical-with-expected",
+      "kind": "compute", "mode": "historical", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100, "historicalExpectedPercent": 80 },
+      "note": "expected overridden to 80 -> delta -30 farBehind; no runOutProbability -> linear eta kept"
+    },
+    {
+      "name": "historical-expected-clamped",
+      "kind": "compute", "mode": "historical", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100, "historicalExpectedPercent": 150 },
+      "note": "override clamps 150 -> 100; delta -50"
+    },
+    {
+      "name": "historical-fallback-linear",
+      "kind": "compute", "mode": "historical", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 56, "remainingPercent": 44, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100 },
+      "note": "historical mode without historicalExpectedPercent falls back to linear expected 50"
+    },
+    {
+      "name": "historical-runout-low-forces-lasts",
+      "kind": "compute", "mode": "historical", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 60, "remainingPercent": 40, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100, "historicalExpectedPercent": 40, "runOutProbability": 0.3 },
+      "note": "prob < 0.5 -> eta nulled, willLastToReset true even though linear eta would fire"
+    },
+    {
+      "name": "historical-runout-high-keeps-eta",
+      "kind": "compute", "mode": "historical", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 60, "remainingPercent": 40, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100, "historicalExpectedPercent": 40, "runOutProbability": 0.9 },
+      "note": "prob >= 0.5 -> keep linear candidate 2000s -> 'Projected empty in 33m'"
+    },
+    {
+      "name": "historical-runout-exact-half",
+      "kind": "compute", "mode": "historical", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 60, "remainingPercent": 40, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100, "historicalExpectedPercent": 40, "runOutProbability": 0.5 },
+      "note": "0.5 is NOT < 0.5 -> keep eta (boundary)"
+    },
+    {
+      "name": "historical-prob-without-override-ignored",
+      "kind": "compute", "mode": "historical", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 60, "remainingPercent": 40, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100, "runOutProbability": 0.2 },
+      "note": "no historicalExpectedPercent -> expectedOverride null -> probability branch NOT taken; linear eta survives"
+    },
+    {
+      "name": "linear-mode-ignores-historical-fields",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 60, "remainingPercent": 40, "resetsAt": "2026-07-10T12:50:00Z", "windowMinutes": 100, "historicalExpectedPercent": 80, "runOutProbability": 0.2 },
+      "note": "linear mode must ignore both historical fields entirely"
+    },
+    {
+      "name": "long-window-multi-day-eta",
+      "kind": "compute", "mode": "linear", "now": "2026-07-10T12:00:00Z",
+      "window": { "label": "weekly", "usedPercent": 30, "remainingPercent": 70, "resetsAt": "2026-07-15T12:00:00Z", "windowMinutes": 10080 },
+      "note": "7d window, 2d elapsed, 30% used: candidate 4.67d < 5d reset -> multi-day eta text"
+    },
+    {
+      "name": "runout-risk-absent",
+      "kind": "runOutRisk",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50 },
+      "note": "no probability -> null"
+    },
+    {
+      "name": "runout-risk-zero",
+      "kind": "runOutRisk",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "runOutProbability": 0 },
+      "note": "pct 0 -> null"
+    },
+    {
+      "name": "runout-risk-rounds-to-zero",
+      "kind": "runOutRisk",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "runOutProbability": 0.004 },
+      "note": "0.4% rounds to 0 -> null"
+    },
+    {
+      "name": "runout-risk-half-percent-rounds-up",
+      "kind": "runOutRisk",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "runOutProbability": 0.005 },
+      "note": "0.5% rounds AwayFromZero to 1 -> label"
+    },
+    {
+      "name": "runout-risk-thirty",
+      "kind": "runOutRisk",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "runOutProbability": 0.3 },
+      "note": "≈ 30% run-out risk"
+    },
+    {
+      "name": "runout-risk-certain",
+      "kind": "runOutRisk",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "runOutProbability": 1.0 },
+      "note": "100%"
+    },
+    {
+      "name": "runout-risk-clamped-above-one",
+      "kind": "runOutRisk",
+      "window": { "label": "weekly", "usedPercent": 50, "remainingPercent": 50, "runOutProbability": 1.5 },
+      "note": "clamps to 1 -> 100%"
+    }
+  ]
+}
