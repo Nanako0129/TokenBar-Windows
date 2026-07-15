@@ -20,12 +20,14 @@ public static class Format
         else if (value >= 1_000) { (scaled, suffix) = (value / 1_000, "K"); }
         else { return count.ToString(CultureInfo.InvariantCulture); }
 
-        // Pre-round half-to-even: Swift's %.1f/%.0f is printf semantics
-        // (round-half-even on exact binary halves, e.g. 1.25M → "1.2M"),
-        // while .NET's F formats round midpoints away from zero.
+        // Bare F0/F1 IS printf %.0f/%.1f: .NET Core formatting is IEEE-correct
+        // from the full binary value (1.05 → "1.1" because the double is
+        // 1.0500…0444, above the half; exact ties like 1.25 go to even →
+        // "1.2"). A Math.Round pre-round would re-quantize near-half values
+        // to exact halves and diverge — the fixture cross-check caught that.
         var text = scaled >= 100
-            ? Math.Round(scaled, MidpointRounding.ToEven).ToString("F0", CultureInfo.InvariantCulture)
-            : Math.Round(scaled, 1, MidpointRounding.ToEven).ToString("F1", CultureInfo.InvariantCulture);
+            ? scaled.ToString("F0", CultureInfo.InvariantCulture)
+            : scaled.ToString("F1", CultureInfo.InvariantCulture);
         if (text.EndsWith(".0", StringComparison.Ordinal))
         {
             text = text[..^2];
@@ -35,11 +37,10 @@ public static class Format
     }
 
     // "$" prepended outside the numeric format so a negative amount renders
-    // "$-1.50" like Swift's "$%.2f", not .NET's "-$1.50"; ToEven matches
-    // printf midpoint rounding.
+    // "$-1.50" like Swift's "$%.2f", not .NET's "-$1.50". Bare F2 is printf
+    // %.2f (IEEE-correct from the binary value — see CompactTokens).
     public static string Usd(double amount) =>
-        "$" + Math.Round(amount, 2, MidpointRounding.ToEven)
-            .ToString("0.00", CultureInfo.InvariantCulture);
+        "$" + amount.ToString("F2", CultureInfo.InvariantCulture);
 
     /// <summary>Today's contribution-graph day key. tokscale-core buckets days
     /// in the local timezone as %Y-%m-%d, so this must match exactly.</summary>

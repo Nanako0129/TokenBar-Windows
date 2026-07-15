@@ -51,4 +51,39 @@ public class QuotaResolverTests
     [Fact]
     public void EmptySelectionActsAsAuto() =>
         Assert.Equal("claude", QuotaResolver.Resolve(Payload, "")!.ClientId);
+
+    [Fact]
+    public void AutoSkipsExcludedClients()
+    {
+        // claude owns the tightest window; excluding it falls through to codex.
+        var pick = QuotaResolver.Resolve(Payload, "auto", new HashSet<string> { "claude" });
+        Assert.NotNull(pick);
+        Assert.Equal("codex", pick.ClientId);
+        Assert.Equal("Weekly", pick.Window.Label); // codex's tightest healthy
+    }
+
+    [Fact]
+    public void ExplicitSelectionIgnoresExclusion()
+    {
+        // The user deliberately pinned claude — honor it even when excluded.
+        var pick = QuotaResolver.Resolve(
+            Payload, "claude|Session", new HashSet<string> { "claude" });
+        Assert.Equal("claude", pick!.ClientId);
+    }
+
+    [Fact]
+    public void ExcludedAllCandidatesDetectsFullyHiddenAuto()
+    {
+        // Both resolvable clients hidden → auto would have resolved, now can't.
+        Assert.True(QuotaResolver.ExcludedAllCandidates(
+            Payload, "auto", new HashSet<string> { "claude", "codex" }));
+        // codex survives → not fully excluded.
+        Assert.False(QuotaResolver.ExcludedAllCandidates(
+            Payload, "auto", new HashSet<string> { "claude" }));
+        // Explicit selection ignores exclusion → never "all candidates hidden".
+        Assert.False(QuotaResolver.ExcludedAllCandidates(
+            Payload, "claude|Session", new HashSet<string> { "claude" }));
+        // Empty exclusion → false.
+        Assert.False(QuotaResolver.ExcludedAllCandidates(Payload, "auto", new HashSet<string>()));
+    }
 }

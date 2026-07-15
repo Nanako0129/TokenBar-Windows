@@ -1,12 +1,27 @@
+using TokenBar.Interop;
 using Xunit;
 
 namespace TokenBar.Core.Tests;
 
-// Ported from SelfTest.swift's ISODay / streaks / grid blocks.
+// Ported from SelfTest.swift's ISODay / streaks / grid blocks, plus the
+// hidden-client filtered-range and visibility-helper delta.
 public class UsageStatsTests
 {
     private static Dictionary<string, PerDay> PerDayOf(params string[] dates) =>
         dates.ToDictionary(d => d, d => new PerDay(d, Tokens: 10, Cost: 1, Intensity: 1));
+
+    private static ContributionClient Client(string id, long tokens, double cost = 1) =>
+        new(id, "m", "anthropic", new TokenBreakdown(tokens, 0, 0, 0, 0), cost, Messages: 1);
+
+    private static Contribution Day(string date, params ContributionClient[] clients) =>
+        new(date, new ContributionTotals(0, 0, 0), 1, new TokenBreakdown(0, 0, 0, 0, 0), clients);
+
+    private static UsagePayload Payload(string metaStart, string metaEnd, params Contribution[] days) =>
+        new(
+            new UsageMeta("g", "v", new DateRange(metaStart, metaEnd)),
+            new UsageSummary(0, 0, 0, 0, 0, 0, [], []),
+            [],
+            days);
 
     [Fact]
     public void EpochDayNumberIsZero() => Assert.Equal(0, ISODay.Parse("1970-01-01")!.Value.Number);
@@ -71,5 +86,74 @@ public class UsageStatsTests
         // Out-of-year tokens don't drive max and out-of-year cells are inactive.
         Assert.Equal(500, grid.MaxTokens);
         Assert.False(grid.Cells.First(c => c.Date == "2025-12-29").Active);
+    }
+
+    // --- Filtered-range & visibility delta ---
+
+    [Fact]
+    public void FilteredStatsDeriveRangeFromSelectedClients()
+    {
+        // meta range spans to 2026-06-20 (a hidden client's later activity), but
+        // the selected client (claude) last acted on 2026-06-05.
+        var payload = Payload(
+            "2026-06-01", "2026-06-20",
+            Day("2026-06-05", Client("claude", 100)),
+            Day("2026-06-20", Client("gemini", 200)));
+
+        var stats = new UsageStats(payload, new HashSet<string> { "claude" });
+        // Range shrinks to the selected client's own span.
+        Assert.Equal("2026-06-05", stats.DateRange.Start);
+        Assert.Equal("2026-06-05", stats.DateRange.End);
+    }
+
+    [Fact]
+    public void UnfilteredStatsKeepMetaRange()
+    {
+        var payload = Payload(
+            "2026-06-01", "2026-06-20",
+            Day("2026-06-05", Client("claude", 100)),
+            Day("2026-06-20", Client("gemini", 200)));
+
+        // All present clients selected → nothing filtered → meta range verbatim.
+        var stats = new UsageStats(payload, new HashSet<string> { "claude", "gemini" });
+        Assert.Equal("2026-06-01", stats.DateRange.Start);
+        Assert.Equal("2026-06-20", stats.DateRange.End);
+    }
+
+    [Fact]
+    public void TotalsSaturateOnCorruptLane()
+    {
+        var payload = Payload(
+            "2026-06-01", "2026-06-02",
+            Day("2026-06-01", Client("claude", long.MaxValue)),
+            Day("2026-06-02", Client("claude", long.MaxValue)));
+
+        var stats = new UsageStats(payload, new HashSet<string> { "claude" });
+        Assert.Equal(long.MaxValue, stats.TotalTokens);
+    }
+
+    [Fact]
+    public void YearsWithVisibleActivityDropsHiddenOnlyYears()
+    {
+        var contributions = new[]
+        {
+            Day("2025-05-01", Client("gemini", 50)),   // only hidden client
+            Day("2026-05-01", Client("claude", 10)),   // visible
+            Day("2026-06-01", Client("gemini", 20)),   // hidden, same year as visible
+        };
+
+        var years = UsageStatsVisibility.YearsWithVisibleActivity(
+            contributions, new HashSet<string> { "gemini" });
+        Assert.Equal(new HashSet<string> { "2026" }, years);
+    }
+
+    [Fact]
+    public void HasVisibleActivityReflectsNonHiddenPresence()
+    {
+        var onlyHidden = new[] { Day("2026-05-01", Client("gemini", 50)) };
+        Assert.False(UsageStatsVisibility.HasVisibleActivity(
+            onlyHidden, new HashSet<string> { "gemini" }));
+        Assert.True(UsageStatsVisibility.HasVisibleActivity(
+            onlyHidden, new HashSet<string>()));
     }
 }

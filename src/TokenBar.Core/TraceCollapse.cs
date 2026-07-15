@@ -11,6 +11,20 @@ public static class TraceCollapse
     /// "unknown" models drop out when a client has named ones too. Rows sort
     /// by tokens descending.
     /// </summary>
+    /// <summary>Sum of live per-minute rates over <paramref name="buckets"/>,
+    /// excluding <paramref name="hidden"/> clients (port of TraceBucket.totalRate
+    /// in UsageTrace.swift; used to derive the menu-bar rate with hidden clients
+    /// dropped, issue #35). Summing the 600s trace rows' rates equals the FFI
+    /// rate_in_window(600) for the surviving clients, since every row's rate
+    /// shares the same window divisor.
+    ///
+    /// Rows carry raw live-tail ids (claude-code); <paramref name="hidden"/>
+    /// holds canonical short ids (claude), so each row is normalized via
+    /// <see cref="ClientRegistry.CanonicalClient"/> before the membership test —
+    /// otherwise hiding a client would leave its live rows in the rate.</summary>
+    public static double TotalRate(IEnumerable<TraceBucket> buckets, IReadOnlySet<string> hidden) =>
+        buckets.Sum(b => hidden.Contains(ClientRegistry.CanonicalClient(b.Client)) ? 0 : b.TokensPerMin);
+
     public static IReadOnlyList<TraceBucket> CollapseByClient(IEnumerable<TraceBucket> buckets)
     {
         var groups = new Dictionary<string, Slot>();
@@ -24,7 +38,7 @@ public static class TraceCollapse
                 order.Add(bucket.Client);
             }
 
-            slot.Tokens += bucket.Tokens;
+            slot.Tokens = slot.Tokens.SaturatingAdd(bucket.Tokens);
             slot.Messages += bucket.Messages;
             slot.TokensPerMin += bucket.TokensPerMin;
             slot.Agents.Add(bucket.Agent);

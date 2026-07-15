@@ -33,4 +33,31 @@ public class TraceCollapseTests
         var collapsed = TraceCollapse.CollapseByClient([Bucket("amp", "Main", "unknown", 5)]);
         Assert.Equal("unknown", Assert.Single(collapsed).Model);
     }
+
+    [Fact]
+    public void CollapseSaturatesTokenFold()
+    {
+        var collapsed = TraceCollapse.CollapseByClient(
+        [
+            Bucket("claude-code", "Main", "m", long.MaxValue),
+            Bucket("claude-code", "Sub", "m", long.MaxValue),
+        ]);
+        Assert.Equal(long.MaxValue, Assert.Single(collapsed).Tokens);
+    }
+
+    [Fact]
+    public void TotalRateNormalizesLiveIdsBeforeHidingThem()
+    {
+        var buckets = new[]
+        {
+            new TraceBucket("claude-code", "Main", "m", 0, 0, TokensPerMin: 30),
+            new TraceBucket("codex-cli", "Main", "m", 0, 0, TokensPerMin: 12),
+        };
+
+        // hidden holds the canonical short id "claude"; the row's raw
+        // "claude-code" must normalize to it and drop out of the rate.
+        Assert.Equal(12, TraceCollapse.TotalRate(buckets, new HashSet<string> { "claude" }));
+        // Nothing hidden → full sum.
+        Assert.Equal(42, TraceCollapse.TotalRate(buckets, new HashSet<string>()));
+    }
 }

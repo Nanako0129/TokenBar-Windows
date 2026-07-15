@@ -143,8 +143,11 @@ public sealed class UsageStats
                     continue;
                 }
 
-                var t = cc.Tokens;
-                dayTokens += t.Input + t.Output + t.CacheRead + t.CacheWrite + t.Reasoning;
+                // Saturating: a corrupt Antigravity stripe can be long.MaxValue
+                // (Rust-side #766 clamp), and the filtered Overview/Stats path
+                // folds these here — a wrapping/throwing += would corrupt or
+                // crash the dashboard.
+                dayTokens = dayTokens.SaturatingAdd(cc.Tokens.Total);
                 dayCost += cc.Cost;
             }
 
@@ -156,7 +159,7 @@ public sealed class UsageStats
             var entry = new PerDay(c.Date, dayTokens, dayCost, c.Intensity);
             perDay.Add(entry);
             perDayMap[c.Date] = entry;
-            totalTokens += dayTokens;
+            totalTokens = totalTokens.SaturatingAdd(dayTokens);
             totalCost += dayCost;
             maxTokens = Math.Max(maxTokens, dayTokens);
             if (bestDay is null || dayCost > bestDay.Value.Cost)
@@ -170,11 +173,82 @@ public sealed class UsageStats
         ActiveDays = perDay.Count;
         BestDay = bestDay;
         AveragePerDay = perDay.Count == 0 ? 0 : totalCost / perDay.Count;
-        DateRange = payload.Meta.DateRange;
+
+        // payload.Meta.DateRange is the activity span across ALL clients in the
+        // payload (aggregator min/max contribution date). When some present
+        // client is filtered out (hidden), copying that unfiltered range lets a
+        // hidden client whose activity extends past the visible clients' last
+        // active day inject trailing empty days that reset/shorten the streaks.
+        // Derive the effective range from the SELECTED clients' own activity in
+        // that case, matching a payload in which the hidden clients never
+        // existed. The all-present (nothing hidden) and empty (nothing active)
+        // cases keep meta.DateRange — byte-identical to before.
+        var filtering = !present.IsSubsetOf(selectedClients);
+        var selectedDates = perDay.Select(p => p.Date).ToList();
+        DateRange effectiveRange;
+        if (filtering && selectedDates.Count > 0)
+        {
+            // Ordinal min/max: date keys are fixed-width ASCII YYYY-MM-DD, so
+            // ordinal order == chronological, and it matches Swift's scalar
+            // String.min()/max() regardless of the host culture.
+            effectiveRange = new DateRange(
+                selectedDates.Min(StringComparer.Ordinal)!,
+                selectedDates.Max(StringComparer.Ordinal)!);
+        }
+        else
+        {
+            effectiveRange = payload.Meta.DateRange;
+        }
+
+        DateRange = effectiveRange;
         PerDay = perDay;
         PerDayMap = perDayMap;
-        Streaks = Streaks.Compute(perDayMap, DateRange.Start, DateRange.End);
+        Streaks = Streaks.Compute(perDayMap, effectiveRange.Start, effectiveRange.End);
         PresentClients = [.. present];
         MaxTokens = maxTokens;
     }
+}
+
+public static class UsageStatsVisibility
+{
+    /// <summary>A contribution stripe is "visible activity" when its client
+    /// isn't hidden and it carries tokens or cost.</summary>
+    private static bool IsVisible(ContributionClient cc, IReadOnlySet<string> hidden) =>
+        !hidden.Contains(cc.Client) && (cc.Tokens.Total > 0 || cc.Cost > 0);
+
+    /// <summary>The set of YYYY years in which at least one NON-hidden client
+    /// had activity (tokens or cost), derived from a payload's contributions.
+    /// Used to drop from the year picker years that only hidden clients used.
+    /// Only meaningful over an all-time payload (contributions spanning every
+    /// year); callers fall back to the unfiltered known-year list when the
+    /// payload is year-scoped.</summary>
+    public static IReadOnlySet<string> YearsWithVisibleActivity(
+        IReadOnlyList<Contribution> contributions, IReadOnlySet<string> hidden)
+    {
+        var years = new HashSet<string>();
+        foreach (var c in contributions)
+        {
+            var year = c.Date.Length >= 4 ? c.Date[..4] : c.Date;
+            if (years.Contains(year))
+            {
+                continue;
+            }
+
+            if (c.Clients.Any(cc => IsVisible(cc, hidden)))
+            {
+                years.Add(year);
+            }
+        }
+
+        return years;
+    }
+
+    /// <summary>Whether ANY non-hidden client had activity in
+    /// <paramref name="contributions"/>. Used to auto-clear a year filter scoped
+    /// to a year only hidden clients used: the year-scoped payload still carries
+    /// the (hidden) activity, so this returns false exactly when the visible
+    /// dashboard would be empty.</summary>
+    public static bool HasVisibleActivity(
+        IReadOnlyList<Contribution> contributions, IReadOnlySet<string> hidden) =>
+        contributions.Any(c => c.Clients.Any(cc => IsVisible(cc, hidden)));
 }

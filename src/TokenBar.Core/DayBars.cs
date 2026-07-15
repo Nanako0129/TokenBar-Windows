@@ -36,7 +36,7 @@ public sealed class DaySegment(string key, string label, string color)
 
 public sealed record DayBar(string Date, IReadOnlyList<DaySegment> Segments)
 {
-    public long TotalTokens => Segments.Sum(s => s.Tokens);
+    public long TotalTokens => Segments.Aggregate(0L, (acc, s) => acc.SaturatingAdd(s.Tokens));
     public double TotalCost => Segments.Sum(s => s.Cost);
     public bool IsEmpty => Segments.Count == 0;
 }
@@ -45,15 +45,26 @@ public static class DayBars
 {
     public const int Window = 30;
 
-    /// <summary>Build the trailing Window-day series ending at the payload's
-    /// range end (endFallback — today — when absent). Days outside the data
-    /// render as empty bars.</summary>
+    /// <summary>Build the trailing Window-day series ending at
+    /// <paramref name="rangeEnd"/> (today, via <paramref name="endFallback"/>,
+    /// when absent). Days outside the data render as empty bars.
+    ///
+    /// <paramref name="rangeEnd"/> must be the SELECTED clients' range end
+    /// (UsageStats.DateRange.End, selection-derived), NOT the unfiltered
+    /// payload.Meta.DateRange.End: a hidden client whose activity extends past
+    /// the visible clients' last day would otherwise shift the trailing window
+    /// forward and push visible activity off the chart while the range-filtered
+    /// headline stats disagree. When nothing is hidden the two are equal, so the
+    /// window is unchanged. Passing null falls back to the unfiltered
+    /// payload range end (the pre-hide behavior for callers not yet plumbed for
+    /// selection-derived ranges).</summary>
     public static IReadOnlyList<DayBar> Build(
         UsagePayload payload,
         IReadOnlyList<string> clientIds,
         StackBy stackBy,
         ModelColorMap colors,
-        string endFallback)
+        string endFallback,
+        string? rangeEnd = null)
     {
         var allowed = new HashSet<string>(clientIds);
         var byDate = new Dictionary<string, DayBar>();
@@ -66,7 +77,8 @@ public static class DayBars
             }
         }
 
-        var end = payload.Meta.DateRange.End.Length == 0 ? endFallback : payload.Meta.DateRange.End;
+        var effectiveRangeEnd = rangeEnd ?? payload.Meta.DateRange.End;
+        var end = effectiveRangeEnd.Length == 0 ? endFallback : effectiveRangeEnd;
         // A malformed (non-empty but unparseable) range end shouldn't blank the
         // whole chart — fall back to today's key, which is always parseable.
         var endDay = ISODay.Parse(end) ?? ISODay.Parse(endFallback);
@@ -98,8 +110,7 @@ public static class DayBars
                 continue;
             }
 
-            var t = client.Tokens;
-            var tokens = t.Input + t.Output + t.CacheRead + t.CacheWrite + t.Reasoning;
+            var tokens = client.Tokens.Total;
             if (tokens <= 0 && client.Cost <= 0)
             {
                 continue;
@@ -118,7 +129,7 @@ public static class DayBars
                 grouped[key] = slot;
             }
 
-            slot.Tokens += tokens;
+            slot.Tokens = slot.Tokens.SaturatingAdd(tokens);
             slot.Cost += client.Cost;
         }
 
@@ -141,7 +152,7 @@ public static class DayBars
                 agg[seg.Key] = slot;
             }
 
-            slot.Tokens += seg.Tokens;
+            slot.Tokens = slot.Tokens.SaturatingAdd(seg.Tokens);
             slot.Cost += seg.Cost;
         }
 

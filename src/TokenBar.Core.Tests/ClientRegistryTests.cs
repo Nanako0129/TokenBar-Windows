@@ -2,8 +2,24 @@ using Xunit;
 
 namespace TokenBar.Core.Tests;
 
-public class ClientRegistryTests
+public class ClientRegistryTests : IDisposable
 {
+    private readonly string _dir = Path.Combine(
+        Path.GetTempPath(), "tokenbar-tests", Guid.NewGuid().ToString("N"));
+
+    private SettingsStore NewStore() => new(Path.Combine(_dir, "settings.json"));
+
+    public void Dispose()
+    {
+        try
+        {
+            Directory.Delete(_dir, recursive: true);
+        }
+        catch
+        {
+        }
+    }
+
     [Fact]
     public void KnownClientHasBrandStyle()
     {
@@ -28,4 +44,135 @@ public class ClientRegistryTests
     [InlineData("antigravity-cli", "Antigravity CLI")] // base collides with the IDE client
     public void ShortNameDropsFormFactorSafely(string id, string expected) =>
         Assert.Equal(expected, ClientRegistry.ShortName(id));
+
+    // --- Tabs order & visibility delta ---
+
+    [Fact]
+    public void GrokBuildIsRegistered()
+    {
+        var style = ClientRegistry.Style("grok");
+        Assert.Equal("Grok Build", style.DisplayName);
+        Assert.Equal("#1f2937", style.Color);
+    }
+
+    [Fact]
+    public void AllIdsAreSortedAndIncludeGrok()
+    {
+        var ids = ClientRegistry.AllIds;
+        Assert.Contains("grok", ids);
+        Assert.Equal(ids.OrderBy(x => x, StringComparer.Ordinal), ids);
+    }
+
+    [Theory]
+    [InlineData("claude-code", "claude")]
+    [InlineData("codex-cli", "codex")]
+    [InlineData("gemini-cli", "gemini")]
+    [InlineData("antigravity-cli", "antigravity-cli")] // NOT folded — distinct client
+    [InlineData("amp", "amp")]
+    public void CanonicalClientAliasesExplicitOnly(string id, string expected) =>
+        Assert.Equal(expected, ClientRegistry.CanonicalClient(id));
+
+    [Fact]
+    public void ParseIdSetAndListTolerateEmptyAndBlanks()
+    {
+        Assert.Empty(ClientRegistry.ParseIdSet(""));
+        Assert.Empty(ClientRegistry.ParseIdList(""));
+        Assert.Equal(new HashSet<string> { "a", "b" }, ClientRegistry.ParseIdSet("a,,b"));
+        Assert.Equal(["a", "b", "c"], ClientRegistry.ParseIdList("a,b,c"));
+    }
+
+    [Fact]
+    public void QuotaExcludedIsUnionOfHiddenAndLimitsHidden()
+    {
+        var store = NewStore();
+        store.SetString(ClientRegistry.TabHiddenKey, "claude,codex");
+        store.SetString(ClientRegistry.LimitsHiddenKey, "codex,gemini");
+
+        Assert.Equal(
+            new HashSet<string> { "claude", "codex", "gemini" },
+            ClientRegistry.QuotaExcludedClients(store));
+    }
+
+    [Fact]
+    public void KnownLimitsClientsDedupesKeepingPresentThenQuotaOrder()
+    {
+        // present carries claude+codex; only codex has a known limit (quota),
+        // claude is offered via placeholder; antigravity is quota-only.
+        var known = ClientRegistry.KnownLimitsClients(
+            present: ["claude", "codex", "mux"],
+            quotaIds: ["codex", "antigravity"],
+            placeholders: new HashSet<string> { "claude" });
+
+        // mux has neither placeholder nor quota → dropped. codex appears once.
+        Assert.Equal(["claude", "codex", "antigravity"], known);
+    }
+
+    [Fact]
+    public void OrderedClientsSortsBySavedOrderAppendingUnknownStably()
+    {
+        var ordered = ClientRegistry.OrderedClients(
+            ["gemini", "claude", "codex", "amp"], orderRaw: "codex,claude");
+        // codex, claude by saved order; gemini, amp keep their incoming order.
+        Assert.Equal(["codex", "claude", "gemini", "amp"], ordered);
+    }
+
+    [Fact]
+    public void OrderedClientsWithEmptyOrderIsIdentity() =>
+        Assert.Equal(["b", "a"], ClientRegistry.OrderedClients(["b", "a"], orderRaw: ""));
+
+    [Fact]
+    public void DisplayClientsFiltersHiddenThenOrders()
+    {
+        var display = ClientRegistry.DisplayClients(
+            present: ["gemini", "claude", "codex"], hiddenRaw: "gemini", orderRaw: "codex,claude");
+        Assert.Equal(["codex", "claude"], display);
+    }
+
+    [Fact]
+    public void DisplayClientsStoreOverloadReadsBothKeys()
+    {
+        var store = NewStore();
+        store.SetString(ClientRegistry.TabHiddenKey, "gemini");
+        store.SetString(ClientRegistry.TabOrderKey, "codex,claude");
+
+        Assert.Equal(
+            ["codex", "claude"],
+            ClientRegistry.DisplayClients(["gemini", "claude", "codex"], store));
+    }
+
+    [Theory]
+    [InlineData("a", "c", "b,c,a,d")] // drag down: insert after target
+    [InlineData("d", "b", "a,d,b,c")] // drag up: insert before target
+    [InlineData("a", "a", "a,b,c,d")] // same id: unchanged
+    public void ReorderIsDirectionAware(string from, string to, string expected)
+    {
+        var result = ClientRegistry.Reorder(["a", "b", "c", "d"], from, to);
+        Assert.Equal(expected.Split(','), result);
+    }
+
+    [Fact]
+    public void MergeReorderPreservesOffscreenPositions()
+    {
+        // full universe a..e; visible subset only a,c,e (b,d hidden off-screen).
+        // Drag a after e within the visible subset → a,c,e becomes c,e,a.
+        var merged = ClientRegistry.MergeReorder(
+            full: ["a", "b", "c", "d", "e"], visible: ["a", "c", "e"], from: "a", to: "e");
+        // b stays at slot 1, d stays at slot 3; visible slots refill c,e,a.
+        Assert.Equal(["c", "b", "e", "d", "a"], merged);
+    }
+
+    [Fact]
+    public void MigrateLegacyOrderKeyFoldsOnceThenIsIdempotent()
+    {
+        var store = NewStore();
+        store.SetString("tokenbar.limits.order", "codex,claude");
+
+        ClientRegistry.MigrateLegacyOrderKey(store);
+        Assert.Equal("codex,claude", store.GetString(ClientRegistry.TabOrderKey));
+
+        // Idempotent: a second run must not overwrite a user-changed new value.
+        store.SetString(ClientRegistry.TabOrderKey, "claude");
+        ClientRegistry.MigrateLegacyOrderKey(store);
+        Assert.Equal("claude", store.GetString(ClientRegistry.TabOrderKey));
+    }
 }

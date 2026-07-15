@@ -22,7 +22,7 @@ public class FormatTests
 
     [Theory]
     [InlineData(0.0, "$0.00")]
-    [InlineData(5.205, "$5.20")] // binary 5.205 ≈ 5.20499…, printf semantics
+    [InlineData(5.205, "$5.21")] // binary 5.205 ≈ 5.2050…0071 (above the half), printf rounds up — Swift-verified via the fixture cross-check
     [InlineData(-1.5, "$-1.50")] // sign inside, matching Swift's "$%.2f"
     [InlineData(4845.174, "$4845.17")]
     public void UsdMatchesSwift(double amount, string expected) =>
