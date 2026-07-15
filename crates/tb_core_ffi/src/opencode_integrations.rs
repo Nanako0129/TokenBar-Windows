@@ -59,13 +59,8 @@ fn subscription_label(provider: &str) -> String {
 }
 
 fn auth_path() -> Option<PathBuf> {
-    // Fixed <home>/.local/share, matching two things at once: opencode core
-    // hardcodes this layout on every platform (including Windows), and the
-    // engine scanner — which this crate invokes with use_env_roots=false —
-    // resolves the opencode root the same way (PathRoot::XdgData ignores
-    // XDG_DATA_HOME in that mode), so usage data and this auth probe always
-    // point at the same opencode installation.
-    crate::home_dir().map(|home| home.join(".local/share/opencode/auth.json"))
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".local/share/opencode/auth.json"))
 }
 
 /// The durable GitHub OAuth token opencode stored for its github-copilot login

@@ -8,10 +8,10 @@ which is the **single sync source** for the shared Rust core. Upstream
 | Field | Value |
 |---|---|
 | Source repo | `Nanako0129/TokenBar` (macOS) |
-| Copied at commit | `04ba9c1f416aa9879ab9a6ee506cd5bb5e790660` |
-| Copied on | 2026-07-02 |
-| Upstream milestone state | M5a + M5b merged (see macOS repo's sync plan); M6/M7 pending |
-| Cache schema version | 21 (`vendor/tokscale-core/src/message_cache.rs`) |
+| Copied at commit | `2ed256ee` (branch `fix-vendor-rustls-tls` = v1.4.0 main `fe19eebc` + our two backports below; update this SHA if that branch lands squashed) |
+| Copied on | 2026-07-15 |
+| Upstream milestone state | M6 + M7 + M9 backports merged; adds Grok Build + Hermes clients, cost-provenance contract, client-selection filter for hourly/agents (ctb.h signature change) |
+| Cache schema version | 29 (`vendor/tokscale-core/src/message_cache.rs`) |
 
 ## Local patches (Windows repo only)
 
@@ -21,7 +21,19 @@ repo first, so future syncs are a plain rsync with zero reapply.
 
 | Patch | Files | Upstreamed to macOS repo? |
 |---|---|---|
-| reqwest TLS: `native-tls-vendored` → `rustls-tls-native-roots` (drops vendored OpenSSL — Perl+NASM toolchain dependency and the slowest unit of a clean build; CI runners ship those tools, local Windows boxes often don't. Native roots keep installed OS trust-store CAs incl. corporate MITM roots; note rustls does no SChannel-style AIA chasing / AuthRoot auto-fetch, so servers with incomplete chains fail where SChannel would recover) | `vendor/tokscale-core/Cargo.toml`, `Cargo.lock` | ❌ pending — PR to TokenBar-Native planned (Phase 1 item 5) |
+| *(none — table intentionally empty)* | | |
+
+Both former divergences were upstreamed to the macOS repo on 2026-07-15
+(branch `fix-vendor-rustls-tls`, the sync source above), so `crates/` +
+`vendor/` are now byte-identical copies:
+
+- reqwest TLS: now 0.13 `rustls` (rustls-platform-verifier — native trust
+  semantics on both OSes: Security.framework / SChannel, keeps scoped trust
+  + AIA chasing; upgraded from our original `rustls-tls-native-roots` after
+  a Codex review finding) — macOS commit `220cf8ab`.
+- `crate-type = ["cdylib", "staticlib"]` for tb_core_ffi (P/Invoke needs the
+  cdylib; was an unrecorded local divergence since Phase 0) — macOS commit
+  `2ed256ee`.
 
 Note: the macOS repo's own local-patch table vs junhoyeo/tokscale lives in
 `vendor/README.md` (copied along) — that provenance chain still applies.

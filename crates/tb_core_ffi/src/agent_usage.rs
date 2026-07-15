@@ -1,12 +1,13 @@
 use crate::agent_antigravity;
 use crate::agent_copilot;
+use crate::agent_grok;
 use crate::agent_history;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -16,6 +17,17 @@ const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+// Minimal-request endpoint whose response headers carry the unified rate-limit
+// windows. Used as a fallback for inference-only `claude setup-token` tokens,
+// which get HTTP 403 on the oauth/usage endpoint (it requires user:profile).
+const CLAUDE_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+// Cheapest model for the header probe. Alias (not a dated snapshot) so it
+// outlives model retirements.
+const CLAUDE_PROBE_MODEL: &str = "claude-haiku-4-5";
+// Keychain generic-password service holding a RAW setup-token (`sk-ant-oat01-…`),
+// the launch-method-independent way to hand TokenBar a token for the limits card:
+//   security add-generic-password -a "$USER" -s tokenbar-claude-oauth-token -w "<token>"
+const CLAUDE_RAW_TOKEN_KEYCHAIN_SERVICE: &str = "tokenbar-claude-oauth-token";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,14 +99,33 @@ impl UsageWindow {
         resets_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Self {
-        let remaining = (remaining_fraction * 100.0).clamp(0.0, 100.0);
+        Self::from_used_percent(
+            label,
+            (1.0 - remaining_fraction) * 100.0,
+            resets_at,
+            now,
+            None,
+        )
+    }
+
+    /// Build a window from an absolute used-percent (0..100), with optional
+    /// window length for pace. Clamps used into range and derives remaining.
+    pub(crate) fn from_used_percent(
+        label: String,
+        used_percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        window_minutes: Option<i64>,
+    ) -> Self {
+        let used = used_percent.clamp(0.0, 100.0);
+        let remaining = (100.0 - used).clamp(0.0, 100.0);
         UsageWindow {
             label,
-            used_percent: (100.0 - remaining).max(0.0),
+            used_percent: used,
             remaining_percent: remaining,
             resets_at: resets_at.map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true)),
             reset_text: resets_at.map(|d| reset_text(d, now)),
-            window_minutes: None,
+            window_minutes,
             historical_expected_percent: None,
             run_out_probability: None,
         }
@@ -130,6 +161,20 @@ struct ClaudeCredentials {
     scopes: Vec<String>,
     rate_limit_tier: Option<String>,
     subscription_type: Option<String>,
+    /// Where the credentials were read from, so a rotated token can be written
+    /// back to the same place (the Claude CLI shares this store).
+    source: ClaudeCredentialSource,
+    /// Full credentials JSON as loaded, so a write-back preserves fields we
+    /// don't model (merge-update rather than overwrite).
+    raw_root: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeCredentialSource {
+    Keychain,
+    File,
+    /// Token injected via env var — read-only, has no refresh token.
+    Environment,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,21 +315,50 @@ struct ClaudeRefreshResponse {
 
 pub async fn run() -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let (codex, claude, antigravity, copilot) = tokio::join!(
+    let (codex, claude, antigravity, copilot, grok) = tokio::join!(
         fetch_codex(),
         fetch_claude(),
         fetch_antigravity(),
-        fetch_copilot()
+        fetch_copilot(),
+        fetch_grok()
     );
     let mut agents = vec![codex, claude, antigravity];
     // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
     if let Some(copilot) = copilot {
         agents.push(copilot);
     }
+    // Grok only appears when ~/.grok/auth.json has credentials.
+    if let Some(grok) = grok {
+        agents.push(grok);
+    }
     AgentUsagePayload {
         generated_at,
         agents,
         opencode_subscriptions: crate::opencode_integrations::detect_subscriptions(),
+    }
+}
+
+async fn fetch_grok() -> Option<AgentUsageSnapshot> {
+    let now = Utc::now();
+    match agent_grok::fetch(now).await? {
+        Ok(data) => Some(AgentUsageSnapshot {
+            client_id: "grok".to_string(),
+            source: "oauth".to_string(),
+            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            identity: data.identity,
+            windows: data.windows,
+            credits: None,
+            error: None,
+        }),
+        Err(error) => Some(AgentUsageSnapshot {
+            client_id: "grok".to_string(),
+            source: "oauth".to_string(),
+            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            identity: None,
+            windows: Vec::new(),
+            credits: None,
+            error: Some(error),
+        }),
     }
 }
 
@@ -455,9 +529,16 @@ async fn fetch_claude() -> AgentUsageSnapshot {
             if let Some(blocked_until) = claude_gate_blocked_until(now) {
                 return claude_gate_fallback(blocked_until, now);
             }
+            // "unconfigured" == no credential at all, so the UI shows a setup
+            // prompt; every other error is a real failure of a present credential.
+            let source = if error.as_str() == CLAUDE_UNCONFIGURED_ERROR {
+                "unconfigured"
+            } else {
+                "oauth"
+            };
             AgentUsageSnapshot {
                 client_id: "claude".to_string(),
-                source: "oauth".to_string(),
+                source: source.to_string(),
                 updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 identity: None,
                 windows: Vec::new(),
@@ -556,7 +637,45 @@ async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
 }
 
 async fn fetch_claude_inner() -> Result<AgentUsageSnapshot, String> {
-    let mut credentials = load_claude_credentials()?;
+    // Mirror Claude Code's auth precedence: CLAUDE_CODE_OAUTH_TOKEN (our env, or
+    // harvested from the user's ~/.zshrc) outranks a stored subscription /login,
+    // because Claude Code itself consumes that token first. So TokenBar reports
+    // the account Claude Code is actually spending against, read from the
+    // ratelimit headers. (This is why the harvest runs even for /login users.)
+    if let Some(token) = resolve_claude_code_oauth_token().await {
+        return claude_header_snapshot(&claude_credentials_from_access_token(token), Utc::now())
+            .await;
+    }
+
+    // A stored full login (TokenBar env override / Keychain / file) uses the
+    // richer oauth/usage endpoint. Any failure -- a login that can't refresh, or
+    // a credentials file that exists but can't be read (permissions / I/O) -- is
+    // deferred: we still try the tokenbar Keychain setup-token below, and surface
+    // the error only if that misses too. So a stale login / read error never
+    // strands a working setup-token, yet a genuine failure isn't masked by the
+    // generic "unconfigured" setup prompt.
+    let deferred_error: Option<String> = match load_claude_login_credentials() {
+        Ok(Some(credentials)) => match fetch_claude_oauth_usage(credentials).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(login_error) => Some(login_error),
+        },
+        Ok(None) => None,
+        Err(read_error) => Some(read_error),
+    };
+
+    // Last resort: the tokenbar-claude-oauth-token Keychain item reads limits
+    // straight from the ratelimit headers (no oauth/usage GET, no 429 gate).
+    if let Some(token) = resolve_claude_keychain_token() {
+        return claude_header_snapshot(&claude_credentials_from_access_token(token), Utc::now())
+            .await;
+    }
+
+    Err(deferred_error.unwrap_or_else(|| CLAUDE_UNCONFIGURED_ERROR.to_string()))
+}
+
+async fn fetch_claude_oauth_usage(
+    mut credentials: ClaudeCredentials,
+) -> Result<AgentUsageSnapshot, String> {
     if claude_credentials_expired(&credentials) {
         credentials = refresh_claude_credentials(&credentials).await?;
     }
@@ -567,10 +686,9 @@ async fn fetch_claude_inner() -> Result<AgentUsageSnapshot, String> {
             .iter()
             .any(|scope| scope == "user:profile")
     {
-        return Err(
-            "Claude OAuth token lacks the user:profile scope. Run `claude logout && claude login`."
-                .to_string(),
-        );
+        // Inference-only token declared explicit non-user:profile scopes — skip
+        // the (guaranteed-403) oauth/usage GET and read limits from headers.
+        return claude_header_snapshot(&credentials, Utc::now()).await;
     }
 
     let client = reqwest::Client::builder()
@@ -605,6 +723,14 @@ async fn fetch_claude_inner() -> Result<AgentUsageSnapshot, String> {
         );
     }
     if status == reqwest::StatusCode::FORBIDDEN {
+        // oauth/usage requires user:profile. An inference-only token (e.g.
+        // `claude setup-token`) is denied *specifically* for that scope — fall
+        // back to the unified rate-limit headers, which it *is* allowed to read.
+        // Any other 403 keeps the actionable re-auth error (and skips the probe,
+        // so we don't spend an inference call on an unrelated denial).
+        if body.contains("user:profile") {
+            return claude_header_snapshot(&credentials, Utc::now()).await;
+        }
         return Err(
             "Claude OAuth usage was denied. Run `claude logout && claude login` to grant user:profile."
                 .to_string(),
@@ -642,6 +768,127 @@ async fn fetch_claude_inner() -> Result<AgentUsageSnapshot, String> {
         }),
         windows,
         credits: claude_credits(usage.extra_usage.as_ref()),
+        error: None,
+    })
+}
+
+/// Fallback for inference-only tokens (`claude setup-token`): the oauth/usage
+/// endpoint requires `user:profile`, but a minimal `/v1/messages` request the
+/// token *can* make returns `anthropic-ratelimit-unified-*` headers carrying the
+/// same Session/Weekly windows. Reads headers on 200 AND 429 (an over-limit
+/// token still returns them). Does NOT arm the oauth/usage rate-limit gate.
+/// Cache for the header-probe windows. The probe is a real `/v1/messages`
+/// inference (it spends the very budget it measures), so reuse the result across
+/// the frequent quota polls (60s popover / 300s tray) instead of probing on
+/// every refresh. Keyed on the token so a changed token re-probes.
+/// `(fetched_at, token, windows)` — the token keys the entry so a changed token
+/// re-probes rather than serving another account's cached windows.
+type ClaudeHeaderCacheEntry = (DateTime<Utc>, String, Vec<UsageWindow>);
+static CLAUDE_HEADER_CACHE: Mutex<Option<ClaudeHeaderCacheEntry>> = Mutex::new(None);
+const CLAUDE_HEADER_TTL_SECS: i64 = 300;
+
+/// Refresh the relative `reset_text` on cached header windows so a 300s-cached
+/// probe doesn't show a frozen countdown. Returns None if any window's reset has
+/// already passed — the cache is then stale, so the caller re-probes for fresh
+/// utilization instead of serving post-reset numbers.
+fn refresh_cached_windows(windows: &[UsageWindow], now: DateTime<Utc>) -> Option<Vec<UsageWindow>> {
+    let mut refreshed = Vec::with_capacity(windows.len());
+    for window in windows {
+        let mut window = window.clone();
+        if let Some(reset) = window.resets_at.as_deref().and_then(parse_datetime) {
+            if now >= reset {
+                return None;
+            }
+            window.reset_text = Some(reset_text(reset, now));
+        }
+        refreshed.push(window);
+    }
+    Some(refreshed)
+}
+
+async fn fetch_claude_via_headers(access_token: &str) -> Result<Vec<UsageWindow>, String> {
+    {
+        let now = Utc::now();
+        let guard = CLAUDE_HEADER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((fetched_at, token, windows)) = guard.as_ref() {
+            if token == access_token && (now - *fetched_at).num_seconds() < CLAUDE_HEADER_TTL_SECS {
+                if let Some(refreshed) = refresh_cached_windows(windows, now) {
+                    return Ok(refreshed);
+                }
+            }
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("build Claude header-probe client: {}", e))?;
+
+    let response = client
+        .post(CLAUDE_MESSAGES_URL)
+        .bearer_auth(access_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::USER_AGENT, claude_user_agent())
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .json(&serde_json::json!({
+            "model": CLAUDE_PROBE_MODEL,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Claude header probe failed: {}", e))?;
+
+    let status = response.status();
+    // Read headers before consuming the body — this returns an owned Vec, ending
+    // the borrow of `response`.
+    let windows = parse_unified_ratelimit_windows(response.headers(), Utc::now());
+
+    if status.is_success() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if windows.is_empty() {
+            return Err("Claude header probe returned no unified rate-limit headers.".to_string());
+        }
+        {
+            let mut guard = CLAUDE_HEADER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some((Utc::now(), access_token.to_string(), windows.clone()));
+        }
+        return Ok(windows);
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    Err(format!(
+        "Claude header probe returned {} ({}).",
+        status.as_u16(),
+        body.chars().take(200).collect::<String>()
+    ))
+}
+
+/// Build a Claude snapshot from the unified rate-limit headers. Shared by the
+/// scope-guard and HTTP-403 branches of `fetch_claude_inner`. `source` is
+/// `"setup-token"` — it doubles as the limits-card badge, so it names the auth
+/// method the user recognizes rather than the fetch mechanism, and still lets
+/// telemetry tell it apart from the richer oauth/usage path.
+async fn claude_header_snapshot(
+    credentials: &ClaudeCredentials,
+    now: DateTime<Utc>,
+) -> Result<AgentUsageSnapshot, String> {
+    let windows = fetch_claude_via_headers(&credentials.access_token).await?;
+    Ok(AgentUsageSnapshot {
+        client_id: "claude".to_string(),
+        source: "setup-token".to_string(),
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: Some(AgentIdentity {
+            email: None,
+            plan: first_non_empty([
+                credentials.subscription_type.as_deref(),
+                credentials.rate_limit_tier.as_deref(),
+            ])
+            .map(clean_plan),
+        }),
+        windows,
+        credits: None,
         error: None,
     })
 }
@@ -688,29 +935,67 @@ fn load_codex_credentials() -> Result<CodexCredentials, String> {
     })
 }
 
-fn load_claude_credentials() -> Result<ClaudeCredentials, String> {
+/// Marker error for "no Claude credential is configured at all" (as opposed to a
+/// credential that exists but failed). `fetch_claude` turns this into a snapshot
+/// with `source == "unconfigured"`, so the UI shows a setup prompt rather than a
+/// red error.
+const CLAUDE_UNCONFIGURED_ERROR: &str = "Claude OAuth credentials not found. Run `claude` to authenticate, or set CLAUDE_CODE_OAUTH_TOKEN / add a `tokenbar-claude-oauth-token` Keychain item to use a setup-token.";
+
+/// Full-login credentials: structured `claudeAiOauth` blobs (Keychain
+/// `Claude Code-credentials`, then `~/.claude/.credentials.json`) plus the
+/// TokenBar env override. These carry refresh tokens / scopes / expiry and go
+/// through the richer oauth/usage endpoint. A present-but-logged-out entry (has
+/// `claudeAiOauth` but no `accessToken` — the #26 daily-logout state) or an
+/// unparseable blob is skipped, not treated as a hard error, so a configured
+/// setup-token can still take over.
+fn load_claude_login_credentials() -> Result<Option<ClaudeCredentials>, String> {
     if let Some(credentials) = load_claude_credentials_from_environment()? {
-        return Ok(credentials);
+        return Ok(Some(credentials));
     }
-
     if let Some(raw) = load_claude_credentials_from_keychain()? {
-        return parse_claude_credentials_data(&raw);
-    }
-
-    let credentials_path = claude_credentials_path();
-    match fs::read_to_string(&credentials_path) {
-        Ok(raw) => return parse_claude_credentials_data(&raw),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "read Claude credentials file {}: {}",
-                credentials_path.display(),
-                error
-            ));
+        if let Ok(credentials) = parse_claude_credentials_data(&raw, ClaudeCredentialSource::Keychain)
+        {
+            return Ok(Some(credentials));
         }
     }
+    match fs::read_to_string(claude_credentials_path()) {
+        Ok(raw) => {
+            if let Ok(credentials) = parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)
+            {
+                return Ok(Some(credentials));
+            }
+            // Parsed but unusable (logged-out / no accessToken): fall through.
+            Ok(None)
+        }
+        // Absent is normal (no file login). A genuine read failure (permissions /
+        // I/O) is a real problem — return it so the caller can surface the
+        // actionable error after setup-token fallbacks miss, rather than the
+        // generic "unconfigured" setup prompt.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "read Claude credentials file {}: {}",
+            claude_credentials_path().display(),
+            error
+        )),
+    }
+}
 
-    Err("Claude OAuth credentials not found. Run `claude` to authenticate.".to_string())
+/// `CLAUDE_CODE_OAUTH_TOKEN` as Claude Code itself resolves it: this process's
+/// own environment (covers `launchctl setenv` / terminal launch), then a
+/// login-shell harvest of the user's `~/.zshrc` (so a plain export a
+/// Finder-launched GUI app never inherits is still found). Per Claude Code's
+/// auth precedence this outranks a stored subscription `/login`.
+async fn resolve_claude_code_oauth_token() -> Option<String> {
+    if let Some(token) = claude_direct_env_token() {
+        return Some(token);
+    }
+    harvest_shell_env_token().await
+}
+
+/// The `tokenbar-claude-oauth-token` Keychain item (a TokenBar-specific setup
+/// token). A last-resort fallback, below the stored `/login`.
+fn resolve_claude_keychain_token() -> Option<String> {
+    load_claude_raw_token_from_keychain().ok().flatten()
 }
 
 fn load_claude_credentials_from_environment() -> Result<Option<ClaudeCredentials>, String> {
@@ -739,10 +1024,17 @@ fn load_claude_credentials_from_environment() -> Result<Option<ClaudeCredentials
         scopes,
         rate_limit_tier: None,
         subscription_type: None,
+        source: ClaudeCredentialSource::Environment,
+        raw_root: None,
     }))
 }
 
-fn parse_claude_credentials_data(raw: &str) -> Result<ClaudeCredentials, String> {
+fn parse_claude_credentials_data(
+    raw: &str,
+    source: ClaudeCredentialSource,
+) -> Result<ClaudeCredentials, String> {
+    let raw_root: Value =
+        serde_json::from_str(raw).map_err(|e| format!("decode Claude OAuth credentials: {}", e))?;
     let root: ClaudeCredentialsRoot =
         serde_json::from_str(raw).map_err(|e| format!("decode Claude OAuth credentials: {}", e))?;
     let oauth = root
@@ -766,6 +1058,8 @@ fn parse_claude_credentials_data(raw: &str) -> Result<ClaudeCredentials, String>
         scopes: oauth.scopes.unwrap_or_default(),
         rate_limit_tier: oauth.rate_limit_tier,
         subscription_type: oauth.subscription_type,
+        source,
+        raw_root: Some(raw_root),
     })
 }
 
@@ -789,6 +1083,196 @@ fn load_claude_credentials_from_keychain() -> Result<Option<String>, String> {
 
 #[cfg(not(target_os = "macos"))]
 fn load_claude_credentials_from_keychain() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// Build credentials from a bare access token (no refresh/expiry/scope metadata).
+/// Used by the setup-token delivery paths (env var, shell harvest, raw keychain);
+/// empty scopes make `fetch_claude_inner` skip the scope guard and reach the
+/// header fallback on the resulting oauth/usage 403.
+fn claude_credentials_from_access_token(access_token: String) -> ClaudeCredentials {
+    ClaudeCredentials {
+        access_token,
+        refresh_token: None,
+        expires_at: None,
+        scopes: Vec::new(),
+        rate_limit_tier: None,
+        subscription_type: None,
+        // A bare setup-token has no refresh token and no backing store to write
+        // to, so treat it as read-only — save_claude_credentials skips it.
+        source: ClaudeCredentialSource::Environment,
+        raw_root: None,
+    }
+}
+
+/// C — `CLAUDE_CODE_OAUTH_TOKEN` from this process's own environment (covers
+/// `launchctl setenv` and terminal-launched runs).
+fn claude_direct_env_token() -> Option<String> {
+    claude_token_from_lookup(|key| std::env::var(key).ok())
+}
+
+fn claude_token_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    lookup("CLAUDE_CODE_OAUTH_TOKEN")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Cache for the shell-harvested token — harvesting spawns a full interactive
+/// login shell, so we do it at most once per TTL rather than per poll.
+static CLAUDE_HARVEST_CACHE: Mutex<Option<(DateTime<Utc>, Option<String>)>> = Mutex::new(None);
+// A found token rarely changes → cache it for an hour. Because the harvest now
+// runs for every user (to mirror Claude Code's CLAUDE_CODE_OAUTH_TOKEN-before-
+// /login precedence), a miss is also cached for a while so we don't re-spawn a
+// login shell on every poll; a freshly-added `~/.zshrc` export is picked up
+// within this window, or immediately on app restart (which clears the cache).
+const CLAUDE_HARVEST_TTL_SECS: i64 = 3600;
+const CLAUDE_HARVEST_NEGATIVE_TTL_SECS: i64 = 1800;
+
+/// D — harvest `CLAUDE_CODE_OAUTH_TOKEN` from the user's login shell, so a plain
+/// `~/.zshrc` export is picked up even though a Finder/login-item GUI app does
+/// not inherit shell environments. Cached; returns None on timeout/miss so the
+/// keychain fallback can still fire.
+async fn harvest_shell_env_token() -> Option<String> {
+    // Scope the guard so it is dropped before the `.await` below (never hold a
+    // std Mutex across an await). Recover a poisoned lock (like `lock_gate`) so a
+    // stray panic can't permanently disable the cache and reintroduce a per-poll
+    // shell spawn.
+    {
+        let guard = CLAUDE_HARVEST_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((fetched_at, token)) = guard.as_ref() {
+            let ttl = if token.is_some() {
+                CLAUDE_HARVEST_TTL_SECS
+            } else {
+                CLAUDE_HARVEST_NEGATIVE_TTL_SECS
+            };
+            if (Utc::now() - *fetched_at).num_seconds() < ttl {
+                return token.clone();
+            }
+        }
+    }
+    let token = harvest_shell_env_token_uncached().await;
+    {
+        let mut guard = CLAUDE_HARVEST_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some((Utc::now(), token.clone()));
+    }
+    token
+}
+
+#[cfg(target_os = "macos")]
+async fn harvest_shell_env_token_uncached() -> Option<String> {
+    // Interactive (-i) so ~/.zshrc is sourced (login -l alone runs ~/.zprofile
+    // only). Null-delimited markers isolate the value from any rc stdout chatter;
+    // rc noise (p10k/gitstatus warnings) goes to stderr, which we discard.
+    let shell = detect_login_shell();
+    let script = "printf '\\0__TB_OAT_S__\\0%s\\0__TB_OAT_E__\\0' \"$CLAUDE_CODE_OAUTH_TOKEN\"";
+    let future = tokio::process::Command::new(&shell)
+        .args(["-l", "-i", "-c", script])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // On the 5s timeout the future is dropped; kill the child so a hanging rc
+        // (e.g. a blocking prompt) doesn't leave an orphaned login shell running.
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), future)
+        .await
+        .ok()?
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let start_marker = "\0__TB_OAT_S__\0";
+    let end_marker = "\0__TB_OAT_E__\0";
+    let start = stdout.find(start_marker)? + start_marker.len();
+    let rest = &stdout[start..];
+    let end = rest.find(end_marker)?;
+    let token = rest[..end].trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn harvest_shell_env_token_uncached() -> Option<String> {
+    None
+}
+
+/// Resolve the user's login shell for the harvest. `$SHELL` is usually unset for
+/// a launchd-spawned GUI app, so fall back to Directory Services.
+#[cfg(target_os = "macos")]
+fn detect_login_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL") {
+        let shell = shell.trim();
+        if !shell.is_empty() {
+            return shell.to_string();
+        }
+    }
+    if let Some(user) = current_username() {
+        if let Ok(output) = std::process::Command::new("/usr/bin/dscl")
+            .args([".", "-read", &format!("/Users/{}", user), "UserShell"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    // "UserShell: /bin/zsh"
+                    if let Some(path) = text.split_whitespace().nth(1) {
+                        if !path.is_empty() {
+                            return path.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    "/bin/zsh".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn current_username() -> Option<String> {
+    if let Ok(user) = std::env::var("USER") {
+        let user = user.trim();
+        if !user.is_empty() {
+            return Some(user.to_string());
+        }
+    }
+    let output = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let user = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!user.is_empty()).then_some(user)
+}
+
+/// B — a RAW setup-token stored in the `tokenbar-claude-oauth-token` Keychain
+/// service. Works regardless of launch method (unlike the env var), which is why
+/// it's the reliable fallback for a Finder/login-item GUI app.
+#[cfg(target_os = "macos")]
+fn load_claude_raw_token_from_keychain() -> Result<Option<String>, String> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            CLAUDE_RAW_TOKEN_KEYCHAIN_SERVICE,
+            "-w",
+        ])
+        .output()
+        .map_err(|e| format!("read TokenBar Claude token from Keychain: {}", e))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let raw = String::from_utf8(output.stdout)
+        .map_err(|_| "TokenBar Claude Keychain token is not UTF-8.".to_string())?;
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(raw))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_claude_raw_token_from_keychain() -> Result<Option<String>, String> {
     Ok(None)
 }
 
@@ -887,7 +1371,7 @@ async fn refresh_claude_credentials(
     }
     let token_response: ClaudeRefreshResponse = serde_json::from_str(&body)
         .map_err(|e| format!("decode Claude refresh response: {}", e))?;
-    Ok(ClaudeCredentials {
+    let refreshed = ClaudeCredentials {
         access_token: token_response.access_token,
         refresh_token: token_response
             .refresh_token
@@ -896,7 +1380,202 @@ async fn refresh_claude_credentials(
         scopes: credentials.scopes.clone(),
         rate_limit_tier: credentials.rate_limit_tier.clone(),
         subscription_type: credentials.subscription_type.clone(),
-    })
+        source: credentials.source,
+        raw_root: credentials.raw_root.clone(),
+    };
+    // Anthropic rotates refresh tokens: the token we just spent is now dead.
+    // Persist the new pair back to the shared store, or the next refresh — by
+    // TokenBar *or* the Claude CLI — fails with a stale token, forcing a manual
+    // `claude logout && claude login`. Best-effort: a write failure shouldn't
+    // sink this usage fetch, but it's worth surfacing in logs.
+    if let Err(error) = save_claude_credentials(&refreshed) {
+        eprintln!("tb_core_ffi: failed to persist refreshed Claude credentials: {error}");
+    }
+    Ok(refreshed)
+}
+
+/// Merge the rotated access/refresh tokens back into the credentials store they
+/// came from, preserving every other field the Claude CLI wrote.
+fn save_claude_credentials(credentials: &ClaudeCredentials) -> Result<(), String> {
+    if credentials.source == ClaudeCredentialSource::Environment {
+        return Ok(());
+    }
+
+    let data = merge_claude_credentials_json(credentials)?;
+    match credentials.source {
+        ClaudeCredentialSource::Keychain => save_claude_credentials_to_keychain(&data),
+        ClaudeCredentialSource::File => atomic_write(&claude_credentials_path(), &data),
+        ClaudeCredentialSource::Environment => Ok(()),
+    }
+}
+
+/// Replace `path` atomically: write a sibling temp file, then rename over the
+/// target. A crash or partial write leaves the original credentials intact
+/// rather than a truncated file that would break both TokenBar and the Claude
+/// CLI (the rename is atomic within one filesystem).
+fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("credentials path {} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("credentials");
+    // Per-write-unique temp name (pid + a monotonic seq). The O_EXCL open below
+    // must never collide with an orphan a crashed earlier write left at a fixed
+    // path, or every later write-back in this long-lived process would fail with
+    // AlreadyExists and silently stop persisting rotated tokens.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".{}.tmp.{}.{}", file_name, std::process::id(), seq));
+
+    // Stage into the temp, fsync it, then rename over the target. Create with
+    // O_EXCL + 0600 up front: the mode-at-creation closes the umask-default
+    // window a write-then-chmod leaves the secret readable in, and O_EXCL
+    // refuses to follow a symlink pre-seeded at the temp path.
+    let staged = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+        file.write_all(data.as_bytes())
+            .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+        // Flush data to disk before the rename so a power loss can't leave the
+        // renamed file pointing at never-written blocks — the crash-safety this
+        // function's doc-comment promises.
+        file.sync_all()
+            .map_err(|e| format!("sync {}: {}", tmp.display(), e))
+    })();
+    // Any failure after the temp exists removes it, so a transient write error
+    // can't strand an orphan that wedges the next write.
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("replace {}: {}", path.display(), error));
+    }
+    // Persist the rename itself so it survives a power loss right afterward.
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Merge the rotated tokens into the loaded credentials JSON, preserving any
+/// other fields, and return it serialized. Pure so it's unit-testable.
+fn merge_claude_credentials_json(credentials: &ClaudeCredentials) -> Result<String, String> {
+    let mut root = credentials
+        .raw_root
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({ "claudeAiOauth": {} }));
+    let oauth = root
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Claude credentials JSON has no claudeAiOauth object.".to_string())?;
+    oauth.insert(
+        "accessToken".to_string(),
+        Value::String(credentials.access_token.clone()),
+    );
+    if let Some(refresh) = &credentials.refresh_token {
+        oauth.insert("refreshToken".to_string(), Value::String(refresh.clone()));
+    }
+    if let Some(expires_at) = credentials.expires_at {
+        oauth.insert(
+            "expiresAt".to_string(),
+            Value::Number(expires_at.timestamp_millis().into()),
+        );
+    }
+    serde_json::to_string(&root).map_err(|e| format!("encode Claude credentials: {}", e))
+}
+
+#[cfg(target_os = "macos")]
+fn save_claude_credentials_to_keychain(data: &str) -> Result<(), String> {
+    // Fail closed: only update the item once we can confirm the exact account
+    // the Claude CLI stored it under. `add-generic-password -U` matches on
+    // (service, account), so updating with the wrong or an empty account would
+    // create a SECOND "Claude Code-credentials" item and confuse the store the
+    // CLI shares — worse than not persisting. If the account can't be read,
+    // skip the write-back (the caller logs it); the next refresh retries.
+    let account = claude_keychain_account().ok_or_else(|| {
+        "could not resolve the Claude Keychain account; skipping write-back to avoid a duplicate item"
+            .to_string()
+    })?;
+    // NOTE: `-w <data>` puts the credential JSON on the argv, briefly visible via
+    // `ps` to same-user processes. security(1) has no stdin form for
+    // add-generic-password (only an interactive `-w` prompt, unusable from a
+    // background app) and the item is already same-user-readable once the
+    // keychain is unlocked, so on a single-user Mac this narrow window is an
+    // accepted trade-off; move to the SecItem API if that assumption changes.
+    let status = std::process::Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            CLAUDE_KEYCHAIN_SERVICE,
+            "-a",
+            &account,
+            "-w",
+            data,
+        ])
+        .status()
+        .map_err(|e| format!("write Claude Keychain credentials: {}", e))?;
+    if !status.success() {
+        return Err("security add-generic-password failed for Claude credentials.".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_claude_credentials_to_keychain(_data: &str) -> Result<(), String> {
+    Err("Keychain writes are only supported on macOS.".to_string())
+}
+
+/// Read the account name the Claude Keychain item is stored under so the
+/// write-back updates that same item instead of creating a duplicate.
+#[cfg(target_os = "macos")]
+fn claude_keychain_account() -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Attribute line looks like: `    "acct"<blob>="alice"`
+    for line in text.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("\"acct\"") {
+            if let Some(eq) = rest.find('=') {
+                let value = rest[eq + 1..].trim();
+                // security renders a non-printable acct as `0x<hex>  "ascii"`;
+                // the string-scrape can't recover the real bytes, so treat it as
+                // unresolved (fail closed) rather than returning a corrupt
+                // account that `add-generic-password -U` would spawn a duplicate
+                // "Claude Code-credentials" item under.
+                if value.starts_with("0x") {
+                    return None;
+                }
+                let value = value.trim_matches('"');
+                if !value.is_empty() && value != "<NULL>" {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn save_codex_credentials(credentials: &CodexCredentials) -> Result<(), String> {
@@ -1083,6 +1762,68 @@ fn map_claude_window(
     })
 }
 
+/// Parse the `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}` response
+/// headers into Session/Weekly usage windows. Pure — no network or I/O.
+///
+/// Unlike the oauth/usage JSON body (`utilization` 0..100, RFC3339 reset), these
+/// headers use a 0..1 fraction and a Unix-epoch-seconds reset. This is the
+/// fallback source for inference-only `claude setup-token` tokens.
+fn parse_unified_ratelimit_windows(
+    headers: &reqwest::header::HeaderMap,
+    now: DateTime<Utc>,
+) -> Vec<UsageWindow> {
+    let read_f64 = |name: &str| -> Option<f64> {
+        headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok()
+    };
+    let read_i64 = |name: &str| -> Option<i64> {
+        headers.get(name)?.to_str().ok()?.trim().parse::<i64>().ok()
+    };
+    let mut windows = Vec::new();
+    if let Some(window) = unified_ratelimit_window(
+        "Session",
+        read_f64("anthropic-ratelimit-unified-5h-utilization"),
+        read_i64("anthropic-ratelimit-unified-5h-reset"),
+        now,
+    ) {
+        windows.push(window);
+    }
+    if let Some(window) = unified_ratelimit_window(
+        "Weekly",
+        read_f64("anthropic-ratelimit-unified-7d-utilization"),
+        read_i64("anthropic-ratelimit-unified-7d-reset"),
+        now,
+    ) {
+        windows.push(window);
+    }
+    windows
+}
+
+/// Build one window from a unified-ratelimit header pair. Gated on utilization
+/// (mirrors `map_claude_window`); reset is optional. `utilization_fraction` is
+/// 0..1 (scaled ×100); `reset_epoch_seconds` is Unix seconds (like the Codex
+/// `map_window` epoch handling).
+fn unified_ratelimit_window(
+    label: &str,
+    utilization_fraction: Option<f64>,
+    reset_epoch_seconds: Option<i64>,
+    now: DateTime<Utc>,
+) -> Option<UsageWindow> {
+    let used = (utilization_fraction? * 100.0).clamp(0.0, 100.0);
+    let resets_at = reset_epoch_seconds
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single());
+    Some(UsageWindow {
+        label: label.to_string(),
+        used_percent: used,
+        remaining_percent: (100.0 - used).max(0.0),
+        resets_at: resets_at.map(|date| date.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        reset_text: resets_at.map(|date| reset_text(date, now)),
+        window_minutes: claude_window_minutes(label),
+        historical_expected_percent: None,
+        run_out_probability: None,
+    })
+}
+
 fn claude_extra_usage_window(extra: Option<&ClaudeExtraUsage>) -> Option<UsageWindow> {
     let extra = extra?;
     if !extra.is_enabled {
@@ -1249,13 +1990,13 @@ fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| crate::home_dir().map(|home| home.join(".codex")))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
 fn claude_credentials_path() -> PathBuf {
-    crate::home_dir()
-        .map(|home| home.join(".claude/.credentials.json"))
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".claude/.credentials.json"))
         .unwrap_or_else(|| PathBuf::from(".claude/.credentials.json"))
 }
 
@@ -1279,17 +2020,8 @@ pub(crate) fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
 }
 
 fn claude_user_agent() -> String {
-    let mut command = std::process::Command::new("claude");
-    command.arg("--version");
-    // Console children flash a visible window on Windows by default —
-    // tb_agent_usage runs on every quota refresh, so each flyout open would
-    // blink a terminal without CREATE_NO_WINDOW.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    command
+    std::process::Command::new("claude")
+        .arg("--version")
         .output()
         .ok()
         .and_then(|output| {
@@ -1543,11 +2275,63 @@ mod tests {
                 "subscriptionType": "pro"
             }
         }"#;
-        let credentials = parse_claude_credentials_data(raw).unwrap();
+        let credentials =
+            parse_claude_credentials_data(raw, ClaudeCredentialSource::File).unwrap();
         assert_eq!(credentials.access_token, "access");
         assert_eq!(credentials.refresh_token.as_deref(), Some("refresh"));
         assert_eq!(credentials.scopes, vec!["user:profile"]);
         assert_eq!(credentials.subscription_type.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn merge_claude_credentials_rotates_tokens_and_preserves_other_fields() {
+        let raw = r#"{
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1700000000000,
+                "scopes": ["user:profile"],
+                "subscriptionType": "pro"
+            }
+        }"#;
+        let mut credentials =
+            parse_claude_credentials_data(raw, ClaudeCredentialSource::File).unwrap();
+        credentials.access_token = "new-access".to_string();
+        credentials.refresh_token = Some("new-refresh".to_string());
+        credentials.expires_at = Utc.timestamp_millis_opt(1_700_009_999_000).single();
+
+        let merged = merge_claude_credentials_json(&credentials).unwrap();
+        let reparsed =
+            parse_claude_credentials_data(&merged, ClaudeCredentialSource::File).unwrap();
+        assert_eq!(reparsed.access_token, "new-access");
+        assert_eq!(reparsed.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(
+            reparsed.expires_at,
+            Utc.timestamp_millis_opt(1_700_009_999_000).single()
+        );
+        // Untouched fields the Claude CLI wrote survive the merge.
+        assert_eq!(reparsed.subscription_type.as_deref(), Some("pro"));
+        assert_eq!(reparsed.scopes, vec!["user:profile"]);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_contents() {
+        let dir = std::env::temp_dir().join(format!("tb_atomic_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        fs::write(&path, "old").unwrap();
+
+        atomic_write(&path, "new").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        // No temp turds left in the directory.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file not cleaned up");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1605,5 +2389,125 @@ mod tests {
             windows.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(),
             vec!["Session", "Weekly", "Sonnet", "Designs", "Daily Routines"]
         );
+    }
+
+    fn header_map(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                reqwest::header::HeaderName::from_static(name),
+                reqwest::header::HeaderValue::from_static(value),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn parses_unified_ratelimit_headers() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let headers = header_map(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.11"),
+            ("anthropic-ratelimit-unified-5h-reset", "1783111200"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
+            ("anthropic-ratelimit-unified-7d-reset", "1783504800"),
+        ]);
+        let windows = parse_unified_ratelimit_windows(&headers, now);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Session");
+        assert!((windows[0].used_percent - 11.0).abs() < 1e-9);
+        assert!((windows[0].remaining_percent - 89.0).abs() < 1e-9);
+        assert_eq!(windows[0].window_minutes, Some(300));
+        assert!(windows[0].resets_at.is_some());
+        assert!(windows[0].reset_text.is_some());
+        assert_eq!(windows[1].label, "Weekly");
+        assert!((windows[1].used_percent - 60.0).abs() < 1e-9);
+        assert!((windows[1].remaining_percent - 40.0).abs() < 1e-9);
+        assert_eq!(windows[1].window_minutes, Some(10_080));
+    }
+
+    #[test]
+    fn unified_reset_text_is_relative() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let reset = 1_700_000_000 + 3600; // now + 1h
+        let window = unified_ratelimit_window("Session", Some(0.5), Some(reset), now).unwrap();
+        assert!((window.used_percent - 50.0).abs() < 1e-9);
+        assert!(window.reset_text.as_deref().unwrap().contains("1h"));
+    }
+
+    #[test]
+    fn unified_windows_skip_missing_and_unparseable() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        // empty -> nothing
+        assert!(parse_unified_ratelimit_windows(&header_map(&[]), now).is_empty());
+
+        // only 5h -> just Session
+        let windows = parse_unified_ratelimit_windows(
+            &header_map(&[("anthropic-ratelimit-unified-5h-utilization", "0.2")]),
+            now,
+        );
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Session");
+
+        // unparseable 5h + valid 7d -> just Weekly
+        let windows = parse_unified_ratelimit_windows(
+            &header_map(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "abc"),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.4"),
+            ]),
+            now,
+        );
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Weekly");
+
+        // utilization present, reset absent -> window with no reset fields
+        let window = unified_ratelimit_window("Weekly", Some(0.4), None, now).unwrap();
+        assert!(window.resets_at.is_none());
+        assert!(window.reset_text.is_none());
+    }
+
+    #[test]
+    fn unified_window_scales_and_clamps_fraction() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let zero = unified_ratelimit_window("Session", Some(0.0), None, now).unwrap();
+        assert!((zero.used_percent - 0.0).abs() < 1e-9);
+        assert!((zero.remaining_percent - 100.0).abs() < 1e-9);
+        let full = unified_ratelimit_window("Session", Some(1.0), None, now).unwrap();
+        assert!((full.used_percent - 100.0).abs() < 1e-9);
+        assert!((full.remaining_percent - 0.0).abs() < 1e-9);
+        let over = unified_ratelimit_window("Session", Some(1.5), None, now).unwrap();
+        assert!((over.used_percent - 100.0).abs() < 1e-9);
+        assert!((over.remaining_percent - 0.0).abs() < 1e-9);
+        // None utilization -> no window
+        assert!(unified_ratelimit_window("Session", None, Some(1_783_111_200), now).is_none());
+    }
+
+    #[test]
+    fn reads_claude_code_oauth_token_via_lookup() {
+        let token = claude_token_from_lookup(|key| match key {
+            "CLAUDE_CODE_OAUTH_TOKEN" => Some("  sk-ant-oat01-test  ".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("sk-ant-oat01-test"));
+        assert!(claude_token_from_lookup(|_| None).is_none());
+        assert!(claude_token_from_lookup(|_| Some("   ".to_string())).is_none());
+    }
+
+    #[test]
+    fn refreshes_or_expires_cached_windows() {
+        let base = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let window =
+            unified_ratelimit_window("Session", Some(0.2), Some(1_700_000_000 + 3600), base)
+                .unwrap();
+
+        // 30 min later, still before the reset: reset_text recomputed to the
+        // shorter countdown (not the frozen original).
+        let later = base + chrono::Duration::seconds(1800);
+        let refreshed = refresh_cached_windows(std::slice::from_ref(&window), later).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert!(refreshed[0].reset_text.as_deref().unwrap().contains("30m"));
+
+        // Past the reset: stale -> expire (None) so the caller re-probes.
+        let after = base + chrono::Duration::seconds(3700);
+        assert!(refresh_cached_windows(std::slice::from_ref(&window), after).is_none());
     }
 }

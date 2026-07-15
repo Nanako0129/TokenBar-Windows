@@ -16,6 +16,7 @@
 
 mod agent_antigravity;
 mod agent_copilot;
+mod agent_grok;
 mod agent_history;
 mod agent_usage;
 mod agents_report;
@@ -31,16 +32,6 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use usage_tail::UsageTailer;
-
-/// Home directory, delegated to the engine's resolver so both halves of the
-/// binary always agree on where "home" is (`HOME` first, then the platform
-/// home — on Windows `HOME` is normally unset and this resolves
-/// `%USERPROFILE%`).
-pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
-    tokscale_core::get_home_dir_string(&None)
-        .ok()
-        .map(std::path::PathBuf::from)
-}
 
 /// Serve `tb_graph` from cache when the last computation is at most this old;
 /// `tb_refresh_graph` always recomputes. Mirrors the Tauri app's oneshot cache.
@@ -61,26 +52,15 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("build tokio runtime for tb_core_ffi")
 });
 
-/// Cap rayon's global thread pool. tokscale-core uses rayon for parallel log
-/// parsing (55+ par_iter sites); the default pool size is num_cpus which is
-/// fine for a one-shot CLI but ruinous for a resident menu-bar daemon: each
-/// idle worker busy-waits before parking, and every 10s poll wakes the entire
-/// pool for trivial mtime-check work.
-///
-/// macOS keeps the post-CPU-bug cap of 2. Windows scales with the machine
-/// (cores/4, clamped 2..=8) — the cold first parse of a large history was
-/// taking 20-30s pinned to 2 threads on a 16-thread desktop, and the visible
-/// first-run stall costs more than the extra parked workers. (Divergence to
-/// discuss when upstreaming to the macOS repo.)
+/// Cap rayon's global thread pool to 2 workers. tokscale-core uses rayon for
+/// parallel log parsing (55+ par_iter sites); the default pool size is num_cpus
+/// which is fine for a one-shot CLI but ruinous for a resident menu-bar daemon:
+/// each idle worker busy-waits before parking, and every 10s poll wakes the
+/// entire pool for trivial mtime-check work. 2 threads keep I/O parallelism
+/// while cutting idle spinning overhead by ~80%.
 static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
-    #[cfg(windows)]
-    let threads = std::thread::available_parallelism()
-        .map(|n| (n.get() / 4).clamp(2, 8))
-        .unwrap_or(2);
-    #[cfg(not(windows))]
-    let threads = 2;
     rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
+        .num_threads(2)
         .build_global()
         .ok();
 });
@@ -166,6 +146,28 @@ unsafe fn year_from(year: *const c_char) -> Result<String, String> {
         .to_str()
         .map(str::to_string)
         .map_err(|_| "year filter is not valid UTF-8".to_string())
+}
+
+/// Read an optional client filter from the C side: a comma-joined list of
+/// canonical client ids. NULL or empty/whitespace means "all clients" (`None`),
+/// exactly the pre-filter behavior. Blank entries between commas are dropped.
+///
+/// # Safety
+/// `clients` must be NULL or a valid NUL-terminated string.
+unsafe fn clients_from(clients: *const c_char) -> Result<Option<Vec<String>>, String> {
+    if clients.is_null() {
+        return Ok(None);
+    }
+    let raw = unsafe { CStr::from_ptr(clients) }
+        .to_str()
+        .map_err(|_| "client filter is not valid UTF-8".to_string())?;
+    let list: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(if list.is_empty() { None } else { Some(list) })
 }
 
 fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
@@ -312,26 +314,44 @@ pub unsafe extern "C" fn tb_model_report(year: *const c_char) -> *mut c_char {
     })
 }
 
-/// Per-hour report (`HourlyReport` in types.ts) for `year` (NULL/empty = all time).
+/// Per-hour report (`HourlyReport` in types.ts) for `year` (NULL/empty = all
+/// time), restricted to `clients` (NULL/empty = all clients; comma-joined
+/// canonical ids otherwise). The filter is applied in the streaming scan so
+/// shared-hour buckets carry only the selected clients' totals.
 ///
 /// # Safety
-/// `year` must be NULL or a valid NUL-terminated string.
+/// `year` and `clients` must each be NULL or a valid NUL-terminated string.
 #[no_mangle]
-pub unsafe extern "C" fn tb_hourly_report(year: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn tb_hourly_report(
+    year: *const c_char,
+    clients: *const c_char,
+) -> *mut c_char {
     guarded("tb_hourly_report", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| hourly_report::run(&year)))
+        envelope(unsafe { year_from(year) }.and_then(|year| {
+            let clients = unsafe { clients_from(clients) }?;
+            hourly_report::run(&year, clients)
+        }))
     })
 }
 
 /// Per-(sub-)agent report (`AgentsReport` in types.ts) for `year`
-/// (NULL/empty = all time).
+/// (NULL/empty = all time), restricted to `clients` (NULL/empty = all clients;
+/// comma-joined canonical ids otherwise). The filter is applied in the
+/// streaming scan so agent buckets shared across clients carry only the
+/// selected clients' totals.
 ///
 /// # Safety
-/// `year` must be NULL or a valid NUL-terminated string.
+/// `year` and `clients` must each be NULL or a valid NUL-terminated string.
 #[no_mangle]
-pub unsafe extern "C" fn tb_agents_report(year: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn tb_agents_report(
+    year: *const c_char,
+    clients: *const c_char,
+) -> *mut c_char {
     guarded("tb_agents_report", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| agents_report::run(&year)))
+        envelope(unsafe { year_from(year) }.and_then(|year| {
+            let clients = unsafe { clients_from(clients) }?;
+            agents_report::run(&year, clients)
+        }))
     })
 }
 
@@ -362,7 +382,7 @@ pub extern "C" fn tb_tokens_per_min() -> *mut c_char {
 }
 
 /// OAuth quota cards (`AgentUsagePayload` in agentUsage.ts) for
-/// codex/claude/antigravity/copilot, fetched concurrently. Network-bound —
+/// codex/claude/antigravity/copilot/grok, fetched concurrently. Network-bound —
 /// call from a background thread. Per-provider failures land in each
 /// snapshot's `error` field; the call itself only fails on serialization.
 #[no_mangle]

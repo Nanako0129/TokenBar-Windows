@@ -19,12 +19,8 @@ use crate::agent_usage::{clean_plan, parse_datetime, percent_encode, AgentIdenti
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
-// Path is also used by the platform-neutral OAuth path (refresh_access_token,
-// write_creds_atomic) — only Command/BTreeSet are macOS-probe-only.
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -129,18 +125,6 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
     Err(last_err)
 }
 
-// Local IDE detection shells out to `ps`/`lsof`; a Windows counterpart
-// (GetExtendedTcpTable) is tracked for Phase 9. `fetch()` falls through to
-// the OAuth remote path when these stubs error.
-#[cfg(not(target_os = "macos"))]
-const LOCAL_PROBE_UNSUPPORTED: &str = "local Antigravity detection not supported on this platform";
-
-#[cfg(not(target_os = "macos"))]
-fn detect_process() -> Result<ProcInfo, String> {
-    Err(LOCAL_PROBE_UNSUPPORTED.to_string())
-}
-
-#[cfg(target_os = "macos")]
 fn detect_process() -> Result<ProcInfo, String> {
     let output = Command::new("/bin/ps")
         .args(["-ax", "-o", "pid=,command="])
@@ -179,19 +163,16 @@ fn detect_process() -> Result<ProcInfo, String> {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn is_language_server(lower_cmd: &str) -> bool {
     lower_cmd.contains("language_server")
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn is_antigravity(lower_cmd: &str) -> bool {
     (lower_cmd.contains("--app_data_dir") && lower_cmd.contains("antigravity"))
         || lower_cmd.contains("/antigravity/")
 }
 
 /// Value of `flag` in a command line, accepting either `flag value` or `flag=value`.
-#[cfg(any(target_os = "macos", test))]
 fn extract_flag(cmd: &str, flag: &str) -> Option<String> {
     let idx = cmd.find(flag)?;
     let rest = &cmd[idx + flag.len()..];
@@ -200,12 +181,6 @@ fn extract_flag(cmd: &str, flag: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn listening_ports(_pid: i32) -> Result<Vec<u16>, String> {
-    Err(LOCAL_PROBE_UNSUPPORTED.to_string())
-}
-
-#[cfg(target_os = "macos")]
 fn listening_ports(pid: i32) -> Result<Vec<u16>, String> {
     let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
         .into_iter()
@@ -225,7 +200,6 @@ fn listening_ports(pid: i32) -> Result<Vec<u16>, String> {
 }
 
 /// Pull the port out of an `lsof` LISTEN line, e.g. `... TCP 127.0.0.1:54321 (LISTEN)`.
-#[cfg(any(target_os = "macos", test))]
 fn parse_listen_port(line: &str) -> Option<u16> {
     let idx = line.find("(LISTEN)")?;
     let before = line[..idx].trim_end();
@@ -680,33 +654,22 @@ fn discover_client_from_app() -> Option<(String, String)> {
 }
 
 fn client_artifact_candidates() -> Vec<PathBuf> {
-    // Scan candidates are macOS-only: the Windows install layout is
-    // unverified until the Phase 9 machine pass, and a guessed path list
-    // would just fail silently — ANTIGRAVITY_OAUTH_CLIENT_ID/SECRET are the
-    // documented override on other platforms until then.
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Vec::new();
+    let relative = [
+        "Contents/Resources/bin/language_server",
+        "Contents/Resources/bin/language_server_macos",
+        "Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
+        "Contents/Resources/app/extensions/antigravity/bin/language_server_macos_x64",
+        "Contents/Resources/app/extensions/antigravity/bin/language_server_macos",
+        "Contents/Resources/app/out/main.js",
+    ];
+    let mut roots = vec![PathBuf::from("/Applications/Antigravity.app")];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Applications/Antigravity.app"));
     }
-    #[cfg(target_os = "macos")]
-    {
-        let relative = [
-            "Contents/Resources/bin/language_server",
-            "Contents/Resources/bin/language_server_macos",
-            "Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
-            "Contents/Resources/app/extensions/antigravity/bin/language_server_macos_x64",
-            "Contents/Resources/app/extensions/antigravity/bin/language_server_macos",
-            "Contents/Resources/app/out/main.js",
-        ];
-        let mut roots = vec![PathBuf::from("/Applications/Antigravity.app")];
-        if let Some(home) = crate::home_dir() {
-            roots.push(home.join("Applications/Antigravity.app"));
-        }
-        roots
-            .iter()
-            .flat_map(|root| relative.iter().map(move |r| root.join(r)))
-            .collect()
-    }
+    roots
+        .iter()
+        .flat_map(|root| relative.iter().map(move |r| root.join(r)))
+        .collect()
 }
 
 fn is_token_byte(b: u8) -> bool {
@@ -788,7 +751,7 @@ fn preferred_client(ids: &[String], secrets: &[String]) -> Option<(String, Strin
 // ── shared ────────────────────────────────────────────────────────────────────
 
 fn gemini_home() -> Option<PathBuf> {
-    crate::home_dir().map(|home| home.join(".gemini"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".gemini"))
 }
 
 fn gemini_active_email() -> Option<String> {

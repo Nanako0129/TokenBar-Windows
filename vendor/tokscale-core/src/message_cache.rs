@@ -27,7 +27,41 @@ use std::time::UNIX_EPOCH;
 // dedup keys / codex token output, so stale entries must be reparsed. (#741
 // roo-family sibling fingerprinting also invalidates naturally, and #737's
 // antigravity-cli timestamps converge with our dropped local patch.)
-const CACHE_SCHEMA_VERSION: u32 = 21;
+// 22 (M6: follow-up correctness + attribution): jcode journal-wins over stale
+// snapshot + tz-less timestamps (#754), micode epoch seconds/ms normalization
+// (#747), fable->anthropic provider inference (#762), and copilot per-message
+// agent attribution (#724/#751) all change cached parser output, so stale
+// entries must be reparsed. (Our own schema counter; do not mirror upstream's.)
+// 23 (PR #30: drop synthetic claude rows): claudecode parsing now discards
+// assistant turns whose model is the `<synthetic>` placeholder (locally
+// fabricated by Claude Code, zero-token, no real cost), so a session cached
+// before this change still carries the phantom zero-token row until reparsed.
+// (Our own schema counter; do not mirror upstream's number.)
+// 24 (M8-B1: cost provenance contract): UnifiedMessage now serializes
+// cost_source, so schema-23 bincode entries must be rebuilt with the new field.
+// 25 (M10-B: Jcode journal corrections that only replace a snapshotted message
+// are now turn-neutral, so a following brand-new journal turn is no longer robbed
+// of its is_turn_start; schema-24 caches carry the under-counted turn flags, so
+// invalidate them.)
+// 26 (M10-C: Pi session_info now supplies subagent attribution. Non-empty
+// schema-25 caches replay Pi messages with no agent metadata, so invalidate them.
+// This is TokenBar's own counter, replacing upstream #856's per-client
+// parser_version rather than importing it.)
+// 27 (M10-D: Claude workflow journals are now excluded, and deep nested workflow
+// transcripts recover Tier-2 parent-session attribution. Schema-26 caches may
+// replay usage-shaped workflow journals or stale/generic deep Tier-2 agent
+// attribution, so invalidate them. The #856 parser_version/shard-cache
+// architecture remains excluded.)
+// 28 (M10-E: Copilot trace fallback now resolves the first root invoke_agent
+// span by walking the parentSpanId hierarchy, so nested sub-agent invokes
+// exported first no longer become the trace default. Schema-27 caches can carry
+// the wrong nested fallback and must be rebuilt. The final #834 resolver covers
+// #821's reversed-export-order semantic.)
+// 29 (M14: Codex token durations now advance from the last accepted token
+// snapshot instead of repeatedly measuring from the turn start. Schema-28
+// caches can replay overlapping duration_ms values or resume an incremental
+// parse without the new cursor, so unchanged sources must be rebuilt.)
+const CACHE_SCHEMA_VERSION: u32 = 29;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -170,6 +204,16 @@ pub(crate) struct RelatedFileFingerprint {
     pub content_hash: [u8; 32],
 }
 
+/// Metadata siblings a Grok `updates.jsonl` session's parse depends on, in the
+/// same session directory. `parse_grok_updates_file` reconciles totals from
+/// `signals.json` and `read_metadata` additionally reads `summary.json` and
+/// `events.jsonl` for the model id. The fingerprint (`from_grok_path`) and every
+/// mtime change probe in `lib.rs` (`latest_source_mtime_ms`, `grok_source_mtime_ms`)
+/// must watch the *same* set, or a sibling-only write goes unnoticed and the
+/// cache serves a stale (fallback-model) session.
+pub(crate) const GROK_METADATA_SIBLINGS: [&str; 3] =
+    ["signals.json", "summary.json", "events.jsonl"];
+
 impl SourceFingerprint {
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         Self::from_path_with_related(path, std::iter::empty())
@@ -193,16 +237,67 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
+    /// Fingerprint a Droid settings snapshot together with the fallback JSONL
+    /// that supplies its model when the snapshot omits one.
+    pub(crate) fn from_droid_path(path: &Path) -> Option<Self> {
+        let Some(jsonl) = crate::sessions::droid::droid_jsonl_path(path) else {
+            return Self::from_path(path);
+        };
+        let related_paths = std::iter::once(("session.jsonl".to_string(), jsonl));
+        Self::from_path_with_related(path, related_paths)
+    }
+
+    /// Fingerprint a legacy Kimi wire log together with the shared config that
+    /// supplies its model.
+    pub(crate) fn from_kimi_path(path: &Path) -> Option<Self> {
+        let Some(config) = crate::sessions::kimi::kimi_config_path(path) else {
+            return Self::from_path(path);
+        };
+        let related_paths = std::iter::once(("config.json".to_string(), config));
+        Self::from_path_with_related(path, related_paths)
+    }
+
+    /// Fingerprint a Kiro CLI session header together with its same-stem
+    /// message sidecar.
+    pub(crate) fn from_kiro_path(path: &Path) -> Option<Self> {
+        let Some(messages) = crate::sessions::kiro::kiro_related_messages_path(path) else {
+            return Self::from_path(path);
+        };
+        let related_paths = std::iter::once(("messages.jsonl".to_string(), messages));
+        Self::from_path_with_related(path, related_paths)
+    }
+
+    /// Fingerprint for a Grok `updates.jsonl` session and every sibling
+    /// `read_metadata` consults. `parse_grok_updates_file` reconciles session
+    /// totals from `signals.json` (compaction), and `read_metadata` additionally
+    /// reads `summary.json` (model id + `updated_at`/`created_at` timestamp) and
+    /// `events.jsonl` (model id, session id, `ts` timestamp) — so a sibling that
+    /// is written or rewritten after the last `updates.jsonl` write must still
+    /// invalidate the cache. An `updates.jsonl`-only (or `signals.json`-only)
+    /// fingerprint would leave a session pinned to its fallback model forever
+    /// when a late-arriving `summary.json`/`events.jsonl` is the only carrier of
+    /// the real model id.
+    ///
+    /// LOCAL DIVERGENCE from upstream junhoyeo/tokscale, which fingerprints only
+    /// `signals.json` here even though its `read_metadata` reads all three — the
+    /// same class of gap as our reported #741 (roo history sibling). Must be
+    /// re-applied on any re-vendor of `message_cache.rs`; candidate to report
+    /// upstream. See vendor/README.md.
+    pub(crate) fn from_grok_path(path: &Path) -> Option<Self> {
+        let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let related_paths = GROK_METADATA_SIBLINGS
+            .into_iter()
+            .map(|name| (name.to_string(), session_dir.join(name)));
+        Self::from_path_with_related(path, related_paths)
+    }
+
     /// Fingerprint for a Roo-family task (`ui_messages.json`) and its sibling
     /// `api_conversation_history.json`. `parse_roo_kilo_file` reads the history
     /// sibling for the model and agent, so a history-only rewrite (the UI file
     /// unchanged) must still invalidate the cache or reports keep stale
     /// model/agent/pricing.
     pub(crate) fn from_roo_path(path: &Path) -> Option<Self> {
-        let history = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("api_conversation_history.json");
+        let history = crate::sessions::roocode::history_path_for_ui_messages(path);
         let related_paths = std::iter::once(("api_conversation_history.json".to_string(), history));
         Self::from_path_with_related(path, related_paths)
     }
@@ -224,6 +319,13 @@ impl SourceFingerprint {
         if let Some(variant_path) = crate::cc_mirror::variant_file_for_session_path(path, home_dir)
         {
             related.push(("cc-mirror/variant.json".to_string(), variant_path));
+        }
+        for (index, parent_path) in
+            crate::sessions::claudecode::parent_session_paths_for_cache(path)
+                .into_iter()
+                .enumerate()
+        {
+            related.push((format!("parent-session-{index}.jsonl"), parent_path));
         }
 
         Self::from_path_with_related(path, related)
@@ -1019,6 +1121,164 @@ mod tests {
         );
     }
 
+    #[test]
+    fn from_roo_path_invalidates_when_history_appears() {
+        let dir = TempDir::new().unwrap();
+        let ui = dir.path().join("ui_messages.json");
+        std::fs::write(&ui, b"[]").unwrap();
+
+        let before = SourceFingerprint::from_roo_path(&ui).unwrap();
+        std::fs::write(
+            crate::sessions::roocode::history_path_for_ui_messages(&ui),
+            b"<environment_details><model>gpt-5</model></environment_details>",
+        )
+        .unwrap();
+        let after = SourceFingerprint::from_roo_path(&ui).unwrap();
+
+        assert_ne!(
+            before, after,
+            "creating the optional history sibling must invalidate the roo fingerprint"
+        );
+    }
+
+    #[test]
+    fn from_droid_path_invalidates_when_fallback_jsonl_appears() {
+        let dir = TempDir::new().unwrap();
+        let settings = dir.path().join("session.settings.json");
+        std::fs::write(&settings, br#"{"tokenUsage":{"inputTokens":1}}"#).unwrap();
+
+        let before = SourceFingerprint::from_droid_path(&settings).unwrap();
+        let plain_before = SourceFingerprint::from_path(&settings).unwrap();
+        let jsonl = crate::sessions::droid::droid_jsonl_path(&settings).unwrap();
+        assert_eq!(jsonl, dir.path().join("session.jsonl"));
+        assert!(before.related_files.is_empty());
+
+        std::fs::write(&jsonl, b"Model: Claude Sonnet 4\n").unwrap();
+
+        let after = SourceFingerprint::from_droid_path(&settings).unwrap();
+        let plain_after = SourceFingerprint::from_path(&settings).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(plain_before, plain_after);
+        assert_eq!(after.related_files[0].suffix, "session.jsonl");
+
+        std::fs::write(&jsonl, b"Model: Claude Opus 4.5 Thinking\n").unwrap();
+        let rewritten = SourceFingerprint::from_droid_path(&settings).unwrap();
+        assert_ne!(after, rewritten);
+        assert_eq!(
+            plain_after,
+            SourceFingerprint::from_path(&settings).unwrap()
+        );
+    }
+
+    #[test]
+    fn from_kimi_path_invalidates_when_config_appears() {
+        let dir = TempDir::new().unwrap();
+        let wire = dir.path().join(".kimi/sessions/group/session/wire.jsonl");
+        std::fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        std::fs::write(&wire, b"usage\n").unwrap();
+
+        let before = SourceFingerprint::from_kimi_path(&wire).unwrap();
+        let plain_before = SourceFingerprint::from_path(&wire).unwrap();
+        let config = crate::sessions::kimi::kimi_config_path(&wire).unwrap();
+        assert_eq!(config, dir.path().join(".kimi/config.json"));
+        assert!(before.related_files.is_empty());
+
+        std::fs::write(&config, br#"{"model":"kimi-k2"}"#).unwrap();
+
+        let after = SourceFingerprint::from_kimi_path(&wire).unwrap();
+        let plain_after = SourceFingerprint::from_path(&wire).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(plain_before, plain_after);
+        assert_eq!(after.related_files[0].suffix, "config.json");
+
+        std::fs::write(&config, br#"{"model":"kimi-k2-thinking"}"#).unwrap();
+        let rewritten = SourceFingerprint::from_kimi_path(&wire).unwrap();
+        assert_ne!(after, rewritten);
+        assert_eq!(plain_after, SourceFingerprint::from_path(&wire).unwrap());
+    }
+
+    #[test]
+    fn from_kiro_path_invalidates_when_messages_sidecar_appears() {
+        let dir = TempDir::new().unwrap();
+        let session = dir.path().join("session.json");
+        std::fs::write(&session, b"{}").unwrap();
+
+        let before = SourceFingerprint::from_kiro_path(&session).unwrap();
+        let plain_before = SourceFingerprint::from_path(&session).unwrap();
+        let messages = crate::sessions::kiro::kiro_related_messages_path(&session).unwrap();
+        assert_eq!(messages, dir.path().join("session.jsonl"));
+        assert!(before.related_files.is_empty());
+
+        std::fs::write(&messages, b"message\n").unwrap();
+
+        let after = SourceFingerprint::from_kiro_path(&session).unwrap();
+        let plain_after = SourceFingerprint::from_path(&session).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(plain_before, plain_after);
+        assert_eq!(after.related_files[0].suffix, "messages.jsonl");
+
+        std::fs::write(&messages, b"rewritten message sidecar\n").unwrap();
+        let rewritten = SourceFingerprint::from_kiro_path(&session).unwrap();
+        assert_ne!(after, rewritten);
+        assert_eq!(plain_after, SourceFingerprint::from_path(&session).unwrap());
+    }
+
+    #[test]
+    fn from_grok_path_invalidates_on_summary_only_change() {
+        // read_metadata reads the model id (and timestamp) from the sibling
+        // summary.json when updates.jsonl carries no per-turn model, so a
+        // summary-only rewrite (updates.jsonl + signals.json byte-identical) must
+        // change the fingerprint or the cache keeps a session pinned to its
+        // fallback model. Local divergence: upstream fingerprints only
+        // signals.json here.
+        let dir = TempDir::new().unwrap();
+        let updates = dir.path().join("updates.jsonl");
+        std::fs::write(&updates, b"{\"totalTokens\":10}\n").unwrap();
+        let summary = dir.path().join("summary.json");
+        std::fs::write(&summary, br#"{"current_model_id":"grok-4"}"#).unwrap();
+
+        let grok_before = SourceFingerprint::from_grok_path(&updates).unwrap();
+        let plain_before = SourceFingerprint::from_path(&updates).unwrap();
+
+        // Rewrite summary.json only; leave updates.jsonl byte-identical.
+        std::fs::write(&summary, br#"{"current_model_id":"grok-4-fast"}"#).unwrap();
+
+        let grok_after = SourceFingerprint::from_grok_path(&updates).unwrap();
+        let plain_after = SourceFingerprint::from_path(&updates).unwrap();
+
+        assert_ne!(
+            grok_before, grok_after,
+            "a summary-only change must alter the grok fingerprint"
+        );
+        assert_eq!(
+            plain_before, plain_after,
+            "from_path ignores the summary sibling (control)"
+        );
+    }
+
+    #[test]
+    fn from_grok_path_invalidates_on_events_only_change() {
+        // events.jsonl is the other metadata sibling read_metadata consults for
+        // the model id / session id / timestamp, so an events-only rewrite must
+        // invalidate the cache too.
+        let dir = TempDir::new().unwrap();
+        let updates = dir.path().join("updates.jsonl");
+        std::fs::write(&updates, b"{\"totalTokens\":10}\n").unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(&events, b"{\"model_id\":\"grok-4\"}\n").unwrap();
+
+        let before = SourceFingerprint::from_grok_path(&updates).unwrap();
+
+        std::fs::write(&events, b"{\"model_id\":\"grok-4-fast\"}\n").unwrap();
+
+        let after = SourceFingerprint::from_grok_path(&updates).unwrap();
+
+        assert_ne!(
+            before, after,
+            "an events-only change must alter the grok fingerprint"
+        );
+    }
+
     fn restore_env_var(key: &str, value: Option<impl AsRef<std::ffi::OsStr>>) {
         unsafe {
             match value {
@@ -1142,6 +1402,76 @@ mod tests {
         std::fs::write(&shm_path, b"shm-1").unwrap();
         let with_shm = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
         assert_eq!(before_shm, with_shm);
+    }
+
+    #[test]
+    fn test_claude_sidechain_fingerprint_tracks_nested_parent_session_changes() {
+        let dir = TempDir::new().unwrap();
+        let project_dir = dir.path().join("projects/project-one");
+        let sidechain_path = project_dir
+            .join("parent-session/subagents")
+            .join("agent-child.jsonl");
+        std::fs::create_dir_all(sidechain_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &sidechain_path,
+            concat!(
+                r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-session","agentId":"child","timestamp":"2026-01-01T00:00:00Z","requestId":"req-1","message":{"id":"msg-1","model":"claude-sonnet-4","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let parent_path =
+            crate::sessions::claudecode::parent_session_paths_for_cache(&sidechain_path)
+                .into_iter()
+                .next()
+                .unwrap();
+        assert_eq!(parent_path, project_dir.join("parent-session.jsonl"));
+        let base =
+            SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
+
+        std::fs::write(&parent_path, b"parent transcript 1\n").unwrap();
+        let with_parent =
+            SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
+        assert_ne!(base, with_parent);
+
+        std::fs::write(&parent_path, b"parent transcript 2\n").unwrap();
+        let updated_parent =
+            SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
+        assert_ne!(with_parent, updated_parent);
+    }
+
+    #[test]
+    fn test_claude_sidechain_fingerprint_tracks_flat_parent_session_changes() {
+        let dir = TempDir::new().unwrap();
+        let project_dir = dir.path().join("projects/project-one");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let sidechain_path = project_dir.join("agent-child.jsonl");
+        let mut sidechain = format!("{}\n", "x".repeat(4096)).repeat(65);
+        sidechain.push_str(concat!(
+            r#"{"type":"assistant","isSidechain":true,"sessionId":"flat-parent","agentId":"child","timestamp":"2026-01-01T00:00:00Z","requestId":"req-1","message":{"id":"msg-1","model":"claude-sonnet-4","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            "\n"
+        ));
+        std::fs::write(&sidechain_path, sidechain).unwrap();
+
+        let parent_path =
+            crate::sessions::claudecode::parent_session_paths_for_cache(&sidechain_path)
+                .into_iter()
+                .next()
+                .unwrap();
+        assert_eq!(parent_path, project_dir.join("flat-parent.jsonl"));
+        let base =
+            SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
+
+        std::fs::write(&parent_path, b"flat parent 1\n").unwrap();
+        let with_parent =
+            SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
+        assert_ne!(base, with_parent);
+
+        std::fs::write(&parent_path, b"flat parent 2\n").unwrap();
+        let updated_parent =
+            SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
+        assert_ne!(with_parent, updated_parent);
     }
 
     #[test]
@@ -1402,27 +1732,571 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_load_ignores_stale_schema_version() {
+    fn test_schema_24_cache_is_stale_and_rebuilt_as_current_schema() {
         let temp_home = TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        restore_env_var("HOME", Some(temp_home.path()));
+        let prev_env = sandbox_cache_env(temp_home.path());
 
         {
+            let source = write_temp_file(b"schema-migration\n");
+            let source_fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+            let mut stale_message = UnifiedMessage::new(
+                "client",
+                "model",
+                "provider",
+                "stale-session",
+                1,
+                TokenBreakdown::default(),
+                0.0,
+            );
+            stale_message.is_turn_start = true;
+            let stale_entry = CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            );
             let cache_file = cache_path().unwrap();
             ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
-            let store = CachedSourceStore {
-                schema_version: CACHE_SCHEMA_VERSION - 1,
-                entries: Vec::new(),
+            let stale_store = CachedSourceStore {
+                schema_version: 24,
+                entries: vec![stale_entry],
             };
 
             let writer = BufWriter::new(File::create(&cache_file).unwrap());
-            bincode::options().serialize_into(writer, &store).unwrap();
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
 
-            let loaded = SourceMessageCache::load();
-            assert!(loaded.entries.is_empty());
+            let mut loaded = SourceMessageCache::load();
+            assert!(loaded.entries.is_empty(), "schema-24 entries must be stale");
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                source_fingerprint,
+                "the stale cache entry and rebuilt parse have the same source fingerprint"
+            );
+
+            let rebuilt_message = UnifiedMessage::new(
+                "client",
+                "model",
+                "provider",
+                "rebuilt-session",
+                2,
+                TokenBreakdown::default(),
+                0.0,
+            );
+            loaded.insert(CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint,
+                vec![rebuilt_message],
+                Vec::new(),
+                None,
+            ));
+            loaded.save_if_dirty();
+
+            let rebuilt = read_store_from_path(&cache_file).unwrap();
+            assert_eq!(rebuilt.schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(rebuilt.entries.len(), 1);
+            assert_eq!(
+                rebuilt.entries[0].messages[0].cost_source,
+                crate::sessions::CostSource::Unknown
+            );
+            assert_eq!(rebuilt.entries[0].messages[0].session_id, "rebuilt-session");
+            assert!(
+                !rebuilt.entries[0].messages[0].is_turn_start,
+                "stale schema-24 turn flags must not survive the rebuild"
+            );
         }
 
-        restore_env_var("HOME", original_home);
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_25_pi_cache_is_stale_and_rebuilt_with_agent() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source = write_temp_file(b"pi-schema-migration\n");
+            let source_fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+            let stale_message = UnifiedMessage::new(
+                "pi",
+                "gpt-5",
+                "openai",
+                "pi-session",
+                1,
+                TokenBreakdown::default(),
+                0.0,
+            );
+            let stale_entry = CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            );
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let stale_store = CachedSourceStore {
+                schema_version: 25,
+                entries: vec![stale_entry],
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
+
+            let mut loaded = SourceMessageCache::load();
+            assert!(
+                loaded.entries.is_empty(),
+                "schema-25 Pi entries must be stale"
+            );
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                source_fingerprint,
+                "the stale cache entry and rebuilt parse have the same source fingerprint"
+            );
+
+            let rebuilt_message = UnifiedMessage::new_with_agent(
+                "pi",
+                "gpt-5",
+                "openai",
+                "pi-session",
+                2,
+                TokenBreakdown::default(),
+                0.0,
+                Some("go-reviewer".to_string()),
+            );
+            loaded.insert(CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint,
+                vec![rebuilt_message],
+                Vec::new(),
+                None,
+            ));
+            loaded.save_if_dirty();
+
+            let rebuilt = read_store_from_path(&cache_file).unwrap();
+            assert_eq!(rebuilt.schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(rebuilt.entries.len(), 1);
+
+            let reloaded = SourceMessageCache::load();
+            assert_eq!(reloaded.entries.len(), 1);
+            assert_eq!(
+                reloaded.entries.values().next().unwrap().messages[0]
+                    .agent
+                    .as_deref(),
+                Some("go-reviewer")
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_26_claude_workflow_cache_is_stale_and_rebuilt_with_parent_agent() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let project_dir = temp_home.path().join(".claude/projects/project-one");
+            let parent_session_id = "claude-schema-parent";
+            let parent_path = project_dir.join(format!("{parent_session_id}.jsonl"));
+            let workflow_dir = project_dir
+                .join(parent_session_id)
+                .join("subagents")
+                .join("workflows")
+                .join("wf_schema");
+            let sidechain_path = workflow_dir.join("agent-deepagent1.jsonl");
+            std::fs::create_dir_all(&workflow_dir).unwrap();
+
+            std::fs::write(
+                &parent_path,
+                r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","message":{"id":"msg_parent","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"tool_use","id":"toolu_schema","name":"Agent","input":{"subagent_type":"code-reviewer","prompt":"review"}}],"usage":{"input_tokens":80,"output_tokens":40}}}
+{"type":"user","timestamp":"2024-12-01T10:00:01.000Z","message":{"role":"user","content":[{"tool_use_id":"toolu_schema","type":"tool_result","content":[{"type":"text","text":"agentId: deepagent1 (use SendMessage)"}]}]}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                &sidechain_path,
+                r#"{"type":"user","isSidechain":true,"sessionId":"claude-schema-parent","agentId":"deepagent1","timestamp":"2024-12-01T10:00:00.500Z","message":{"content":"task"}}
+{"type":"assistant","isSidechain":true,"sessionId":"claude-schema-parent","agentId":"deepagent1","timestamp":"2024-12-01T10:00:01.000Z","requestId":"req_schema","message":{"id":"msg_schema","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":120}}}"#,
+            )
+            .unwrap();
+
+            let source_fingerprint = SourceFingerprint::from_claude_code_path_with_home(
+                &sidechain_path,
+                Some(temp_home.path()),
+            )
+            .unwrap();
+            let stale_message = UnifiedMessage::new(
+                "claude",
+                "claude-sonnet-4",
+                "anthropic",
+                parent_session_id,
+                1,
+                TokenBreakdown {
+                    input: 300,
+                    output: 120,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            );
+            assert!(stale_message.agent.is_none());
+            let stale_entry = CachedSourceEntry::new(
+                &sidechain_path,
+                source_fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            );
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let stale_store = CachedSourceStore {
+                schema_version: 26,
+                entries: vec![stale_entry],
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
+
+            let mut loaded = SourceMessageCache::load();
+            assert!(
+                loaded.entries.is_empty(),
+                "schema-26 Claude workflow entries must be stale"
+            );
+            assert_eq!(
+                SourceFingerprint::from_claude_code_path_with_home(
+                    &sidechain_path,
+                    Some(temp_home.path())
+                )
+                .unwrap(),
+                source_fingerprint,
+                "the stale cache entry and rebuilt parse have the same source fingerprint"
+            );
+
+            let rebuilt_messages = crate::sessions::claudecode::parse_claude_file_with_home(
+                &sidechain_path,
+                Some(temp_home.path()),
+            );
+            assert_eq!(rebuilt_messages.len(), 1);
+            assert_eq!(
+                rebuilt_messages[0].agent.as_deref(),
+                Some("Code Reviewer"),
+                "rebuilding must recover Tier-2 attribution from the parent session"
+            );
+            loaded.insert(CachedSourceEntry::new(
+                &sidechain_path,
+                source_fingerprint,
+                rebuilt_messages,
+                Vec::new(),
+                None,
+            ));
+            loaded.save_if_dirty();
+
+            let rebuilt = read_store_from_path(&cache_file).unwrap();
+            assert_eq!(rebuilt.schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(rebuilt.entries.len(), 1);
+            assert_eq!(
+                rebuilt.entries[0].messages[0].agent.as_deref(),
+                Some("Code Reviewer")
+            );
+
+            let reloaded = SourceMessageCache::load();
+            assert_eq!(reloaded.entries.len(), 1);
+            assert_eq!(
+                reloaded.entries.values().next().unwrap().messages[0]
+                    .agent
+                    .as_deref(),
+                Some("Code Reviewer")
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_27_copilot_cache_is_stale_and_rebuilt_with_root_agent() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            // The nested invoke_agent is exported before the root invoke_agent,
+            // while the agentless chat turn is covered by the root span. The
+            // intermediate tool-task span deliberately has no attributes: the
+            // pre-hardening resolver dropped its tool-task -> invoke-root edge,
+            // making the nested invoke look like a root and poisoning the
+            // schema-27 fallback.
+            let source = write_temp_file(
+                br#"{"type":"span","traceId":"trace-nested","spanId":"invoke-sub","parentSpanId":"tool-task","name":"invoke_agent","endTime":[1775934261,0],"attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.provider.name":"github","gen_ai.request.model":"claude-sonnet-4.6","gen_ai.agent.id":"github.copilot.subagent"}}
+{"type":"span","traceId":"trace-nested","spanId":"chat-sub","parentSpanId":"invoke-sub","name":"chat claude-sonnet-4.6","endTime":[1775934262,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.provider.name":"github","gen_ai.request.model":"claude-sonnet-4.6","gen_ai.response.model":"claude-sonnet-4.6","gen_ai.response.id":"resp-sub","gen_ai.agent.id":"github.copilot.subagent","gen_ai.usage.input_tokens":100,"gen_ai.usage.output_tokens":10}}
+{"type":"span","traceId":"trace-nested","spanId":"tool-task","parentSpanId":"invoke-root","name":"execute_tool task","endTime":[1775934263,0]}
+{"type":"span","traceId":"trace-nested","spanId":"invoke-root","name":"invoke_agent","endTime":[1775934260,0],"attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.provider.name":"github","gen_ai.request.model":"claude-sonnet-4.6","gen_ai.agent.id":"github.copilot.default"}}
+{"type":"span","traceId":"trace-nested","spanId":"chat-plain","parentSpanId":"invoke-root","name":"chat gpt-5.4-mini","endTime":[1775934264,967317833],"attributes":{"gen_ai.operation.name":"chat","gen_ai.provider.name":"github","gen_ai.request.model":"gpt-5.4-mini","gen_ai.response.model":"gpt-5.4-mini","gen_ai.response.id":"resp-plain","gen_ai.usage.input_tokens":200,"gen_ai.usage.output_tokens":20}}"#,
+            );
+            let source_fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+            let parsed_messages = crate::sessions::copilot::parse_copilot_file(source.path());
+            assert_eq!(parsed_messages.len(), 2);
+            assert_eq!(
+                parsed_messages
+                    .iter()
+                    .find(|message| message.model_id == "gpt-5.4-mini")
+                    .unwrap()
+                    .agent
+                    .as_deref(),
+                Some("github.copilot.default")
+            );
+            assert_eq!(
+                parsed_messages
+                    .iter()
+                    .find(|message| message.model_id == "claude-sonnet-4.6")
+                    .unwrap()
+                    .agent
+                    .as_deref(),
+                Some("github.copilot.subagent")
+            );
+
+            // Reproduce a schema-27 entry produced by the first-invoke resolver:
+            // the agentless turn incorrectly inherits the nested sub-agent.
+            let mut stale_messages = parsed_messages.clone();
+            let stale_plain = stale_messages
+                .iter_mut()
+                .find(|message| message.model_id == "gpt-5.4-mini")
+                .unwrap();
+            stale_plain.agent = Some("github.copilot.subagent".to_string());
+            assert_eq!(
+                stale_plain.agent.as_deref(),
+                Some("github.copilot.subagent")
+            );
+            let stale_entry = CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint.clone(),
+                stale_messages,
+                Vec::new(),
+                None,
+            );
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let stale_store = CachedSourceStore {
+                schema_version: 27,
+                entries: vec![stale_entry],
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
+
+            let mut loaded = SourceMessageCache::load();
+            assert!(
+                loaded.entries.is_empty(),
+                "schema-27 Copilot entries must be stale"
+            );
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                source_fingerprint,
+                "the stale cache entry and rebuilt parse have the same source fingerprint"
+            );
+
+            let rebuilt_messages = crate::sessions::copilot::parse_copilot_file(source.path());
+            let rebuilt_plain = rebuilt_messages
+                .iter()
+                .find(|message| message.model_id == "gpt-5.4-mini")
+                .unwrap();
+            assert_eq!(
+                rebuilt_plain.agent.as_deref(),
+                Some("github.copilot.default"),
+                "reparse must use the root invoke_agent for the agentless turn"
+            );
+            let rebuilt_sub = rebuilt_messages
+                .iter()
+                .find(|message| message.model_id == "claude-sonnet-4.6")
+                .unwrap();
+            assert_eq!(
+                rebuilt_sub.agent.as_deref(),
+                Some("github.copilot.subagent"),
+                "per-record nested attribution must remain unchanged"
+            );
+            loaded.insert(CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint,
+                rebuilt_messages,
+                Vec::new(),
+                None,
+            ));
+            loaded.save_if_dirty();
+
+            let rebuilt = read_store_from_path(&cache_file).unwrap();
+            assert_eq!(rebuilt.schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(rebuilt.entries.len(), 1);
+            let rebuilt_entry = &rebuilt.entries[0];
+            assert_eq!(
+                rebuilt_entry
+                    .messages
+                    .iter()
+                    .find(|message| message.model_id == "gpt-5.4-mini")
+                    .unwrap()
+                    .agent
+                    .as_deref(),
+                Some("github.copilot.default")
+            );
+            assert_eq!(
+                rebuilt_entry
+                    .messages
+                    .iter()
+                    .find(|message| message.model_id == "claude-sonnet-4.6")
+                    .unwrap()
+                    .agent
+                    .as_deref(),
+                Some("github.copilot.subagent")
+            );
+
+            let reloaded = SourceMessageCache::load();
+            let reloaded_entry = reloaded.get(source.path()).unwrap();
+            assert_eq!(
+                reloaded_entry
+                    .messages
+                    .iter()
+                    .find(|message| message.model_id == "gpt-5.4-mini")
+                    .unwrap()
+                    .agent
+                    .as_deref(),
+                Some("github.copilot.default")
+            );
+            assert_eq!(
+                reloaded_entry
+                    .messages
+                    .iter()
+                    .find(|message| message.model_id == "claude-sonnet-4.6")
+                    .unwrap()
+                    .agent
+                    .as_deref(),
+                Some("github.copilot.subagent")
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_28_codex_cache_is_stale_and_rebuilt_with_non_overlapping_durations() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source = write_temp_file(include_bytes!(
+                "../tests/fixtures/codex_duration_timing.jsonl"
+            ));
+            let source_fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+            let parsed = crate::sessions::codex::parse_codex_file_incremental(
+                source.path(),
+                0,
+                CodexParseState::default(),
+            );
+            assert!(parsed.parse_succeeded);
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)]
+            );
+
+            let mut stale_messages = parsed.messages.clone();
+            stale_messages[1].duration_ms = Some(5_000);
+            let stale_incremental =
+                build_codex_incremental_cache(source.path(), parsed.consumed_offset, parsed.state)
+                    .unwrap();
+            let stale_entry = CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint.clone(),
+                stale_messages,
+                Vec::new(),
+                Some(stale_incremental),
+            );
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let stale_store = CachedSourceStore {
+                schema_version: 28,
+                entries: vec![stale_entry],
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
+
+            let mut loaded = SourceMessageCache::load();
+            assert!(
+                loaded.entries.is_empty(),
+                "schema-28 Codex durations and incremental state must be stale"
+            );
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                source_fingerprint,
+                "the stale entry and rebuilt parse have the same source fingerprint"
+            );
+
+            let rebuilt = crate::sessions::codex::parse_codex_file_incremental(
+                source.path(),
+                0,
+                CodexParseState::default(),
+            );
+            assert!(rebuilt.parse_succeeded);
+            assert_eq!(
+                rebuilt
+                    .messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)]
+            );
+            assert!(rebuilt.state.last_accepted_token_timestamp_ms.is_some());
+            let rebuilt_incremental = build_codex_incremental_cache(
+                source.path(),
+                rebuilt.consumed_offset,
+                rebuilt.state,
+            )
+            .unwrap();
+            loaded.insert(CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint,
+                rebuilt.messages,
+                rebuilt.fallback_timestamp_indices,
+                Some(rebuilt_incremental),
+            ));
+            loaded.save_if_dirty();
+
+            let persisted = read_store_from_path(&cache_file).unwrap();
+            assert_eq!(persisted.schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(persisted.entries.len(), 1);
+            assert_eq!(
+                persisted.entries[0]
+                    .messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)]
+            );
+            assert!(persisted.entries[0]
+                .codex_incremental
+                .as_ref()
+                .unwrap()
+                .state
+                .last_accepted_token_timestamp_ms
+                .is_some());
+        }
+
+        restore_cache_env(prev_env);
     }
 
     #[test]

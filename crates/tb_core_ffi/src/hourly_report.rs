@@ -35,12 +35,17 @@ struct HourlyReportData {
     total_cost: f64,
 }
 
-/// Build the per-hour report for `year` (empty string = all time).
-pub fn run(year: &str) -> Result<Value, String> {
+/// Build the per-hour report for `year` (empty string = all time), restricted
+/// to `clients` (None = every client). The client filter is applied in the
+/// streaming scan, so shared-hour buckets carry only the selected clients'
+/// tokens/cost — a membership filter downstream cannot do this because each
+/// `HourAggregator` folds all clients into one mixed total.
+pub fn run(year: &str, clients: Option<Vec<String>>) -> Result<Value, String> {
     let year = normalize_year(year)?;
 
     let options = tokscale_core::ReportOptions {
         year,
+        clients,
         ..Default::default()
     };
 
@@ -72,7 +77,16 @@ fn map_report(report: tokscale_core::HourlyReport) -> HourlyReportData {
             .entries
             .into_iter()
             .map(|e| {
-                let total = e.input + e.output + e.cache_read + e.cache_write + e.reasoning;
+                // saturating_add so #766's i64::MAX-clamped buckets (corrupt
+                // Antigravity DB) can't overflow this FFI-exposed total in
+                // debug/release (see agents_report.rs's map_report for the
+                // same pattern).
+                let total = e
+                    .input
+                    .saturating_add(e.output)
+                    .saturating_add(e.cache_read)
+                    .saturating_add(e.cache_write)
+                    .saturating_add(e.reasoning);
                 HourlyEntry {
                     hour: e.hour,
                     clients: e.clients,
@@ -90,5 +104,65 @@ fn map_report(report: tokscale_core::HourlyReport) -> HourlyReportData {
             })
             .collect(),
         total_cost: report.total_cost,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #766 clamps corrupt Antigravity varints to `i64::MAX` per bucket. Two
+    /// such buckets in one hourly entry must saturate the mapped `total`, not
+    /// overflow it (a plain `+` panics in debug / wraps in release).
+    fn entry(input: i64, output: i64, cache_read: i64, cache_write: i64, reasoning: i64) -> tokscale_core::HourlyUsage {
+        tokscale_core::HourlyUsage {
+            hour: "2026-07-12 00:00".to_string(),
+            clients: vec!["antigravity_cli".to_string()],
+            models: vec!["gemini-3-pro".to_string()],
+            input,
+            output,
+            cache_read,
+            cache_write,
+            message_count: 1,
+            turn_count: 1,
+            reasoning,
+            cost: 0.0,
+        }
+    }
+
+    fn wrap(entries: Vec<tokscale_core::HourlyUsage>) -> tokscale_core::HourlyReport {
+        tokscale_core::HourlyReport {
+            entries,
+            total_cost: 0.0,
+            processing_time_ms: 0,
+        }
+    }
+
+    #[test]
+    fn total_saturates_on_overlarge_buckets() {
+        let report = wrap(vec![entry(i64::MAX, i64::MAX, 0, 0, 0)]);
+        let mapped = map_report(report);
+        assert_eq!(mapped.entries[0].total, i64::MAX);
+    }
+
+    /// The two-MAX-field case above only pins `input`/`output` into the fold.
+    /// Pin the other three fields too: nonzero `input`/`output`/`cache_write`
+    /// plus clamped `cache_read`/`reasoning`, so those two are independently
+    /// exercised, not just present-but-untested.
+    #[test]
+    fn total_saturates_when_cache_read_and_reasoning_are_overlarge() {
+        let report = wrap(vec![entry(10, 20, i64::MAX, 5, i64::MAX)]);
+        let mapped = map_report(report);
+        assert_eq!(mapped.entries[0].total, i64::MAX);
+    }
+
+    /// The saturating cases can't catch a dropped operand (another MAX field
+    /// keeps the total at MAX), so pin every field's inclusion with distinct
+    /// powers of two: omitting any one operand changes the exact sum.
+    #[test]
+    fn total_includes_every_token_field() {
+        let report = wrap(vec![entry(1, 2, 4, 8, 16)]);
+        let mapped = map_report(report);
+        assert_eq!(mapped.entries[0].total, 31);
     }
 }

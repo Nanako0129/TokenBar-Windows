@@ -21,7 +21,7 @@ pub use sessionize::{
     compute_daily_active_time, compute_time_metrics, sessionize, SessionizeAccumulator,
     SessionInterval, TimeMetrics, DEFAULT_IDLE_GAP_MS,
 };
-pub use sessions::UnifiedMessage;
+pub use sessions::{CostSource, UnifiedMessage};
 
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -181,7 +181,13 @@ pub struct TokenBreakdown {
 
 impl TokenBreakdown {
     pub fn total(&self) -> i64 {
-        self.input + self.output + self.cache_read + self.cache_write + self.reasoning
+        // saturating so clamped (i64::MAX) buckets from a corrupt source can't
+        // overflow the sum.
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.reasoning)
     }
 }
 
@@ -850,52 +856,47 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
 
-    // Parse OpenCode: prefer SQLite, collapse forked SQLite history there, then
-    // suppress legacy JSON overlap by message identity.
-    let mut opencode_seen: HashSet<String> = HashSet::new();
-
-    for db_path in &scan_result.opencode_dbs {
-        let CachedParseOutcome {
-            messages,
-            cache_entry,
-            ..
-        } = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
-            sessions::opencode::parse_opencode_sqlite(path)
-        });
-
-        // Dedup across channel-suffixed dbs: the same session can end up in
-        // both `opencode.db` and `opencode-<channel>.db` if the user
-        // switches channels mid-session. `discover_opencode_dbs` returns
-        // paths in sorted order, so the first-seen copy is deterministic.
-        all_messages.extend(messages.into_iter().filter(|message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_none_or(|key| opencode_seen.insert(key.clone()))
-        }));
-
-        if let Some(entry) = cache_entry {
-            source_cache.insert(entry);
-        }
-    }
-
-    let opencode_outcomes: Vec<CachedParseOutcome> = scan_result
+    // Parse OpenCode from both stores before merging so a provider-reported
+    // duplicate wins even when it appears after an estimated copy.
+    let opencode_sqlite_outcomes: Vec<CachedParseOutcome> = scan_result
+        .opencode_dbs
+        .iter()
+        .map(|db_path| {
+            load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
+                sessions::opencode::parse_opencode_sqlite(path)
+            })
+        })
+        .collect();
+    let opencode_json_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
-        .filter_map(|path| {
-            Some(load_or_parse_source(path, &source_cache, pricing, |path| {
+        .map(|path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::opencode::parse_opencode_file(path)
                     .into_iter()
                     .collect()
-            }))
+            })
         })
         .collect();
-    for outcome in opencode_outcomes {
+    let opencode_authoritative: HashSet<String> = opencode_sqlite_outcomes
+        .iter()
+        .chain(opencode_json_outcomes.iter())
+        .flat_map(|outcome| outcome.messages.iter())
+        .filter(|message| message.cost_source == CostSource::ProviderReported)
+        .filter_map(|message| message.dedup_key.clone())
+        .collect();
+    let mut opencode_seen: HashSet<String> = HashSet::new();
+
+    for outcome in opencode_sqlite_outcomes
+        .into_iter()
+        .chain(opencode_json_outcomes)
+    {
         all_messages.extend(outcome.messages.into_iter().filter(|message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_none_or(|key| opencode_seen.insert(key.clone()))
+            message.dedup_key.as_ref().is_none_or(|key| {
+                (!opencode_authoritative.contains(key)
+                    || message.cost_source == CostSource::ProviderReported)
+                    && opencode_seen.insert(key.clone())
+            })
         }));
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
@@ -1075,9 +1076,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Droid)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::droid::parse_droid_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_droid_path,
+                sessions::droid::parse_droid_file,
+            )
         })
         .collect();
     for outcome in droid_outcomes {
@@ -1123,9 +1128,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Kimi)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::kimi::parse_kimi_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_kimi_path,
+                sessions::kimi::parse_kimi_file,
+            )
         })
         .collect();
     for outcome in kimi_outcomes {
@@ -1241,12 +1250,18 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    // micode: WAL-mode SQLite, cached via from_sqlite_path (-wal-aware).
+    // micode: WAL-mode SQLite, cached via from_sqlite_path (-wal-aware). Pass
+    // pricing: None so the loader returns the raw embedded cost, then reprice
+    // below only when it's absent (cost-guarded, #742 Part 2 — mirrors the
+    // streaming lane and gjc so MiMo Code's authoritative cost is never
+    // overwritten by a recomputed tokens*rate). This materialized path is dead
+    // code today (public API only), guarded here for parity with the streaming
+    // lane.
     let micode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::MiMoCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_sqlite_source(path, &source_cache, pricing, |path| {
+            load_or_parse_sqlite_source(path, &source_cache, None, |path| {
                 sessions::micode::parse_micode_sqlite(path)
             })
         })
@@ -1257,6 +1272,12 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             outcome
                 .messages
                 .into_iter()
+                .map(|mut m| {
+                    if m.cost <= 0.0 {
+                        apply_pricing_if_available(&mut m, pricing);
+                    }
+                    m
+                })
                 .filter(|message| should_keep_deduped_message(&mut micode_seen, message)),
         );
         if let Some(entry) = outcome.cache_entry {
@@ -1264,9 +1285,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    // gjc: non-cached so the authoritative embedded cost is never repriced by
-    // the source cache. Reprice only when usage.cost.total was absent (A1
-    // guard); message-level dedup collapses depth-1/depth-2 replays.
+    // gjc: non-cached. Every message enters the shared pricing policy, which
+    // preserves provider-reported totals and estimates only unknown costs;
+    // message-level dedup collapses depth-1/depth-2 replays.
     let mut gjc_seen: HashSet<String> = HashSet::new();
     let gjc_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Gjc)
@@ -1275,9 +1296,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             sessions::gjc::parse_gjc_file(path)
                 .into_iter()
                 .map(|mut msg| {
-                    if msg.cost <= 0.0 {
-                        apply_pricing_if_available(&mut msg, pricing);
-                    }
+                    apply_pricing_if_available(&mut msg, pricing);
                     msg
                 })
                 .collect::<Vec<_>>()
@@ -1288,6 +1307,30 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             .into_iter()
             .filter(|message| should_keep_deduped_message(&mut gjc_seen, message)),
     );
+
+    // Grok Build: updates.jsonl + metadata-sibling fingerprint (signals/summary/
+    // events; a compaction rollup or late model id must invalidate the cache).
+    // Cumulative totalTokens deltas land as
+    // input tokens; pricing treats them as input at the resolved xai rates.
+    let grok_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Grok)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_grok_path,
+                sessions::grok::parse_grok_updates_file,
+            )
+        })
+        .collect();
+    for outcome in grok_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
     let mux_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Mux)
@@ -1352,9 +1395,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Kiro)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::kiro::parse_kiro_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_kiro_path,
+                sessions::kiro::parse_kiro_file,
+            )
         })
         .collect();
     for outcome in kiro_outcomes {
@@ -1611,11 +1658,13 @@ fn aggregate_model_usage_entries(
             entry.provider = format!("{}, {}", entry.provider, msg.provider_id);
         }
 
-        entry.input += msg.tokens.input;
-        entry.output += msg.tokens.output;
-        entry.cache_read += msg.tokens.cache_read;
-        entry.cache_write += msg.tokens.cache_write;
-        entry.reasoning += msg.tokens.reasoning;
+        // saturating_add so clamped (i64::MAX) buckets from a corrupt source
+        // can't overflow the fold (matches the grand-total sum below).
+        entry.input = entry.input.saturating_add(msg.tokens.input);
+        entry.output = entry.output.saturating_add(msg.tokens.output);
+        entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
+        entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
+        entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
         entry
@@ -1626,11 +1675,13 @@ fn aggregate_model_usage_entries(
     let mut entries: Vec<ModelUsage> = model_map
         .into_values()
         .map(|mut entry| {
-            let total_tokens = entry.input.max(0)
-                + entry.output.max(0)
-                + entry.cache_read.max(0)
-                + entry.cache_write.max(0)
-                + entry.reasoning.max(0);
+            let total_tokens = entry
+                .input
+                .max(0)
+                .saturating_add(entry.output.max(0))
+                .saturating_add(entry.cache_read.max(0))
+                .saturating_add(entry.cache_write.max(0))
+                .saturating_add(entry.reasoning.max(0));
             entry.performance.finalize(total_tokens);
             let mut providers: Vec<&str> = entry.provider.split(", ").collect();
             providers.sort_unstable();
@@ -1653,11 +1704,32 @@ fn aggregate_model_usage_entries(
 }
 
 fn positive_token_total(tokens: &TokenBreakdown) -> i64 {
-    tokens.input.max(0)
-        + tokens.output.max(0)
-        + tokens.cache_read.max(0)
-        + tokens.cache_write.max(0)
-        + tokens.reasoning.max(0)
+    // saturating so multiple clamped (i64::MAX) buckets can't overflow the sum.
+    tokens
+        .input
+        .max(0)
+        .saturating_add(tokens.output.max(0))
+        .saturating_add(tokens.cache_read.max(0))
+        .saturating_add(tokens.cache_write.max(0))
+        .saturating_add(tokens.reasoning.max(0))
+}
+
+/// Sum the (input, output, cache_read, cache_write) token fields across model
+/// usage entries with saturating_add, so clamped (i64::MAX) entry buckets from a
+/// corrupt source can't overflow the report-level totals (the entries are
+/// already saturated per-field by aggregate_model_usage_entries).
+fn model_report_token_totals(entries: &[ModelUsage]) -> (i64, i64, i64, i64) {
+    entries.iter().fold(
+        (0, 0, 0, 0),
+        |(input, output, cache_read, cache_write), entry| {
+            (
+                input.saturating_add(entry.input),
+                output.saturating_add(entry.output),
+                cache_read.saturating_add(entry.cache_read),
+                cache_write.saturating_add(entry.cache_write),
+            )
+        },
+    )
 }
 
 /// Returns the effective client list for a report: uses the caller-supplied
@@ -1673,6 +1745,61 @@ fn resolve_report_clients(options: &ReportOptions) -> Vec<String> {
     })
 }
 
+/// Two-level client filter for the streaming hourly/agents reports (TokenBar
+/// local patch). `scan_messages_streaming` selects scanner LANES from the
+/// client list, but some visible client ids are not lanes of their own: a
+/// `cc-mirror/<variant>` id is produced *during Claude-lane parsing* (#659), so
+/// requesting it alone would enable no lane (`ClientId::from_str` returns None)
+/// and the report would come back empty for a client that Daily/Models still
+/// show. Split the request into:
+/// - the lanes to scan — each `cc-mirror/*` maps to its producing `claude`
+///   lane (the Claude scanner discovers `.cc-mirror/*/config/projects`), every
+///   other id maps to itself; and
+/// - an optional EXACT client-id set the aggregation keeps. Unlike the scan's
+///   built-in `retain_for_requested_clients`, requesting `claude` here does NOT
+///   sweep in the distinct `cc-mirror/*` variants: the graph/model/daily
+///   payloads fold by `msg.client`, surfacing each variant as its own client
+///   id, so the hourly/agents slices must match that exact-id grouping. The
+///   `synthetic` special-case is preserved (synthetic is a model/provider match,
+///   not a literal client id). `None` = no client filter (every message),
+///   preserving the all-clients behavior.
+fn split_report_client_filter(options: &ReportOptions) -> (Vec<String>, Option<HashSet<String>>) {
+    let Some(requested) = options.clients.as_ref() else {
+        return (resolve_report_clients(options), None);
+    };
+    let mut lanes: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for id in requested {
+        let lane = if id.starts_with("cc-mirror/") {
+            "claude".to_string()
+        } else {
+            id.clone()
+        };
+        if seen.insert(lane.clone()) {
+            lanes.push(lane);
+        }
+    }
+    (lanes, Some(requested.iter().cloned().collect()))
+}
+
+/// Exact per-message client gate for `split_report_client_filter`'s aggregation
+/// half: keep a message iff its exact client id was requested, or it is a
+/// synthetic match when `synthetic` was requested. `None` keeps every message.
+fn report_message_client_passes(exact: &Option<HashSet<String>>, m: &UnifiedMessage) -> bool {
+    match exact {
+        None => true,
+        Some(req) => {
+            req.contains(m.client.as_str())
+                || (req.contains("synthetic")
+                    && sessions::synthetic::matches_synthetic_filter(
+                        &m.client,
+                        &m.model_id,
+                        &m.provider_id,
+                    ))
+        }
+    }
+}
+
 /// Returns `true` when the message should pass the cross-file dedup gate for
 /// lanes that track per-client seen keys.
 ///
@@ -1684,6 +1811,94 @@ fn dedup_gate_passes(key: &str, seen: &mut HashSet<String>) -> bool {
     }
     seen.insert(key.to_owned());
     true
+}
+
+/// Applies one OpenCode source-priority snapshot without requiring sink
+/// retraction. Only estimated SQLite messages hidden by that snapshot are
+/// retained as fallbacks; JSON messages remain fully streaming.
+struct OpenCodeStreamingSelection {
+    authoritative_snapshot: HashSet<String>,
+    seen: HashSet<String>,
+    deferred_sqlite: Vec<Option<UnifiedMessage>>,
+    deferred_by_key: HashMap<String, usize>,
+}
+
+impl OpenCodeStreamingSelection {
+    fn new(authoritative_snapshot: HashSet<String>) -> Self {
+        Self {
+            authoritative_snapshot,
+            seen: HashSet::new(),
+            deferred_sqlite: Vec::new(),
+            deferred_by_key: HashMap::new(),
+        }
+    }
+
+    fn select_sqlite(&mut self, message: UnifiedMessage) -> Option<UnifiedMessage> {
+        let Some(key) = message.dedup_key.as_deref() else {
+            return Some(message);
+        };
+        if self.seen.contains(key) {
+            return None;
+        }
+        if let Some(&index) = self.deferred_by_key.get(key) {
+            if message.cost_source != CostSource::ProviderReported {
+                return None;
+            }
+            self.deferred_by_key.remove(key);
+            self.deferred_sqlite[index] = None;
+            self.seen.insert(key.to_owned());
+            return Some(message);
+        }
+        if self.authoritative_snapshot.contains(key)
+            && message.cost_source != CostSource::ProviderReported
+        {
+            let index = self.deferred_sqlite.len();
+            self.deferred_by_key.insert(key.to_owned(), index);
+            self.deferred_sqlite.push(Some(message));
+            return None;
+        }
+        self.seen.insert(key.to_owned());
+        Some(message)
+    }
+
+    fn select_json(
+        &mut self,
+        message: UnifiedMessage,
+        will_emit: bool,
+    ) -> Option<UnifiedMessage> {
+        let Some(key) = message.dedup_key.as_deref() else {
+            return will_emit.then_some(message);
+        };
+        if self.seen.contains(key) {
+            return None;
+        }
+        if self.authoritative_snapshot.contains(key) {
+            if message.cost_source != CostSource::ProviderReported || !will_emit {
+                return None;
+            }
+            self.seen.insert(key.to_owned());
+            if let Some(index) = self.deferred_by_key.remove(key) {
+                self.deferred_sqlite[index] = None;
+            }
+            return Some(message);
+        }
+        self.seen.insert(key.to_owned());
+        will_emit.then_some(message)
+    }
+
+    fn finish(self) -> impl Iterator<Item = UnifiedMessage> {
+        let Self {
+            mut seen,
+            deferred_sqlite,
+            ..
+        } = self;
+        deferred_sqlite.into_iter().flatten().filter(move |message| {
+            message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| seen.insert(key.clone()))
+        })
+    }
 }
 
 pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, String> {
@@ -1710,12 +1925,13 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
     );
     let entries = aggregate_model_usage_entries(model_msgs, &options.group_by);
 
-    let total_input: i64 = entries.iter().map(|e| e.input).sum();
-    let total_output: i64 = entries.iter().map(|e| e.output).sum();
-    let total_cache_read: i64 = entries.iter().map(|e| e.cache_read).sum();
-    let total_cache_write: i64 = entries.iter().map(|e| e.cache_write).sum();
+    let (total_input, total_output, total_cache_read, total_cache_write) =
+        model_report_token_totals(&entries);
     let total_messages: i32 = entries.iter().map(|e| e.message_count).sum();
-    let total_cost: f64 = entries.iter().map(|e| e.cost).sum();
+    // f64's Sum identity is -0.0, so an empty report would serialize as
+    // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
+    // any non-zero total.
+    let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
 
     Ok(ModelReport {
         entries,
@@ -1774,10 +1990,12 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
             entry
                 .models
                 .insert(normalize_model_for_grouping(&msg.model_id));
-            entry.input += msg.tokens.input;
-            entry.output += msg.tokens.output;
-            entry.cache_read += msg.tokens.cache_read;
-            entry.cache_write += msg.tokens.cache_write;
+            // saturating_add so clamped (i64::MAX) buckets from a corrupt source
+            // can't overflow the fold.
+            entry.input = entry.input.saturating_add(msg.tokens.input);
+            entry.output = entry.output.saturating_add(msg.tokens.output);
+            entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
+            entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
             entry.message_count += msg.message_count.max(0);
             entry.cost += msg.cost;
         },
@@ -1799,7 +2017,10 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
 
     entries.sort_by(|a, b| a.month.cmp(&b.month));
 
-    let total_cost: f64 = entries.iter().map(|e| e.cost).sum();
+    // f64's Sum identity is -0.0, so an empty report would serialize as
+    // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
+    // any non-zero total.
+    let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
 
     Ok(MonthlyReport {
         entries,
@@ -1821,17 +2042,19 @@ struct AgentAccumulator {
 }
 
 impl AgentAccumulator {
-    // Plain `+=` (not saturating_add) folds tokens EXACTLY like the model
-    // report's `aggregate_model_usage_entries`; the per-client parity those two
+    // Folds tokens like the model report's `aggregate_model_usage_entries`
+    // (saturating_add — see that fn for why): the per-client parity those two
     // reports must hold depends on identical arithmetic. `message_count.max(0)`
     // matches the model/monthly aggregators (not the sessionizer's `.max(1)`).
     fn add(&mut self, msg: &UnifiedMessage) {
         self.clients.insert(msg.client.clone());
-        self.input += msg.tokens.input;
-        self.output += msg.tokens.output;
-        self.cache_read += msg.tokens.cache_read;
-        self.cache_write += msg.tokens.cache_write;
-        self.reasoning += msg.tokens.reasoning;
+        // saturating_add so clamped (i64::MAX) buckets from a corrupt source
+        // can't overflow the fold.
+        self.input = self.input.saturating_add(msg.tokens.input);
+        self.output = self.output.saturating_add(msg.tokens.output);
+        self.cache_read = self.cache_read.saturating_add(msg.tokens.cache_read);
+        self.cache_write = self.cache_write.saturating_add(msg.tokens.cache_write);
+        self.reasoning = self.reasoning.saturating_add(msg.tokens.reasoning);
         self.cost += msg.cost;
         self.messages += msg.message_count.max(0);
     }
@@ -1843,6 +2066,14 @@ impl AgentAccumulator {
 /// streaming migration.
 fn agent_bucket_key(msg: &UnifiedMessage) -> String {
     match msg.agent.as_deref() {
+        // Copilot emits raw OTEL agent ids (e.g. "github.copilot.default",
+        // "Plugin:team:slug") via #724; upstream prettifies them in its CLI TUI
+        // (which we do not vendor), so apply the copilot-specific normalization
+        // here on our streaming agents-report path. Every other client keeps the
+        // generic normalization (opencode already normalizes at parse time).
+        Some(raw) if !raw.trim().is_empty() && msg.client == "copilot" => {
+            sessions::normalize_copilot_agent_name(raw)
+        }
         Some(raw) if !raw.trim().is_empty() => sessions::normalize_agent_name(raw),
         _ => "Main".to_string(),
     }
@@ -1882,13 +2113,16 @@ pub async fn get_agents_report(options: ReportOptions) -> Result<AgentReport, St
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
-    let clients = resolve_report_clients(&options);
+    // Two-level filter: scan the producing lanes (cc-mirror variants ride the
+    // claude lane), then keep only the exact requested client ids at fold time.
+    let (clients, exact) = split_report_client_filter(&options);
 
     let pricing = load_pricing_for_local_parse().await;
     let year_prefix = options.year.as_ref().map(|y| format!("{}-", y));
     let since_s = options.since.clone();
     let until_s = options.until.clone();
     let msg_filter = |m: &UnifiedMessage| -> bool {
+        if !report_message_client_passes(&exact, m) { return false; }
         if let Some(ref yp) = year_prefix { if !m.date.starts_with(yp.as_str()) { return false; } }
         if let Some(ref s) = since_s { if m.date.as_str() < s.as_str() { return false; } }
         if let Some(ref u) = until_s { if m.date.as_str() > u.as_str() { return false; } }
@@ -1923,16 +2157,32 @@ pub async fn get_agents_report(options: ReportOptions) -> Result<AgentReport, St
     // Cost desc, then total-tokens desc — matches the old FFI agents report
     // ordering. This token-total formula MUST stay identical to the `total`
     // computed in the FFI mapper (crates/tb_core_ffi/src/agents_report.rs).
+    // saturating_add so #766's i64::MAX-clamped buckets from a corrupt
+    // Antigravity DB can't overflow the sort key (matches the model report's
+    // saturating total; for normal >=0 tokens the result is unchanged).
     entries.sort_by(|a, b| {
-        let a_total = a.input + a.output + a.cache_read + a.cache_write + a.reasoning;
-        let b_total = b.input + b.output + b.cache_read + b.cache_write + b.reasoning;
+        let a_total = a
+            .input
+            .saturating_add(a.output)
+            .saturating_add(a.cache_read)
+            .saturating_add(a.cache_write)
+            .saturating_add(a.reasoning);
+        let b_total = b
+            .input
+            .saturating_add(b.output)
+            .saturating_add(b.cache_read)
+            .saturating_add(b.cache_write)
+            .saturating_add(b.reasoning);
         b.cost
             .partial_cmp(&a.cost)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(b_total.cmp(&a_total))
     });
 
-    let total_cost: f64 = entries.iter().map(|e| e.cost).sum();
+    // f64's Sum identity is -0.0, so an empty report would serialize as
+    // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
+    // any non-zero total.
+    let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
     let total_messages: i32 = entries.iter().map(|e| e.messages).sum();
 
     Ok(AgentReport {
@@ -1967,13 +2217,16 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
-    let clients = resolve_report_clients(&options);
+    // Two-level filter: scan the producing lanes (cc-mirror variants ride the
+    // claude lane), then keep only the exact requested client ids at fold time.
+    let (clients, exact) = split_report_client_filter(&options);
 
     let pricing = load_pricing_for_local_parse().await;
     let year_prefix = options.year.as_ref().map(|y| format!("{}-", y));
     let since_s = options.since.clone();
     let until_s = options.until.clone();
     let msg_filter = |m: &UnifiedMessage| -> bool {
+        if !report_message_client_passes(&exact, m) { return false; }
         if let Some(ref yp) = year_prefix { if !m.date.starts_with(yp.as_str()) { return false; } }
         if let Some(ref s) = since_s { if m.date.as_str() < s.as_str() { return false; } }
         if let Some(ref u) = until_s { if m.date.as_str() > u.as_str() { return false; } }
@@ -2002,11 +2255,13 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
             entry
                 .models
                 .insert(normalize_model_for_grouping(&msg.model_id));
-            entry.input += msg.tokens.input;
-            entry.output += msg.tokens.output;
-            entry.cache_read += msg.tokens.cache_read;
-            entry.cache_write += msg.tokens.cache_write;
-            entry.reasoning += msg.tokens.reasoning;
+            // saturating_add so clamped (i64::MAX) buckets from a corrupt source
+            // can't overflow the fold.
+            entry.input = entry.input.saturating_add(msg.tokens.input);
+            entry.output = entry.output.saturating_add(msg.tokens.output);
+            entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
+            entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
+            entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
             entry.message_count += msg.message_count.max(0);
             if msg.is_turn_start {
                 entry.turn_count += 1;
@@ -2042,7 +2297,10 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 
     entries.sort_by(|a, b| a.hour.cmp(&b.hour));
 
-    let total_cost: f64 = entries.iter().map(|e| e.cost).sum();
+    // f64's Sum identity is -0.0, so an empty report would serialize as
+    // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
+    // any non-zero total.
+    let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
 
     Ok(HourlyReport {
         entries,
@@ -2109,27 +2367,46 @@ where
     // Trae keep-latest buffer — flushed after all other lanes.
     let mut trae_latest: HashMap<String, UnifiedMessage> = HashMap::new();
 
-    // ---- OpenCode SQLite ----
-    let mut opencode_seen: HashSet<String> = HashSet::new();
-    for db_path in &scan_result.opencode_dbs {
-        for mut m in sessions::opencode::parse_opencode_sqlite(db_path) {
-            apply_pricing_if_available(&mut m, pricing);
-            let keep = m.dedup_key.as_ref().is_none_or(|k| dedup_gate_passes(k, &mut opencode_seen));
-            if keep && passes_client(&m) && filter(&m) { sink(&m); }
-        }
-    }
-    // OpenCode JSON legacy
-    let opencode_parsed: Vec<Vec<UnifiedMessage>> = scan_result
+    // ---- OpenCode SQLite + legacy JSON ----
+    // The sink cannot retract an estimated duplicate, so pre-scan only the
+    // authoritative identities before streaming the lane in its existing order.
+    // Legacy JSON is parsed again below so this pass never retains message bodies.
+    let mut opencode_authoritative: HashSet<String> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
-        .map(|path| sessions::opencode::parse_opencode_file(path).into_iter().collect::<Vec<_>>())
+        .filter_map(|path| sessions::opencode::parse_opencode_file(path))
+        .filter(|message| message.cost_source == CostSource::ProviderReported)
+        .filter_map(|message| message.dedup_key)
         .collect();
-    for msgs in opencode_parsed {
-        for mut m in msgs {
-            apply_pricing_if_available(&mut m, pricing);
-            let keep = m.dedup_key.as_ref().is_none_or(|k| dedup_gate_passes(k, &mut opencode_seen));
-            if keep && passes_client(&m) && filter(&m) { sink(&m); }
+    for db_path in &scan_result.opencode_dbs {
+        opencode_authoritative.extend(
+            sessions::opencode::parse_opencode_sqlite(db_path)
+                .into_iter()
+                .filter(|message| message.cost_source == CostSource::ProviderReported)
+                .filter_map(|message| message.dedup_key),
+        );
+    }
+
+    let mut opencode_selection = OpenCodeStreamingSelection::new(opencode_authoritative);
+    for db_path in &scan_result.opencode_dbs {
+        for mut message in sessions::opencode::parse_opencode_sqlite(db_path) {
+            apply_pricing_if_available(&mut message, pricing);
+            if let Some(message) = opencode_selection.select_sqlite(message) {
+                if passes_client(&message) && filter(&message) { sink(&message); }
+            }
         }
+    }
+    for path in scan_result.get(ClientId::OpenCode) {
+        if let Some(mut message) = sessions::opencode::parse_opencode_file(path) {
+            apply_pricing_if_available(&mut message, pricing);
+            let will_emit = passes_client(&message) && filter(&message);
+            if let Some(message) = opencode_selection.select_json(message, will_emit) {
+                sink(&message);
+            }
+        }
+    }
+    for message in opencode_selection.finish() {
+        if passes_client(&message) && filter(&message) { sink(&message); }
     }
 
     // ---- Claude Code JSONL (cache-aware, reference-iterate on hit) ----
@@ -2213,7 +2490,16 @@ where
         // Custom fingerprint fn — for sources whose cache validity depends on a
         // sibling file (e.g. jcode's `.journal.jsonl`), so a sibling-only write
         // still invalidates the cache instead of serving stale data.
-        ($client_id:expr, $parse_fn:expr, $fingerprint_fn:expr) => {{
+        ($client_id:expr, $parse_fn:expr, $fingerprint_fn:expr) => {
+            simple_lane!($client_id, $parse_fn, $fingerprint_fn, false)
+        };
+        // 4-arg (cost-guarded reprice): clients that embed an authoritative
+        // per-message cost (e.g. MiMo Code — #742 Part 2) pass `true`, so a
+        // recomputed tokens*rate never clobbers the embedded cost; only a
+        // missing cost (`<= 0.0`) is repriced. The cache still stores raw
+        // (unpriced) messages, so the guard is applied on emit here — exactly
+        // like the default unconditional path (which passes `false`).
+        ($client_id:expr, $parse_fn:expr, $fingerprint_fn:expr, $guard_cost:expr) => {{
             // Per-lane dedup set: persists across this client's files, never
             // shared with other clients (see the note above the trae buffer).
             let mut seen_keys: HashSet<String> = HashSet::new();
@@ -2228,7 +2514,7 @@ where
                     for msg in cached.messages.iter() {
                         let mut m = msg.clone();
                         m.refresh_derived_fields();
-                        apply_pricing_if_available(&mut m, pricing);
+                        reprice_lane_message(&mut m, pricing, $guard_cost);
                         if !passes_client(&m) { continue; }
                         let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut seen_keys));
                         if keep && filter(&m) { sink(&m); }
@@ -2252,7 +2538,7 @@ where
                     }
                 }
                 for mut m in msgs {
-                    apply_pricing_if_available(&mut m, pricing);
+                    reprice_lane_message(&mut m, pricing, $guard_cost);
                     if !passes_client(&m) { continue; }
                     let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut seen_keys));
                     if keep && filter(&m) { sink(&m); }
@@ -2265,10 +2551,18 @@ where
     simple_lane!(ClientId::Warp,      sessions::warp::parse_warp_file);
     simple_lane!(ClientId::Amp,       sessions::amp::parse_amp_file);
     simple_lane!(ClientId::Codebuff,  sessions::codebuff::parse_codebuff_file);
-    simple_lane!(ClientId::Droid,     sessions::droid::parse_droid_file);
+    simple_lane!(
+        ClientId::Droid,
+        sessions::droid::parse_droid_file,
+        message_cache::SourceFingerprint::from_droid_path
+    );
     simple_lane!(ClientId::OpenClaw,  sessions::openclaw::parse_openclaw_transcript);
     simple_lane!(ClientId::Pi,        sessions::pi::parse_pi_file);
-    simple_lane!(ClientId::Kimi,      sessions::kimi::parse_kimi_file);
+    simple_lane!(
+        ClientId::Kimi,
+        sessions::kimi::parse_kimi_file,
+        message_cache::SourceFingerprint::from_kimi_path
+    );
     simple_lane!(ClientId::Qwen,      sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -2293,20 +2587,36 @@ where
         sessions::jcode::parse_jcode_file,
         message_cache::SourceFingerprint::from_jcode_path
     );
+    // Grok Build: fingerprint updates.jsonl + every metadata sibling the parser
+    // reads (signals/summary/events) so a late compaction rollup or sibling-only
+    // model id invalidates the cache (parse reconciles signals totals).
+    simple_lane!(
+        ClientId::Grok,
+        sessions::grok::parse_grok_updates_file,
+        message_cache::SourceFingerprint::from_grok_path
+    );
     // micode is WAL-mode SQLite; fingerprint via from_sqlite_path so a `-wal`
-    // write invalidates the cache. Unlike gjc, this lane does not guard the
-    // embedded cost: apply_pricing overwrites it whenever the model resolves to
-    // a non-zero price. That is a no-op for native MiMo models (absent from the
-    // pricing dataset) but WOULD reprice a priced provider routed through MiMo
-    // Code — faithful to upstream, which passes pricing through the same loader
-    // unguarded.
+    // write invalidates the cache. MiMo Code records an authoritative per-message
+    // cost (usage.cost), so this lane is cost-guarded (`true`): apply_pricing
+    // only runs when the embedded cost is absent (`<= 0.0`), never overwriting a
+    // real embedded cost with a recomputed tokens*rate. Today MiMo models are
+    // absent from the pricing dataset so unconditional repricing would be a
+    // no-op, but the guard future-proofs against a priced provider routed
+    // through MiMo Code / the model being added to the dataset. (#742 Part 2 —
+    // upstream applies this guard in its materialized lane, which is dead code
+    // for us; the streaming lane is where the app actually reprices.)
     simple_lane!(
         ClientId::MiMoCode,
         sessions::micode::parse_micode_sqlite,
-        message_cache::SourceFingerprint::from_sqlite_path
+        message_cache::SourceFingerprint::from_sqlite_path,
+        true
     );
     simple_lane!(ClientId::Mux,       sessions::mux::parse_mux_file);
-    simple_lane!(ClientId::Kiro,      sessions::kiro::parse_kiro_file);
+    simple_lane!(
+        ClientId::Kiro,
+        sessions::kiro::parse_kiro_file,
+        message_cache::SourceFingerprint::from_kiro_path
+    );
 
     // ---- Gemini (cache-aware with invalidate_cache semantics) ----
     // Uses load_or_parse_source_with_fingerprint_and_policy equivalent:
@@ -2403,17 +2713,14 @@ where
         }
     }
 
-    // ---- gjc (gajae-code) JSONL, authoritative embedded cost (A1 guard) ----
-    // gjc embeds `usage.cost.total` (USD). Reprice ONLY when it was absent
-    // (cost <= 0.0); routing through the cached/simple_lane path would reprice
-    // unconditionally and overwrite the authoritative cost.
+    // ---- gjc (gajae-code) JSONL with cost provenance ----
+    // Route every message through the shared pricing policy. Provider-reported
+    // totals return unchanged; unknown totals receive an estimate when possible.
     {
         let mut gjc_seen: HashSet<String> = HashSet::new();
         for path in scan_result.get(ClientId::Gjc) {
             for mut m in sessions::gjc::parse_gjc_file(path) {
-                if m.cost <= 0.0 {
-                    apply_pricing_if_available(&mut m, pricing);
-                }
+                apply_pricing_if_available(&mut m, pricing);
                 if !passes_client(&m) { continue; }
                 let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut gjc_seen));
                 if keep && filter(&m) { sink(&m); }
@@ -2698,6 +3005,10 @@ fn apply_pricing_if_available(
     message: &mut UnifiedMessage,
     pricing: Option<&pricing::PricingService>,
 ) {
+    if message.has_authoritative_cost() {
+        return;
+    }
+
     let Some(pricing) = pricing else {
         return;
     };
@@ -2710,6 +3021,25 @@ fn apply_pricing_if_available(
 
     if calculated_cost > 0.0 {
         message.cost = calculated_cost;
+        message.mark_estimated_cost();
+    }
+}
+
+/// Reprice a streaming-lane message, respecting an authoritative embedded cost.
+///
+/// Clients that record a real per-message cost of their own (e.g. MiMo Code,
+/// which stores `usage.cost`) pass `guard_authoritative_cost = true`: the
+/// message is repriced only when its embedded cost is absent (`<= 0.0`), so a
+/// recomputed `tokens * rate` never clobbers the authoritative value if the
+/// model later resolves to a price. Every other lane passes `false` and
+/// reprices unconditionally (unchanged behaviour). `#742` Part 2.
+fn reprice_lane_message(
+    message: &mut UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+    guard_authoritative_cost: bool,
+) {
+    if !guard_authoritative_cost || message.cost <= 0.0 {
+        apply_pricing_if_available(message, pricing);
     }
 }
 
@@ -2814,8 +3144,8 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
         &scan_result.kiro_db,
     ];
     dbs.extend(single_dbs.into_iter().flatten().cloned());
-    // Hermes/Zed dbs may also be discovered via user-provided extra scan
-    // roots (the `files` lanes) — use the plural helpers so every db gets
+    // Hermes/Zed dbs may also be auto-discovered or supplied through extra
+    // scan roots (the `files` lanes) — use the plural helpers so every db gets
     // its `-wal` sidecar probed, not just the default-path single.
     dbs.extend(scan_result.hermes_db_paths());
     dbs.extend(scan_result.zed_db_paths());
@@ -2846,6 +3176,40 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
         let journal = message_cache::jcode_journal_path(snapshot);
         latest = latest.max(file_mtime_ms(&journal).unwrap_or(0));
     }
+    // Grok Build reconciles totals from sibling signals.json and reads the model
+    // id from summary.json / events.jsonl. Any of those metadata siblings can
+    // rewrite without touching updates.jsonl (compaction / live session refresh /
+    // a late-arriving model id), so probe every sibling the fingerprint covers for
+    // the live-tail change token too — otherwise a sibling-only write leaves the
+    // token unchanged and the tail never re-parses the new model.
+    for updates in scan_result.get(ClientId::Grok) {
+        if let Some(parent) = updates.parent() {
+            for sibling in message_cache::GROK_METADATA_SIBLINGS {
+                latest = latest.max(file_mtime_ms(&parent.join(sibling)).unwrap_or(0));
+            }
+        }
+    }
+    // Roo-family task parsers read model and agent identity from the sibling
+    // api_conversation_history.json. Probe it alongside ui_messages.json so a
+    // history-only rewrite reaches the cache fingerprint and active lane.
+    for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
+        for ui_messages in scan_result.get(client) {
+            latest = latest.max(roo_source_mtime_ms(ui_messages).unwrap_or(0));
+        }
+    }
+    // These file-backed parsers consult secondary sources whose writes do not
+    // update the scanned primary: Droid's fallback transcript, legacy Kimi's
+    // shared config, and Kiro CLI's same-stem message log. Probe each dependency
+    // so a sibling-only change reaches the specialized cache fingerprint.
+    for settings in scan_result.get(ClientId::Droid) {
+        latest = latest.max(droid_source_mtime_ms(settings).unwrap_or(0));
+    }
+    for wire in scan_result.get(ClientId::Kimi) {
+        latest = latest.max(kimi_source_mtime_ms(wire).unwrap_or(0));
+    }
+    for session in scan_result.get(ClientId::Kiro) {
+        latest = latest.max(kiro_source_mtime_ms(session).unwrap_or(0));
+    }
     Ok(latest)
 }
 
@@ -2856,19 +3220,89 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
     Some(duration.as_millis() as u64)
 }
 
+/// Newest mtime for a primary source and every related path its parser reads.
+/// Missing optional paths are ignored. Any other metadata failure returns
+/// `None`, allowing pruning callers to fail open rather than silently dropping
+/// a source whose freshness cannot be established.
+fn source_with_related_mtime_ms(
+    source: &Path,
+    related_paths: impl IntoIterator<Item = PathBuf>,
+) -> Option<u64> {
+    let mut latest = file_mtime_ms(source)?;
+    for related in related_paths {
+        let metadata = match std::fs::metadata(&related) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let modified = metadata.modified().ok()?;
+        let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        latest = latest.max(duration.as_millis() as u64);
+    }
+    Some(latest)
+}
+
+fn roo_source_mtime_ms(ui_messages_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(
+        ui_messages_path,
+        std::iter::once(sessions::roocode::history_path_for_ui_messages(
+            ui_messages_path,
+        )),
+    )
+}
+
+fn droid_source_mtime_ms(settings_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(
+        settings_path,
+        sessions::droid::droid_jsonl_path(settings_path),
+    )
+}
+
+fn kimi_source_mtime_ms(wire_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(wire_path, sessions::kimi::kimi_config_path(wire_path))
+}
+
+fn kiro_source_mtime_ms(session_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(
+        session_path,
+        sessions::kiro::kiro_related_messages_path(session_path),
+    )
+}
+
+/// Newest mtime for a Grok session's scanned updates file and every metadata
+/// sibling the parser reads (`signals.json` / `summary.json` / `events.jsonl` —
+/// kept in lockstep with the fingerprint via `GROK_METADATA_SIBLINGS`). `None`
+/// keeps the source during pruning because over-parsing is safer than dropping a
+/// session when the updates file or an existing sibling cannot be inspected.
+fn grok_source_mtime_ms(updates_path: &Path) -> Option<u64> {
+    let mut latest = file_mtime_ms(updates_path)?;
+    let Some(parent) = updates_path.parent() else {
+        return Some(latest);
+    };
+    for name in message_cache::GROK_METADATA_SIBLINGS {
+        let sibling = parent.join(name);
+        if sibling.exists() {
+            latest = latest.max(file_mtime_ms(&sibling)?);
+        }
+    }
+    Some(latest)
+}
+
 /// Drop file-backed session logs older than `threshold_ms` (unix ms, mtime)
 /// from a scan. Sources whose freshness is not captured by their scanned
 /// file's own mtime are left untouched, because a sibling can change without
 /// touching it: the Hermes/Zed/Antigravity-CLI/micode lanes hold SQLite dbs
-/// (WAL writes may not bump the main `.db` mtime), and the jcode lane holds a
+/// (WAL writes may not bump the main `.db` mtime), while the jcode lane holds a
 /// `session_*.json` snapshot whose sibling `.journal.jsonl` is appended between
-/// snapshot rewrites. Pruning any of these by the scanned file's mtime would
-/// drop a still-active source, so they are exempt and always parsed. Any stat
-/// failure keeps the file — over-parsing is safe, silently skipping is not.
+/// snapshot rewrites. Those lanes remain exempt. Roo-family, Droid, legacy Kimi,
+/// Kiro CLI, and Grok sources can still be bounded by folding every parser
+/// dependency into their newest mtime.
+/// Any stat failure keeps the file — over-parsing is safe, silently skipping is
+/// not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
     // Lanes whose scanned file's mtime does not reflect a sibling write
-    // (SQLite `-wal`, or jcode's `.journal.jsonl`); kept in lockstep with the
-    // `-wal`/journal probes in `latest_source_mtime_ms`.
+    // (SQLite `-wal` or jcode's `.journal.jsonl`); kept in lockstep with the
+    // sibling probes in `latest_source_mtime_ms`.
     let db_lanes = [
         ClientId::Hermes as usize,
         ClientId::Zed as usize,
@@ -2876,8 +3310,42 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
         ClientId::MiMoCode as usize,
         ClientId::Jcode as usize,
     ];
+    let roo_lanes = [
+        ClientId::RooCode as usize,
+        ClientId::KiloCode as usize,
+        ClientId::Cline as usize,
+    ];
     for (lane, files) in scan_result.files.iter_mut().enumerate() {
         if db_lanes.contains(&lane) {
+            continue;
+        }
+        if roo_lanes.contains(&lane) {
+            files
+                .retain(|path| roo_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms));
+            continue;
+        }
+        if lane == ClientId::Droid as usize {
+            files.retain(|path| {
+                droid_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
+            continue;
+        }
+        if lane == ClientId::Kimi as usize {
+            files.retain(|path| {
+                kimi_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
+            continue;
+        }
+        if lane == ClientId::Kiro as usize {
+            files.retain(|path| {
+                kiro_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
+            continue;
+        }
+        if lane == ClientId::Grok as usize {
+            files.retain(|path| {
+                grok_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
             continue;
         }
         files.retain(|path| {
@@ -3250,6 +3718,20 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Gjc, gjc_count);
     messages.extend(gjc_msgs);
 
+    let grok_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Grok)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::grok::parse_grok_updates_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let grok_count = summed_parsed_message_count(&grok_msgs);
+    counts.set(ClientId::Grok, grok_count);
+    messages.extend(grok_msgs);
+
     let mux_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mux)
         .par_iter()
@@ -3553,6 +4035,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
             reasoning: msg.reasoning,
         },
         cost,
+        cost_source: CostSource::Unknown,
         duration_ms: msg.duration_ms,
         message_count: msg.message_count,
         agent: msg.agent.clone(),
@@ -3565,18 +4048,290 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 mod tests {
     use super::{
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
-        dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_model_report,
-        message_cache, normalize_model_for_grouping, parse_all_messages_with_pricing,
-        parse_local_clients, parse_local_unified_messages, parsed_to_unified, pricing,
-        retain_for_requested_clients, scan_messages_streaming, scanner, select_local_parse_pricing,
-        unified_to_parsed,
-        AgentAccumulator, ClientId, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
+        dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
+        get_model_report, get_monthly_report, latest_source_mtime_ms, message_cache,
+        normalize_model_for_grouping, parse_all_messages_with_pricing,
+        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
+        parse_local_unified_messages, parsed_to_unified, pricing, prune_scan_result_by_mtime,
+        reprice_lane_message, retain_for_requested_clients, scan_messages_streaming, scanner,
+        select_local_parse_pricing, sessions, unified_to_parsed, AgentAccumulator, ClientId,
+        CostSource, GroupBy, LocalParseOptions, OpenCodeStreamingSelection, ReportOptions,
+        TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::str::FromStr;
     use std::sync::Arc;
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+
+        fn set(vars: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+            let keys: Vec<_> = vars.iter().map(|(key, _)| *key).collect();
+            let guard = Self::capture(&keys);
+            unsafe {
+                for (key, value) in vars {
+                    std::env::set_var(key, value);
+                }
+            }
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_guard_restores_some_and_none_after_panic() {
+        const KEYS: [&str; 2] = ["HOME", "TOKSCALE_PRICING_CACHE_ONLY"];
+        let _original = EnvGuard::capture(&KEYS);
+
+        unsafe {
+            std::env::set_var("HOME", "/tmp/tokscale-env-guard-home-before");
+            std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
+        }
+        let first = std::panic::catch_unwind(|| {
+            let _guard = EnvGuard::set(&[
+                (
+                    "HOME",
+                    std::ffi::OsStr::new("/tmp/tokscale-env-guard-home-during"),
+                ),
+                ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+            ]);
+            panic!("exercise EnvGuard unwinding");
+        });
+        assert!(first.is_err());
+        assert_eq!(
+            std::env::var_os("HOME"),
+            Some(std::ffi::OsString::from(
+                "/tmp/tokscale-env-guard-home-before"
+            ))
+        );
+        assert_eq!(std::env::var_os("TOKSCALE_PRICING_CACHE_ONLY"), None);
+
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "before");
+        }
+        let second = std::panic::catch_unwind(|| {
+            let _guard = EnvGuard::set(&[
+                (
+                    "HOME",
+                    std::ffi::OsStr::new("/tmp/tokscale-env-guard-home-during"),
+                ),
+                ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+            ]);
+            panic!("exercise inverse EnvGuard unwinding");
+        });
+        assert!(second.is_err());
+        assert_eq!(std::env::var_os("HOME"), None);
+        assert_eq!(
+            std::env::var_os("TOKSCALE_PRICING_CACHE_ONLY"),
+            Some(std::ffi::OsString::from("before"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_empty_reports_normalize_total_cost_to_positive_zero() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["opencode".to_string()]),
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let totals = [
+            runtime
+                .block_on(get_model_report(options.clone()))
+                .unwrap()
+                .total_cost,
+            runtime
+                .block_on(get_monthly_report(options.clone()))
+                .unwrap()
+                .total_cost,
+            runtime
+                .block_on(get_hourly_report(options.clone()))
+                .unwrap()
+                .total_cost,
+            runtime
+                .block_on(get_agents_report(options))
+                .unwrap()
+                .total_cost,
+        ];
+
+        for total in totals {
+            assert_eq!(total.to_bits(), 0.0f64.to_bits());
+        }
+    }
+
+    fn make_opencode_selection_message(key: &str, cost: f64, source: CostSource) -> UnifiedMessage {
+        let mut message = UnifiedMessage::new_with_dedup(
+            "opencode", "gpt-4o", "openai", "oc-session", 1_733_011_200_000,
+            TokenBreakdown { input: 10, output: 5, cache_read: 0, cache_write: 0, reasoning: 0 },
+            cost, Some(key.to_string()),
+        );
+        match source {
+            CostSource::ProviderReported => message.mark_provider_reported_cost(),
+            CostSource::Estimated => message.mark_estimated_cost(),
+            CostSource::Unknown => {}
+        }
+        message
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_flushes_snapshot_fallback_on_json_drift() {
+        // A missing file and an invalid file both produce no second-pass message;
+        // a downgraded file produces an estimated message. All must flush SQLite.
+        for second_pass in [None, None, Some(CostSource::Estimated)] {
+            let key = "snapshot-authoritative";
+            let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+            assert!(selection.select_sqlite(make_opencode_selection_message(
+                key, 0.25, CostSource::Estimated,
+            )).is_none());
+            if let Some(source) = second_pass {
+                assert!(selection.select_json(make_opencode_selection_message(
+                    key, 0.0, source,
+                ), true).is_none());
+            }
+            let selected: Vec<_> = selection.finish().collect();
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].cost, 0.25);
+            assert_eq!(selected[0].cost_source, CostSource::Estimated);
+        }
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_replaces_deferred_sqlite_estimate() {
+        let key = "sqlite-authoritative-replacement";
+        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        assert!(selection
+            .select_sqlite(make_opencode_selection_message(
+                key, 0.25, CostSource::Estimated,
+            ))
+            .is_none());
+
+        let selected = selection
+            .select_sqlite(make_opencode_selection_message(
+                key, 0.50, CostSource::ProviderReported,
+            ))
+            .expect("a later authoritative SQLite message must replace the fallback");
+        assert_eq!(selected.cost, 0.50);
+        assert_eq!(selected.cost_source, CostSource::ProviderReported);
+        assert_eq!(selection.finish().count(), 0);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_keeps_first_sqlite_estimate() {
+        let key = "sqlite-estimated-first-wins";
+        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        assert!(selection
+            .select_sqlite(make_opencode_selection_message(
+                key, 0.25, CostSource::Estimated,
+            ))
+            .is_none());
+        assert!(selection
+            .select_sqlite(make_opencode_selection_message(
+                key, 0.50, CostSource::Estimated,
+            ))
+            .is_none());
+
+        let selected: Vec<_> = selection.finish().collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].cost, 0.25);
+        assert_eq!(selected[0].cost_source, CostSource::Estimated);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_keeps_first_sqlite_authority() {
+        let key = "sqlite-authoritative-first-wins";
+        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        let first = selection
+            .select_sqlite(make_opencode_selection_message(
+                key, 0.50, CostSource::ProviderReported,
+            ))
+            .expect("the first authoritative SQLite message must be selected");
+        assert_eq!(first.cost, 0.50);
+        assert!(selection
+            .select_sqlite(make_opencode_selection_message(
+                key, 0.75, CostSource::ProviderReported,
+            ))
+            .is_none());
+        assert_eq!(selection.finish().count(), 0);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_keeps_fallback_until_json_is_emitted() {
+        let key = "filtered-authoritative";
+        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        assert!(selection.select_sqlite(make_opencode_selection_message(
+            key, 0.25, CostSource::Estimated,
+        )).is_none());
+        assert!(selection.select_json(make_opencode_selection_message(
+            key, 0.50, CostSource::ProviderReported,
+        ), false).is_none());
+        let selected: Vec<_> = selection.finish().collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].cost, 0.25);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_does_not_double_count_new_authority() {
+        let key = "newly-authoritative";
+        let mut selection = OpenCodeStreamingSelection::new(HashSet::new());
+        assert!(selection.select_sqlite(make_opencode_selection_message(
+            key, 0.25, CostSource::Estimated,
+        )).is_some());
+        assert!(selection.select_json(make_opencode_selection_message(
+            key, 0.50, CostSource::ProviderReported,
+        ), true).is_none());
+        assert_eq!(selection.finish().count(), 0);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_prefers_snapshot_authority() {
+        let key = "stable-authoritative";
+        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        assert!(selection.select_sqlite(make_opencode_selection_message(
+            key, 0.25, CostSource::Estimated,
+        )).is_none());
+        let json = selection.select_json(make_opencode_selection_message(
+            key, 0.50, CostSource::ProviderReported,
+        ), true).unwrap();
+        assert_eq!(json.cost, 0.50);
+        assert_eq!(json.cost_source, CostSource::ProviderReported);
+        assert_eq!(selection.finish().count(), 0);
+    }
 
     fn make_workspace_message(
         client: &str,
@@ -4837,6 +5592,174 @@ mod tests {
         std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
     }
 
+    // Issue #36: the client selection must be applied at the STREAMING SCAN,
+    // not by a downstream membership filter over the pre-aggregated buckets.
+    // codebuff (200/80) and kimi (100/50) fold into ONE shared "Main" agent
+    // bucket; the FFI/DashboardModel now thread the selection into
+    // ReportOptions.clients, so filtering to codebuff yields ONLY its 200/80 —
+    // NOT the mixed 300/130. The old approach (unfiltered report + a Swift
+    // membership filter over whole buckets) kept the entire shared bucket and
+    // would read 300/130 here, so this test is RED against it and GREEN now.
+    #[test]
+    #[serial_test::serial]
+    fn test_agents_report_client_filter_scopes_shared_bucket_issue36() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+
+        {
+            let cb_dir = source_home.path().join(".config/manicode/projects/proj");
+            std::fs::create_dir_all(&cb_dir).unwrap();
+            std::fs::write(
+                cb_dir.join("chat-messages.json"),
+                r#"[{"role":"assistant","id":"A","metadata":{"model":"claude-sonnet-4","usage":{"inputTokens":200,"outputTokens":80}},"credits":0.02}]"#,
+            )
+            .unwrap();
+            let kimi_dir = source_home.path().join(".kimi/sessions/g/s");
+            std::fs::create_dir_all(&kimi_dir).unwrap();
+            std::fs::write(
+                kimi_dir.join("wire.jsonl"),
+                "{\"type\": \"metadata\", \"protocol_version\": \"1.3\"}\n{\"timestamp\": 1770983410.0, \"message\": {\"type\": \"StatusUpdate\", \"payload\": {\"token_usage\": {\"input_other\": 100, \"output\": 50, \"input_cache_read\": 0, \"input_cache_creation\": 0}, \"message_id\": \"K\"}}}",
+            )
+            .unwrap();
+
+            let home = source_home.path().to_str().unwrap().to_string();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let run = |clients: Option<Vec<String>>| {
+                rt.block_on(get_agents_report(ReportOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients,
+                    ..Default::default()
+                }))
+                .unwrap()
+            };
+
+            // All clients: one shared "Main" bucket carrying the mixed total.
+            let all = run(None);
+            assert_eq!(all.entries.len(), 1, "codebuff + kimi share one Main bucket");
+            assert_eq!(all.entries[0].agent, "Main");
+            assert_eq!(all.entries[0].input, 300, "mixed bucket = 200 + 100");
+            assert_eq!(all.entries[0].output, 130, "mixed bucket = 80 + 50");
+            assert_eq!(all.total_messages, 2);
+
+            // Filtered to codebuff: the SAME shared bucket, scoped at the scan
+            // to codebuff's contribution alone — proves the FFI-level filter,
+            // not a whole-bucket membership keep (which would still read 300).
+            let filtered = run(Some(vec!["codebuff".to_string()]));
+            assert_eq!(filtered.entries.len(), 1);
+            assert_eq!(filtered.entries[0].agent, "Main");
+            assert_eq!(
+                filtered.entries[0].input, 200,
+                "filtered = codebuff only, not the mixed 300"
+            );
+            assert_eq!(filtered.entries[0].output, 80);
+            assert_eq!(filtered.entries[0].clients, vec!["codebuff".to_string()]);
+            assert_eq!(filtered.total_messages, 1, "kimi's message is gone");
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
+    }
+
+    // Issue #36 (round 3): a cc-mirror variant id (`cc-mirror/kimi-code`) is
+    // produced during CLAUDE-lane parsing, not by a scanner lane of its own —
+    // `ClientId::from_str("cc-mirror/kimi-code")` is None. The two-level split
+    // must (a) map the variant to its producing `claude` lane so the scan finds
+    // it, and (b) keep ONLY the exact requested ids at fold time so requesting
+    // the variant returns just the variant, and requesting `claude` returns
+    // plain claude WITHOUT the variant (which the graph/daily/models surface as
+    // its own client id). RED against the old lane-only filter: requesting the
+    // variant returned empty, and requesting claude swept the variant in.
+    #[test]
+    #[serial_test::serial]
+    fn test_agents_report_cc_mirror_variant_slice_issue36() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+
+        {
+            // Plain claude session (client "claude"): 100 in / 50 out.
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            std::fs::write(
+                claude_dir.join("conversation.jsonl"),
+                r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_plain","message":{"id":"msg_plain","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+            )
+            .unwrap();
+            // cc-mirror variant (client "cc-mirror/kimi-code"): 300 in / 70 out.
+            let variant_dir = source_home.path().join(".cc-mirror/kimi-code");
+            let config_dir = variant_dir.join("config");
+            let project_dir = config_dir.join("projects/proj");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            std::fs::write(
+                variant_dir.join("variant.json"),
+                format!(
+                    r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
+                    config_dir.display()
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                project_dir.join("session.jsonl"),
+                r#"{"type":"assistant","timestamp":"2024-12-01T11:00:00.000Z","requestId":"req_variant","message":{"id":"msg_variant","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":70}}}"#,
+            )
+            .unwrap();
+
+            let home = source_home.path().to_str().unwrap().to_string();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let run = |clients: Option<Vec<String>>| {
+                let report = rt
+                    .block_on(get_agents_report(ReportOptions {
+                        home_dir: Some(home.clone()),
+                        use_env_roots: false,
+                        clients,
+                        ..Default::default()
+                    }))
+                    .unwrap();
+                let input: i64 = report.entries.iter().map(|e| e.input).sum();
+                (report.total_messages, input)
+            };
+
+            // All clients: both messages fold into "Main".
+            assert_eq!(run(None), (2, 400), "all: plain(100) + variant(300)");
+
+            // Variant slice: the claude lane is scanned (so the variant is
+            // found), then narrowed to exactly the variant id.
+            assert_eq!(
+                run(Some(vec!["cc-mirror/kimi-code".to_string()])),
+                (1, 300),
+                "variant slice = just the variant (300), not empty"
+            );
+
+            // Claude slice: plain claude ONLY — the distinct variant is excluded.
+            assert_eq!(
+                run(Some(vec!["claude".to_string()])),
+                (1, 100),
+                "claude slice = plain claude (100), not the mixed 400"
+            );
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
+    }
+
     // Agent bucketing + fold arithmetic in isolation (no fixtures): normalized
     // names, the "Main" fallback, plain `+=` token sums, and message_count.max(0).
     #[test]
@@ -4880,6 +5803,77 @@ mod tests {
         assert!((acc.cost - 1.0).abs() < 1e-9);
         assert_eq!(acc.messages, 2, "message_count.max(0): 2 + 0");
         assert!(acc.clients.contains("codebuff"));
+    }
+
+    #[test]
+    fn agent_accumulator_saturates_overflowing_token_folds() {
+        // Vendor-local sibling sweep alongside #823: AgentAccumulator::add is
+        // its own per-field CROSS-MESSAGE fold (agents streaming report), not
+        // one of the 6 sites #823 covers. An antigravity-cli row can carry an
+        // i64::MAX bucket after the untrusted-varint clamp, so two such rows
+        // folded into one agent bucket with plain `+=` overflow (debug panic /
+        // release wrap) before any saturating grand total runs.
+        let make = || {
+            UnifiedMessage::new(
+                "antigravity-cli",
+                "gemini-3-pro",
+                "antigravity",
+                "session-overflow",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input: i64::MAX,
+                    output: 0,
+                    cache_read: i64::MAX,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )
+        };
+
+        let mut acc = AgentAccumulator::default();
+        acc.add(&make());
+        acc.add(&make());
+
+        assert_eq!(acc.input, i64::MAX);
+        assert_eq!(acc.cache_read, i64::MAX);
+    }
+
+    #[test]
+    fn test_agent_bucket_key_copilot_uses_copilot_normalizer() {
+        // #724/#751: copilot messages carry a raw OTEL agent id. Our agents
+        // report must prettify it with the copilot-specific normalizer (the
+        // prettification upstream does in its CLI), while other clients keep the
+        // generic normalization.
+        let msg = |client: &str, agent: &str| {
+            UnifiedMessage::new_with_agent(
+                client,
+                "m",
+                "p",
+                "s",
+                0,
+                TokenBreakdown::default(),
+                0.0,
+                Some(agent.to_string()),
+            )
+        };
+
+        // Copilot: raw OTEL ids resolve to their pretty display form.
+        assert_eq!(
+            agent_bucket_key(&msg("copilot", "github.copilot.default")),
+            "GitHub Copilot"
+        );
+        assert_eq!(
+            agent_bucket_key(&msg("copilot", "Plugin:code-review-team:api-reviewer")),
+            "Code Review Team: API Reviewer"
+        );
+
+        // A non-copilot client with the same raw id must NOT get the
+        // copilot-specific prettification (proves the branch is client-scoped).
+        assert_ne!(
+            agent_bucket_key(&msg("codebuff", "github.copilot.default")),
+            "GitHub Copilot"
+        );
     }
 
     #[test]
@@ -5422,6 +6416,313 @@ mod tests {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// Regression fixture for Codex sessions that are live-only, archive-only,
+    /// or briefly present in both roots while the CLI moves a transcript.
+    fn write_codex_sessions_and_archived_sessions_fixture(source_home: &std::path::Path) {
+        let sessions_dir = source_home.join(".codex/sessions");
+        let archived_dir = source_home.join(".codex/archived_sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&archived_dir).unwrap();
+
+        std::fs::write(
+            sessions_dir.join("live-only.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"33333333-3333-7333-8333-333333333333","source":"interactive","model_provider":"openai","cwd":"/repo"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55},"last_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            archived_dir.join("archived-only.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-06-20T09:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-7444-8444-444444444444","source":"interactive","model_provider":"openai","cwd":"/repo"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-20T09:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-20T09:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":70,"output_tokens":7,"total_tokens":77},"last_token_usage":{"input_tokens":70,"output_tokens":7,"total_tokens":77}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let shared_content = concat!(
+            r#"{"timestamp":"2026-06-22T08:00:00Z","type":"session_meta","payload":{"id":"55555555-5555-7555-8555-555555555555","source":"interactive","model_provider":"openai","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-22T08:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-22T08:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":3,"total_tokens":33},"last_token_usage":{"input_tokens":30,"output_tokens":3,"total_tokens":33}}}}"#,
+            "\n"
+        );
+        std::fs::write(
+            sessions_dir.join("shared-in-sessions.jsonl"),
+            shared_content,
+        )
+        .unwrap();
+        std::fs::write(
+            archived_dir.join("shared-in-archived.jsonl"),
+            shared_content,
+        )
+        .unwrap();
+    }
+
+    fn with_isolated_tokscale_cache<T>(
+        cache_home: &std::path::Path,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        action()
+    }
+
+    fn write_codex_duration_prefix_fixture(
+        source_home: &std::path::Path,
+    ) -> (std::path::PathBuf, String) {
+        let lines = include_str!("../tests/fixtures/codex_duration_timing.jsonl")
+            .lines()
+            .collect::<Vec<_>>();
+        let sessions_dir = source_home.join(".codex/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let source = sessions_dir.join("codex-duration-timing.jsonl");
+        std::fs::write(&source, format!("{}\n", lines[..5].join("\n"))).unwrap();
+        (source, format!("{}\n", lines[5..].join("\n")))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_non_overlapping_durations_survive_incremental_and_streaming_caches() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let (source, suffix) = write_codex_duration_prefix_fixture(source_home.path());
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["codex".to_string()];
+        let parse_materialized = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        };
+
+        let prefix = with_isolated_tokscale_cache(materialized_cache.path(), parse_materialized);
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].duration_ms, Some(1_000));
+
+        let mut source_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap();
+        source_file.write_all(suffix.as_bytes()).unwrap();
+        source_file.flush().unwrap();
+        drop(source_file);
+
+        let materialized_incremental =
+            with_isolated_tokscale_cache(materialized_cache.path(), parse_materialized);
+        let materialized_warm =
+            with_isolated_tokscale_cache(materialized_cache.path(), parse_materialized);
+        for (phase, messages) in [
+            ("incremental", &materialized_incremental),
+            ("warm", &materialized_warm),
+        ] {
+            assert_eq!(messages.len(), 3, "{phase} materialized messages");
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)],
+                "{phase} materialized durations"
+            );
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report_options = || ReportOptions {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        };
+        let streaming_cold = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+
+        // The cold Codex streaming lane does not persist SourceMessageCache.
+        // Seed this isolated cache through the public materialized path so the
+        // second report exercises the shipping cache-hit branch.
+        let cache_seed = with_isolated_tokscale_cache(streaming_cache.path(), parse_materialized);
+        assert_eq!(cache_seed.len(), 3);
+        assert!(
+            streaming_cache
+                .path()
+                .join("cache/source-message-cache.bin")
+                .is_file(),
+            "materialized seed must persist the cache used by the warm report"
+        );
+        let streaming_warm = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+
+        for (phase, report) in [("cold", &streaming_cold), ("warm", &streaming_warm)] {
+            assert_eq!(report.total_messages, 3, "{phase} streaming messages");
+            assert_eq!(report.entries.len(), 1, "{phase} model groups");
+            let performance = &report.entries[0].performance;
+            assert_eq!(
+                performance.total_duration_ms, 7_000,
+                "{phase} total duration"
+            );
+            assert_eq!(performance.timed_tokens, 170, "{phase} timed tokens");
+            assert_eq!(performance.sample_count, 3, "{phase} samples");
+            assert_eq!(performance.token_coverage, 1.0, "{phase} coverage");
+            let expected_ms_per_1k = 7_000.0 * 1_000.0 / 170.0;
+            assert!(
+                (performance.ms_per_1k_tokens.unwrap() - expected_ms_per_1k).abs() < f64::EPSILON,
+                "{phase} milliseconds per 1K tokens"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_archive_roots_are_exact_once_across_all_consumers() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let count_cache = tempfile::TempDir::new().unwrap();
+
+        write_codex_sessions_and_archived_sessions_fixture(source_home.path());
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["codex".to_string()];
+        let materialized = with_isolated_tokscale_cache(materialized_cache.path(), || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        });
+
+        assert_eq!(materialized.len(), 3);
+        let session_ids: HashSet<_> = materialized
+            .iter()
+            .map(|message| message.session_id.as_str())
+            .collect();
+        assert!(session_ids.contains("live-only"));
+        assert!(session_ids.contains("archived-only"));
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            150,
+        );
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.output)
+                .sum::<i64>(),
+            15,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report_options = || ReportOptions {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        };
+        let streaming_cold = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+
+        // Codex's cold streaming lane does not populate SourceMessageCache, so
+        // seed the same isolated cache through the public materialized path
+        // before exercising the streaming cache-hit branch.
+        let cache_seed = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        });
+        assert_eq!(cache_seed.len(), 3);
+        assert!(
+            streaming_cache
+                .path()
+                .join("cache/source-message-cache.bin")
+                .is_file(),
+            "materialized seed must persist the cache used by the warm pass",
+        );
+        let streaming_warm = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+        for (phase, streaming) in [("cold", &streaming_cold), ("warm", &streaming_warm)] {
+            assert_eq!(streaming.total_messages, 3, "{phase} streaming messages");
+            assert_eq!(streaming.total_input, 150, "{phase} streaming input");
+            assert_eq!(streaming.total_output, 15, "{phase} streaming output");
+        }
+
+        let counted = with_isolated_tokscale_cache(count_cache.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(home),
+                use_env_roots: false,
+                clients: Some(clients),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: None,
+            })
+            .unwrap()
+        });
+        assert_eq!(counted.counts.get(ClientId::Codex), 3);
+        assert_eq!(counted.messages.len(), 3);
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            150,
+        );
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.output)
+                .sum::<i64>(),
+            15,
+        );
     }
 
     fn write_codex_forked_history_fixture(source_home: &std::path::Path) {
@@ -6448,6 +7749,175 @@ mod tests {
         apply_pricing_if_available(&mut msg, Some(&pricing));
 
         assert_eq!(msg.cost, 0.02);
+        assert_eq!(msg.cost_source, CostSource::Estimated);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_preserves_provider_reported_cost() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4o".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let mut msg = UnifiedMessage::new(
+            "opencode",
+            "gpt-4o",
+            "openai",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.42,
+        );
+        msg.mark_provider_reported_cost();
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.42);
+        assert_eq!(msg.cost_source, CostSource::ProviderReported);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_cost_provenance_matches_materialized_and_streaming_lanes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[("HOME", cache_home.path().as_os_str())]);
+
+        let opencode_data_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&opencode_data_dir).unwrap();
+        let opencode_db =
+            rusqlite::Connection::open(opencode_data_dir.join("opencode.db")).unwrap();
+        opencode_db.execute_batch("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);").unwrap();
+        let sqlite_rows = [
+            (
+                "sqlite-a",
+                r#"{"id":"json-authoritative","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.0,"tokens":{"input":20,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011200000}}"#,
+            ),
+            (
+                "sqlite-b",
+                r#"{"id":"sqlite-authoritative","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.06,"tokens":{"input":20,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011201000}}"#,
+            ),
+            (
+                "sqlite-c",
+                r#"{"id":"both-authoritative","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.07,"tokens":{"input":20,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011202000}}"#,
+            ),
+            (
+                "sqlite-d",
+                r#"{"id":"both-estimated","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.0,"tokens":{"input":40,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011203000}}"#,
+            ),
+        ];
+        for (row_id, data) in sqlite_rows {
+            opencode_db
+                .execute(
+                    "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![row_id, "oc-session", data],
+                )
+                .unwrap();
+        }
+        drop(opencode_db);
+
+        let opencode_dir = opencode_data_dir.join("storage/message/project-1");
+        std::fs::create_dir_all(&opencode_dir).unwrap();
+        let json_rows = [
+            (
+                "a-json-authoritative.json",
+                r#"{"id":"json-authoritative","sessionID":"oc-session","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.05,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011200000}}"#,
+            ),
+            (
+                "b-json-estimated.json",
+                r#"{"id":"sqlite-authoritative","sessionID":"oc-session","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011201000}}"#,
+            ),
+            (
+                "c-json-authoritative.json",
+                r#"{"id":"both-authoritative","sessionID":"oc-session","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.08,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011202000}}"#,
+            ),
+            (
+                "d-json-estimated.json",
+                r#"{"id":"both-estimated","sessionID":"oc-session","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011203000}}"#,
+            ),
+        ];
+        for (name, data) in json_rows {
+            std::fs::write(opencode_dir.join(name), data).unwrap();
+        }
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let clients = vec!["opencode".to_string()];
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+
+        let summarize = |messages: Vec<UnifiedMessage>| {
+            let mut rows: Vec<(String, f64, CostSource)> = messages
+                .into_iter()
+                .map(|message| {
+                    (
+                        message.dedup_key.unwrap_or_default(),
+                        message.cost,
+                        message.cost_source,
+                    )
+                })
+                .collect();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows
+        };
+        let materialized = summarize(materialized);
+        let streamed = summarize(streamed);
+        assert_eq!(materialized, streamed);
+        assert_eq!(
+            materialized,
+            vec![
+                (
+                    "both-authoritative".to_string(),
+                    0.07,
+                    CostSource::ProviderReported
+                ),
+                ("both-estimated".to_string(), 0.5, CostSource::Estimated),
+                (
+                    "json-authoritative".to_string(),
+                    0.05,
+                    CostSource::ProviderReported
+                ),
+                (
+                    "sqlite-authoritative".to_string(),
+                    0.06,
+                    CostSource::ProviderReported
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -7327,7 +8797,7 @@ mod tests {
     #[test]
     fn test_parse_local_clients_honors_scanner_extra_scan_paths_for_hermes_profile_db() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        let profile_dir = temp_dir.path().join("external-hermes/director_planning");
         std::fs::create_dir_all(&profile_dir).unwrap();
         let profile_db = profile_dir.join("state.db");
         let conn = create_hermes_sqlite_db(&profile_db);
@@ -7390,13 +8860,94 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn test_auto_discovered_hermes_profile_reaches_all_consumers() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let count_cache = tempfile::TempDir::new().unwrap();
+        let profile_dir = source_home.path().join(".hermes/profiles/research");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &conn,
+            "hermes-auto-profile",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(conn);
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["hermes".to_string()];
+        let materialized = with_isolated_tokscale_cache(materialized_cache.path(), || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        });
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].session_id, "hermes-auto-profile");
+        assert_eq!(materialized[0].tokens.input, 100);
+        assert_eq!(materialized[0].tokens.output, 25);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let streaming = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(ReportOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients: Some(clients.clone()),
+                    ..Default::default()
+                }))
+                .unwrap()
+        });
+        assert_eq!(streaming.total_messages, 2);
+        assert_eq!(streaming.total_input, 100);
+        assert_eq!(streaming.total_output, 25);
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        let counted = with_isolated_tokscale_cache(count_cache.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(home),
+                use_env_roots: false,
+                clients: Some(clients),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: Some(future_ms),
+            })
+            .unwrap()
+        });
+        assert_eq!(counted.counts.get(ClientId::Hermes), 2);
+        assert_eq!(counted.messages.len(), 1);
+        assert_eq!(counted.messages[0].session_id, "hermes-auto-profile");
+        assert_eq!(counted.messages[0].input, 100);
+        assert_eq!(counted.messages[0].output, 25);
+    }
+
+    #[test]
     fn test_modified_after_never_prunes_hermes_dbs_from_extra_scan_paths() {
         // SQLite WAL writes may leave the main db file's mtime untouched, so
         // `modified_after` must not prune Hermes/Zed dbs even when they come
         // from user scan roots (the `files` lanes) rather than the default
         // single-db path. A threshold in the future would prune any mtime.
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        let profile_dir = temp_dir.path().join("external-hermes/director_planning");
         std::fs::create_dir_all(&profile_dir).unwrap();
         let profile_db = profile_dir.join("state.db");
         let conn = create_hermes_sqlite_db(&profile_db);
@@ -7639,7 +9190,7 @@ mod tests {
         std::env::set_var("HOME", cache_home.path());
 
         {
-            let micode_dir = source_home.path().join(".local/share/micode");
+            let micode_dir = source_home.path().join(".local/share/mimocode");
             std::fs::create_dir_all(&micode_dir).unwrap();
             let db_path = micode_dir.join("test.db");
             {
@@ -7685,6 +9236,784 @@ mod tests {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // #742 Part 2: the micode lane is cost-guarded so MiMo Code's authoritative
+    // embedded cost is never overwritten by a recomputed tokens*rate when the
+    // model resolves to a price. reprice_lane_message(.., guard=true) reprices
+    // only when the embedded cost is absent (<= 0.0); guard=false is the old
+    // unconditional behavior that this fix replaces for micode.
+    #[test]
+    fn test_reprice_lane_message_guards_authoritative_micode_cost() {
+        // A pricing service that WOULD recompute a large cost for the MiMo model
+        // (1000*0.001 + 500*0.002 = 2.0, versus the embedded 0.05).
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "mimo-v2.5-pro".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let recomputed = 1000.0 * 0.001 + 500.0 * 0.002; // 2.0
+
+        let make = |embedded_cost: f64| {
+            UnifiedMessage::new(
+                "micode",
+                "mimo-v2.5-pro",
+                "mimo",
+                "ses",
+                1_700_000_000_000,
+                TokenBreakdown {
+                    input: 1000,
+                    output: 500,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                embedded_cost,
+            )
+        };
+
+        // guard=true + embedded cost present -> authoritative cost survives.
+        let mut guarded = make(0.05);
+        reprice_lane_message(&mut guarded, Some(&pricing), true);
+        assert!(
+            (guarded.cost - 0.05).abs() < 1e-9,
+            "cost-guarded reprice must keep the embedded 0.05, got {}",
+            guarded.cost
+        );
+
+        // guard=false (old behavior) -> unconditionally overwritten by the recompute.
+        let mut unguarded = make(0.05);
+        reprice_lane_message(&mut unguarded, Some(&pricing), false);
+        assert!(
+            (unguarded.cost - recomputed).abs() < 1e-9,
+            "unguarded reprice overwrites the embedded cost with {recomputed}, got {}",
+            unguarded.cost
+        );
+
+        // guard=true + embedded cost absent (<= 0.0) -> still repriced (fallback).
+        let mut absent = make(0.0);
+        reprice_lane_message(&mut absent, Some(&pricing), true);
+        assert!(
+            (absent.cost - recomputed).abs() < 1e-9,
+            "a missing embedded cost must still be priced, got {}",
+            absent.cost
+        );
+    }
+
+    fn roo_task_root(home: &Path, client: ClientId) -> PathBuf {
+        let relative = match client {
+            ClientId::RooCode => ".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks",
+            ClientId::KiloCode => ".config/Code/User/globalStorage/kilocode.kilo-code/tasks",
+            ClientId::Cline => ".config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
+            _ => panic!("not a Roo-family client: {client:?}"),
+        };
+        home.join(relative)
+    }
+
+    fn write_roo_history_fixture(history: &Path, model: &str, agent: &str) {
+        std::fs::write(
+            history,
+            format!(
+                "<environment_details><model>{model}</model><slug>{agent}</slug></environment_details>"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_roo_task_fixture(
+        home: &Path,
+        client: ClientId,
+        task_id: &str,
+        model: &str,
+        agent: &str,
+    ) -> (PathBuf, PathBuf) {
+        let task_dir = roo_task_root(home, client).join(task_id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let ui_messages = task_dir.join("ui_messages.json");
+        std::fs::write(
+            &ui_messages,
+            r#"[{"type":"say","say":"api_req_started","ts":"2026-06-25T10:00:00Z","text":"{\"cost\":0.125,\"tokensIn\":100,\"tokensOut\":25,\"cacheReads\":10,\"cacheWrites\":5,\"apiProtocol\":\"anthropic\"}"}]"#,
+        )
+        .unwrap();
+        let history = sessions::roocode::history_path_for_ui_messages(&ui_messages);
+        write_roo_history_fixture(&history, model, agent);
+        (ui_messages, history)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_roo_family_history_rewrite_refreshes_materialized_and_streaming_caches() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let family = [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline];
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "old-model".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "new-model-with-longer-id".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let mut histories = Vec::new();
+        for client in family {
+            let task_id = format!("{}-task", client.as_str());
+            let (_, history) = write_roo_task_fixture(
+                source_home.path(),
+                client,
+                &task_id,
+                "old-model",
+                "old-agent",
+            );
+            histories.push(history);
+        }
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients: Vec<String> = family
+            .into_iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        let run_materialized = || {
+            with_isolated_tokscale_cache(materialized_cache.path(), || {
+                parse_all_messages_with_pricing_with_env_strategy(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                )
+            })
+        };
+        let run_streaming = || {
+            with_isolated_tokscale_cache(streaming_cache.path(), || {
+                let mut messages = Vec::new();
+                scan_messages_streaming(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                    &|_: &UnifiedMessage| true,
+                    &mut |message: &UnifiedMessage| messages.push(message.clone()),
+                );
+                messages
+            })
+        };
+
+        let materialized_before = run_materialized();
+        let streaming_before = run_streaming();
+        for (lane, messages) in [
+            ("materialized", &materialized_before),
+            ("streaming", &streaming_before),
+        ] {
+            assert_eq!(messages.len(), 3, "{lane} seed message count");
+            assert!(messages.iter().all(|message| {
+                message.model_id == "old-model" && message.agent.as_deref() == Some("old-agent")
+            }));
+        }
+
+        for history in &histories {
+            write_roo_history_fixture(history, "new-model-with-longer-id", "new-agent");
+        }
+
+        let materialized_after = run_materialized();
+        let streaming_after = run_streaming();
+        assert_eq!(materialized_after.len(), 3);
+        assert_eq!(streaming_after.len(), 3);
+        for client in family {
+            let client_name = client.as_str();
+            let materialized = materialized_after
+                .iter()
+                .find(|message| message.client == client_name)
+                .unwrap();
+            let streaming = streaming_after
+                .iter()
+                .find(|message| message.client == client_name)
+                .unwrap();
+            let materialized_before = materialized_before
+                .iter()
+                .find(|message| message.client == client_name)
+                .unwrap();
+
+            assert_eq!(materialized.session_id, format!("{client_name}-task"));
+            assert_eq!(materialized.model_id, "new-model-with-longer-id");
+            assert_eq!(materialized.agent.as_deref(), Some("new-agent"));
+            assert_eq!(materialized.tokens.input, 100);
+            assert_eq!(materialized.tokens.output, 25);
+            assert_eq!(materialized.tokens.cache_read, 10);
+            assert_eq!(materialized.tokens.cache_write, 5);
+            assert!(
+                materialized.cost > materialized_before.cost,
+                "{client_name} history model rewrite must refresh derived pricing"
+            );
+
+            assert_eq!(streaming.client, materialized.client);
+            assert_eq!(streaming.session_id, materialized.session_id);
+            assert_eq!(streaming.model_id, materialized.model_id);
+            assert_eq!(streaming.agent, materialized.agent);
+            assert_eq!(streaming.tokens.input, materialized.tokens.input);
+            assert_eq!(streaming.tokens.output, materialized.tokens.output);
+            assert_eq!(streaming.tokens.cache_read, materialized.tokens.cache_read);
+            assert_eq!(
+                streaming.tokens.cache_write,
+                materialized.tokens.cache_write
+            );
+            assert!((streaming.cost - materialized.cost).abs() < 1e-9);
+        }
+    }
+
+    fn latest_source_mtime_probes_roo_history(client: ClientId) {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (ui_messages, history) = write_roo_task_fixture(
+            source_home.path(),
+            client,
+            "mtime-task",
+            "test-model",
+            "test-agent",
+        );
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for (path, time) in [(&ui_messages, stale_time), (&history, fresh_time)] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let Ok(()) = file.set_modified(time) else {
+                return;
+            };
+        }
+
+        let token = latest_source_mtime_ms(&LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec![client.as_str().to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            token,
+            1_700_086_400_000,
+            "{} change token must include the history sibling",
+            client.as_str()
+        );
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_roocode_history() {
+        latest_source_mtime_probes_roo_history(ClientId::RooCode);
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_kilocode_history() {
+        latest_source_mtime_probes_roo_history(ClientId::KiloCode);
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_cline_history() {
+        latest_source_mtime_probes_roo_history(ClientId::Cline);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_modified_after_keeps_roo_family_with_fresh_history() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let family = [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline];
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+
+        for client in family {
+            let stale_id = format!("{}-stale", client.as_str());
+            let active_id = format!("{}-active", client.as_str());
+            let (stale_ui, stale_history) = write_roo_task_fixture(
+                source_home.path(),
+                client,
+                &stale_id,
+                "stale-model",
+                "stale-agent",
+            );
+            let (active_ui, active_history) = write_roo_task_fixture(
+                source_home.path(),
+                client,
+                &active_id,
+                "active-model",
+                "active-agent",
+            );
+            for path in [&stale_ui, &stale_history, &active_ui, &active_history] {
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                let Ok(()) = file.set_modified(stale_time) else {
+                    return;
+                };
+            }
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&active_history)
+                .unwrap();
+            let Ok(()) = file.set_modified(fresh_time) else {
+                return;
+            };
+        }
+
+        let clients: Vec<String> = family
+            .into_iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        let parsed = with_isolated_tokscale_cache(cache_home.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: Some(1_700_043_200_000),
+            })
+            .unwrap()
+        });
+
+        assert_eq!(parsed.messages.len(), 3);
+        for client in family {
+            assert_eq!(parsed.counts.get(client), 1);
+            assert!(parsed.messages.iter().any(|message| {
+                message.client == client.as_str()
+                    && message.session_id == format!("{}-active", client.as_str())
+                    && message.model_id == "active-model"
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_modified_after_roo_history_stat_failure_keeps_source() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ui_messages = temp_dir.path().join("ui_messages.json");
+        std::fs::write(&ui_messages, b"[]").unwrap();
+        let history = sessions::roocode::history_path_for_ui_messages(&ui_messages);
+        std::os::unix::fs::symlink("api_conversation_history.json", &history).unwrap();
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::RooCode)
+            .push(ui_messages.clone());
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        prune_scan_result_by_mtime(&mut scan_result, future_ms);
+
+        assert_eq!(
+            scan_result.get(ClientId::RooCode),
+            std::slice::from_ref(&ui_messages),
+            "an unreadable history sibling must fail open during pruning"
+        );
+    }
+
+    struct M13RelatedFixture {
+        droid_source: PathBuf,
+        droid_related: PathBuf,
+        kimi_source: PathBuf,
+        kimi_related: PathBuf,
+        kiro_source: PathBuf,
+        kiro_related: PathBuf,
+    }
+
+    fn write_m13_primary_fixtures(home: &Path) -> M13RelatedFixture {
+        let droid_dir = home.join(".factory/sessions");
+        std::fs::create_dir_all(&droid_dir).unwrap();
+        let droid_source = droid_dir.join("droid-session.settings.json");
+        std::fs::write(
+            &droid_source,
+            r#"{"providerLock":"anthropic","providerLockTimestamp":"2026-01-01T00:00:00Z","tokenUsage":{"inputTokens":100,"outputTokens":20,"cacheCreationTokens":5,"cacheReadTokens":10,"thinkingTokens":2}}"#,
+        )
+        .unwrap();
+        let droid_related = droid_dir.join("droid-session.jsonl");
+
+        let kimi_session_dir = home.join(".kimi/sessions/group-1/kimi-session");
+        std::fs::create_dir_all(&kimi_session_dir).unwrap();
+        let kimi_source = kimi_session_dir.join("wire.jsonl");
+        std::fs::write(
+            &kimi_source,
+            r#"{"timestamp":1767225600.0,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":50,"output":5,"input_cache_read":3,"input_cache_creation":2},"message_id":"kimi-turn"}}}"#,
+        )
+        .unwrap();
+        let kimi_related = home.join(".kimi/config.json");
+
+        let kiro_dir = home.join(".kiro/sessions/cli");
+        std::fs::create_dir_all(&kiro_dir).unwrap();
+        let kiro_source = kiro_dir.join("kiro-session.json");
+        std::fs::write(
+            &kiro_source,
+            r#"{"session_id":"kiro-session","cwd":"/tmp/m13-project","session_state":{"rts_model_state":{"model_info":{"model_id":"kiro-model","context_window_tokens":1000}},"conversation_metadata":{"user_turn_metadatas":[{"input_token_count":0,"output_token_count":0,"end_timestamp":1767225601,"total_request_count":1,"message_ids":["kiro-turn"],"context_usage_percentage":10.0}]}}}"#,
+        )
+        .unwrap();
+        let kiro_related = kiro_source.with_extension("jsonl");
+
+        M13RelatedFixture {
+            droid_source,
+            droid_related,
+            kimi_source,
+            kimi_related,
+            kiro_source,
+            kiro_related,
+        }
+    }
+
+    fn write_m13_related_fixtures(paths: &M13RelatedFixture) {
+        std::fs::write(
+            &paths.droid_related,
+            r#"{"message":"Model: Claude-Opus-4.5-[Anthropic]"}"#,
+        )
+        .unwrap();
+        std::fs::write(&paths.kimi_related, r#"{"model":"kimi-new-model"}"#).unwrap();
+        std::fs::write(
+            &paths.kiro_related,
+            concat!(
+                r#"{"version":"v1","kind":"Prompt","data":{"message_id":"kiro-prompt","content":[{"kind":"text","data":"prompt body"}],"meta":{"timestamp":1767225600.0}}}"#,
+                "\n",
+                r#"{"version":"v1","kind":"AssistantMessage","data":{"message_id":"kiro-turn","content":[{"kind":"text","data":"abcdefghijklmnop"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn set_m13_fixture_mtimes(
+        paths: &M13RelatedFixture,
+        primary_time: std::time::SystemTime,
+        related_time: std::time::SystemTime,
+    ) -> bool {
+        for path in [&paths.droid_source, &paths.kimi_source, &paths.kiro_source] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            if file.set_modified(primary_time).is_err() {
+                return false;
+            }
+        }
+        for path in [
+            &paths.droid_related,
+            &paths.kimi_related,
+            &paths.kiro_related,
+        ] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            if file.set_modified(related_time).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_m13_related_sources_refresh_materialized_and_streaming_caches() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        let clients = vec!["droid".to_string(), "kimi".to_string(), "kiro".to_string()];
+
+        let mut litellm = HashMap::new();
+        for (model, input_rate, output_rate) in [
+            ("claude-unknown", 0.001, 0.002),
+            ("claude-opus-4-5", 0.01, 0.02),
+            ("kimi-for-coding", 0.001, 0.002),
+            ("kimi-new-model", 0.01, 0.02),
+            ("kiro-model", 0.003, 0.004),
+        ] {
+            litellm.insert(
+                model.to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(input_rate),
+                    output_cost_per_token: Some(output_rate),
+                    ..Default::default()
+                },
+            );
+        }
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let home = source_home.path().to_str().unwrap().to_string();
+        let run_materialized = || {
+            with_isolated_tokscale_cache(materialized_cache.path(), || {
+                parse_all_messages_with_pricing_with_env_strategy(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                )
+            })
+        };
+        let run_streaming = || {
+            with_isolated_tokscale_cache(streaming_cache.path(), || {
+                let mut messages = Vec::new();
+                scan_messages_streaming(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                    &|_: &UnifiedMessage| true,
+                    &mut |message: &UnifiedMessage| messages.push(message.clone()),
+                );
+                messages
+            })
+        };
+
+        let materialized_before = run_materialized();
+        let streaming_before = run_streaming();
+        assert_eq!(materialized_before.len(), 3);
+        assert_eq!(streaming_before.len(), 3);
+        for (client, model) in [
+            ("droid", "claude-unknown"),
+            ("kimi", "kimi-for-coding"),
+            ("kiro", "kiro-model"),
+        ] {
+            assert_eq!(
+                materialized_before
+                    .iter()
+                    .find(|message| message.client == client)
+                    .unwrap()
+                    .model_id,
+                model
+            );
+            assert_eq!(
+                streaming_before
+                    .iter()
+                    .find(|message| message.client == client)
+                    .unwrap()
+                    .model_id,
+                model
+            );
+        }
+
+        write_m13_related_fixtures(&paths);
+
+        let materialized_after = run_materialized();
+        let streaming_after = run_streaming();
+        assert_eq!(materialized_after.len(), 3);
+        assert_eq!(streaming_after.len(), 3);
+        for client in ["droid", "kimi", "kiro"] {
+            let before = materialized_before
+                .iter()
+                .find(|message| message.client == client)
+                .unwrap();
+            let materialized = materialized_after
+                .iter()
+                .find(|message| message.client == client)
+                .unwrap();
+            let streaming = streaming_after
+                .iter()
+                .find(|message| message.client == client)
+                .unwrap();
+
+            let expected_model = match client {
+                "droid" => "claude-opus-4-5",
+                "kimi" => "kimi-new-model",
+                "kiro" => "kiro-model",
+                _ => unreachable!(),
+            };
+            assert_eq!(materialized.model_id, expected_model);
+            assert!(
+                materialized.cost > before.cost,
+                "{client} related-source creation must refresh derived cost"
+            );
+            if client == "kiro" {
+                assert_eq!(before.tokens.output, 0);
+                assert_eq!(materialized.tokens.output, 4);
+                assert_eq!(materialized.timestamp, 1_767_225_600_000);
+                assert_eq!(materialized.duration_ms, Some(1_000));
+            }
+
+            assert_eq!(streaming.client, materialized.client);
+            assert_eq!(streaming.session_id, materialized.session_id);
+            assert_eq!(streaming.model_id, materialized.model_id);
+            assert_eq!(streaming.provider_id, materialized.provider_id);
+            assert_eq!(streaming.workspace_key, materialized.workspace_key);
+            assert_eq!(streaming.workspace_label, materialized.workspace_label);
+            assert_eq!(streaming.timestamp, materialized.timestamp);
+            assert_eq!(streaming.duration_ms, materialized.duration_ms);
+            assert_eq!(streaming.message_count, materialized.message_count);
+            assert_eq!(streaming.tokens.input, materialized.tokens.input);
+            assert_eq!(streaming.tokens.output, materialized.tokens.output);
+            assert_eq!(streaming.tokens.cache_read, materialized.tokens.cache_read);
+            assert_eq!(
+                streaming.tokens.cache_write,
+                materialized.tokens.cache_write
+            );
+            assert_eq!(streaming.tokens.reasoning, materialized.tokens.reasoning);
+            assert!((streaming.cost - materialized.cost).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_m13_related_sources() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        write_m13_related_fixtures(&paths);
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        if !set_m13_fixture_mtimes(&paths, stale_time, fresh_time) {
+            return;
+        }
+
+        for client in [ClientId::Droid, ClientId::Kimi, ClientId::Kiro] {
+            let token = latest_source_mtime_ms(&LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec![client.as_str().to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: None,
+            })
+            .unwrap();
+            assert_eq!(
+                token,
+                1_700_086_400_000,
+                "{} change token must include its parser dependency",
+                client.as_str()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_modified_after_keeps_m13_sources_with_fresh_dependencies() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        write_m13_related_fixtures(&paths);
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        if !set_m13_fixture_mtimes(&paths, stale_time, fresh_time) {
+            return;
+        }
+
+        let parsed = with_isolated_tokscale_cache(cache_home.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec![
+                    "droid".to_string(),
+                    "kimi".to_string(),
+                    "kiro".to_string(),
+                ]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: Some(1_700_043_200_000),
+            })
+            .unwrap()
+        });
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.counts.get(ClientId::Droid), 1);
+        assert_eq!(parsed.counts.get(ClientId::Kimi), 1);
+        assert_eq!(parsed.counts.get(ClientId::Kiro), 1);
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| { message.client == "droid" && message.model_id == "claude-opus-4-5" }));
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| { message.client == "kimi" && message.model_id == "kimi-new-model" }));
+        assert!(parsed.messages.iter().any(|message| {
+            message.client == "kiro" && message.output == 4 && message.duration_ms == Some(1_000)
+        }));
+    }
+
+    #[test]
+    fn test_modified_after_prunes_stale_m13_sources_without_dependencies() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Droid)
+            .push(paths.droid_source);
+        scan_result.get_mut(ClientId::Kimi).push(paths.kimi_source);
+        scan_result.get_mut(ClientId::Kiro).push(paths.kiro_source);
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        prune_scan_result_by_mtime(&mut scan_result, future_ms);
+
+        assert!(scan_result.get(ClientId::Droid).is_empty());
+        assert!(scan_result.get(ClientId::Kimi).is_empty());
+        assert!(scan_result.get(ClientId::Kiro).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_modified_after_m13_dependency_stat_failures_keep_sources() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        for related in [
+            &paths.droid_related,
+            &paths.kimi_related,
+            &paths.kiro_related,
+        ] {
+            std::os::unix::fs::symlink(related.file_name().unwrap(), related).unwrap();
+        }
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Droid)
+            .push(paths.droid_source.clone());
+        scan_result
+            .get_mut(ClientId::Kimi)
+            .push(paths.kimi_source.clone());
+        scan_result
+            .get_mut(ClientId::Kiro)
+            .push(paths.kiro_source.clone());
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        prune_scan_result_by_mtime(&mut scan_result, future_ms);
+
+        assert_eq!(
+            scan_result.get(ClientId::Droid),
+            std::slice::from_ref(&paths.droid_source)
+        );
+        assert_eq!(
+            scan_result.get(ClientId::Kimi),
+            std::slice::from_ref(&paths.kimi_source)
+        );
+        assert_eq!(
+            scan_result.get(ClientId::Kiro),
+            std::slice::from_ref(&paths.kiro_source)
+        );
     }
 
     // micode `.db` is WAL-mode SQLite reached via the generic `*.db` glob, so it
@@ -7810,6 +10139,230 @@ mod tests {
         assert!(
             scan_result.get(ClientId::Claude).is_empty(),
             "a plain-file client's stale log is still pruned"
+        );
+    }
+
+    #[test]
+    fn test_modified_after_prunes_grok_by_updates_or_signals_mtime() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let stale_dir = temp_dir.path().join("stale");
+        let active_dir = temp_dir.path().join("active");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::create_dir_all(&active_dir).unwrap();
+
+        let stale_updates = stale_dir.join("updates.jsonl");
+        let stale_signals = stale_dir.join("signals.json");
+        let active_updates = active_dir.join("updates.jsonl");
+        let active_signals = active_dir.join("signals.json");
+        for path in [&stale_updates, &stale_signals, &active_updates, &active_signals] {
+            std::fs::File::create(path).unwrap();
+        }
+
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let active_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for path in [&stale_updates, &stale_signals, &active_updates] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let Ok(()) = file.set_modified(stale_time) else {
+                return;
+            };
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_signals)
+            .unwrap();
+        let Ok(()) = file.set_modified(active_time) else {
+            return;
+        };
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Grok)
+            .extend([stale_updates.clone(), active_updates.clone()]);
+
+        crate::prune_scan_result_by_mtime(&mut scan_result, 1_700_043_200_000);
+
+        assert_eq!(
+            scan_result.get(ClientId::Grok),
+            std::slice::from_ref(&active_updates),
+            "stale Grok sessions should be pruned while a fresh signals sibling keeps its session"
+        );
+    }
+
+    // The pruning helper must treat a fresh write to *any* metadata sibling the
+    // parser reads (not just signals.json) as source activity — otherwise a
+    // summary.json- or events.jsonl-only write (a late-arriving model id) lets an
+    // otherwise-stale session be pruned and its fresh model never re-parsed.
+    fn prune_grok_keeps_session_with_fresh_sibling(fresh_sibling: &str) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let stale_dir = temp_dir.path().join("stale");
+        let active_dir = temp_dir.path().join("active");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::create_dir_all(&active_dir).unwrap();
+
+        let stale_updates = stale_dir.join("updates.jsonl");
+        let active_updates = active_dir.join("updates.jsonl");
+        let active_fresh = active_dir.join(fresh_sibling);
+        // Every session file starts stale; only the one fresh sibling moves.
+        let mut all_paths = vec![stale_updates.clone(), active_updates.clone()];
+        for name in message_cache::GROK_METADATA_SIBLINGS {
+            all_paths.push(stale_dir.join(name));
+            all_paths.push(active_dir.join(name));
+        }
+        for path in &all_paths {
+            std::fs::File::create(path).unwrap();
+        }
+
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let active_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for path in &all_paths {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let Ok(()) = file.set_modified(stale_time) else {
+                return;
+            };
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_fresh)
+            .unwrap();
+        let Ok(()) = file.set_modified(active_time) else {
+            return;
+        };
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Grok)
+            .extend([stale_updates.clone(), active_updates.clone()]);
+
+        crate::prune_scan_result_by_mtime(&mut scan_result, 1_700_043_200_000);
+
+        assert_eq!(
+            scan_result.get(ClientId::Grok),
+            std::slice::from_ref(&active_updates),
+            "a fresh {fresh_sibling} sibling must keep its otherwise-stale Grok session"
+        );
+    }
+
+    #[test]
+    fn test_modified_after_prunes_grok_keeps_session_with_fresh_summary() {
+        prune_grok_keeps_session_with_fresh_sibling("summary.json");
+    }
+
+    #[test]
+    fn test_modified_after_prunes_grok_keeps_session_with_fresh_events() {
+        prune_grok_keeps_session_with_fresh_sibling("events.jsonl");
+    }
+
+    // The live-tail change token must move when Grok rewrites *any* metadata
+    // sibling the parser reads, even though updates.jsonl is unchanged; otherwise
+    // UsageTail short-circuits and the session stays pinned to its fallback model.
+    fn latest_source_mtime_ms_probes_grok_sibling(fresh_sibling: &str) {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let session_dir = source_home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fproject/session-uuid-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let updates = session_dir.join("updates.jsonl");
+        std::fs::write(&updates, b"{\"totalTokens\":1}\n").unwrap();
+        // Every sibling exists and is stale; only the target sibling is newer.
+        for name in message_cache::GROK_METADATA_SIBLINGS {
+            std::fs::write(session_dir.join(name), b"{}").unwrap();
+        }
+
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for name in std::iter::once("updates.jsonl").chain(message_cache::GROK_METADATA_SIBLINGS) {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(session_dir.join(name))
+                .unwrap();
+            let Ok(()) = f.set_modified(stale_time) else {
+                return;
+            };
+        }
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(session_dir.join(fresh_sibling))
+            .unwrap();
+        let Ok(()) = f.set_modified(fresh_time) else {
+            return;
+        };
+
+        let options = LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["grok".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        };
+        let token = crate::latest_source_mtime_ms(&options).unwrap();
+
+        assert_eq!(
+            token, 1_700_086_400_000,
+            "the change token must reflect the fresh {fresh_sibling} mtime, not just updates.jsonl"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_latest_source_mtime_ms_probes_grok_summary() {
+        latest_source_mtime_ms_probes_grok_sibling("summary.json");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_latest_source_mtime_ms_probes_grok_events() {
+        latest_source_mtime_ms_probes_grok_sibling("events.jsonl");
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_auto_discovered_hermes_profile_wal() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let profile_dir = source_home.path().join(".hermes/profiles/research");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let db = profile_dir.join("state.db");
+        let wal = profile_dir.join("state.db-wal");
+        std::fs::File::create(&db).unwrap();
+        std::fs::File::create(&wal).unwrap();
+
+        let db_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let wal_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        let db_file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        let Ok(()) = db_file.set_modified(db_time) else {
+            return;
+        };
+        drop(db_file);
+        let wal_file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        let Ok(()) = wal_file.set_modified(wal_time) else {
+            return;
+        };
+        drop(wal_file);
+
+        let options = LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        };
+        let token = crate::latest_source_mtime_ms(&options).unwrap();
+
+        assert_eq!(
+            token, 1_700_086_400_000,
+            "the change token must include an auto-discovered profile WAL"
         );
     }
 
@@ -7987,7 +10540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_local_clients_dedups_hermes_sessions_across_default_and_extra_dbs() {
+    fn test_parse_local_clients_dedups_default_and_auto_discovered_hermes_profile() {
         let temp_dir = tempfile::TempDir::new().unwrap();
 
         let default_dir = temp_dir.path().join(".hermes");
@@ -8018,10 +10571,17 @@ mod tests {
             999,
             9.99,
         );
+        insert_hermes_session(
+            &profile_conn,
+            "profile-only-session",
+            "claude-sonnet-4",
+            1,
+            30,
+            3,
+            0.02,
+        );
         drop(profile_conn);
 
-        let mut extra_scan_paths = std::collections::BTreeMap::new();
-        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
         let parsed = parse_local_clients(LocalParseOptions {
             home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
             use_env_roots: false,
@@ -8029,19 +10589,24 @@ mod tests {
             since: None,
             until: None,
             year: None,
-            scanner_settings: scanner::ScannerSettings {
-                extra_scan_paths,
-                ..Default::default()
-            },
+            scanner_settings: scanner::ScannerSettings::default(),
             modified_after: None,
         })
         .unwrap();
 
-        assert_eq!(parsed.counts.get(ClientId::Hermes), 2);
-        assert_eq!(parsed.messages.len(), 1);
-        assert_eq!(parsed.messages[0].session_id, "shared-hermes-session");
-        assert_eq!(parsed.messages[0].input, 100);
-        assert_eq!(parsed.messages[0].output, 25);
+        assert_eq!(parsed.counts.get(ClientId::Hermes), 3);
+        assert_eq!(parsed.messages.len(), 2);
+        let shared = parsed
+            .messages
+            .iter()
+            .find(|message| message.session_id == "shared-hermes-session")
+            .unwrap();
+        assert_eq!(shared.input, 100);
+        assert_eq!(shared.output, 25);
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| message.session_id == "profile-only-session"));
     }
 
     #[test]
@@ -8413,6 +10978,7 @@ mod tests {
                 reasoning: 0,
             },
             cost,
+            cost_source: crate::CostSource::Unknown,
             duration_ms: None,
             message_count: 1,
             agent: None,
@@ -8682,4 +11248,71 @@ mod tests {
             "trae dedup: message count must be 2 (1 trae winner + 1 claude)");
     }
 
+    #[test]
+    fn model_aggregation_saturates_overflowing_token_folds() {
+        // token_total_saturates_on_overlarge_buckets (see positive_token_total's
+        // callers) covers a single message's grand total; the per-field
+        // CROSS-MESSAGE fold in aggregate_model_usage_entries must saturate too.
+        // An antigravity-cli row can carry an i64::MAX bucket after the
+        // untrusted-varint clamp (sessions/antigravity_cli.rs to_i64), so two
+        // such rows folded into one model group with plain `+=` overflow (debug
+        // panic / release wrap) before the already-saturating grand total runs.
+        let make = || {
+            UnifiedMessage::new(
+                "antigravity-cli",
+                "gemini-3-pro",
+                "antigravity",
+                "session-overflow",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input: i64::MAX,
+                    output: 0,
+                    cache_read: i64::MAX,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )
+        };
+
+        let entries = aggregate_model_usage_entries(vec![make(), make()], &GroupBy::Model);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].input, i64::MAX);
+        assert_eq!(entries[0].cache_read, i64::MAX);
+    }
+
+    #[test]
+    fn model_report_totals_saturate_across_groups() {
+        // aggregate_model_usage_entries saturates each entry's fields, so an
+        // entry can be i64::MAX. get_model_report sums the entries into the
+        // report-level totals via model_report_token_totals; two saturated
+        // entries (two distinct models) must not overflow that sum either.
+        let make = |model: &str| {
+            UnifiedMessage::new(
+                "antigravity-cli",
+                model,
+                "antigravity",
+                "session-overflow",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input: i64::MAX,
+                    output: 0,
+                    cache_read: i64::MAX,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )
+        };
+
+        let entries = aggregate_model_usage_entries(
+            vec![make("gemini-3-pro"), make("claude-opus-4-6")],
+            &GroupBy::Model,
+        );
+        assert_eq!(entries.len(), 2);
+        let (total_input, _total_output, total_cache_read, _total_cache_write) =
+            super::model_report_token_totals(&entries);
+        assert_eq!(total_input, i64::MAX);
+        assert_eq!(total_cache_read, i64::MAX);
+    }
 }

@@ -102,9 +102,17 @@ pub fn aggregate_by_session(messages: Vec<UnifiedMessage>) -> Vec<SessionContrib
 
 /// Calculate summary statistics
 pub fn calculate_summary(contributions: &[DailyContribution]) -> DataSummary {
-    let total_tokens: i64 = contributions.iter().map(|c| c.totals.tokens).sum();
+    // saturating_add: a day's tokens can already be saturated to i64::MAX by
+    // TokenBreakdown::total, so this cross-day sum can overflow the same way.
+    let total_tokens: i64 = contributions
+        .iter()
+        .fold(0i64, |acc, c| acc.saturating_add(c.totals.tokens));
     let total_cost: f64 = contributions.iter().map(|c| c.totals.cost).sum();
-    let active_days = contributions.iter().filter(|c| c.totals.tokens > 0).count() as i32;
+    let total_cost = if total_cost == 0.0 { 0.0 } else { total_cost };
+    let active_days = contributions
+        .iter()
+        .filter(|c| c.totals.tokens > 0 || c.totals.cost > 0.0 || c.totals.messages > 0)
+        .count() as i32;
     let max_cost = contributions
         .iter()
         .map(|c| c.totals.cost)
@@ -159,7 +167,10 @@ pub fn calculate_years(contributions: &[DailyContribution]) -> Vec<YearSummary> 
         }
         let year = &c.date[0..4];
         let entry = years_map.entry(year.to_string()).or_default();
-        entry.tokens += c.totals.tokens;
+        // saturating_add: a contribution's total can already be saturated to
+        // i64::MAX by TokenBreakdown::total, so this scalar fold can overflow
+        // the same way.
+        entry.tokens = entry.tokens.saturating_add(c.totals.tokens);
         entry.cost += c.totals.cost;
 
         if entry.start.is_empty() || c.date < entry.start {
@@ -889,6 +900,7 @@ mod tests {
                 reasoning: 0,
             },
             cost,
+            cost_source: crate::CostSource::Unknown,
             duration_ms: None,
             message_count: 1,
             agent: None,
@@ -987,7 +999,7 @@ mod tests {
         let summary = calculate_summary(&contributions);
 
         assert_eq!(summary.total_tokens, 0);
-        assert_eq!(summary.total_cost, 0.0);
+        assert_eq!(summary.total_cost.to_bits(), 0.0f64.to_bits());
         assert_eq!(summary.total_days, 0);
         assert_eq!(summary.active_days, 0);
         assert_eq!(summary.average_per_day, 0.0);
@@ -1065,6 +1077,53 @@ mod tests {
         assert_eq!(summary.total_days, 2);
         assert_eq!(summary.active_days, 1);
         assert!((summary.average_per_day - 0.05).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_calculate_summary_counts_cost_only_days_as_active() {
+        let contributions = vec![
+            DailyContribution {
+                date: "2024-01-01".to_string(),
+                totals: DailyTotals {
+                    tokens: 1000,
+                    cost: 0.05,
+                    messages: 1,
+                },
+                intensity: 0,
+                token_breakdown: TokenBreakdown::default(),
+                clients: Vec::new(),
+                active_time_ms: None,
+            },
+            DailyContribution {
+                date: "2024-01-02".to_string(),
+                totals: DailyTotals {
+                    tokens: 0,
+                    cost: 1.25,
+                    messages: 0,
+                },
+                intensity: 0,
+                token_breakdown: TokenBreakdown::default(),
+                clients: Vec::new(),
+                active_time_ms: None,
+            },
+            DailyContribution {
+                date: "2024-01-03".to_string(),
+                totals: DailyTotals {
+                    tokens: 0,
+                    cost: 0.0,
+                    messages: 0,
+                },
+                intensity: 0,
+                token_breakdown: TokenBreakdown::default(),
+                clients: Vec::new(),
+                active_time_ms: None,
+            },
+        ];
+
+        let summary = calculate_summary(&contributions);
+        assert_eq!(summary.total_days, 3);
+        assert_eq!(summary.active_days, 2);
+        assert!((summary.average_per_day - 0.65).abs() < 0.0001);
     }
 
     #[test]
@@ -1150,6 +1209,88 @@ mod tests {
 
         let years = calculate_years(&contributions);
         assert_eq!(years.len(), 0); // Should skip invalid dates
+    }
+
+    #[test]
+    fn test_calculate_years_saturates_overflowing_token_fold() {
+        // Vendor-local sibling sweep alongside #823: a DailyContribution's
+        // `totals.tokens` can already be saturated to i64::MAX (via
+        // TokenBreakdown::total on a corrupt/clamped source), so folding two
+        // such days into one YearAccumulator with plain `+=` overflows (debug
+        // panic / release wrap).
+        let contributions = vec![
+            DailyContribution {
+                date: "2024-01-01".to_string(),
+                totals: DailyTotals {
+                    tokens: i64::MAX,
+                    cost: 0.0,
+                    messages: 1,
+                },
+                intensity: 0,
+                token_breakdown: TokenBreakdown::default(),
+                clients: Vec::new(),
+                active_time_ms: None,
+            },
+            DailyContribution {
+                date: "2024-01-02".to_string(),
+                totals: DailyTotals {
+                    tokens: i64::MAX,
+                    cost: 0.0,
+                    messages: 1,
+                },
+                intensity: 0,
+                token_breakdown: TokenBreakdown::default(),
+                clients: Vec::new(),
+                active_time_ms: None,
+            },
+        ];
+
+        let years = calculate_years(&contributions);
+        assert_eq!(years.len(), 1);
+        assert_eq!(years[0].total_tokens, i64::MAX);
+    }
+
+    #[test]
+    fn test_calculate_summary_saturates_overflowing_token_fold() {
+        // External-review catch after the calculate_years sibling sweep: the
+        // cross-day `total_tokens` sum in calculate_summary has the same
+        // overflow class — a day's tokens can already be saturated to
+        // i64::MAX by TokenBreakdown::total. Also exercises the full
+        // generate_graph_result path (summary + years) in one pass.
+        let contributions = vec![
+            DailyContribution {
+                date: "2024-01-01".to_string(),
+                totals: DailyTotals {
+                    tokens: i64::MAX,
+                    cost: 0.0,
+                    messages: 1,
+                },
+                intensity: 0,
+                token_breakdown: TokenBreakdown::default(),
+                clients: Vec::new(),
+                active_time_ms: None,
+            },
+            DailyContribution {
+                date: "2024-01-02".to_string(),
+                totals: DailyTotals {
+                    tokens: i64::MAX,
+                    cost: 0.0,
+                    messages: 1,
+                },
+                intensity: 0,
+                token_breakdown: TokenBreakdown::default(),
+                clients: Vec::new(),
+                active_time_ms: None,
+            },
+        ];
+
+        let summary = calculate_summary(&contributions);
+        assert_eq!(summary.total_tokens, i64::MAX);
+
+        let result = generate_graph_result(contributions, 0);
+        assert_eq!(result.summary.total_tokens, i64::MAX);
+        assert_eq!(result.years.len(), 1);
+        assert_eq!(result.years[0].total_tokens, i64::MAX);
     }
 
     #[test]
@@ -1430,6 +1571,7 @@ mod tests {
             date: date.to_string(),
             tokens,
             cost,
+            cost_source: crate::CostSource::Unknown,
             message_count: 1,
             agent: None,
             dedup_key: None,
@@ -1717,6 +1859,7 @@ mod tests {
                 reasoning: 0,
             },
             cost,
+            cost_source: crate::CostSource::Unknown,
             duration_ms: None,
             message_count: 1,
             agent: None,

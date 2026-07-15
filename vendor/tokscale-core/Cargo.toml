@@ -23,13 +23,13 @@ bincode = "1.3"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
-# Local patch (recorded in SYNC.md, to be upstreamed to the macOS repo):
 # rustls instead of native-tls-vendored — vendored OpenSSL needs Perl+NASM on
 # Windows builds (CI runners ship them; local dev boxes often don't) and is
-# the slowest unit in a clean build. native-roots reads the installed OS
-# trust store, so corporate MITM-proxy root CAs still verify (rustls does no
-# SChannel-style AIA chasing, though).
-reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"], default-features = false }
+# the slowest unit in a clean build. 0.13's `rustls` feature verifies via
+# rustls-platform-verifier (Security.framework on macOS, SChannel on Windows),
+# so scoped Keychain trust, corporate MITM roots, and AIA chain fetching all
+# keep native semantics. Matches tb_core_ffi's reqwest line exactly.
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
 dirs = "5"
 once_cell = "1"

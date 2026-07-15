@@ -458,7 +458,9 @@ define_clients!(
     MiMoCode = 28 => {
         id: "micode",
         root: PathRoot::XdgData,
-        relative: "micode",
+        // Real MiMo Code installs write to ~/.local/share/mimocode, not /micode
+        // (#784) — the old path found nothing, so MiMo usage read as empty.
+        relative: "mimocode",
         pattern: "*.db",
         headless: false,
         parse_local: true,
@@ -476,6 +478,24 @@ define_clients!(
         },
         relative: "sessions",
         pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Grok Build stores ACP session updates under
+    // `$GROK_HOME/sessions/<urlencoded-workspace>/<session-id>/updates.jsonl`
+    // (default `~/.grok`). Cumulative `totalTokens` deltas are recorded as
+    // input tokens; sibling `signals.json` reconciles compaction undercount.
+    // Upstream numbers this client 27 — intervening clients differ in our
+    // vendor numbering.
+    Grok = 30 => {
+        id: "grok",
+        root: PathRoot::EnvVar {
+            var: "GROK_HOME",
+            fallback_relative: ".grok",
+        },
+        relative: "sessions",
+        pattern: "updates.jsonl",
         headless: false,
         parse_local: true,
         submit_default: true
@@ -531,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 30);
+        assert_eq!(ClientId::COUNT, 31);
     }
 
     #[test]
@@ -818,10 +838,16 @@ mod tests {
 
     #[test]
     fn test_zed_data_dir_path() {
+        let _guard = env_lock().lock().unwrap();
+        let previous = std::env::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+
         assert_eq!(
             ClientId::Zed.data().resolve_path("/tmp/home"),
             "/tmp/home/.local/share/zed/threads/threads.db"
         );
+
+        restore_env("XDG_DATA_HOME", previous);
     }
 
     #[test]
@@ -839,5 +865,18 @@ mod tests {
         assert!(ClientId::Kiro.parse_local());
         assert!(ClientId::Kiro.submit_default());
         assert!(!ClientId::Kiro.supports_headless());
+    }
+
+    #[test]
+    fn test_grok_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("grok").expect("grok client should be registered");
+        assert_eq!(client.data().relative_path, "sessions");
+        assert_eq!(client.data().pattern, "updates.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.grok/sessions"
+        );
     }
 }

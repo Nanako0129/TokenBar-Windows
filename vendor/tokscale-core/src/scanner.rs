@@ -138,11 +138,11 @@ impl ScanResult {
 
     /// Return every Hermes SQLite database that should be parsed.
     ///
-    /// Hermes has a default `state.db` path plus optional profile databases
-    /// discovered through `scanner.extraScanPaths.hermes`. The generic
-    /// `files` bucket carries the extra profile DBs, so this helper gives
-    /// callers a single deduped view without changing older `hermes_db`
-    /// consumers that only expect the default path.
+    /// Hermes has a default `state.db` path plus profile databases discovered
+    /// automatically or through `scanner.extraScanPaths.hermes`. The generic
+    /// `files` bucket carries the profile DBs, so this helper gives callers a
+    /// single deduped view without changing older `hermes_db` consumers that
+    /// only expect the default path.
     pub fn hermes_db_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -303,6 +303,9 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "*.settings.json" => file_name.ends_with(".settings.json"),
                 "sessions.json" => file_name == "sessions.json",
                 "wire.jsonl" => file_name == "wire.jsonl",
+                // Grok Build ACP session updates under
+                // ~/.grok/sessions/<workspace>/<session-id>/updates.jsonl
+                "updates.jsonl" => file_name == "updates.jsonl",
                 "ui_messages.json" => file_name == "ui_messages.json",
                 "session-usage.json" => file_name == "session-usage.json",
                 "chat-messages.json" => file_name == "chat-messages.json",
@@ -403,6 +406,44 @@ pub fn built_in_extra_scan_paths_for(
     }
 
     paths
+}
+
+/// Discover Hermes profile databases under a resolved Hermes home directory.
+///
+/// Hermes stores the default profile at `<hermes-home>/state.db` and named
+/// profiles at `<hermes-home>/profiles/<profile>/state.db`.
+///
+/// Data-isolation rule: sibling and default profiles are discovered only when
+/// scanning from the root Hermes home. When `HERMES_HOME` resolves to a named
+/// profile such as `<root>/profiles/coder`, the user has scoped discovery to
+/// that profile, so the primary `state.db` is handled separately and this
+/// helper must not climb to sibling or default profiles.
+///
+/// `read_dir` keeps discovery intentionally shallow: only immediate children
+/// of the root home's `profiles/` directory are considered.
+pub(crate) fn discover_hermes_profile_state_dbs(hermes_home: &Path) -> Vec<PathBuf> {
+    let is_profile_scoped = |path: &Path| {
+        path.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "profiles")
+    };
+    if is_profile_scoped(hermes_home)
+        || std::fs::canonicalize(hermes_home).is_ok_and(|path| is_profile_scoped(&path))
+    {
+        return Vec::new();
+    }
+
+    let mut dbs: Vec<PathBuf> = std::fs::read_dir(hermes_home.join("profiles"))
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter_map(|entry| {
+            let state_db = entry.path().join("state.db");
+            state_db.is_file().then_some(state_db)
+        })
+        .collect();
+    dbs.sort_unstable();
+    dbs.dedup();
+    dbs
 }
 
 /// Claude desktop "Cowork" (local-agent-mode) writes standard Claude Code
@@ -999,11 +1040,19 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     if enabled.contains(&ClientId::Hermes) {
-        let hermes_db_path = ClientId::Hermes
-            .data()
-            .resolve_path_with_env_strategy(home_dir, use_env_roots);
-        if std::path::Path::new(&hermes_db_path).exists() {
-            result.hermes_db = Some(PathBuf::from(hermes_db_path));
+        let hermes_db_path = PathBuf::from(
+            ClientId::Hermes
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots),
+        );
+        let hermes_home = hermes_db_path.parent().map(Path::to_path_buf);
+        if hermes_db_path.is_file() {
+            result.hermes_db = Some(hermes_db_path);
+        }
+        if let Some(hermes_home) = hermes_home {
+            result
+                .get_mut(ClientId::Hermes)
+                .extend(discover_hermes_profile_state_dbs(&hermes_home));
         }
     }
 
@@ -1514,6 +1563,14 @@ mod tests {
             .unwrap();
     }
 
+    fn setup_mock_grok_dir(base: &std::path::Path) {
+        let grok_session = base.join(".grok/sessions/%2Ftmp%2Fproject/session-uuid-1");
+        fs::create_dir_all(&grok_session).unwrap();
+        let mut file = File::create(grok_session.join("updates.jsonl")).unwrap();
+        file.write_all(b"{\"method\":\"session/update\"}\n")
+            .unwrap();
+    }
+
     fn setup_mock_openclaw_dir(base: &std::path::Path) {
         // Mirror real OpenClaw layout: ~/.openclaw/agents/<agentId>/sessions/*.jsonl
         let openclaw_sessions = base.join(".openclaw/agents/main/sessions");
@@ -1945,7 +2002,7 @@ mod tests {
         let default_db = default_dir.join("state.db");
         File::create(&default_db).unwrap();
 
-        let profile_dir = home.join(".hermes/profiles/director_planning");
+        let profile_dir = home.join("external-hermes/director_planning");
         fs::create_dir_all(&profile_dir).unwrap();
         let profile_db = profile_dir.join("state.db");
         File::create(&profile_db).unwrap();
@@ -1963,12 +2020,185 @@ mod tests {
         let result = scan_all_clients_with_scanner_settings(
             home.to_str().unwrap(),
             &["hermes".to_string()],
-            true,
+            false,
             &settings,
         );
 
         assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
         assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    fn test_scan_all_clients_auto_discovers_hermes_profile_dbs() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let hermes_home = home.join(".hermes");
+        fs::create_dir_all(&hermes_home).unwrap();
+        let default_db = hermes_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_a_dir = hermes_home.join("profiles/director_planning");
+        fs::create_dir_all(&profile_a_dir).unwrap();
+        let profile_a_db = profile_a_dir.join("state.db");
+        File::create(&profile_a_db).unwrap();
+
+        let profile_b_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&profile_b_dir).unwrap();
+        let profile_b_db = profile_b_dir.join("state.db");
+        File::create(&profile_b_db).unwrap();
+
+        let nested_dir = profile_b_dir.join("archive");
+        fs::create_dir_all(&nested_dir).unwrap();
+        File::create(nested_dir.join("state.db")).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(
+            result.hermes_db_paths(),
+            vec![default_db, profile_a_db, profile_b_db]
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_auto_discovers_hermes_profiles_without_default_db() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let profile_dir = home.join(".hermes/profiles/research");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db, None);
+        assert_eq!(result.hermes_db_paths(), vec![profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_auto_discovers_profiles_under_hermes_home() {
+        let previous = std::env::var("HERMES_HOME").ok();
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let hermes_home = home.join("custom-hermes-home");
+
+        fs::create_dir_all(&hermes_home).unwrap();
+        let default_db = hermes_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        unsafe { std::env::set_var("HERMES_HOME", &hermes_home) };
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+        restore_env("HERMES_HOME", previous);
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_profile_scoped_hermes_home_isolates_to_own_profile() {
+        let previous = std::env::var("HERMES_HOME").ok();
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let hermes_home = home.join(".hermes");
+        fs::create_dir_all(&hermes_home).unwrap();
+        let default_db = hermes_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let coder_dir = hermes_home.join("profiles/coder");
+        fs::create_dir_all(&coder_dir).unwrap();
+        let coder_db = coder_dir.join("state.db");
+        File::create(&coder_db).unwrap();
+
+        let research_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&research_dir).unwrap();
+        let research_db = research_dir.join("state.db");
+        File::create(&research_db).unwrap();
+
+        let nested_dir = coder_dir.join("profiles/archived");
+        fs::create_dir_all(&nested_dir).unwrap();
+        File::create(nested_dir.join("state.db")).unwrap();
+
+        unsafe { std::env::set_var("HERMES_HOME", &coder_dir) };
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+        restore_env("HERMES_HOME", previous);
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&coder_db));
+        assert_eq!(result.hermes_db_paths(), vec![coder_db]);
+        assert!(!result.hermes_db_paths().contains(&research_db));
+        assert!(!result.hermes_db_paths().contains(&default_db));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_symlinked_profile_scoped_hermes_home_preserves_isolation() {
+        let previous = std::env::var("HERMES_HOME").ok();
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let hermes_home = home.join(".hermes");
+        fs::create_dir_all(&hermes_home).unwrap();
+        File::create(hermes_home.join("state.db")).unwrap();
+
+        let coder_dir = hermes_home.join("profiles/coder");
+        fs::create_dir_all(&coder_dir).unwrap();
+        File::create(coder_dir.join("state.db")).unwrap();
+
+        let research_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&research_dir).unwrap();
+        File::create(research_dir.join("state.db")).unwrap();
+
+        let nested_dir = coder_dir.join("profiles/archived");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested_db = nested_dir.join("state.db");
+        File::create(&nested_db).unwrap();
+
+        let profile_alias = home.join("coder-profile");
+        std::os::unix::fs::symlink(&coder_dir, &profile_alias).unwrap();
+        let aliased_db = profile_alias.join("state.db");
+
+        unsafe { std::env::set_var("HERMES_HOME", &profile_alias) };
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+        restore_env("HERMES_HOME", previous);
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&aliased_db));
+        assert_eq!(result.hermes_db_paths(), vec![aliased_db]);
+        assert!(!result.hermes_db_paths().contains(&nested_db));
     }
 
     #[test]
@@ -2004,7 +2234,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
 
-        let profile_dir = home.join(".hermes/profiles/director_planning");
+        let profile_dir = home.join("external-hermes/director_planning");
         fs::create_dir_all(&profile_dir).unwrap();
         let profile_db = profile_dir.join("state.db");
         File::create(&profile_db).unwrap();
@@ -2019,7 +2249,7 @@ mod tests {
         let claude_only = scan_all_clients_with_scanner_settings(
             home.to_str().unwrap(),
             &["claude".to_string()],
-            true,
+            false,
             &settings,
         );
         assert!(claude_only.hermes_db_paths().is_empty());
@@ -2027,7 +2257,7 @@ mod tests {
         let hermes_only = scan_all_clients_with_scanner_settings(
             home.to_str().unwrap(),
             &["hermes".to_string()],
-            true,
+            false,
             &settings,
         );
         assert_eq!(hermes_only.hermes_db_paths(), vec![profile_db]);
@@ -2289,6 +2519,32 @@ mod tests {
         let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
         assert_eq!(result.get(ClientId::Claude).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
+    }
+
+    /// Regression for #815: nested-layout subagent/workflow transcripts
+    /// (`<session>/subagents/workflows/<wf>/agent-*.jsonl`) must be discovered by
+    /// the recursive project-dir walk, so their usage is counted. The sibling
+    /// `journal.jsonl` orchestration metadata is discovered too, but the parser
+    /// drops it (covered in the claudecode parser tests).
+    #[test]
+    fn test_scan_all_clients_claude_nested_workflow_agents() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let wf = home.join(".claude/projects/myproject/sess-uuid/subagents/workflows/wf_abc");
+        fs::create_dir_all(&wf).unwrap();
+        let agent = wf.join("agent-a123.jsonl");
+        File::create(&agent).unwrap().write_all(b"{}\n").unwrap();
+        File::create(wf.join("journal.jsonl"))
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
+
+        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        assert!(
+            result.get(ClientId::Claude).iter().any(|p| p == &agent),
+            "nested workflow agent transcript must be discovered, got {:?}",
+            result.get(ClientId::Claude)
+        );
     }
 
     #[test]
@@ -2781,6 +3037,40 @@ mod tests {
         let result = scan_all_clients(home.to_str().unwrap(), &["kimi".to_string()]);
         assert_eq!(result.get(ClientId::Kimi).len(), 1);
         assert!(result.get(ClientId::Kimi)[0].ends_with("wire.jsonl"));
+        assert!(result.get(ClientId::OpenCode).is_empty());
+        assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    #[test]
+    fn test_scan_directory_updates_jsonl_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        let session_dir = path.join("%2Ftmp%2Fproject").join("session-uuid-1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        File::create(session_dir.join("updates.jsonl")).unwrap();
+        File::create(session_dir.join("events.jsonl")).unwrap();
+        File::create(session_dir.join("updates.json")).unwrap();
+
+        let updates_files = scan_directory(path.to_str().unwrap(), "updates.jsonl");
+        assert_eq!(updates_files.len(), 1);
+        assert!(updates_files[0].ends_with("updates.jsonl"));
+    }
+
+    #[test]
+    fn test_scan_all_clients_grok() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_grok_dir(home);
+
+        // use_env_roots=false so a real GROK_HOME cannot steal the scan root.
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["grok".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Grok).len(), 1);
+        assert!(result.get(ClientId::Grok)[0].ends_with("updates.jsonl"));
         assert!(result.get(ClientId::OpenCode).is_empty());
         assert!(result.get(ClientId::Claude).is_empty());
     }
