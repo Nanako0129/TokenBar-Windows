@@ -67,13 +67,25 @@ Step("tb_model_report", () =>
 Step("tb_hourly_report", () =>
 {
     var r = TbCore.HourlyReport();
-    return $"ok entries={r.Entries.Count} totalCost={r.TotalCost:F2}";
+    // Exercise the clients-filter marshaling path too: a single-client slice
+    // must never cost more than the unfiltered report.
+    var filtered = TbCore.HourlyReport(clients: ["claude"]);
+    if (filtered.TotalCost > r.TotalCost)
+        throw new InvalidOperationException(
+            $"filtered cost {filtered.TotalCost} exceeds unfiltered {r.TotalCost}");
+    return $"ok entries={r.Entries.Count} totalCost={r.TotalCost:F2} " +
+           $"claudeOnlyCost={filtered.TotalCost:F2}";
 });
 
 Step("tb_agents_report", () =>
 {
     var r = TbCore.AgentsReport();
-    return $"ok entries={r.Entries.Count} totalMessages={r.TotalMessages}";
+    var filtered = TbCore.AgentsReport(clients: ["claude"]);
+    if (filtered.TotalMessages > r.TotalMessages)
+        throw new InvalidOperationException(
+            $"filtered messages {filtered.TotalMessages} exceed unfiltered {r.TotalMessages}");
+    return $"ok entries={r.Entries.Count} totalMessages={r.TotalMessages} " +
+           $"claudeOnlyMessages={filtered.TotalMessages}";
 });
 
 Step("tb_usage_trace", () =>

@@ -51,11 +51,26 @@ public static class TbCore
     public static ModelReport ModelReport(string? year = null) =>
         Unwrap<ModelReport>(NativeMethods.tb_model_report(year));
 
-    public static HourlyReport HourlyReport(string? year = null) =>
-        Unwrap<HourlyReport>(NativeMethods.tb_hourly_report(year));
+    /// <summary>Per-hour report for <paramref name="year"/> (null = all time),
+    /// restricted to <paramref name="clients"/> (null/empty = all clients).
+    /// The core filters at the streaming scan, so a client slice yields
+    /// accurate per-client totals for hours shared across clients (a
+    /// downstream membership filter cannot — buckets fold all clients into
+    /// one mixed total). NOTE: an empty selection therefore reaches the core
+    /// as "all clients", not "no clients" — the all-hidden case is enforced
+    /// by the lens views' strict membership filter, not here.</summary>
+    public static HourlyReport HourlyReport(string? year = null, IReadOnlyList<string>? clients = null) =>
+        Unwrap<HourlyReport>(NativeMethods.tb_hourly_report(year, JoinClients(clients)));
 
-    public static AgentsReport AgentsReport(string? year = null) =>
-        Unwrap<AgentsReport>(NativeMethods.tb_agents_report(year));
+    /// <summary>Per-agent report for <paramref name="year"/> (null = all
+    /// time), restricted to <paramref name="clients"/> (null/empty = all
+    /// clients). Scan-level filter, same rationale as
+    /// <see cref="HourlyReport"/>.</summary>
+    public static AgentsReport AgentsReport(string? year = null, IReadOnlyList<string>? clients = null) =>
+        Unwrap<AgentsReport>(NativeMethods.tb_agents_report(year, JoinClients(clients)));
+
+    private static string? JoinClients(IReadOnlyList<string>? clients) =>
+        clients is { Count: > 0 } ? string.Join(',', clients) : null;
 
     /// <summary>Live trace buckets over the trailing window (lazily re-parses
     /// at most every 10s inside the cdylib).</summary>

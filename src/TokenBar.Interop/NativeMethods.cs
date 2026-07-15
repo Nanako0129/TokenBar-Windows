@@ -28,10 +28,10 @@ internal static partial class NativeMethods
     internal static partial nint tb_model_report(string? year);
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial nint tb_hourly_report(string? year);
+    internal static partial nint tb_hourly_report(string? year, string? clients);
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial nint tb_agents_report(string? year);
+    internal static partial nint tb_agents_report(string? year, string? clients);
 
     [LibraryImport(Lib)]
     internal static partial nint tb_usage_trace(long windowSecs);
