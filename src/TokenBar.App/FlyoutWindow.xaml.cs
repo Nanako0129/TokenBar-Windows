@@ -511,7 +511,10 @@ public sealed partial class FlyoutWindow : Window
                 if (inside)
                 {
                     var delta = unchecked((short)(data.mouseData >> 16));
-                    _ = DispatcherQueue.TryEnqueue(() => Dashboard.ScrollBy(-delta));
+                    var windowX = data.pt.X - pos.X;
+                    var windowY = data.pt.Y - pos.Y;
+                    _ = DispatcherQueue.TryEnqueue(() =>
+                        Dashboard.RouteGlobalWheel(windowX, windowY, delta));
                     return 1; // consumed: don't let the focused app scroll too
                 }
             }

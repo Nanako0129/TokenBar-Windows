@@ -39,8 +39,56 @@ public static class HoverTip
     {
         target.PointerEntered += (_, e) => Show(target, build(), e);
         target.PointerMoved += (_, e) => Move(target, e);
-        target.PointerExited += (_, _) => Hide(target);
-        target.Unloaded += (_, _) => Hide(target);
+        target.PointerExited += (_, _) => HideFor(target);
+        target.Unloaded += (_, _) => HideFor(target);
+    }
+
+    /// <summary>Programmatic path for custom hit-tested surfaces such as the
+    /// D3D contribution graph. <paramref name="rootPosition"/> is expressed in
+    /// the target's XamlRoot coordinate space.</summary>
+    public static void ShowAt(
+        FrameworkElement target, UIElement content, Windows.Foundation.Point rootPosition)
+    {
+        if (target.XamlRoot is not { } root)
+        {
+            return;
+        }
+
+        var host = EnsureHost(root);
+        host.Card.Child = content;
+        Position(host, root, rootPosition);
+        host.Popup.IsOpen = true;
+    }
+
+    /// <summary>Move an already-open programmatic tooltip without rebuilding
+    /// its content. No-op when this XamlRoot has no active hover card.</summary>
+    public static bool MoveAt(FrameworkElement target, Windows.Foundation.Point rootPosition)
+    {
+        if (target.XamlRoot is { } root
+            && _hosts.TryGetValue(root, out var host)
+            && host.Popup.IsOpen)
+        {
+            Position(host, root, rootPosition);
+            return true;
+        }
+
+        return false;
+    }
+
+    public static void HideFor(FrameworkElement target)
+    {
+        if (target.XamlRoot is { } root && _hosts.TryGetValue(root, out var host))
+        {
+            host.Popup.IsOpen = false;
+            return;
+        }
+
+        // XamlRoot already gone (e.g. Unloaded): close any open tooltip so a
+        // stray card can't linger.
+        foreach (var h in _hosts.Values)
+        {
+            h.Popup.IsOpen = false;
+        }
     }
 
     private static Host EnsureHost(XamlRoot root)
@@ -79,10 +127,7 @@ public static class HoverTip
             return;
         }
 
-        var host = EnsureHost(root);
-        host.Card.Child = content;
-        Position(host, root, e);
-        host.Popup.IsOpen = true;
+        ShowAt(target, content, e.GetCurrentPoint(root.Content).Position);
     }
 
     private static void Move(FrameworkElement target, PointerRoutedEventArgs e)
@@ -91,45 +136,29 @@ public static class HoverTip
             && _hosts.TryGetValue(root, out var host)
             && host.Popup.IsOpen)
         {
-            Position(host, root, e);
+            Position(host, root, e.GetCurrentPoint(root.Content).Position);
         }
     }
 
-    private static void Position(Host host, XamlRoot root, PointerRoutedEventArgs e)
+    private static void Position(
+        Host host, XamlRoot root, Windows.Foundation.Point rootPosition)
     {
-        var p = e.GetCurrentPoint(root.Content).Position;
         host.Card.Measure(new Windows.Foundation.Size(300, double.PositiveInfinity));
         var size = host.Card.DesiredSize;
-        var x = p.X + 14;
-        var y = p.Y + 18;
+        var x = rootPosition.X + 14;
+        var y = rootPosition.Y + 18;
         if (x + size.Width > root.Size.Width - 4)
         {
-            x = p.X - size.Width - 10; // flip left near the right edge
+            x = rootPosition.X - size.Width - 10; // flip left near the right edge
         }
 
         if (y + size.Height > root.Size.Height - 4)
         {
-            y = p.Y - size.Height - 10;
+            y = rootPosition.Y - size.Height - 10;
         }
 
         host.Popup.HorizontalOffset = Math.Max(4, x);
         host.Popup.VerticalOffset = Math.Max(4, y);
-    }
-
-    private static void Hide(FrameworkElement target)
-    {
-        if (target.XamlRoot is { } root && _hosts.TryGetValue(root, out var host))
-        {
-            host.Popup.IsOpen = false;
-            return;
-        }
-
-        // XamlRoot already gone (e.g. Unloaded): close any open tooltip so a
-        // stray card can't linger.
-        foreach (var h in _hosts.Values)
-        {
-            h.Popup.IsOpen = false;
-        }
     }
 
     /// <summary>True when <paramref name="popup"/> is one of HoverTip's tooltip

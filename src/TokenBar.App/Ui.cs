@@ -18,25 +18,49 @@ public static class Ui
         ("reasoning", "R", "#ec4899"),
     ];
 
-    public static Border Card(string title, UIElement content, string? subtitle = null)
+    public static Border Card(
+        string title, UIElement content, string? subtitle = null, UIElement? trailing = null)
     {
         var stack = new StackPanel();
         var head = new Microsoft.UI.Xaml.Controls.Grid { Margin = new Thickness(0, 0, 0, 8) };
+        head.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         head.Children.Add(new TextBlock
         {
             Text = title,
             FontSize = 13,
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
         });
-        if (subtitle is not null)
+        if (subtitle is not null || trailing is not null)
         {
-            head.Children.Add(new TextBlock
+            var end = new StackPanel
             {
-                Text = subtitle,
-                FontSize = 11,
-                Opacity = 0.6,
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
                 HorizontalAlignment = HorizontalAlignment.Right,
-            });
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            if (subtitle is not null)
+            {
+                end.Children.Add(new TextBlock
+                {
+                    Text = subtitle,
+                    FontSize = 11,
+                    Opacity = 0.6,
+                    VerticalAlignment = VerticalAlignment.Center,
+                });
+            }
+
+            if (trailing is not null)
+            {
+                end.Children.Add(trailing);
+            }
+
+            Microsoft.UI.Xaml.Controls.Grid.SetColumn(end, 1);
+            head.Children.Add(end);
         }
 
         stack.Children.Add(head);

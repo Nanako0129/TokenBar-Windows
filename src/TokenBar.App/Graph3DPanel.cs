@@ -1,21 +1,18 @@
 using System.Runtime.InteropServices;
+using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
+using TokenBar.Core;
+using Windows.Foundation;
+using Windows.UI;
 
 namespace TokenBar.App;
 
 /// <summary>
-/// SwapChainPanel host for the 3D contribution graph — Phase 8 Gate 0. Owns
-/// the D3D renderer's lifetime against the flyout show/hide cycle: created
-/// lazily on <see cref="Activate"/> once the panel has a real pixel size,
-/// torn down on <see cref="Release"/>. DXGI device-removed/reset is caught,
-/// logged, and answered by a full re-create on the next show.
-///
-/// This is the ONE file with WinUI-specific COM interop
-/// (ISwapChainPanelNative.SetSwapChain); the interop is isolated below and
-/// flagged as the highest-risk unverifiable seam in the Gate 0 report.
-///
-/// The static counters are the soak's assertion surface (see Soak3D): a single
-/// panel exists per process, so process-global counters are simplest.
+/// SwapChainPanel host for the 3D contribution graph. The panel owns the
+/// renderer's lifetime against the flyout show/hide cycle, caches data while
+/// inactive, and turns pointer input into render-on-demand camera/hover work.
 /// </summary>
 internal sealed class Graph3DPanel : SwapChainPanel
 {
@@ -24,33 +21,103 @@ internal sealed class Graph3DPanel : SwapChainPanel
     public static int DeviceRemovedCount;
     public static int ErrorCount;
 
-    private Graph3DRenderer? _renderer;
-    private bool _active;
+    private const string CameraStorageKey = "tokenbar.orbit.v1";
 
-    // Fixed orbit angle for Gate 0 — visuals beyond the spike's grid are out
-    // of scope; this only exercises the swapchain/device lifecycle.
-    private const float Azimuth = 35f;
-    private const float Elevation = 30f;
+    private Graph3DRenderer? _renderer;
+    private GridLayout? _grid;
+    private bool _dark;
+    private bool _hasData;
+    private bool _active;
+    private bool _creating;
+    private string? _dataSignature;
+
+    private uint? _dragPointerId;
+    private Point _lastPointer;
+    private bool _panDrag;
+    private int _dragFrames;
+    private long _dragRenderTicks;
+
+    private readonly record struct PointerLocation(
+        Point Local,
+        Point Root,
+        bool LeftPressed,
+        bool RightPressed,
+        int WheelDelta);
 
     public Graph3DPanel()
     {
-        // A collapsed panel has no size at Activate time; the first layout
-        // pass fires SizeChanged, which is where creation actually lands.
         SizeChanged += (_, _) => OnSizeChanged();
+        // ActualWidth/Height are DIPs and may stay unchanged when the flyout
+        // crosses monitors. Resize the physical swapchain as soon as WinUI's
+        // composition scale changes so rendering and pointer pixels keep the
+        // same denominator.
+        CompositionScaleChanged += (_, _) => OnSizeChanged();
+        PointerPressed += OnPointerPressed;
+        PointerMoved += OnPointerMoved;
+        PointerReleased += OnPointerReleased;
+        PointerCanceled += OnPointerCanceled;
+        PointerCaptureLost += OnPointerCaptureLost;
+        PointerExited += OnPointerExited;
+        PointerWheelChanged += OnPointerWheelChanged;
     }
 
-    /// <summary>Flyout shown with the dev toggle on: create (or re-create)
-    /// the device and render one frame.</summary>
+    public bool IsActive => _active;
+
+    /// <summary>Cache data regardless of visibility. If a renderer exists,
+    /// rebuild it and render exactly one updated frame.</summary>
+    public void SetData(GridLayout grid, bool dark)
+    {
+        var signature = DataSignature(grid, dark);
+        var changed = signature != _dataSignature;
+        _dataSignature = signature;
+        _grid = grid;
+        _dark = dark;
+        _hasData = true;
+        if (!_active)
+        {
+            return;
+        }
+
+        if (_renderer is null)
+        {
+            TryCreate();
+            return;
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        try
+        {
+            // The renderer resets its highlighted instance when geometry is
+            // replaced; close the matching popup in the same transaction so a
+            // periodic snapshot refresh cannot leave stale hover text behind.
+            HoverTip.HideFor(this);
+            _renderer.SetData(grid, dark);
+            RenderOrRecover("data");
+        }
+        catch (Exception ex)
+        {
+            HandleDeviceError("data", ex);
+        }
+    }
+
+    /// <summary>Create (or re-create) the device once the panel has a real
+    /// pixel size and render one frame.</summary>
     public void Activate()
     {
         _active = true;
         TryCreate();
     }
 
-    /// <summary>Flyout hidden: dispose the swapchain + device deterministically
-    /// so nothing GPU-side lingers while the flyout is away.</summary>
+    /// <summary>Release the swapchain/device deterministically while hidden.
+    /// Camera motion is persisted before teardown if a drag was in progress.</summary>
     public void Release()
     {
+        EndDrag(persist: true);
+        HoverTip.HideFor(this);
         _active = false;
         if (_renderer is null)
         {
@@ -63,6 +130,77 @@ internal sealed class Graph3DPanel : SwapChainPanel
         Interlocked.Increment(ref ReleasedCount);
         DevLog.Write(
             $"graph3d: released (created={CreatedCount} released={ReleasedCount})");
+    }
+
+    public void FitToContent()
+    {
+        if (_renderer is null)
+        {
+            if (_active)
+            {
+                TryCreate();
+            }
+
+            return;
+        }
+
+        try
+        {
+            HoverTip.HideFor(this);
+            _renderer.ClearHover();
+            _renderer.FitToContent();
+            RenderOrRecover("fit");
+        }
+        catch (Exception ex)
+        {
+            HandleDeviceError("fit", ex);
+        }
+    }
+
+    public void ResetCamera()
+    {
+        // Clear even while inactive; the next renderer will auto-fit cached
+        // data because no tokenbar.orbit.v1 pose remains.
+        AppSettings.Store.Remove(CameraStorageKey);
+        if (_renderer is null)
+        {
+            return;
+        }
+
+        try
+        {
+            HoverTip.HideFor(this);
+            _renderer.ClearHover();
+            _renderer.ResetCamera();
+            RenderOrRecover("reset");
+        }
+        catch (Exception ex)
+        {
+            HandleDeviceError("reset", ex);
+        }
+    }
+
+    public void ZoomFromWheel(int wheelDelta)
+    {
+        if (_renderer is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // Both WinUI pointer events and the focusless flyout's low-level
+            // wheel hook land here. Clear the old picked cell before moving
+            // the camera so neither route can leave stale text/highlight.
+            HoverTip.HideFor(this);
+            _renderer.ClearHover();
+            _renderer.ZoomFromWheel(wheelDelta);
+            RenderOrRecover("zoom");
+        }
+        catch (Exception ex)
+        {
+            HandleDeviceError("zoom", ex);
+        }
     }
 
     private void OnSizeChanged()
@@ -81,13 +219,14 @@ internal sealed class Graph3DPanel : SwapChainPanel
         var (w, h) = PixelSize();
         if (w == 0 || h == 0)
         {
-            return; // collapsed mid-life; keep the device, wait for real size
+            return;
         }
 
         try
         {
             _renderer.Resize(w, h);
-            _renderer.Render(Azimuth, Elevation);
+            _renderer.SetCompositionScale(EffectiveScaleX, EffectiveScaleY);
+            RenderOrRecover("resize");
         }
         catch (Exception ex)
         {
@@ -105,47 +244,410 @@ internal sealed class Graph3DPanel : SwapChainPanel
         var (w, h) = PixelSize();
         if (w == 0 || h == 0)
         {
-            return; // no size yet; SizeChanged re-enters here after layout
+            return;
         }
 
+        _creating = true;
         try
         {
             _renderer = new Graph3DRenderer(w, h);
             SetSwapChain(_renderer.SwapChainPointer);
+            _renderer.SetCompositionScale(EffectiveScaleX, EffectiveScaleY);
             Interlocked.Increment(ref CreatedCount);
-            DevLog.Write($"graph3d: created {w}x{h} (created={CreatedCount})");
-            if (!_renderer.Render(Azimuth, Elevation))
+            DevLog.Write($"graph3d: created {w}x{h} scale="
+                + $"{EffectiveScaleX:F2},{EffectiveScaleY:F2} (created={CreatedCount})");
+
+            // Always reapply the cache after recreation. Do not signature-gate
+            // this: the renderer owns fresh GPU buffers after every release.
+            if (_hasData && _grid is not null)
             {
-                HandleDeviceLost("initial-render");
+                _renderer.SetData(_grid, _dark);
             }
+
+            RenderOrRecover("initial-render");
         }
         catch (Exception ex)
         {
-            HandleDeviceError("create", ex);
+            // A constructor/shader/API failure is persistent for this build.
+            // Re-entering TryCreate from its own catch recurses until stack
+            // overflow, so leave the active panel empty and retry on the next
+            // activation, size change, or data update instead.
+            Interlocked.Increment(ref ErrorCount);
+            DevLog.Write($"graph3d: create FAILED (errors={ErrorCount}): {ex.Message}");
+            DetachSwapChain();
+            _renderer?.Dispose();
+            _renderer = null;
+        }
+        finally
+        {
+            _creating = false;
+        }
+    }
+
+    private void RenderOrRecover(string where)
+    {
+        if (_renderer is null)
+        {
+            return;
+        }
+
+        if (!_renderer.Render())
+        {
+            HandleDeviceLost(where);
         }
     }
 
     private (int Width, int Height) PixelSize()
     {
-        // SwapChainPanel renders at physical pixels; ActualWidth is in DIPs, so
-        // scale by the composition scale (1.0 before the first layout pass).
-        var scaleX = CompositionScaleX > 0 ? CompositionScaleX : 1f;
-        var scaleY = CompositionScaleY > 0 ? CompositionScaleY : 1f;
-        return ((int)(ActualWidth * scaleX), (int)(ActualHeight * scaleY));
+        return ((int)(ActualWidth * EffectiveScaleX),
+            (int)(ActualHeight * EffectiveScaleY));
     }
 
-    /// <summary>Device-removed/reset (TDR, driver update, GPU reset): expected
-    /// and recoverable — count it and re-create on the spot if still active.</summary>
+    private float EffectiveScaleX => CompositionScaleX > 0 ? CompositionScaleX : 1f;
+    private float EffectiveScaleY => CompositionScaleY > 0 ? CompositionScaleY : 1f;
+
+    private void OnPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_active || _renderer is null)
+        {
+            return;
+        }
+
+        if (!TryGetPointerLocation(e, out var point)
+            || (!point.LeftPressed && !point.RightPressed))
+        {
+            return;
+        }
+
+        ClearHover();
+        _dragPointerId = e.Pointer.PointerId;
+        _lastPointer = point.Local;
+        _panDrag = point.RightPressed;
+        _dragFrames = 0;
+        _dragRenderTicks = 0;
+        CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void OnPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_active || _renderer is null)
+        {
+            return;
+        }
+
+        if (!TryGetPointerLocation(e, out var point))
+        {
+            return;
+        }
+
+        if (_dragPointerId is { } dragPointerId
+            && e.Pointer.PointerId == dragPointerId)
+        {
+            var dx = (float)((point.Local.X - _lastPointer.X) * EffectiveScaleX);
+            var dy = (float)((point.Local.Y - _lastPointer.Y) * EffectiveScaleY);
+            _lastPointer = point.Local;
+            try
+            {
+                if (_panDrag)
+                {
+                    _renderer.Pan(dx, dy);
+                }
+                else
+                {
+                    _renderer.Orbit(dx, dy);
+                }
+
+                var renderStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                RenderOrRecover("drag");
+                _dragRenderTicks += System.Diagnostics.Stopwatch.GetTimestamp() - renderStart;
+                _dragFrames++;
+            }
+            catch (Exception ex)
+            {
+                HandleDeviceError("drag", ex);
+            }
+
+            e.Handled = true;
+            return;
+        }
+
+        UpdateHover(point);
+    }
+
+    private void OnPointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_dragPointerId is not { } dragPointerId
+            || e.Pointer.PointerId != dragPointerId)
+        {
+            return;
+        }
+
+        var hasPoint = TryGetPointerLocation(e, out var point);
+        try
+        {
+            ReleasePointerCapture(e.Pointer);
+        }
+        finally
+        {
+            EndDrag(persist: true);
+        }
+
+        if (hasPoint)
+        {
+            UpdateHover(point);
+        }
+
+        e.Handled = true;
+    }
+
+    private void OnPointerCanceled(object sender, PointerRoutedEventArgs e) =>
+        EndDrag(persist: true);
+
+    private void OnPointerCaptureLost(object sender, PointerRoutedEventArgs e) =>
+        EndDrag(persist: true);
+
+    private void OnPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        ClearHover();
+    }
+
+    private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_active || _renderer is null)
+        {
+            return;
+        }
+
+        if (!TryGetPointerLocation(e, out var point))
+        {
+            return;
+        }
+
+        ZoomFromWheel(point.WheelDelta);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// SwapChainPanel's element-relative PointerPoint can include its
+    /// composition offset a second time after the panel is reparented inside a
+    /// scroller. Read the pointer in XamlRoot space (the same space WinUI uses
+    /// for its accelerator tooltip), then subtract the panel's visual origin.
+    /// Both values are DIPs; CompositionScale is applied only at the renderer
+    /// boundary below.
+    /// </summary>
+    private bool TryGetPointerLocation(
+        PointerRoutedEventArgs e, out PointerLocation location)
+    {
+        location = default;
+        if (XamlRoot?.Content is not UIElement root)
+        {
+            return false;
+        }
+
+        try
+        {
+            var atRoot = e.GetCurrentPoint(root);
+            var origin = TransformToVisual(root).TransformPoint(new Point(0, 0));
+            location = new PointerLocation(
+                new Point(
+                    atRoot.Position.X - origin.X,
+                    atRoot.Position.Y - origin.Y),
+                atRoot.Position,
+                atRoot.Properties.IsLeftButtonPressed,
+                atRoot.Properties.IsRightButtonPressed,
+                atRoot.Properties.MouseWheelDelta);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            // The panel can detach while a queued pointer event is delivered.
+            return false;
+        }
+    }
+
+    private void UpdateHover(PointerLocation point)
+    {
+        if (_renderer is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var changed = _renderer.UpdateHover(
+                (float)(point.Local.X * EffectiveScaleX),
+                (float)(point.Local.Y * EffectiveScaleY), out var cell);
+
+            if (cell is null)
+            {
+                HoverTip.HideFor(this);
+            }
+            else
+            {
+                if (changed)
+                {
+                    HoverTip.ShowAt(this, BuildTooltip(cell), point.Root);
+                }
+                else if (!HoverTip.MoveAt(this, point.Root))
+                {
+                    // A light-dismiss or another hover host may have closed
+                    // the shared popup while the pointer stayed on this cell.
+                    // Reopen it without forcing a GPU highlight change.
+                    HoverTip.ShowAt(this, BuildTooltip(cell), point.Root);
+                }
+            }
+
+            if (changed)
+            {
+                RenderOrRecover("hover");
+            }
+        }
+        catch (Exception ex)
+        {
+            HandleDeviceError("hover", ex);
+        }
+    }
+
+    private void ClearHover()
+    {
+        HoverTip.HideFor(this);
+        if (_renderer is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (_renderer.ClearHover())
+            {
+                RenderOrRecover("hover-clear");
+            }
+        }
+        catch (Exception ex)
+        {
+            HandleDeviceError("hover-clear", ex);
+        }
+    }
+
+    private void EndDrag(bool persist)
+    {
+        var hadDrag = _dragPointerId is not null;
+        _dragPointerId = null;
+        _panDrag = false;
+        try
+        {
+            ReleasePointerCaptures();
+        }
+        catch
+        {
+            // Pointer capture may already have been lost during teardown.
+        }
+
+        if (persist && hadDrag)
+        {
+            _renderer?.PersistCamera();
+        }
+
+        if (hadDrag && _dragFrames > 0 && _dragRenderTicks > 0)
+        {
+            var renderFps = _dragFrames * (double)System.Diagnostics.Stopwatch.Frequency
+                / _dragRenderTicks;
+            DevLog.Write(
+                $"graph3d: drag frames={_dragFrames} renderFps={renderFps:F1}");
+        }
+
+        _dragFrames = 0;
+        _dragRenderTicks = 0;
+    }
+
+    private static UIElement BuildTooltip(GridCell cell)
+    {
+        var panel = new StackPanel { Spacing = 4, MinWidth = 150 };
+        panel.Children.Add(TooltipText(Format.MonthDay(cell.Date), 12, bold: true));
+        panel.Children.Add(TooltipText(
+            $"{Format.ExactTokens(cell.Tokens)} tokens", 11, 0.9));
+        panel.Children.Add(TooltipText(Format.Usd(cell.Cost), 11, 0.9));
+        return panel;
+    }
+
+    private static TextBlock TooltipText(
+        string text, double size, double opacity = 1, bool bold = false) => new()
+    {
+        Text = text,
+        FontSize = size,
+        Opacity = opacity,
+        FontWeight = bold
+            ? Microsoft.UI.Text.FontWeights.SemiBold
+            : Microsoft.UI.Text.FontWeights.Normal,
+        Foreground = new SolidColorBrush(Color.FromArgb(255, 240, 240, 245)),
+    };
+
+    /// <summary>The Swift reference gates on cols|maxTokens|activeCount|theme.
+    /// Keep that contract, plus a compact content fingerprint so two years with
+    /// coincidentally equal aggregates cannot retain stale geometry/tooltips.</summary>
+    private static string DataSignature(GridLayout grid, bool dark)
+    {
+        const ulong offset = 14695981039346656037;
+        const ulong prime = 1099511628211;
+        var fingerprint = offset;
+        var activeCount = 0;
+
+        void Mix(ulong value)
+        {
+            fingerprint ^= value;
+            fingerprint *= prime;
+        }
+
+        foreach (var cell in grid.Cells)
+        {
+            Mix((ulong)(uint)cell.Col);
+            Mix((ulong)(uint)cell.Row);
+            Mix(cell.InYear ? 1UL : 0UL);
+            Mix(cell.Active ? 1UL : 0UL);
+            if (!cell.InYear)
+            {
+                continue;
+            }
+
+            foreach (var ch in cell.Date)
+            {
+                Mix(ch);
+            }
+
+            Mix(unchecked((ulong)cell.Tokens));
+            Mix(unchecked((ulong)BitConverter.DoubleToInt64Bits(cell.Cost)));
+            if (cell.Active)
+            {
+                activeCount++;
+            }
+        }
+
+        return $"{grid.Cols}|{grid.MaxTokens}|{activeCount}|{dark}|{fingerprint:X16}";
+    }
+
+    /// <summary>Device-removed/reset (TDR, driver update, GPU reset): count it
+    /// and recreate on the spot if still active.</summary>
     private void HandleDeviceLost(string where)
     {
         Interlocked.Increment(ref DeviceRemovedCount);
         DevLog.Write($"graph3d: device lost at {where} (removed={DeviceRemovedCount})");
+        if (_creating)
+        {
+            // A freshly-created device that is already removed will fail again
+            // immediately. Tear it down and let a later lifecycle event retry,
+            // rather than recursively creating devices on the same call stack.
+            DetachSwapChain();
+            _renderer?.Dispose();
+            _renderer = null;
+            return;
+        }
+
         Recreate();
     }
 
-    /// <summary>An unexpected throw from the render path — logged as an error
-    /// (the soak treats errors as failure), then recovered like a lost device
-    /// so a single stray fault doesn't wedge the panel.</summary>
+    /// <summary>An unexpected render-path throw is logged and recovered like a
+    /// lost device so a transient fault cannot wedge the flyout.</summary>
     private void HandleDeviceError(string where, Exception ex)
     {
         Interlocked.Increment(ref ErrorCount);
@@ -155,6 +657,8 @@ internal sealed class Graph3DPanel : SwapChainPanel
 
     private void Recreate()
     {
+        EndDrag(persist: true);
+        HoverTip.HideFor(this);
         DetachSwapChain();
         _renderer?.Dispose();
         _renderer = null;
@@ -177,12 +681,6 @@ internal sealed class Graph3DPanel : SwapChainPanel
     }
 
     // ── ISwapChainPanelNative interop (the one unverifiable seam) ──────────
-    //
-    // The documented WinUI 3 path to bind a DXGI swapchain to a SwapChainPanel:
-    // QI the panel for ISwapChainPanelNative and hand it the swapchain's
-    // IUnknown. CsWinRT's CastExtensions.As<T> performs the QI for a hand-
-    // declared [ComImport] interface (the same As<T> the flyout uses for
-    // ICompositionSupportsSystemBackdrop). Passing nint.Zero detaches.
 
     private void SetSwapChain(nint swapChain)
     {
@@ -190,12 +688,13 @@ internal sealed class Graph3DPanel : SwapChainPanel
         Marshal.ThrowExceptionForHR(native.SetSwapChain(swapChain));
     }
 
-    [ComImport]
-    [Guid("63aad0b8-7c24-40ff-85a8-640d944cc325")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [System.Runtime.InteropServices.ComImport]
+    [System.Runtime.InteropServices.Guid("63aad0b8-7c24-40ff-85a8-640d944cc325")]
+    [System.Runtime.InteropServices.InterfaceType(
+        System.Runtime.InteropServices.ComInterfaceType.InterfaceIsIUnknown)]
     private interface ISwapChainPanelNative
     {
-        [PreserveSig]
+        [System.Runtime.InteropServices.PreserveSig]
         int SetSwapChain(nint swapChain);
     }
 }

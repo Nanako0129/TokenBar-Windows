@@ -42,10 +42,18 @@ public sealed partial class DashboardView : UserControl
     private ChartMetric _chartMetric =
         AppSettings.Store.GetString("tokenbar.chart.metric") == "cost"
             ? ChartMetric.Cost : ChartMetric.Tokens;
+    private bool _chartView3D =
+        AppSettings.Store.GetString("tokenbar.chart.view", "2d") == "3d";
 
     public DashboardView()
     {
         InitializeComponent();
+        // WinUI otherwise synthesizes a tooltip containing "Esc" for the
+        // dashboard-wide Escape accelerator whenever the pointer rests over
+        // the graph. The accelerator remains active; only its automatic
+        // tooltip chrome is suppressed.
+        KeyboardAcceleratorPlacementMode =
+            Microsoft.UI.Xaml.Input.KeyboardAcceleratorPlacementMode.Hidden;
 
         foreach (var view in Enum.GetValues<AppView>())
         {
@@ -124,6 +132,8 @@ public sealed partial class DashboardView : UserControl
                 _model?.RefreshForce();
                 UpdateRefreshControl();
             });
+        AddAccel(Windows.System.VirtualKey.G, Windows.System.VirtualKeyModifiers.Control,
+            ToggleChartView);
         AddAccel((Windows.System.VirtualKey)0xBC /* comma */,
             Windows.System.VirtualKeyModifiers.Control,
             () => TrayService.OpenSettings?.Invoke());
@@ -141,36 +151,115 @@ public sealed partial class DashboardView : UserControl
             Windows.System.VirtualKeyModifiers.Control, () => CycleLens(-1));
         AddAccel((Windows.System.VirtualKey)0xDD /* ] */,
             Windows.System.VirtualKeyModifiers.Control, () => CycleLens(1));
+
+        ActualThemeChanged += (_, _) => UpdateGraph3DData(_snapshot);
     }
 
     /// <summary>The flyout owns hiding (Esc/Ctrl+W land here).</summary>
     public event Action? HideRequested;
 
-    // ── Dev-only 3D panel (Phase 8 Gate 0) ───────────────────────────────
+    // ── 3D contribution graph ────────────────────────────────────────────
 
     private Graph3DPanel? _graph3d;
+    private Border? _graph3dContentHost;
+    private bool _graph3dDevMode;
+    private bool _flyoutVisible;
 
     /// <summary>Mount the 3D contribution-graph panel and reveal its host.
-    /// Dev-only: nothing calls this in normal use (only the --graph3d /
-    /// --soak3d launch hooks), so the SwapChainPanel stays absent and inert
-    /// otherwise. Idempotent.</summary>
+    /// Dev-only Gate 0 path used by --graph3d / --soak3d. The normal product
+    /// path mounts the same panel inside the Token Usage card.</summary>
     public void EnableGraph3D()
     {
-        if (_graph3d is not null)
+        if (_graph3dDevMode)
         {
             return;
         }
 
-        _graph3d = new Graph3DPanel();
+        _graph3dDevMode = true;
+        var panel = EnsureGraph3D();
+        DetachGraph3DContentHost();
+        _graph3d = panel;
         Graph3DHost.Child = _graph3d;
         Graph3DHost.Visibility = Visibility.Visible;
+        UpdateGraph3DData(_snapshot);
+        SyncGraph3DActivity();
     }
 
     /// <summary>Flyout show/hide hooks — the renderer holds no GPU resources
     /// while the flyout is away.</summary>
-    public void OnFlyoutShown() => _graph3d?.Activate();
+    public void OnFlyoutShown()
+    {
+        _flyoutVisible = true;
+        SyncGraph3DActivity();
+    }
 
-    public void OnFlyoutHidden() => _graph3d?.Release();
+    public void OnFlyoutHidden()
+    {
+        _flyoutVisible = false;
+        _graph3d?.Release();
+    }
+
+    private Graph3DPanel EnsureGraph3D() => _graph3d ??= new Graph3DPanel();
+
+    private bool Graph3DShouldBeActive =>
+        _graph3dDevMode || (_chartView3D
+            && _view is AppView.Overview or AppView.Stats);
+
+    private void SyncGraph3DActivity()
+    {
+        if (_flyoutVisible && Graph3DShouldBeActive)
+        {
+            EnsureGraph3D().Activate();
+        }
+        else
+        {
+            _graph3d?.Release();
+        }
+    }
+
+    private void UpdateGraph3DData(DashboardModel.Snapshot? snapshot)
+    {
+        if (snapshot is null || _graph3d is null)
+        {
+            return;
+        }
+
+        var selectedClients = snapshot.Graph.Summary.Clients.ToHashSet(StringComparer.Ordinal);
+        var stats = new UsageStats(snapshot.Graph, selectedClients);
+        var year = _model?.Year ?? Format.TodayKey()[..4];
+        var grid = TokenBar.Core.Grid.Build(year, stats.PerDayMap);
+        _graph3d.SetData(grid, ActualTheme == ElementTheme.Dark);
+    }
+
+    private void DetachGraph3DContentHost()
+    {
+        if (_graph3dContentHost is not null
+            && ReferenceEquals(_graph3dContentHost.Child, _graph3d))
+        {
+            _graph3dContentHost.Child = null;
+        }
+
+        _graph3dContentHost = null;
+    }
+
+    private void ToggleChartView() => SetChartView(!_chartView3D);
+
+    private void SetChartView(bool use3D)
+    {
+        if (_chartView3D == use3D)
+        {
+            return;
+        }
+
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        _chartView3D = use3D;
+        AppSettings.Store.SetString("tokenbar.chart.view", use3D ? "3d" : "2d");
+        RenderContent(animated: false);
+        SyncGraph3DActivity();
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        DevLog.Write($"graph3d: toggle view={(use3D ? "3d" : "2d")} "
+            + $"elapsed={elapsed:F1}ms");
+    }
 
     private void AddAccel(
         Windows.System.VirtualKey key, Windows.System.VirtualKeyModifiers mods,
@@ -250,6 +339,7 @@ public sealed partial class DashboardView : UserControl
             $"{graph.Summary.ActiveDays} active days";
         FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
         UpdateYearPicker();
+        UpdateGraph3DData(snapshot);
         RenderContent(animated: false);
     }
 
@@ -310,10 +400,68 @@ public sealed partial class DashboardView : UserControl
         CardsScroll.ChangeView(
             null, CardsScroll.VerticalOffset + delta, null, disableAnimation: false);
 
+    /// <summary>Route the flyout's WH_MOUSE_LL wheel event. Coordinates are
+    /// physical pixels relative to the window; graph hit-testing happens in
+    /// XAML DIPs, and only wheel events over the live 3D surface become zoom.</summary>
+    public void RouteGlobalWheel(double windowPixelX, double windowPixelY, int delta)
+    {
+        var rasterScale = XamlRoot?.RasterizationScale ?? 1.0;
+        var point = new Windows.Foundation.Point(
+            windowPixelX / rasterScale, windowPixelY / rasterScale);
+        if (!TryZoomGraphAt(point, delta))
+        {
+            ScrollBy(-delta);
+        }
+    }
+
     private void OnWheel(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
-        ScrollBy(-e.GetCurrentPoint(this).Properties.MouseWheelDelta);
+        // Graph3DPanel consumes native wheel events itself. This root handler is
+        // registered with handledEventsToo for the rest of the dashboard, so
+        // honor that flag or a focused 3D panel zooms twice per notch.
+        if (e.Handled)
+        {
+            return;
+        }
+
+        var point = e.GetCurrentPoint(this);
+        if (!TryZoomGraphAt(point.Position, point.Properties.MouseWheelDelta))
+        {
+            ScrollBy(-point.Properties.MouseWheelDelta);
+        }
+
         e.Handled = true;
+    }
+
+    private bool TryZoomGraphAt(Windows.Foundation.Point point, int delta)
+    {
+        var panel = _graph3d;
+        if (!Graph3DShouldBeActive || panel?.IsActive != true
+            || panel.ActualWidth <= 0 || panel.ActualHeight <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            var origin = panel.TransformToVisual(this)
+                .TransformPoint(new Windows.Foundation.Point(0, 0));
+            if (point.X < origin.X || point.Y < origin.Y
+                || point.X >= origin.X + panel.ActualWidth
+                || point.Y >= origin.Y + panel.ActualHeight)
+            {
+                return false;
+            }
+
+            panel.ZoomFromWheel(delta);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            // The content presenter can detach the old chart between a model
+            // refresh and this queued hook callback. Treat it as normal scroll.
+            return false;
+        }
     }
 
     private void UpdateTabChrome()
@@ -338,6 +486,7 @@ public sealed partial class DashboardView : UserControl
             return;
         }
 
+        DetachGraph3DContentHost();
         UIElement content = _view switch
         {
             AppView.Models => BuildModels(_snapshot),
@@ -348,6 +497,7 @@ public sealed partial class DashboardView : UserControl
             _ => BuildOverview(_snapshot),
         };
         ContentHost.Content = content;
+        SyncGraph3DActivity();
         if (animated)
         {
             CardsScroll.ChangeView(null, 0, null, disableAnimation: true);
@@ -380,7 +530,7 @@ public sealed partial class DashboardView : UserControl
     private UIElement BuildOverview(DashboardModel.Snapshot snapshot)
     {
         var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(Ui.Card("Token Usage", BuildChart(snapshot), "30 days"));
+        stack.Children.Add(BuildUsageChartCard(snapshot));
         stack.Children.Add(Ui.Card("Agent limits", BuildLimits(snapshot)));
         var trace = BuildTrace(snapshot);
         if (trace is not null)
@@ -393,8 +543,40 @@ public sealed partial class DashboardView : UserControl
         return stack;
     }
 
+    /// <summary>The same persisted 2D/3D usage card is shared by Overview and
+    /// Stats, matching the macOS UsageChartCard ownership. Keeping one builder
+    /// also ensures the single Graph3DPanel is reparented through the same
+    /// lifecycle path in both lenses.</summary>
+    private Border BuildUsageChartCard(DashboardModel.Snapshot snapshot) =>
+        Ui.Card(
+            "Token Usage",
+            BuildChart(snapshot),
+            _chartView3D ? "Full year" : "30 days",
+            BuildChartViewToggle());
+
+    private FrameworkElement BuildChartViewToggle()
+    {
+        var row = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 2,
+        };
+        var twoD = LensPill("2D", !_chartView3D);
+        var threeD = LensPill("3D", _chartView3D);
+        twoD.Click += (_, _) => SetChartView(false);
+        threeD.Click += (_, _) => SetChartView(true);
+        row.Children.Add(twoD);
+        row.Children.Add(threeD);
+        return row;
+    }
+
     private FrameworkElement BuildChart(DashboardModel.Snapshot snapshot)
     {
+        if (_chartView3D)
+        {
+            return BuildGraph3D(snapshot);
+        }
+
         var colors = new ModelColorMap(snapshot.Models);
         var bars = DayBars.Build(
             snapshot.Graph,
@@ -542,6 +724,45 @@ public sealed partial class DashboardView : UserControl
 
         canvas.SizeChanged += (_, _) => Draw();
         return holder;
+    }
+
+    private FrameworkElement BuildGraph3D(DashboardModel.Snapshot snapshot)
+    {
+        const double chartHeight = 196;
+        var root = new Grid { Height = chartHeight };
+        var panel = EnsureGraph3D();
+        UpdateGraph3DData(snapshot);
+
+        // --graph3d owns the panel through the fixed Gate 0 host. In normal
+        // operation the same panel lives here, inside the product card.
+        if (!_graph3dDevMode)
+        {
+            _graph3dContentHost = new Border
+            {
+                Height = chartHeight,
+                Child = panel,
+            };
+            root.Children.Add(_graph3dContentHost);
+        }
+
+        var controls = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 4,
+            Margin = new Thickness(6),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Top,
+        };
+        var fit = LensPill("Fit", false);
+        var reset = LensPill("Reset", false);
+        fit.Click += (_, _) => panel.FitToContent();
+        reset.Click += (_, _) => panel.ResetCamera();
+        HoverTip.Attach(fit, () => "Frame active days");
+        HoverTip.Attach(reset, () => "Reset the saved 3D camera");
+        controls.Children.Add(fit);
+        controls.Children.Add(reset);
+        root.Children.Add(controls);
+        return root;
     }
 
     private static FrameworkElement BuildLimits(DashboardModel.Snapshot snapshot)
@@ -910,7 +1131,7 @@ public sealed partial class DashboardView : UserControl
     private UIElement BuildStats(DashboardModel.Snapshot snapshot)
     {
         var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(Ui.Card("Token Usage", BuildChart(snapshot), "30 days"));
+        stack.Children.Add(BuildUsageChartCard(snapshot));
 
         var stats = new UsageStats(
             snapshot.Graph, new HashSet<string>(snapshot.Graph.Summary.Clients));
