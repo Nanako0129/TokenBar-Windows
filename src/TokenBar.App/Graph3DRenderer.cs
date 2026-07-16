@@ -163,31 +163,51 @@ internal sealed class Graph3DRenderer : IDisposable
 
     public Graph3DRenderer(int width, int height)
     {
-        _width = Math.Max(1, width);
-        _height = Math.Max(1, height);
-        _cameraReady = RestoreCamera();
+        try
+        {
+            _width = Math.Max(1, width);
+            _height = Math.Max(1, height);
+            _cameraReady = RestoreCamera();
 
-        CreateDevice();
-        // Flip-model composition backbuffers cannot be multisampled; MSAA lives
-        // in an offscreen target that resolves into the backbuffer each frame.
-        var colorQuality = _device.CheckMultisampleQualityLevels(
-            DxgiFormat.B8G8R8A8_UNorm, 4);
-        var depthQuality = _device.CheckMultisampleQualityLevels(DxgiFormat.D32_Float, 4);
-        _sampleCount = colorQuality > 0 && depthQuality > 0 ? 4 : 1;
-        CreateSwapChain(_width, _height);
-        CreatePipeline();
+            CreateDevice();
+            // Flip-model composition backbuffers cannot be multisampled; MSAA lives
+            // in an offscreen target that resolves into the backbuffer each frame.
+            var colorQuality = _device.CheckMultisampleQualityLevels(
+                DxgiFormat.B8G8R8A8_UNorm, 4);
+            var depthQuality = _device.CheckMultisampleQualityLevels(DxgiFormat.D32_Float, 4);
+            _sampleCount = colorQuality > 0 && depthQuality > 0 ? 4 : 1;
+            CreateSwapChain(_width, _height);
+            CreatePipeline();
 
-        var cube = BuildCube(0.5f); // CELL / 2
-        _cubeVertexCount = cube.Length;
-        _vertexBuffer = _device.CreateBuffer(cube, new BufferDescription(
-            (uint)(cube.Length * Marshal.SizeOf<Vertex>()), BindFlags.VertexBuffer));
+            var cube = BuildCube(0.5f); // CELL / 2
+            _cubeVertexCount = cube.Length;
+            _vertexBuffer = _device.CreateBuffer(cube, new BufferDescription(
+                (uint)(cube.Length * Marshal.SizeOf<Vertex>()), BindFlags.VertexBuffer));
 
-        _sceneBuffer = _device.CreateBuffer(new BufferDescription(
-            (uint)Marshal.SizeOf<Scene>(), BindFlags.ConstantBuffer,
-            ResourceUsage.Dynamic, CpuAccessFlags.Write));
+            _sceneBuffer = _device.CreateBuffer(new BufferDescription(
+                (uint)Marshal.SizeOf<Scene>(), BindFlags.ConstantBuffer,
+                ResourceUsage.Dynamic, CpuAccessFlags.Write));
 
-        ConfigurePipeline();
-        CreateRenderTargets(_width, _height);
+            ConfigurePipeline();
+            CreateRenderTargets(_width, _height);
+        }
+        catch
+        {
+            // The instance never reaches Graph3DPanel when construction fails,
+            // so unwind every native resource that was initialized before the
+            // failure here. Preserve the construction exception if cleanup also
+            // encounters a driver error.
+            try
+            {
+                Dispose();
+            }
+            catch
+            {
+                // Best-effort cleanup during exception unwinding.
+            }
+
+            throw;
+        }
     }
 
     /// <summary>Native pointer of the composition swapchain, handed to
@@ -536,8 +556,8 @@ internal sealed class Graph3DRenderer : IDisposable
 
     private void CreatePipeline()
     {
-        var vsBlob = Compiler.Compile(Hlsl, "VSMain", "graph3d.hlsl", "vs_5_0");
-        var psBlob = Compiler.Compile(Hlsl, "PSMain", "graph3d.hlsl", "ps_5_0");
+        using var vsBlob = Compiler.Compile(Hlsl, "VSMain", "graph3d.hlsl", "vs_5_0");
+        using var psBlob = Compiler.Compile(Hlsl, "PSMain", "graph3d.hlsl", "ps_5_0");
         _vs = _device.CreateVertexShader(vsBlob.Span);
         _ps = _device.CreatePixelShader(psBlob.Span);
         _layout = _device.CreateInputLayout(
@@ -604,9 +624,8 @@ internal sealed class Graph3DRenderer : IDisposable
 
     public void Dispose()
     {
-        // Reverse of construction. Every field is non-null once the ctor
-        // returns; a ctor that threw disposes nothing (caller drops the
-        // half-built renderer and re-creates).
+        // Reverse of construction. Null-conditionals also make this safe while
+        // the constructor unwinds a partially initialized renderer.
         _sceneBuffer?.Dispose();
         _instanceBuffer?.Dispose();
         _vertexBuffer?.Dispose();
