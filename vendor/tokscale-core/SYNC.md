@@ -8,7 +8,7 @@ which is the **single sync source** for the shared Rust core. Upstream
 | Field | Value |
 |---|---|
 | Source repo | `Nanako0129/TokenBar` (macOS) |
-| Copied at commit | `2ed256ee` (branch `fix-vendor-rustls-tls` = v1.4.0 main `fe19eebc` + our two backports below; update this SHA if that branch lands squashed) |
+| Copied at commit | `2ed256ee` (= v1.4.0 `fe19eebc` + the two backports below; landed on macOS main 2026-07-16 via ff-merge, SHA preserved) |
 | Copied on | 2026-07-15 |
 | Upstream milestone state | M6 + M7 + M9 backports merged; adds Grok Build + Hermes clients, cost-provenance contract, client-selection filter for hourly/agents (ctb.h signature change) |
 | Cache schema version | 29 (`vendor/tokscale-core/src/message_cache.rs`) |
