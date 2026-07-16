@@ -31,6 +31,24 @@ public sealed partial class FlyoutWindow : Window
         Dashboard.Bind(_model);
         Dashboard.HideRequested += HideFlyout;
         WireResizeGrip();
+        AppSettings.Store.Changed += key =>
+        {
+            if (key != "tokenbar.popover.height")
+            {
+                return;
+            }
+
+            _ = DispatcherQueue.TryEnqueue(() =>
+            {
+                if (!IsFlyoutVisible || _hiding)
+                {
+                    return;
+                }
+
+                var (resting, _) = PositionNearTray();
+                AppWindow.Move(resting);
+            });
+        };
 
         // --view=<lens> debug flag (the macOS `defaults write tokenbar.view`
         // counterpart) so remote lens screenshots need no clicking.
