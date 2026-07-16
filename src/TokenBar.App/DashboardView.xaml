@@ -87,6 +87,19 @@
             <ContentPresenter x:Name="ContentHost" />
         </ScrollViewer>
 
+        <!-- Dev-only 3D contribution-graph panel (Phase 8 Gate 0). Collapsed
+             and empty in normal use; EnableGraph3D() mounts the SwapChainPanel
+             and reveals it, overlaying the top of the chart area. Fixed size so
+             the swapchain gets a deterministic pixel extent for the soak. -->
+        <Border
+            x:Name="Graph3DHost"
+            Grid.Row="2"
+            Visibility="Collapsed"
+            Width="352"
+            Height="180"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Top" />
+
         <!-- Footer, macOS parity: status text left, gear + Quit hugging the
              right edge. -->
         <Grid Grid.Row="3">

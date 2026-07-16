@@ -118,7 +118,12 @@ public sealed partial class FlyoutWindow : Window
         FadeContent(from: 0f, to: 1f, durationMs: 180);
         _model.Start();
         RenderSnapshot();
+        Dashboard.OnFlyoutShown();
     }
+
+    /// <summary>Dev-only (Phase 8 Gate 0): mount the 3D panel so the next
+    /// show activates it. Wired to the --graph3d / --soak3d launch hooks.</summary>
+    public void EnableGraph3D() => Dashboard.EnableGraph3D();
 
     public void HideFlyout()
     {
@@ -131,6 +136,7 @@ public sealed partial class FlyoutWindow : Window
         var generation = ++_hideGeneration;
         RemoveWheelHook();
         _model.Stop();
+        Dashboard.OnFlyoutHidden();
         var resting = AppWindow.Position;
         var sink = Toward(resting, TaskbarEdge(), 16);
         FadeContent(from: 1f, to: 0f, durationMs: 120);

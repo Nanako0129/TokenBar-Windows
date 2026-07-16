@@ -146,6 +146,32 @@ public sealed partial class DashboardView : UserControl
     /// <summary>The flyout owns hiding (Esc/Ctrl+W land here).</summary>
     public event Action? HideRequested;
 
+    // ── Dev-only 3D panel (Phase 8 Gate 0) ───────────────────────────────
+
+    private Graph3DPanel? _graph3d;
+
+    /// <summary>Mount the 3D contribution-graph panel and reveal its host.
+    /// Dev-only: nothing calls this in normal use (only the --graph3d /
+    /// --soak3d launch hooks), so the SwapChainPanel stays absent and inert
+    /// otherwise. Idempotent.</summary>
+    public void EnableGraph3D()
+    {
+        if (_graph3d is not null)
+        {
+            return;
+        }
+
+        _graph3d = new Graph3DPanel();
+        Graph3DHost.Child = _graph3d;
+        Graph3DHost.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>Flyout show/hide hooks — the renderer holds no GPU resources
+    /// while the flyout is away.</summary>
+    public void OnFlyoutShown() => _graph3d?.Activate();
+
+    public void OnFlyoutHidden() => _graph3d?.Release();
+
     private void AddAccel(
         Windows.System.VirtualKey key, Windows.System.VirtualKeyModifiers mods,
         Action action)

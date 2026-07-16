@@ -66,6 +66,20 @@ public partial class App : Application
             }
 
             _started = true;
+
+            // Dev-only 3D panel (Phase 8 Gate 0). --graph3d mounts and shows
+            // it for manual inspection; --soak3d runs the device-lifecycle
+            // soak (50 open/close cycles) and exits with a pass/fail code.
+            if (Environment.GetCommandLineArgs().Contains("--graph3d"))
+            {
+                _flyout.EnableGraph3D();
+                _flyout.ShowFlyout();
+            }
+
+            if (Environment.GetCommandLineArgs().Contains("--soak3d"))
+            {
+                Soak3D.Run(_flyout);
+            }
         }
         catch (Exception ex)
         {

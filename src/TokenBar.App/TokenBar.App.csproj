@@ -22,6 +22,12 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.*" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.*" />
     <PackageReference Include="H.NotifyIcon.WinUI" Version="2.*" />
+    <!-- Phase 8 Gate 0: 3D contribution graph on D3D11, mirroring the Phase 2
+         spike's Vortice stack. DXGI is explicit (composition swapchain +
+         IDXGIFactory2.CreateSwapChainForComposition live here). -->
+    <PackageReference Include="Vortice.Direct3D11" Version="3.*" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.*" />
+    <PackageReference Include="Vortice.DXGI" Version="3.*" />
   </ItemGroup>
 
   <ItemGroup>
