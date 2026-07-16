@@ -3,7 +3,7 @@
     "meta": {
       "generatedAt": "2026-07-10T10:30:00Z",
       "version": "crosscheck",
-      "dateRange": { "start": "2026-07-09", "end": "2026-07-10" }
+      "dateRange": { "start": "2026-07-08", "end": "2026-07-10" }
     },
     "summary": {
       "totalTokens": 5100, "totalCost": 2.13, "totalDays": 2, "activeDays": 2,
@@ -12,6 +12,13 @@
     },
     "years": [],
     "contributions": [
+      {
+        "date": "2026-07-08",
+        "totals": { "tokens": 9223372036854775807, "cost": 0.01, "messages": 1 },
+        "intensity": 4,
+        "tokenBreakdown": { "input": 9223372036854775807, "output": 0, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0 },
+        "clients": []
+      },
       {
         "date": "2026-07-09",
         "totals": { "tokens": 800, "cost": 0.4, "messages": 3 },
@@ -97,6 +104,7 @@
     { "name": "todaycost-absent-day", "fn": "todayCost", "now": "2026-07-11T09:00:00+08:00" },
     { "name": "todaytokens-utc-crosses-local-midnight", "fn": "todayTokens", "now": "2026-07-10T16:00:01Z" },
     { "name": "todaytokens-last-local-second", "fn": "todayTokens", "now": "2026-07-10T15:59:59Z" },
+    { "name": "todaytokens-int64-max-exact-roundtrip", "fn": "todayTokens", "now": "2026-07-08T12:00:00+08:00" },
     { "name": "duration-zero", "fn": "paceDurationText", "arg": 0 },
     { "name": "duration-29s-now", "fn": "paceDurationText", "arg": 29 },
     { "name": "duration-30s-rounds-to-1m", "fn": "paceDurationText", "arg": 30 },

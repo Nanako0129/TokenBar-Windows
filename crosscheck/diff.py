@@ -17,6 +17,11 @@ REL_EPS = 1e-9
 
 
 def numbers_equal(a, b):
+    # Integers compare exactly: token counts run to Int64 scale, where a
+    # relative epsilon masks real divergence (5_600_000_000 vs …005) and
+    # adjacent ints collapse to the same binary64 (Codex review finding).
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
     if a == b:
         return True
     fa, fb = float(a), float(b)
@@ -44,7 +49,22 @@ def diff(a, b, path, out):
         out.append(f"{path}: {a!r} != {b!r}")
 
 
+def self_test():
+    int64_max = 9223372036854775807
+    assert not numbers_equal(5_600_000_000, 5_600_000_005), "large-int drift must fail"
+    assert not numbers_equal(int64_max, int64_max - 9_000_000_000), "near-max drift must fail"
+    assert not numbers_equal(int64_max, int64_max - 1), "adjacent ints must fail"
+    assert numbers_equal(int64_max, int64_max)
+    assert numbers_equal(42, 42.0), "int/float cross-type uses the float path"
+    assert numbers_equal(0.1 + 0.2, 0.3), "serializer digit noise stays tolerated"
+    assert not numbers_equal(1.0, 1.001)
+    assert not numbers_equal(0.0, -0.001)
+    print("diff.py self-test OK")
+
+
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        return self_test()
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     left_dir, right_dir = Path(sys.argv[1]), Path(sys.argv[2])
