@@ -69,7 +69,8 @@ public partial class App : Application
 
             // Dev-only 3D panel (Phase 8 Gate 0). --graph3d mounts and shows
             // it for manual inspection; --soak3d runs the device-lifecycle
-            // soak (50 open/close cycles) and exits with a pass/fail code.
+            // soak (50 cycles, or --soak3d-minutes duration mode) and exits
+            // with a pass/fail code.
             if (Environment.GetCommandLineArgs().Contains("--graph3d"))
             {
                 _flyout.EnableGraph3D();

@@ -556,8 +556,8 @@ internal sealed class Graph3DRenderer : IDisposable
 
     private void CreatePipeline()
     {
-        using var vsBlob = Compiler.Compile(Hlsl, "VSMain", "graph3d.hlsl", "vs_5_0");
-        using var psBlob = Compiler.Compile(Hlsl, "PSMain", "graph3d.hlsl", "ps_5_0");
+        var vsBlob = Compiler.Compile(Hlsl, "VSMain", "graph3d.hlsl", "vs_5_0");
+        var psBlob = Compiler.Compile(Hlsl, "PSMain", "graph3d.hlsl", "ps_5_0");
         _vs = _device.CreateVertexShader(vsBlob.Span);
         _ps = _device.CreatePixelShader(psBlob.Span);
         _layout = _device.CreateInputLayout(
