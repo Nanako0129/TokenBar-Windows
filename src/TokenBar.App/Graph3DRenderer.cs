@@ -174,7 +174,7 @@ internal sealed class Graph3DRenderer : IDisposable
         _depthView.Dispose();
         _depth.Dispose();
         _swapChain.ResizeBuffers(
-            2, width, height, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
+            2, (uint)width, (uint)height, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
         _width = width;
         _height = height;
         CreateBackbufferViews(width, height);
@@ -208,8 +208,8 @@ internal sealed class Graph3DRenderer : IDisposable
         // SwapChainPanel's DirectComposition visual owns presentation.
         var desc = new SwapChainDescription1
         {
-            Width = width,
-            Height = height,
+            Width = (uint)width,
+            Height = (uint)height,
             Format = Format.B8G8R8A8_UNorm,
             Stereo = false,
             SampleDescription = new SampleDescription(1, 0),
@@ -256,8 +256,8 @@ internal sealed class Graph3DRenderer : IDisposable
         _rtv = _device.CreateRenderTargetView(backbuffer);
         _depth = _device.CreateTexture2D(new Texture2DDescription
         {
-            Width = width,
-            Height = height,
+            Width = (uint)width,
+            Height = (uint)height,
             MipLevels = 1,
             ArraySize = 1,
             Format = Format.D32_Float,
