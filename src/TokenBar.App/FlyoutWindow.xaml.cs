@@ -45,6 +45,7 @@ public sealed partial class FlyoutWindow : Window
                     return;
                 }
 
+                _slideToken++; // Cancel an in-flight entrance slide using the old height.
                 var (resting, _) = PositionNearTray();
                 AppWindow.Move(resting);
             });
