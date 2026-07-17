@@ -1125,7 +1125,7 @@ fn scan_all_clients_with_env_strategy_inner(
             }
         }
         #[cfg(target_os = "windows")]
-        if result.zed_db.is_none() {
+        if use_env_roots && result.zed_db.is_none() {
             if let Some(local_app_data) = dirs::data_local_dir() {
                 let windows_path = local_app_data.join("Zed/threads/threads.db");
                 if windows_path.is_file() {
