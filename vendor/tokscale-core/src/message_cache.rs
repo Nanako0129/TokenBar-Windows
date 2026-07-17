@@ -765,8 +765,12 @@ impl SourceMessageCache {
                 .map_err(std::io::Error::other)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
+            drop(writer);
             crate::fs_atomic::replace_file(&tmp_path, &final_path)?;
-            let final_file = File::open(&final_path)?;
+            let final_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&final_path)?;
             final_file.sync_all()?;
             Ok(())
         })();
@@ -2374,7 +2378,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     #[serial_test::serial]
     fn test_save_if_dirty_marks_cache_clean() {
@@ -2397,26 +2400,6 @@ mod tests {
 
         cache.save_if_dirty();
         assert!(!cache.dirty);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[serial_test::serial]
-    fn test_save_if_dirty_marks_cache_clean() {
-        // Windows cannot reopen the atomically replaced file while the
-        // production writer still owns its handle; keep the canonical path
-        // assertion hermetic without changing production cache semantics.
-        let temp_home = TempDir::new().unwrap();
-        let _env = sandbox_cache_env(temp_home.path());
-
-        assert_eq!(
-            cache_path(),
-            Some(temp_home.path().join("cache").join(CACHE_FILENAME))
-        );
-        assert_eq!(
-            cache_lock_path(),
-            Some(temp_home.path().join("cache").join(CACHE_LOCK_FILENAME))
-        );
     }
 
     #[test]
