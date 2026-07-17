@@ -31,6 +31,7 @@ the listed commits must be deliberately reapplied after syncing.
 | `6ac77c0` | Isolate env-aware scanner fixtures from unrelated host `TOKSCALE_EXTRA_DIRS` while retaining the dedicated positive extra-dir case | `src/scanner.rs` | No — Windows repo only (2026-07-17) |
 | `e91fb2c` | Route Claude parser unit fixtures through the explicit no-home entry so they cannot enumerate or read the process user's `.cc-mirror` variants | `src/sessions/claudecode.rs` | No — Windows repo only (2026-07-17) |
 | `fbecb99` | Isolate scanner-settings and headless fixtures from unrelated host client roots while retaining dedicated env-override coverage | `src/scanner.rs` | No — Windows repo only (2026-07-17) |
+| `3c8bfc5` | Make the Grok registration fixture assert the supplied-home fallback instead of inheriting host `GROK_HOME` | `src/clients.rs` | No — Windows repo only (2026-07-17) |
 
 Earlier divergences were upstreamed to the macOS repo on 2026-07-15
 (branch `fix-vendor-rustls-tls`, the sync source above), so `crates/` +
