@@ -4050,8 +4050,8 @@ mod tests {
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
         get_model_report, get_monthly_report, latest_source_mtime_ms, message_cache,
-        normalize_model_for_grouping, parse_all_messages_with_pricing,
-        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
+        normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
+        parse_local_clients,
         parse_local_unified_messages, parsed_to_unified, pricing, prune_scan_result_by_mtime,
         reprice_lane_message, retain_for_requested_clients, scan_messages_streaming, scanner,
         select_local_parse_pricing, sessions, unified_to_parsed, AgentAccumulator, ClientId,
@@ -4120,6 +4120,20 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.as_os_str()),
             ("XDG_DATA_HOME", xdg_data_home.as_os_str()),
         ])
+    }
+
+    fn parse_all_messages_with_pricing(
+        home_dir: &str,
+        clients: &[String],
+        pricing: Option<&pricing::PricingService>,
+    ) -> Vec<UnifiedMessage> {
+        parse_all_messages_with_pricing_with_env_strategy(
+            home_dir,
+            clients,
+            pricing,
+            false,
+            &scanner::ScannerSettings::default(),
+        )
     }
 
     #[test]
