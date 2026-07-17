@@ -14,6 +14,7 @@
 //! names (TokenBar-tokcat/src-tauri/src/*.rs) with the Tauri command plumbing
 //! stripped; keep them diffable against the originals.
 
+mod agent_account_scope;
 mod agent_antigravity;
 mod agent_copilot;
 mod agent_grok;
