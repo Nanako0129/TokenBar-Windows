@@ -20,6 +20,7 @@ mod agent_copilot;
 mod agent_grok;
 mod agent_history;
 mod agent_quota_duration;
+mod agent_quota_history;
 mod agent_usage;
 mod agents_report;
 mod hourly_report;
