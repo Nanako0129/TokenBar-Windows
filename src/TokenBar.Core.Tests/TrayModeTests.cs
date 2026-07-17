@@ -1,3 +1,4 @@
+using TokenBar.Interop;
 using Xunit;
 
 namespace TokenBar.Core.Tests;
@@ -63,11 +64,27 @@ public class TrayModeTests
     }
 
     [Fact]
+    public void UsageModesFormatProvidedVisibleTotals()
+    {
+        var totals = new TrayTotals(
+            TodayTokens: 12_345,
+            TodayCost: 1.25,
+            TotalTokens: 2_500_000,
+            TotalCost: 42.5);
+
+        Assert.Equal("12.3K", TrayMode.TodayTokens.Title(totals, null));
+        Assert.Equal("$1.25", TrayMode.TodayCost.Title(totals, null));
+        Assert.Equal("2.5M", TrayMode.TotalTokens.Title(totals, null));
+        Assert.Equal("$42.50", TrayMode.TotalCost.Title(totals, null));
+        Assert.Equal("1.5K/m", TrayMode.TokensPerMin.Title(totals, 1_500));
+    }
+
+    [Fact]
     public void TokensPerMinWithoutRateShowsPlaceholder()
     {
-        // graph must be non-null for the rate mode to format, but the rate
-        // placeholder path only needs the mode's own guard order — macOS
-        // returns "" for nil graph before consulting the rate.
         Assert.Equal("", TrayMode.TokensPerMin.Title(null, null));
+        Assert.Equal(
+            "—/m",
+            TrayMode.TokensPerMin.Title(new TrayTotals(0, 0, 0, 0), null));
     }
 }

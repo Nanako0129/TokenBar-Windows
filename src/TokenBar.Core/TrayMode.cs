@@ -119,11 +119,11 @@ public static class TrayModes
         return title[..dot] + title[end..];
     }
 
-    /// <summary>The tray title for this mode ("" = icon only). Faithful to
-    /// macOS title(graph:tokensPerMin:quotaRemaining:), including Swift's
-    /// away-from-zero rounding.</summary>
+    /// <summary>The tray title for this mode ("" = icon only), formatted from
+    /// already-filtered usage totals plus the visible live rate. Quota rounding
+    /// remains faithful to Swift's away-from-zero behavior.</summary>
     public static string Title(
-        this TrayMode mode, UsagePayload? graph, double? tokensPerMin,
+        this TrayMode mode, TrayTotals? totals, double? tokensPerMin,
         double? quotaRemaining = null)
     {
         if (mode == TrayMode.QuotaLeft)
@@ -133,17 +133,17 @@ public static class TrayModes
                 : "—%";
         }
 
-        if (mode == TrayMode.Hidden || graph is null)
+        if (mode == TrayMode.Hidden || totals is null)
         {
             return "";
         }
 
         return mode switch
         {
-            TrayMode.TodayTokens => Format.CompactTokens(Format.TodayTokens(graph)),
-            TrayMode.TodayCost => Format.Usd(Format.TodayCost(graph)),
-            TrayMode.TotalTokens => Format.CompactTokens(graph.Summary.TotalTokens),
-            TrayMode.TotalCost => Format.Usd(graph.Summary.TotalCost),
+            TrayMode.TodayTokens => Format.CompactTokens(totals.Value.TodayTokens),
+            TrayMode.TodayCost => Format.Usd(totals.Value.TodayCost),
+            TrayMode.TotalTokens => Format.CompactTokens(totals.Value.TotalTokens),
+            TrayMode.TotalCost => Format.Usd(totals.Value.TotalCost),
             TrayMode.TokensPerMin => tokensPerMin is { } rate
                 ? $"{Format.CompactTokens((long)Math.Round(Math.Max(0, rate), MidpointRounding.AwayFromZero))}/m"
                 : "—/m",

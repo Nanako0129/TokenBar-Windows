@@ -24,9 +24,15 @@ public sealed class TrayFeed : IDisposable
 
     public UsagePayload? Graph { get; private set; }
 
+    public IReadOnlyList<TraceBucket> Trace { get; private set; } = [];
+
+    public TrayTotals? VisibleTotals { get; private set; }
+
     public double? TokensPerMin { get; private set; }
 
     public AgentUsagePayload? Quota { get; private set; }
+
+    private bool _hasTrace;
 
     /// <summary>Resolved remaining % for the selected quota window. Boots
     /// from the persisted last reading (macOS lastRemaining: the gauge never
@@ -62,6 +68,14 @@ public sealed class TrayFeed : IDisposable
                     Changed?.Invoke();
                 });
             }
+            else if (key == ClientRegistry.TabHiddenKey)
+            {
+                _ = _dispatcher.TryEnqueue(() =>
+                {
+                    RecomputeVisibleUsage();
+                    Changed?.Invoke();
+                });
+            }
         };
         AppSettings.Store.Changed += _onStoreChanged;
     }
@@ -88,7 +102,7 @@ public sealed class TrayFeed : IDisposable
             try
             {
                 using var boost = ProcessPower.Boost(); // live-tail parse
-                var rate = TbCore.TokensPerMin();
+                var trace = TbCore.UsageTrace(600);
                 _ = _dispatcher.TryEnqueue(() =>
                 {
                     if (_disposed)
@@ -96,7 +110,9 @@ public sealed class TrayFeed : IDisposable
                         return; // don't touch the tray icon after shutdown
                     }
 
-                    TokensPerMin = rate;
+                    Trace = trace;
+                    _hasTrace = true;
+                    RecomputeVisibleUsage();
                     Changed?.Invoke();
                 });
             }
@@ -152,6 +168,7 @@ public sealed class TrayFeed : IDisposable
 
                     Graph = graph ?? Graph;
                     Quota = quota ?? Quota;
+                    RecomputeVisibleUsage();
                     ResolveRemaining();
                     Changed?.Invoke();
                 });
@@ -161,6 +178,13 @@ public sealed class TrayFeed : IDisposable
                 Volatile.Write(ref _slowInFlight, 0);
             }
         });
+    }
+
+    private void RecomputeVisibleUsage()
+    {
+        var hidden = ClientRegistry.HiddenClients(AppSettings.Store);
+        VisibleTotals = Graph?.TrayTotals(hidden, Format.TodayKey());
+        TokensPerMin = _hasTrace ? TraceCollapse.TotalRate(Trace, hidden) : null;
     }
 
     private void ResolveRemaining()

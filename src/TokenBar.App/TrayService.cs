@@ -198,8 +198,7 @@ public sealed class TrayService : IDisposable
     /// window. Kept well under the ~127-char Shell_NotifyIcon tip limit.</summary>
     private string BuildTooltip()
     {
-        var graph = _feed.Graph;
-        if (graph is null)
+        if (_feed.VisibleTotals is not { } totals)
         {
             return "TokenBar — loading…";
         }
@@ -207,8 +206,8 @@ public sealed class TrayService : IDisposable
         var lines = new List<string>
         {
             "TokenBar",
-            $"Today {Format.CompactTokens(Format.TodayTokens(graph))} · {Format.Usd(Format.TodayCost(graph))}",
-            $"All time {Format.CompactTokens(graph.Summary.TotalTokens)} · {Format.Usd(graph.Summary.TotalCost)}",
+            $"Today {Format.CompactTokens(totals.TodayTokens)} · {Format.Usd(totals.TodayCost)}",
+            $"All time {Format.CompactTokens(totals.TotalTokens)} · {Format.Usd(totals.TotalCost)}",
         };
         var selection = AppSettings.Store.GetString("tokenbar.quota.source", "auto")
             ?? QuotaResolver.Auto;
@@ -229,7 +228,7 @@ public sealed class TrayService : IDisposable
             AppSettings.Store.GetString("tokenbar.icon.coloring"));
         var dark = IsSystemDark();
         var remaining = _feed.QuotaRemaining;
-        var title = mode.Title(_feed.Graph, _feed.TokensPerMin, remaining);
+        var title = mode.Title(_feed.VisibleTotals, _feed.TokensPerMin, remaining);
 
         // The tooltip is the summary layer (parity table #1): it carries the
         // full figures whatever the icon shows — including the icon-only
