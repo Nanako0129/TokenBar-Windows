@@ -699,12 +699,14 @@ public sealed partial class DashboardView : UserControl
         }
 
         var colors = new ModelColorMap(snapshot.Models);
+        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
         var bars = DayBars.Build(
             snapshot.Graph,
             _selectedClients,
             _chartStackBy,
             colors,
-            Format.TodayKey());
+            Format.TodayKey(),
+            rangeEnd: stats.DateRange.End);
 
         var holder = new StackPanel();
         var canvas = new Canvas { Height = 120 };
