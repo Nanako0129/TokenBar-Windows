@@ -22,13 +22,8 @@ jobs:
           dotnet-version: 10.0.x
       - name: cargo build (cdylib)
         run: cargo build --release
-      # Scoped to our FFI crate: the vendored tokscale-core suite has
-      # pre-existing failures on Windows (upstream never ran Windows CI;
-      # env-mutex poisoning cascades + path assumptions). Full-workspace
-      # tests run green on macOS via scripts/check.sh; the vendor Windows
-      # test debt is tracked for the Phase 9 vendor re-sync.
-      - name: cargo test (tb_core_ffi)
-        run: cargo test -p tb_core_ffi --release
+      - name: cargo test (workspace)
+        run: cargo test --workspace --release
       - name: dotnet build
         run: dotnet build src/TokenBar.slnx -c Release
       - name: dotnet test
@@ -67,11 +62,9 @@ jobs:
           path: out/smoke-win-x64
 
   # The ARM64 verification box is a Win11 ARM VM; cross-build the Rust core so
-  # arm64 breakage surfaces in CI. Non-blocking until tokscale-core drops
-  # vendored OpenSSL (plan Phase 1) — openssl-src cross-builds are fragile.
+  # arm64 breakage blocks the same change that introduced it.
   arm64-cross:
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
