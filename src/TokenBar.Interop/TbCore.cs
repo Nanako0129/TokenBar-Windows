@@ -57,8 +57,8 @@ public static class TbCore
     /// accurate per-client totals for hours shared across clients (a
     /// downstream membership filter cannot — buckets fold all clients into
     /// one mixed total). NOTE: an empty selection therefore reaches the core
-    /// as "all clients", not "no clients" — the all-hidden case is enforced
-    /// by the lens views' strict membership filter, not here.</summary>
+    /// as "all clients", not "no clients" — DashboardModel must publish an
+    /// explicit empty report without calling this method.</summary>
     public static HourlyReport HourlyReport(string? year = null, IReadOnlyList<string>? clients = null) =>
         Unwrap<HourlyReport>(NativeMethods.tb_hourly_report(year, JoinClients(clients)));
 

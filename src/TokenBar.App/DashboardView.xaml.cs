@@ -349,7 +349,7 @@ public sealed partial class DashboardView : UserControl
             return;
         }
 
-        ApplyClientSelection(snapshot);
+        snapshot = ApplyClientSelection(snapshot);
         RenderHeader(snapshot);
         UpdateYearPicker();
         UpdateGraph3DData(snapshot);
@@ -363,13 +363,14 @@ public sealed partial class DashboardView : UserControl
             return;
         }
 
-        ApplyClientSelection(snapshot);
+        snapshot = ApplyClientSelection(snapshot);
         RenderHeader(snapshot);
+        UpdateYearPicker();
         UpdateGraph3DData(snapshot);
         RenderContent(animated);
     }
 
-    private void ApplyClientSelection(DashboardModel.Snapshot snapshot)
+    private DashboardModel.Snapshot ApplyClientSelection(DashboardModel.Snapshot snapshot)
     {
         var selection = ClientRegistry.ResolveSelection(
             snapshot.Graph.Summary.Clients, AppSettings.Store);
@@ -379,10 +380,21 @@ public sealed partial class DashboardView : UserControl
         _selectedStats = new UsageStats(snapshot.Graph, _selectedSet);
         _activeClientTab = selection.ActiveTab;
 
+        if (_model?.SetClientSelection(selection.SelectedClients) == true
+            && _model.Current is { } current)
+        {
+            // Membership changes clear stale pre-aggregated lazy reports in the
+            // model before this same Dashboard render reaches Hourly/Agents.
+            snapshot = current;
+        }
+
+        _snapshot = snapshot;
         if (AppSettings.Store.GetString(ClientRegistry.ActiveTabKey) != selection.ActiveTab)
         {
             AppSettings.Store.SetString(ClientRegistry.ActiveTabKey, selection.ActiveTab);
         }
+
+        return snapshot;
     }
 
     private void RenderHeader(DashboardModel.Snapshot snapshot)

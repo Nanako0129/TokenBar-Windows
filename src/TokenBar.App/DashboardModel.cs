@@ -1,4 +1,5 @@
 using Microsoft.UI.Dispatching;
+using TokenBar.Core;
 using TokenBar.Interop;
 
 namespace TokenBar.App;
@@ -37,13 +38,102 @@ public sealed class DashboardModel
     private readonly object _yearGate = new();
     private volatile string? _year = ResolveYear();
     private volatile List<string> _knownYears = [];
+    private volatile UsagePayload? _allTimeGraph;
+
+    // Hourly/Agents are already aggregated across clients, so their FFI scans
+    // capture one immutable selection generation. Graph/Models stay all-client.
+    private readonly object _selectionGate = new();
+    private string[] _selectedClients = [];
+    private HashSet<string> _selectedSet = new(StringComparer.Ordinal);
+    private HashSet<string> _hiddenClients = new(StringComparer.Ordinal);
+    private long _selectionGeneration;
+    private bool _selectionInitialized;
+    private int _lazyInFlight;
+    private int _lazyPending;
 
     public string? Year => _year;
 
     /// <summary>Union of the payload's years across loads — a year-filtered
     /// payload only reports the selected year, so the picker remembers the
-    /// rest (macOS knownYears).</summary>
-    public IReadOnlyList<string> KnownYears => _knownYears;
+    /// rest (macOS knownYears). An all-time graph can additionally remove years
+    /// whose activity belongs only to hidden clients.</summary>
+    public IReadOnlyList<string> KnownYears
+    {
+        get
+        {
+            var years = _knownYears;
+            if (_allTimeGraph is not { } graph)
+            {
+                return years;
+            }
+
+            HashSet<string> hidden;
+            lock (_selectionGate)
+            {
+                hidden = new HashSet<string>(_hiddenClients, StringComparer.Ordinal);
+            }
+
+            var visible = UsageStatsVisibility.YearsWithVisibleActivity(
+                graph.Contributions, hidden);
+            return years.Where(visible.Contains).ToList();
+        }
+    }
+
+    /// <summary>Install the canonical Dashboard selection for pre-aggregated
+    /// lazy reports. Reordering updates the immutable capture order but does not
+    /// invalidate membership or trigger another scan.</summary>
+    public bool SetClientSelection(IReadOnlyList<string> clients)
+    {
+        var canonical = clients
+            .Select(ClientRegistry.CanonicalClient)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var hidden = ClientRegistry.HiddenClients(AppSettings.Store)
+            .Select(ClientRegistry.CanonicalClient)
+            .ToHashSet(StringComparer.Ordinal);
+        bool changed;
+        lock (_selectionGate)
+        {
+            changed = !_selectionInitialized || !_selectedSet.SetEquals(canonical);
+            _selectionInitialized = true;
+            _selectedClients = canonical;
+            _selectedSet = canonical.ToHashSet(StringComparer.Ordinal);
+            _hiddenClients = hidden;
+            if (changed)
+            {
+                _selectionGeneration++;
+            }
+        }
+
+        if (changed)
+        {
+            ClearLazyReports(emptySelection: canonical.Length == 0);
+            RequestLazyRefresh();
+        }
+
+        var year = _year;
+        if (year is not null && Current is { } current
+            && !UsageStatsVisibility.HasVisibleActivity(current.Graph.Contributions, hidden))
+        {
+            _ = _dispatcher.TryEnqueue(() =>
+            {
+                HashSet<string> latestHidden;
+                lock (_selectionGate)
+                {
+                    latestHidden = new HashSet<string>(_hiddenClients, StringComparer.Ordinal);
+                }
+
+                if (_year == year && Current is { } latest
+                    && !UsageStatsVisibility.HasVisibleActivity(
+                        latest.Graph.Contributions, latestHidden))
+                {
+                    SetYear(null);
+                }
+            });
+        }
+
+        return changed;
+    }
 
     /// <summary>The `--year=` debug flag wins over the persisted selection
     /// (and is itself never persisted), macOS resolveYear parity.</summary>
@@ -82,10 +172,8 @@ public sealed class DashboardModel
         // new year before the lens refetch lands, and a lingering Hourly/
         // Agents report would render the old year's rows under the new
         // filter until then.
-        if (_hourlyWanted || _agentsWanted)
-        {
-            Publish(s => s with { Hourly = null, Agents = null }, graph: null);
-        }
+        ClearLazyReports(emptySelection: SelectionIsEmpty());
+        RequestLazyRefresh();
 
         _refreshing = true; // macOS setYear spins the header control too
         Updated?.Invoke();
@@ -142,52 +230,132 @@ public sealed class DashboardModel
         public AgentsReport? Agents { get; init; }
     }
 
-    private bool _hourlyWanted;
-    private bool _agentsWanted;
+    private volatile bool _hourlyWanted;
+    private volatile bool _agentsWanted;
 
     /// <summary>Marks a lazy lens as needed and fetches it once; later slow
     /// refreshes keep it current.</summary>
     public void EnsureHourly()
     {
-        if (!_hourlyWanted)
-        {
-            _hourlyWanted = true;
-            _ = Task.Run(() => FetchLazy(hourly: true, agents: false));
-        }
+        _hourlyWanted = true;
+        RequestLazyRefresh();
     }
 
     public void EnsureAgents()
     {
-        if (!_agentsWanted)
+        _agentsWanted = true;
+        RequestLazyRefresh();
+    }
+
+    private void RequestLazyRefresh()
+    {
+        if (!_hourlyWanted && !_agentsWanted)
         {
-            _agentsWanted = true;
-            _ = Task.Run(() => FetchLazy(hourly: false, agents: true));
+            return;
+        }
+
+        Volatile.Write(ref _lazyPending, 1);
+        if (Interlocked.CompareExchange(ref _lazyInFlight, 1, 0) != 0)
+        {
+            return;
+        }
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                while (Interlocked.Exchange(ref _lazyPending, 0) == 1)
+                {
+                    FetchLazyWanted();
+                }
+            }
+            finally
+            {
+                Volatile.Write(ref _lazyInFlight, 0);
+                if (Volatile.Read(ref _lazyPending) == 1)
+                {
+                    RequestLazyRefresh();
+                }
+            }
+        });
+    }
+
+    private void FetchLazyWanted()
+    {
+        var hourly = _hourlyWanted;
+        var agents = _agentsWanted;
+        string[] clients;
+        long generation;
+        lock (_selectionGate)
+        {
+            if (!_selectionInitialized)
+            {
+                return;
+            }
+
+            clients = _selectedClients;
+            generation = _selectionGeneration;
+        }
+
+        var year = _year;
+        HourlyReport? hourlyReport;
+        AgentsReport? agentsReport;
+        if (clients.Length == 0)
+        {
+            hourlyReport = hourly ? new HourlyReport([], 0) : null;
+            agentsReport = agents ? new AgentsReport([], 0, 0) : null;
+        }
+        else
+        {
+            using var boost = ProcessPower.Boost();
+            hourlyReport = hourly
+                ? TryFetch(() => TbCore.HourlyReport(year, clients), "hourly") : null;
+            agentsReport = agents
+                ? TryFetch(() => TbCore.AgentsReport(year, clients), "agents") : null;
+        }
+
+        if (!SelectionStillValid(year, generation))
+        {
+            RequestLazyRefresh();
+            return;
+        }
+
+        Publish(s => s with
+        {
+            Hourly = hourly ? hourlyReport : s.Hourly,
+            Agents = agents ? agentsReport : s.Agents,
+        }, graph: null, stillValid: () => SelectionStillValid(year, generation));
+    }
+
+    private bool SelectionStillValid(string? year, long generation)
+    {
+        lock (_selectionGate)
+        {
+            return _year == year && _selectionGeneration == generation;
         }
     }
 
-    private void FetchLazy(bool hourly, bool agents)
+    private bool SelectionIsEmpty()
     {
-        using var boost = ProcessPower.Boost();
-        var year = _year;
-        try
+        lock (_selectionGate)
         {
-            HourlyReport? h = hourly ? TbCore.HourlyReport(year) : null;
-            AgentsReport? a = agents ? TbCore.AgentsReport(year) : null;
-            if (_year != year)
-            {
-                return; // stale slice; the slow lane re-fetches for the new year
-            }
+            return _selectionInitialized && _selectedClients.Length == 0;
+        }
+    }
 
-            Publish(s => s with
-            {
-                Hourly = hourly ? h : s.Hourly,
-                Agents = agents ? a : s.Agents,
-            }, graph: null, stillValid: () => _year == year);
-        }
-        catch (Exception ex)
+    private void ClearLazyReports(bool emptySelection)
+    {
+        if (Current is not { } current)
         {
-            DevLog.Write($"lazy lens fetch failed: {ex.Message}");
+            return;
         }
+
+        Current = current with
+        {
+            Hourly = emptySelection ? new HourlyReport([], 0) : null,
+            Agents = emptySelection ? new AgentsReport([], 0, 0) : null,
+        };
+        _lastSnapshot = Current;
     }
 
     /// <summary>Begin polling (flyout opened). Fires an immediate refresh of
@@ -283,6 +451,11 @@ public sealed class DashboardModel
                 if (graph is not null)
                 {
                     RememberYears(graph);
+                    if (year is null)
+                    {
+                        _allTimeGraph = graph;
+                    }
+
                     var seeded = graph;
                     Publish(s => s with
                     {
@@ -297,33 +470,10 @@ public sealed class DashboardModel
                         stillValid: () => _year == year);
                 }
 
-                var wantHourly = _hourlyWanted;
-                var wantAgents = _agentsWanted;
-                if (wantHourly || wantAgents)
-                {
-                    HourlyReport? hourly;
-                    AgentsReport? agentsReport;
-                    using (ProcessPower.Boost())
-                    {
-                        hourly = wantHourly
-                            ? TryFetch(() => TbCore.HourlyReport(year), "hourly") : null;
-                        agentsReport = wantAgents
-                            ? TryFetch(() => TbCore.AgentsReport(year), "agents") : null;
-                    }
-
-                    if (_year == year)
-                    {
-                        // Fetched lenses land as-is (macOS reload assigns the
-                        // result directly): a failed refetch blanks the lens
-                        // rather than leaving another year's rows under the
-                        // new filter.
-                        Publish(s => s with
-                        {
-                            Hourly = wantHourly ? hourly : s.Hourly,
-                            Agents = wantAgents ? agentsReport : s.Agents,
-                        }, graph: null, stillValid: () => _year == year);
-                    }
-                }
+                // Lazy reports use their own single-flight coordinator so a
+                // selection/year change can invalidate and retry without
+                // spawning overlapping scans.
+                RequestLazyRefresh();
             }
             finally
             {
