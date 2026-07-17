@@ -1576,6 +1576,10 @@ mod tests {
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
 
+    fn parse_claude_file(path: &std::path::Path) -> Vec<UnifiedMessage> {
+        super::parse_claude_file_with_home(path, None)
+    }
+
     #[test]
     fn is_human_turn_counts_html_user_prompt() {
         let line = r#"{"type":"user","message":{"content":"<div>hello</div>"}}"#;
