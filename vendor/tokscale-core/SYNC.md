@@ -28,6 +28,7 @@ the listed commits must be deliberately reapplied after syncing.
 | `e807f33` | Gate the Windows Zed known-folder fallback on `use_env_roots` | `src/scanner.rs` | No — Windows repo only (2026-07-17) |
 | `0979cdb` | Make Windows `PathRoot::Config` use `%APPDATA%` only for environment-aware scans; explicit-home scans use the supplied home | `src/clients.rs` | No — Windows repo only (2026-07-17) |
 | `26b892a` | Compare extra-path warnings with the scanner's supplied home instead of querying the process user's platform known folder | `src/scanner.rs` | No — Windows repo only (2026-07-17) |
+| `6ac77c0` | Isolate env-aware scanner fixtures from unrelated host `TOKSCALE_EXTRA_DIRS` while retaining the dedicated positive extra-dir case | `src/scanner.rs` | No — Windows repo only (2026-07-17) |
 
 Earlier divergences were upstreamed to the macOS repo on 2026-07-15
 (branch `fix-vendor-rustls-tls`, the sync source above), so `crates/` +
