@@ -1,7 +1,6 @@
 use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
-use crate::agent_history;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,14 +70,11 @@ pub struct UsageWindow {
     /// Total length of this rate-limit window in minutes. Lets the frontend
     /// derive a usage *pace* (expected vs actual at this point in the window).
     window_minutes: Option<i64>,
-    /// Expected used-percent at this point in the window derived from *historical*
-    /// usage samples (not the naive linear elapsed/duration). Only Codex weekly
-    /// carries this once enough completed weeks have accrued; everything else is
-    /// `None` and the frontend falls back to linear pace.
+    /// Legacy pace placeholder retained until the v3 wire cutover. Production
+    /// mappings no longer populate it, so serde omits it while it remains `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     historical_expected_percent: Option<f64>,
-    /// Probability (0..1) the window empties before its reset at the historical
-    /// burn rate. Companion to `historical_expected_percent`.
+    /// Legacy companion to `historical_expected_percent`; likewise never populated.
     #[serde(skip_serializing_if = "Option::is_none")]
     run_out_probability: Option<f64>,
 }
@@ -611,13 +607,11 @@ async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
                 .map(clean_plan)
         }),
     });
-    let mut windows = codex_windows(
+    let windows = codex_windows(
         usage.rate_limit.as_ref(),
         usage.additional_rate_limits.as_deref(),
         now,
     );
-    let account_key = codex_account_key(&credentials, identity.as_ref());
-    enrich_codex_weekly_history(&mut windows, &account_key, now);
     if windows.is_empty() && usage.credits.as_ref().and_then(|c| c.balance).is_none() {
         return Err("Codex usage API returned no rate-limit windows.".to_string());
     }
@@ -1596,46 +1590,6 @@ fn save_codex_credentials(credentials: &CodexCredentials) -> Result<(), String> 
     fs::write(&credentials.auth_path, data).map_err(|e| format!("save Codex auth.json: {}", e))
 }
 
-/// Stable per-account key for scoping historical samples, so switching ChatGPT
-/// accounts doesn't mix usage curves. Prefer the account id, fall back to email.
-fn codex_account_key(credentials: &CodexCredentials, identity: Option<&AgentIdentity>) -> String {
-    credentials
-        .account_id
-        .clone()
-        .filter(|id| !id.is_empty())
-        .or_else(|| identity.and_then(|i| i.email.clone()))
-        .unwrap_or_else(|| "default".to_string())
-}
-
-/// Record the live Codex weekly reading and, once enough past weeks exist, fill
-/// the window's `historical_expected_percent` / `run_out_probability` so the
-/// frontend can offer a history-based pace alongside the linear one.
-fn enrich_codex_weekly_history(windows: &mut [UsageWindow], account_key: &str, now: DateTime<Utc>) {
-    for window in windows.iter_mut() {
-        if !window.label.eq_ignore_ascii_case("Weekly") {
-            continue;
-        }
-        let (Some(resets_str), Some(minutes)) =
-            (window.resets_at.as_deref(), window.window_minutes)
-        else {
-            continue;
-        };
-        let Some(resets_at) = parse_datetime(resets_str) else {
-            continue;
-        };
-        if let Some(pace) = agent_history::record_and_evaluate(
-            account_key,
-            resets_at.timestamp(),
-            minutes,
-            window.used_percent,
-            now.timestamp(),
-        ) {
-            window.historical_expected_percent = Some(pace.expected_percent);
-            window.run_out_probability = pace.run_out_probability;
-        }
-    }
-}
-
 fn codex_windows(
     rate_limit: Option<&CodexRateLimit>,
     additional_rate_limits: Option<&[CodexAdditionalRateLimit]>,
@@ -2240,6 +2194,45 @@ mod tests {
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].remaining_percent, 65.0);
+    }
+
+    #[test]
+    fn agent_usage_payload_omits_legacy_history_fields() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let rate_limit = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 35.0,
+                reset_at: 1_700_172_800,
+                limit_window_seconds: 604_800,
+            }),
+            secondary_window: None,
+        };
+        let payload = AgentUsagePayload {
+            generated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            agents: vec![AgentUsageSnapshot {
+                client_id: "codex".to_string(),
+                source: "oauth".to_string(),
+                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                identity: None,
+                windows: codex_windows(Some(&rate_limit), None, now),
+                credits: None,
+                error: None,
+            }],
+            opencode_subscriptions: Vec::new(),
+        };
+        let serialized = serde_json::to_value(payload).unwrap();
+        let weekly = serialized["agents"][0]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|window| window["label"] == "Weekly")
+            .expect("normal Codex Weekly mapping");
+        let object = weekly.as_object().unwrap();
+        assert_eq!(object["usedPercent"], 35.0);
+        assert_eq!(object["remainingPercent"], 65.0);
+        assert_eq!(object["windowMinutes"], 10_080);
+        assert!(!object.contains_key("historicalExpectedPercent"));
+        assert!(!object.contains_key("runOutProbability"));
     }
 
     #[test]
