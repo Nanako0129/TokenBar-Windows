@@ -1970,8 +1970,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_scan_all_clients_with_scanner_settings_merges_user_path() {
-        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
-
         let dir = TempDir::new().unwrap();
         let home = dir.path();
         // Auto-discoverable channel db inside XDG data dir.
@@ -1986,8 +1984,6 @@ mod tests {
         let outside_db = outside_dir.join("opencode.db");
         File::create(&outside_db).unwrap();
 
-        _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
-
         let settings = ScannerSettings {
             opencode_db_paths: vec![outside_db.clone()],
             ..Default::default()
@@ -1995,7 +1991,7 @@ mod tests {
         let result = scan_all_clients_with_scanner_settings(
             home.to_str().unwrap(),
             &["opencode".to_string()],
-            true,
+            false,
             &settings,
         );
 
@@ -2042,7 +2038,7 @@ mod tests {
         let result = scan_all_clients_with_scanner_settings(
             home.to_str().unwrap(),
             &["codex".to_string()],
-            true,
+            false,
             &settings,
         );
 
@@ -2148,7 +2144,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_scan_all_clients_auto_discovers_profiles_under_hermes_home() {
-        let mut _hermes = EnvGuard::capture(&["HERMES_HOME"]);
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
         let dir = TempDir::new().unwrap();
         let home = dir.path();
         let hermes_home = home.join("custom-hermes-home");
@@ -2177,7 +2174,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_profile_scoped_hermes_home_isolates_to_own_profile() {
-        let mut _hermes = EnvGuard::capture(&["HERMES_HOME"]);
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
         let dir = TempDir::new().unwrap();
         let home = dir.path();
 
@@ -2218,7 +2216,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_symlinked_profile_scoped_hermes_home_preserves_isolation() {
-        let mut _hermes = EnvGuard::capture(&["HERMES_HOME"]);
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
         let dir = TempDir::new().unwrap();
         let home = dir.path();
 
@@ -2321,9 +2320,10 @@ mod tests {
     #[test]
     #[serial]
     fn test_scan_all_clients_with_scanner_settings_dedups_settings_and_env_extra_paths() {
-        let mut _extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+        let mut _extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS", "CODEX_HOME"]);
         let dir = TempDir::new().unwrap();
         let home = dir.path();
+        _extra.set("CODEX_HOME", home.join(".codex"));
 
         let default_root = home.join(".codex/sessions");
         fs::create_dir_all(&default_root).unwrap();
@@ -2371,8 +2371,6 @@ mod tests {
         //   2. ["opencode"]  → both auto + user-configured dbs present
         //   3. ["synthetic"] → both present (synthetic enables all)
         //   4. []            → both present (empty filter = all clients)
-        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
-
         let dir = TempDir::new().unwrap();
         let home = dir.path();
 
@@ -2389,8 +2387,6 @@ mod tests {
         let outside_db = outside_dir.join("opencode.db");
         File::create(&outside_db).unwrap();
 
-        _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
-
         let settings = ScannerSettings {
             opencode_db_paths: vec![outside_db.clone()],
             ..Default::default()
@@ -2398,7 +2394,7 @@ mod tests {
 
         let scan = |clients: &[&str]| {
             let owned: Vec<String> = clients.iter().map(|s| s.to_string()).collect();
-            scan_all_clients_with_scanner_settings(home.to_str().unwrap(), &owned, true, &settings)
+            scan_all_clients_with_scanner_settings(home.to_str().unwrap(), &owned, false, &settings)
         };
 
         // 1. clients=["claude"] — OpenCode disabled, dbs must stay empty.
@@ -3007,8 +3003,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_scan_all_clients_headless_paths() {
-        let mut _headless = EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR"]);
+        let mut _headless = EnvGuard::capture(&[
+            "TOKSCALE_HEADLESS_DIR",
+            "CODEX_HOME",
+            "GEMINI_CLI_HOME",
+        ]);
         _headless.remove("TOKSCALE_HEADLESS_DIR");
+        _headless.remove("CODEX_HOME");
+        _headless.remove("GEMINI_CLI_HOME");
 
         let dir = TempDir::new().unwrap();
         let home = dir.path();
