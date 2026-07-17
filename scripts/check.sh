@@ -3,9 +3,8 @@
 # The dotnet tests load the release dylib (copied by src/Directory.Build.targets),
 # so the cargo release build must come first.
 #
-# Optional: WIN_CHECK=1 also type-checks the Windows target (needs
-# `rustup target add x86_64-pc-windows-msvc`; viable once tokscale-core's TLS
-# is switched off vendored OpenSSL — see the plan, Phase 1).
+# Optional: WIN_CHECK=1 also type-checks the Windows target; install it with
+# `rustup target add x86_64-pc-windows-msvc`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
