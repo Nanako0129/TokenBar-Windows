@@ -389,8 +389,7 @@ public sealed partial class DashboardView : UserControl
     {
         var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
         stats.PerDayMap.TryGetValue(Format.TodayKey(), out var today);
-        var rate = snapshot.Trace
-            .Where(b => _selectedSet.Contains(ClientRegistry.CanonicalClient(b.Client)))
+        var rate = TraceCollapse.FilterByClients(snapshot.Trace, _selectedSet)
             .Sum(b => b.TokensPerMin);
         TodayValue.Text = Format.CompactTokens(today?.Tokens ?? 0);
         TotalValue.Text = Format.CompactTokens(stats.TotalTokens);
@@ -900,15 +899,18 @@ public sealed partial class DashboardView : UserControl
         return panel;
     }
 
-    private static FrameworkElement? BuildTrace(DashboardModel.Snapshot snapshot)
+    private FrameworkElement? BuildTrace(DashboardModel.Snapshot snapshot)
     {
         // tokenbar.trace.detailed (macOS UsageTraceCard): one row per
         // agent-and-model bucket instead of one collapsed row per app.
+        // Selection must happen before collapse and Take(5), or a high-rate
+        // hidden client can evict every selected row from the card.
+        var selected = TraceCollapse.FilterByClients(snapshot.Trace, _selectedSet);
         var detailed = AppSettings.Store.GetBool("tokenbar.trace.detailed", false);
         var rows = detailed
-            ? snapshot.Trace
+            ? selected
                 .Select(b => (b.Client, b.Model, b.TokensPerMin)).Take(5).ToList()
-            : TraceCollapse.CollapseByClient(snapshot.Trace)
+            : TraceCollapse.CollapseByClient(selected)
                 .Select(r => (r.Client, r.Model, r.TokensPerMin)).Take(5).ToList();
         if (rows.Count == 0)
         {
@@ -945,10 +947,11 @@ public sealed partial class DashboardView : UserControl
     {
         var stack = new StackPanel { Spacing = 10 };
         var report = snapshot.Models;
+        var entries = SelectedModelEntries(snapshot);
         var subtitleParts = new List<string>();
         if (report is not null)
         {
-            subtitleParts.Add($"{report.Entries.Count} models · {Format.Usd(report.TotalCost)}");
+            subtitleParts.Add($"{entries.Count} models · {Format.Usd(entries.Sum(e => e.Cost))}");
             if (report.PricingUpdatedAt is { } ts)
             {
                 subtitleParts.Add($"Prices updated {Format.RelativeTime(ts)}");
@@ -988,10 +991,15 @@ public sealed partial class DashboardView : UserControl
         return stack;
     }
 
+    private List<ModelReportEntry> SelectedModelEntries(DashboardModel.Snapshot snapshot) =>
+        (snapshot.Models?.Entries ?? [])
+            .Where(e => _selectedSet.Contains(ClientRegistry.CanonicalClient(e.Client)))
+            .ToList();
+
     private FrameworkElement BuildModelRows(DashboardModel.Snapshot snapshot, int? maxRows)
     {
         var panel = new StackPanel { Spacing = 8 };
-        var entries = (snapshot.Models?.Entries ?? [])
+        var entries = SelectedModelEntries(snapshot)
             .OrderByDescending(e => e.Cost)
             .ToList();
         if (maxRows is { } cap)
@@ -1037,7 +1045,22 @@ public sealed partial class DashboardView : UserControl
         var panel = new StackPanel { Spacing = 6 };
         var colors = new ModelColorMap(snapshot.Models);
         var days = snapshot.Graph.Contributions
-            .Where(c => c.Totals.Tokens > 0 || c.Totals.Cost > 0)
+            .Select(day =>
+            {
+                var clients = day.Clients
+                    .Where(c => _selectedSet.Contains(ClientRegistry.CanonicalClient(c.Client)))
+                    .OrderByDescending(c => c.Cost)
+                    .ToList();
+                var tokens = clients.Aggregate(
+                    0L, (total, client) => total.SaturatingAdd(client.Tokens.Total));
+                return (
+                    Day: day,
+                    Clients: clients,
+                    Tokens: tokens,
+                    Cost: clients.Sum(c => c.Cost),
+                    Messages: clients.Sum(c => c.Messages));
+            })
+            .Where(day => day.Tokens > 0 || day.Cost > 0)
             .Reverse()
             .ToList();
         if (days.Count == 0)
@@ -1045,22 +1068,21 @@ public sealed partial class DashboardView : UserControl
             panel.Children.Add(Ui.Dim("No active days."));
         }
 
-        foreach (var day in days)
+        foreach (var selectedDay in days)
         {
+            var day = selectedDay.Day;
             var block = new StackPanel { Spacing = 4 };
             var head = Ui.Row(
                 Ui.Text(Format.MonthDay(day.Date), 12, bold: true),
                 Ui.Text(
-                    $"{day.Totals.Messages} msgs · {Format.CompactTokens(day.Totals.Tokens)} · {Format.Usd(day.Totals.Cost)}",
+                    $"{selectedDay.Messages} msgs · {Format.CompactTokens(selectedDay.Tokens)} · {Format.Usd(selectedDay.Cost)}",
                     11, 0.8));
             block.Children.Add(head);
 
             if (_expandedDay == day.Date)
             {
-                foreach (var client in day.Clients.OrderByDescending(c => c.Cost))
+                foreach (var client in selectedDay.Clients)
                 {
-                    var t = client.Tokens;
-                    var tokens = t.Input + t.Output + t.CacheRead + t.CacheWrite + t.Reasoning;
                     var name = new StackPanel
                     {
                         Orientation = Orientation.Horizontal,
@@ -1072,7 +1094,7 @@ public sealed partial class DashboardView : UserControl
                         $"{client.ModelId} · {ClientRegistry.ShortName(client.Client)}", 10, 0.85));
                     block.Children.Add(Ui.Row(
                         name,
-                        Ui.Text($"{Format.CompactTokens(tokens)} · {Format.Usd(client.Cost)}", 10, 0.7)));
+                        Ui.Text($"{Format.CompactTokens(client.Tokens.Total)} · {Format.Usd(client.Cost)}", 10, 0.7)));
                 }
             }
 
@@ -1202,8 +1224,7 @@ public sealed partial class DashboardView : UserControl
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.RowDefinitions.Add(new RowDefinition());
         grid.RowDefinitions.Add(new RowDefinition());
-        var favorite = (snapshot.Models?.Entries ?? [])
-            .Where(e => _selectedSet.Contains(ClientRegistry.CanonicalClient(e.Client)))
+        var favorite = SelectedModelEntries(snapshot)
             .OrderByDescending(e => e.Cost)
             .FirstOrDefault();
         (string Value, string Label)[] metrics =

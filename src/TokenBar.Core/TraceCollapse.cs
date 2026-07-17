@@ -25,6 +25,16 @@ public static class TraceCollapse
     public static double TotalRate(IEnumerable<TraceBucket> buckets, IReadOnlySet<string> hidden) =>
         buckets.Sum(b => hidden.Contains(ClientRegistry.CanonicalClient(b.Client)) ? 0 : b.TokensPerMin);
 
+    /// <summary>Keep only the selected canonical clients before callers collapse
+    /// or cap rows. Live buckets use raw ids such as claude-code, so normalize
+    /// both membership and the returned row id in one pass.</summary>
+    public static IReadOnlyList<TraceBucket> FilterByClients(
+        IEnumerable<TraceBucket> buckets, IReadOnlySet<string> selected) =>
+        buckets
+            .Select(b => b with { Client = ClientRegistry.CanonicalClient(b.Client) })
+            .Where(b => selected.Contains(b.Client))
+            .ToList();
+
     public static IReadOnlyList<TraceBucket> CollapseByClient(IEnumerable<TraceBucket> buckets)
     {
         var groups = new Dictionary<string, Slot>();

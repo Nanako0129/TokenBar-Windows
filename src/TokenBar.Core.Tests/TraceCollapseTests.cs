@@ -46,6 +46,23 @@ public class TraceCollapseTests
     }
 
     [Fact]
+    public void FilterByClientsRunsBeforeRowCapAndCanonicalizesIds()
+    {
+        var buckets = Enumerable.Range(0, 5)
+            .Select(i => Bucket($"hidden-{i}", "Main", "m", 100 - i))
+            .Append(Bucket("claude-code", "Main", "selected", 1));
+
+        var rows = TraceCollapse.FilterByClients(
+                buckets, new HashSet<string> { "claude" })
+            .Take(5)
+            .ToList();
+
+        var row = Assert.Single(rows);
+        Assert.Equal("claude", row.Client);
+        Assert.Equal("selected", row.Model);
+    }
+
+    [Fact]
     public void TotalRateNormalizesLiveIdsBeforeHidingThem()
     {
         var buckets = new[]
