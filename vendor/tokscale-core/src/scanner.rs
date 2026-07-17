@@ -2492,7 +2492,11 @@ mod tests {
         let home = dir.path();
         setup_mock_pi_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["pi".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["pi".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Pi).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
         assert!(result.get(ClientId::Claude).is_empty());
@@ -2504,7 +2508,11 @@ mod tests {
         let home = dir.path();
         setup_mock_omp_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["pi".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["pi".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Pi).len(), 1);
         assert!(result.get(ClientId::Pi)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl"));
         assert!(result.get(ClientId::OpenCode).is_empty());
@@ -2517,7 +2525,11 @@ mod tests {
         setup_mock_pi_dir(home);
         setup_mock_omp_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["pi".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["pi".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Pi).len(), 2);
     }
 
@@ -2558,7 +2570,11 @@ mod tests {
         let home = dir.path();
         setup_mock_claude_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Claude).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
     }
@@ -2581,7 +2597,11 @@ mod tests {
             .write_all(b"{}\n")
             .unwrap();
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
         assert!(
             result.get(ClientId::Claude).iter().any(|p| p == &agent),
             "nested workflow agent transcript must be discovered, got {:?}",
@@ -2596,7 +2616,11 @@ mod tests {
         setup_mock_claude_dir(home);
         let transcript = setup_mock_claude_transcripts_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
 
         assert_eq!(result.get(ClientId::Claude).len(), 2);
         assert!(
@@ -2617,7 +2641,11 @@ mod tests {
         let home = dir.path();
         let transcript = setup_mock_claude_transcripts_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
 
         assert_eq!(result.get(ClientId::Claude), &vec![transcript]);
         assert!(result.get(ClientId::OpenCode).is_empty());
@@ -2647,7 +2675,11 @@ mod tests {
         let variant_session = project_dir.join("variant-session.jsonl");
         File::create(&variant_session).unwrap();
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
 
         assert_eq!(result.get(ClientId::Claude).len(), 2);
         assert!(
@@ -2681,7 +2713,11 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
 
         assert_eq!(
             result.get(ClientId::Claude).len(),
@@ -2696,7 +2732,11 @@ mod tests {
         let home = dir.path();
         setup_mock_gemini_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["gemini".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["gemini".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Gemini).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
     }
@@ -2709,7 +2749,11 @@ mod tests {
         fs::create_dir_all(&gemini_path).unwrap();
         File::create(gemini_path.join("session-abc.jsonl")).unwrap();
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["gemini".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["gemini".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Gemini).len(), 1);
         assert!(result.get(ClientId::Gemini)[0].ends_with("session-abc.jsonl"));
     }
@@ -2755,7 +2799,11 @@ mod tests {
         let home = dir.path();
         setup_mock_openclaw_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["openclaw".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::OpenClaw).len(), 3);
         assert!(result
             .get(ClientId::OpenClaw)
@@ -2781,7 +2829,11 @@ mod tests {
         File::create(openclaw_sessions.join("session-archived.jsonl.deleted.1700000000000"))
             .unwrap();
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["openclaw".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::OpenClaw).len(), 1);
         assert!(result.get(ClientId::OpenClaw)[0]
             .ends_with("session-archived.jsonl.deleted.1700000000000"));
@@ -3057,7 +3109,11 @@ mod tests {
         let home = dir.path();
         setup_mock_kimi_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["kimi".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Kimi).len(), 1);
         assert!(result.get(ClientId::Kimi)[0].ends_with("wire.jsonl"));
         assert!(result.get(ClientId::OpenCode).is_empty());
@@ -3104,7 +3160,11 @@ mod tests {
         let home = dir.path();
         setup_mock_roocode_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["roocode".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["roocode".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::RooCode).len(), 2);
         assert!(result
             .get(ClientId::RooCode)
@@ -3118,7 +3178,11 @@ mod tests {
         let home = dir.path();
         setup_mock_kilocode_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["kilocode".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kilocode".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::KiloCode).len(), 2);
         assert!(result
             .get(ClientId::KiloCode)
@@ -3132,7 +3196,11 @@ mod tests {
         let home = dir.path();
         setup_mock_cline_dir(home);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["cline".to_string()]);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            false,
+        );
         assert_eq!(result.get(ClientId::Cline).len(), 4);
         assert!(result
             .get(ClientId::Cline)
