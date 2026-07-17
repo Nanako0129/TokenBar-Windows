@@ -121,6 +121,24 @@ public class UsageStatsTests
     }
 
     [Fact]
+    public void EmptySelectionDoesNotFallBackToAllClients()
+    {
+        var payload = Payload(
+            "2026-06-01", "2026-06-02",
+            Day("2026-06-01", Client("claude", 100, 2)),
+            Day("2026-06-02", Client("gemini", 200, 3)));
+
+        var stats = new UsageStats(payload, new HashSet<string>());
+
+        Assert.Equal(0, stats.TotalTokens);
+        Assert.Equal(0, stats.TotalCost);
+        Assert.Equal(0, stats.ActiveDays);
+        Assert.Empty(stats.PerDay);
+        Assert.Empty(stats.PerDayMap);
+        Assert.Equal(new Streaks(0, 0), stats.Streaks);
+    }
+
+    [Fact]
     public void TotalsSaturateOnCorruptLane()
     {
         var payload = Payload(

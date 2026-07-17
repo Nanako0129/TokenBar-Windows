@@ -61,6 +61,18 @@ public sealed partial class FlyoutWindow : Window
             Dashboard.SwitchTo(lens);
         }
 
+        // --tab=<id> verification hook. Duplicate flags are ambiguous and fall
+        // back to Overview; unknown/hidden ids normalize after the first graph.
+        var tabArgs = Environment.GetCommandLineArgs()
+            .Where(a => a.StartsWith("--tab=", StringComparison.Ordinal))
+            .ToList();
+        if (tabArgs.Count > 0)
+        {
+            Dashboard.SelectClientTab(tabArgs.Count == 1
+                ? tabArgs[0]["--tab=".Length..]
+                : ClientRegistry.OverviewTab);
+        }
+
         // Transient surface → Acrylic, via the manual controller so the
         // backdrop stays translucent while unfocused: the flyout is a
         // glanceable dashboard, not a focused editor — matching the macOS

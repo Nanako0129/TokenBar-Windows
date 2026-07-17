@@ -32,6 +32,11 @@ public sealed partial class DashboardView : UserControl
     private DashboardModel? _model;
     private AppView _view = AppView.Overview;
     private readonly Dictionary<AppView, Button> _tabs = [];
+    private IReadOnlyList<string> _displayClients = [];
+    private IReadOnlyList<string> _selectedClients = [];
+    private HashSet<string> _selectedSet = new(StringComparer.Ordinal);
+    private UsageStats? _selectedStats;
+    private string _activeClientTab = ClientRegistry.OverviewTab;
     private string? _expandedDay; // Daily drill-down state
     private bool _hourlyProfileMode;
     private int _hourlyWindow = 48; // Timeline rows shown; +48 per "Show more"
@@ -92,7 +97,11 @@ public sealed partial class DashboardView : UserControl
         // panel's right-column preview equivalent is the flyout itself).
         AppSettings.Store.Changed += key =>
         {
-            if (key.StartsWith("tokenbar.limits.", StringComparison.Ordinal)
+            if (key is ClientRegistry.TabHiddenKey or ClientRegistry.TabOrderKey)
+            {
+                _ = DispatcherQueue.TryEnqueue(() => RefreshSelection(animated: false));
+            }
+            else if (key.StartsWith("tokenbar.limits.", StringComparison.Ordinal)
                 || key == "tokenbar.trace.detailed")
             {
                 _ = DispatcherQueue.TryEnqueue(() => RenderContent(animated: false));
@@ -224,8 +233,7 @@ public sealed partial class DashboardView : UserControl
             return;
         }
 
-        var selectedClients = snapshot.Graph.Summary.Clients.ToHashSet(StringComparer.Ordinal);
-        var stats = new UsageStats(snapshot.Graph, selectedClients);
+        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
         var year = _model?.Year ?? Format.TodayKey()[..4];
         var grid = TokenBar.Core.Grid.Build(year, stats.PerDayMap);
         _graph3d.SetData(grid, ActualTheme == ElementTheme.Dark);
@@ -298,6 +306,17 @@ public sealed partial class DashboardView : UserControl
     /// <summary>The model powers lazy lens loading (hourly/agents).</summary>
     public void Bind(DashboardModel model) => _model = model;
 
+    /// <summary>Persist a requested client tab. The next selection pass validates
+    /// it against the visible clients before any usage surface renders.</summary>
+    public void SelectClientTab(string? clientId)
+    {
+        var requested = string.IsNullOrWhiteSpace(clientId)
+            ? ClientRegistry.OverviewTab
+            : ClientRegistry.CanonicalClient(clientId.Trim());
+        AppSettings.Store.SetString(ClientRegistry.ActiveTabKey, requested);
+        RefreshSelection(animated: false);
+    }
+
     public void SwitchTo(AppView view)
     {
         if (_view == view)
@@ -330,17 +349,56 @@ public sealed partial class DashboardView : UserControl
             return;
         }
 
-        var graph = snapshot.Graph;
-        TodayValue.Text = Format.CompactTokens(Format.TodayTokens(graph));
-        TotalValue.Text = Format.CompactTokens(graph.Summary.TotalTokens);
-        RateValue.Text = Format.CompactTokens((long)snapshot.TokensPerMin);
-        CostLine.Text =
-            $"{Format.Usd(Format.TodayCost(graph))} today · {Format.Usd(graph.Summary.TotalCost)} all time · " +
-            $"{graph.Summary.ActiveDays} active days";
-        FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
+        ApplyClientSelection(snapshot);
+        RenderHeader(snapshot);
         UpdateYearPicker();
         UpdateGraph3DData(snapshot);
         RenderContent(animated: false);
+    }
+
+    private void RefreshSelection(bool animated)
+    {
+        if (_snapshot is not { } snapshot)
+        {
+            return;
+        }
+
+        ApplyClientSelection(snapshot);
+        RenderHeader(snapshot);
+        UpdateGraph3DData(snapshot);
+        RenderContent(animated);
+    }
+
+    private void ApplyClientSelection(DashboardModel.Snapshot snapshot)
+    {
+        var selection = ClientRegistry.ResolveSelection(
+            snapshot.Graph.Summary.Clients, AppSettings.Store);
+        _displayClients = selection.DisplayClients;
+        _selectedClients = selection.SelectedClients;
+        _selectedSet = new HashSet<string>(selection.SelectedClients, StringComparer.Ordinal);
+        _selectedStats = new UsageStats(snapshot.Graph, _selectedSet);
+        _activeClientTab = selection.ActiveTab;
+
+        if (AppSettings.Store.GetString(ClientRegistry.ActiveTabKey) != selection.ActiveTab)
+        {
+            AppSettings.Store.SetString(ClientRegistry.ActiveTabKey, selection.ActiveTab);
+        }
+    }
+
+    private void RenderHeader(DashboardModel.Snapshot snapshot)
+    {
+        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
+        stats.PerDayMap.TryGetValue(Format.TodayKey(), out var today);
+        var rate = snapshot.Trace
+            .Where(b => _selectedSet.Contains(ClientRegistry.CanonicalClient(b.Client)))
+            .Sum(b => b.TokensPerMin);
+        TodayValue.Text = Format.CompactTokens(today?.Tokens ?? 0);
+        TotalValue.Text = Format.CompactTokens(stats.TotalTokens);
+        RateValue.Text = Format.CompactTokens((long)rate);
+        CostLine.Text =
+            $"{Format.Usd(today?.Cost ?? 0)} today · {Format.Usd(stats.TotalCost)} all time · " +
+            $"{stats.ActiveDays} active days";
+        FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
     }
 
     private string _yearPickerSignature = "";
@@ -572,6 +630,11 @@ public sealed partial class DashboardView : UserControl
 
     private FrameworkElement BuildChart(DashboardModel.Snapshot snapshot)
     {
+        if (_selectedClients.Count == 0)
+        {
+            return Ui.Dim("No visible client usage.");
+        }
+
         if (_chartView3D)
         {
             return BuildGraph3D(snapshot);
@@ -580,7 +643,7 @@ public sealed partial class DashboardView : UserControl
         var colors = new ModelColorMap(snapshot.Models);
         var bars = DayBars.Build(
             snapshot.Graph,
-            [.. snapshot.Graph.Summary.Clients],
+            _selectedClients,
             _chartStackBy,
             colors,
             Format.TodayKey());
@@ -865,10 +928,9 @@ public sealed partial class DashboardView : UserControl
         return panel;
     }
 
-    private static FrameworkElement BuildStreaks(DashboardModel.Snapshot snapshot)
+    private FrameworkElement BuildStreaks(DashboardModel.Snapshot snapshot)
     {
-        var stats = new UsageStats(
-            snapshot.Graph, new HashSet<string>(snapshot.Graph.Summary.Clients));
+        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 24 };
         row.Children.Add(Metric($"{stats.Streaks.Current}d", "current"));
         row.Children.Add(Metric($"{stats.Streaks.Longest}d", "longest"));
@@ -1133,8 +1195,7 @@ public sealed partial class DashboardView : UserControl
         var stack = new StackPanel { Spacing = 10 };
         stack.Children.Add(BuildUsageChartCard(snapshot));
 
-        var stats = new UsageStats(
-            snapshot.Graph, new HashSet<string>(snapshot.Graph.Summary.Clients));
+        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
         var grid = new Grid { ColumnSpacing = 16, RowSpacing = 12 };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -1142,6 +1203,7 @@ public sealed partial class DashboardView : UserControl
         grid.RowDefinitions.Add(new RowDefinition());
         grid.RowDefinitions.Add(new RowDefinition());
         var favorite = (snapshot.Models?.Entries ?? [])
+            .Where(e => _selectedSet.Contains(ClientRegistry.CanonicalClient(e.Client)))
             .OrderByDescending(e => e.Cost)
             .FirstOrDefault();
         (string Value, string Label)[] metrics =
