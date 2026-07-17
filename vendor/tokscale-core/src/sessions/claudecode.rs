@@ -1672,10 +1672,12 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             variant_dir.join("variant.json"),
-            format!(
-                r#"{{"name":"{variant}","provider":"{provider}","configDir":"{}"}}"#,
-                config_dir.display()
-            ),
+            serde_json::json!({
+                "name": variant,
+                "provider": provider,
+                "configDir": config_dir,
+            })
+            .to_string(),
         )
         .unwrap();
         std::fs::write(&path, content).unwrap();

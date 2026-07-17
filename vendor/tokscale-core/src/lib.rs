@@ -4100,15 +4100,41 @@ mod tests {
         }
     }
 
+    fn scanner_fixture_path(home: &Path, relative: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            // The production scanner builds these roots with format!("{home}/{relative}").
+            // Match that lexical path on Windows so cache assertions use the same key.
+            PathBuf::from(format!("{}/{}", home.display(), relative))
+        }
+        #[cfg(not(windows))]
+        {
+            home.join(relative)
+        }
+    }
+
+    fn opencode_test_env(cache_home: &Path, source_home: &Path) -> EnvGuard {
+        let xdg_data_home = scanner_fixture_path(source_home, ".local/share");
+        EnvGuard::set(&[
+            ("HOME", cache_home.as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.as_os_str()),
+            ("XDG_DATA_HOME", xdg_data_home.as_os_str()),
+        ])
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_env_guard_restores_some_and_none_after_panic() {
-        const KEYS: [&str; 2] = ["HOME", "TOKSCALE_PRICING_CACHE_ONLY"];
+        const KEYS: [&str; 3] = ["HOME", "TOKSCALE_PRICING_CACHE_ONLY", "TOKSCALE_CONFIG_DIR"];
         let _original = EnvGuard::capture(&KEYS);
 
         unsafe {
             std::env::set_var("HOME", "/tmp/tokscale-env-guard-home-before");
             std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
+            std::env::set_var(
+                "TOKSCALE_CONFIG_DIR",
+                "/tmp/tokscale-env-guard-config-before",
+            );
         }
         let first = std::panic::catch_unwind(|| {
             let _guard = EnvGuard::set(&[
@@ -4117,6 +4143,10 @@ mod tests {
                     std::ffi::OsStr::new("/tmp/tokscale-env-guard-home-during"),
                 ),
                 ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+                (
+                    "TOKSCALE_CONFIG_DIR",
+                    std::ffi::OsStr::new("/tmp/tokscale-env-guard-config-during"),
+                ),
             ]);
             panic!("exercise EnvGuard unwinding");
         });
@@ -4128,10 +4158,17 @@ mod tests {
             ))
         );
         assert_eq!(std::env::var_os("TOKSCALE_PRICING_CACHE_ONLY"), None);
+        assert_eq!(
+            std::env::var_os("TOKSCALE_CONFIG_DIR"),
+            Some(std::ffi::OsString::from(
+                "/tmp/tokscale-env-guard-config-before"
+            ))
+        );
 
         unsafe {
             std::env::remove_var("HOME");
             std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "before");
+            std::env::remove_var("TOKSCALE_CONFIG_DIR");
         }
         let second = std::panic::catch_unwind(|| {
             let _guard = EnvGuard::set(&[
@@ -4140,6 +4177,10 @@ mod tests {
                     std::ffi::OsStr::new("/tmp/tokscale-env-guard-home-during"),
                 ),
                 ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+                (
+                    "TOKSCALE_CONFIG_DIR",
+                    std::ffi::OsStr::new("/tmp/tokscale-env-guard-config-during"),
+                ),
             ]);
             panic!("exercise inverse EnvGuard unwinding");
         });
@@ -4149,6 +4190,7 @@ mod tests {
             std::env::var_os("TOKSCALE_PRICING_CACHE_ONLY"),
             Some(std::ffi::OsString::from("before"))
         );
+        assert_eq!(std::env::var_os("TOKSCALE_CONFIG_DIR"), None);
     }
 
     #[test]
@@ -5189,7 +5231,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_cursor_parse_path_reprices_zero_cost_composer_1_5_rows() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
         let temp_dir = tempfile::TempDir::new().unwrap();
         let cursor_cache_dir = temp_dir.path().join(".config/tokscale/cursor-cache");
         std::fs::create_dir_all(&cursor_cache_dir).unwrap();
@@ -5231,8 +5279,10 @@ mod tests {
     fn test_parse_all_messages_with_pricing_kimi_deduplicates_repeated_status_updates() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_kimi_repeated_status_fixture(source_home.path());
@@ -5247,11 +5297,6 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 5);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -5259,8 +5304,10 @@ mod tests {
     fn test_parse_local_clients_kimi_deduplicates_repeated_status_updates() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_kimi_repeated_status_fixture(source_home.path());
@@ -5282,11 +5329,6 @@ mod tests {
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 40);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 5);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     // Regression: the streaming driver must NOT share one dedup set across
@@ -5301,8 +5343,10 @@ mod tests {
     fn test_streaming_driver_does_not_dedup_across_clients() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             // kimi: one StatusUpdate carrying message_id "COLLIDE".
@@ -5344,11 +5388,6 @@ mod tests {
                 "codebuff message with shared dedup_key must survive: {seen:?}"
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     // M2 (codex fork-replay): the parser-level fork dedup (#649/#681) must also
@@ -5362,8 +5401,10 @@ mod tests {
     fn test_streaming_codex_collapses_parent_replay_across_forks() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_codex_parent_replay_fixture(source_home.path());
@@ -5394,11 +5435,6 @@ mod tests {
             assert_eq!(input_sum, 140);
             assert_eq!(output_sum, 14);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     // Issue #6: the agents report must dedup the simple_lane! clients
@@ -5413,10 +5449,12 @@ mod tests {
     fn test_agents_report_dedups_like_model_report_issue6() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
         // Hermetic: cache-only pricing + temp HOME → no network, pricing None.
-        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+        let _pricing = EnvGuard::set(&[("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1"))]);
 
         {
             let write_codebuff = |proj: &str| {
@@ -5488,12 +5526,6 @@ mod tests {
                 model.total_cost
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
     }
 
     // Preservation: with no duplicate dedup_keys (and only parse_local==true
@@ -5505,9 +5537,11 @@ mod tests {
     fn test_agents_report_preserves_numbers_without_duplicates() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
-        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let _pricing = EnvGuard::set(&[("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1"))]);
 
         {
             let cb_dir = source_home.path().join(".config/manicode/projects/proj");
@@ -5584,12 +5618,6 @@ mod tests {
             // Sanity: codebuff contributes its known tokens.
             assert!(main.input >= 200 && main.output >= 80);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
     }
 
     // Issue #36: the client selection must be applied at the STREAMING SCAN,
@@ -5605,9 +5633,11 @@ mod tests {
     fn test_agents_report_client_filter_scopes_shared_bucket_issue36() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
-        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let _pricing = EnvGuard::set(&[("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1"))]);
 
         {
             let cb_dir = source_home.path().join(".config/manicode/projects/proj");
@@ -5662,12 +5692,6 @@ mod tests {
             assert_eq!(filtered.entries[0].clients, vec!["codebuff".to_string()]);
             assert_eq!(filtered.total_messages, 1, "kimi's message is gone");
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
     }
 
     // Issue #36 (round 3): a cc-mirror variant id (`cc-mirror/kimi-code`) is
@@ -5684,9 +5708,11 @@ mod tests {
     fn test_agents_report_cc_mirror_variant_slice_issue36() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
-        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let _pricing = EnvGuard::set(&[("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1"))]);
 
         {
             // Plain claude session (client "claude"): 100 in / 50 out.
@@ -5704,10 +5730,12 @@ mod tests {
             std::fs::create_dir_all(&project_dir).unwrap();
             std::fs::write(
                 variant_dir.join("variant.json"),
-                format!(
-                    r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                    config_dir.display()
-                ),
+                serde_json::json!({
+                    "name": "kimi-code",
+                    "provider": "kimi",
+                    "configDir": config_dir,
+                })
+                .to_string(),
             )
             .unwrap();
             std::fs::write(
@@ -5752,12 +5780,6 @@ mod tests {
                 "claude slice = plain claude (100), not the mixed 400"
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
     }
 
     // Agent bucketing + fold arithmetic in isolation (no fixtures): normalized
@@ -5881,13 +5903,13 @@ mod tests {
     fn test_source_cache_refreshes_stale_date_on_cache_hit() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         {
-            let message_dir = source_home
-                .path()
-                .join(".local/share/opencode/storage/message/project-1");
+            let message_dir = scanner_fixture_path(
+                source_home.path(),
+                ".local/share/opencode/storage/message/project-1",
+            );
             std::fs::create_dir_all(&message_dir).unwrap();
             let path = message_dir.join("msg_001.json");
             std::fs::write(
@@ -5952,11 +5974,6 @@ mod tests {
                 .date
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[cfg(unix)]
@@ -5967,13 +5984,13 @@ mod tests {
 
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         {
-            let message_dir = source_home
-                .path()
-                .join(".local/share/opencode/storage/message/project-1");
+            let message_dir = scanner_fixture_path(
+                source_home.path(),
+                ".local/share/opencode/storage/message/project-1",
+            );
             std::fs::create_dir_all(&message_dir).unwrap();
             let path = message_dir.join("msg_001.json");
             std::fs::write(
@@ -6007,11 +6024,6 @@ mod tests {
             );
             assert_eq!(second_messages.len(), 1);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6019,25 +6031,34 @@ mod tests {
     fn test_empty_cache_hits_are_reparsed_for_optional_file_sources() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         {
-            let message_dir = source_home
-                .path()
-                .join(".local/share/opencode/storage/message/project-1");
+            let message_dir = scanner_fixture_path(
+                source_home.path(),
+                ".local/share/opencode/storage/message/project-1",
+            );
             std::fs::create_dir_all(&message_dir).unwrap();
-            let path = message_dir.join("msg_001.json");
+            let source_path = message_dir.join("msg_001.json");
             std::fs::write(
-                &path,
+                &source_path,
                 r#"{"id":"msg-1","sessionID":"session-1","role":"assistant","modelID":"accounts/fireworks/models/deepseek-v3-0324","providerID":"fireworks","cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011200000}}"#,
             )
             .unwrap();
+            let cache_path = scanner::scan_all_clients_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                true,
+            )
+            .get(ClientId::OpenCode)
+            .first()
+            .cloned()
+            .expect("scanner must find the OpenCode fixture");
 
-            let fingerprint = message_cache::SourceFingerprint::from_path(&path).unwrap();
+            let fingerprint = message_cache::SourceFingerprint::from_path(&cache_path).unwrap();
             let mut cache = message_cache::SourceMessageCache::default();
             cache.insert(message_cache::CachedSourceEntry::new(
-                &path,
+                &cache_path,
                 fingerprint,
                 Vec::new(),
                 Vec::new(),
@@ -6053,13 +6074,8 @@ mod tests {
             assert_eq!(messages.len(), 1);
 
             let loaded = message_cache::SourceMessageCache::load();
-            let repaired_entry = loaded.get(&path).unwrap();
+            let repaired_entry = loaded.get(&cache_path).unwrap();
             assert_eq!(repaired_entry.messages.len(), 1);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -6068,8 +6084,7 @@ mod tests {
     fn test_sqlite_source_cache_invalidates_on_wal_change() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6133,11 +6148,6 @@ mod tests {
             );
             assert_eq!(refreshed_messages.len(), 2);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6148,8 +6158,7 @@ mod tests {
         // must only be counted once.
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6249,11 +6258,6 @@ mod tests {
                 "warm cache must also dedup shared message across channel dbs"
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6261,8 +6265,7 @@ mod tests {
     fn test_parse_all_messages_with_pricing_opencode_sqlite_deduplicates_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6327,11 +6330,6 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 250);
             assert_eq!(messages.iter().map(|m| m.cost).sum::<f64>(), 0.06);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6339,8 +6337,7 @@ mod tests {
     fn test_parse_local_clients_opencode_sqlite_counts_deduplicated_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6410,11 +6407,6 @@ mod tests {
             assert_eq!(parsed.messages.len(), 3);
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 600);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 250);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -6874,8 +6866,10 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_deduplicates_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_codex_forked_history_fixture(source_home.path());
@@ -6909,11 +6903,6 @@ mod tests {
                 33
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6921,8 +6910,10 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_keeps_user_fork_own_turn() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_codex_user_fork_replay_fixture(source_home.path());
@@ -6944,11 +6935,6 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.cache_read).sum::<i64>(), 500);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 150);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6956,8 +6942,10 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_deduplicates_parent_replay_across_forks() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_codex_parent_replay_fixture(source_home.path());
@@ -6980,11 +6968,6 @@ mod tests {
             assert_eq!(messages.len(), 3);
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 140);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 14);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7017,8 +7000,10 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_keeps_twin_token_counts_at_distinct_timestamps() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_codex_twin_token_count_fixture(source_home.path());
@@ -7057,11 +7042,6 @@ mod tests {
                 4,
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7069,8 +7049,10 @@ mod tests {
     fn test_parse_local_clients_codex_counts_deduplicated_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             write_codex_forked_history_fixture(source_home.path());
@@ -7114,11 +7096,6 @@ mod tests {
                 33
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7127,11 +7104,13 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let codex_dir = source_home.path().join(".codex/sessions");
+            let codex_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&codex_dir).unwrap();
             let path = codex_dir.join("session.jsonl");
             std::fs::write(
@@ -7176,7 +7155,10 @@ mod tests {
                 &["codex".to_string()],
                 None,
             );
-            std::env::set_var("HOME", fresh_cache_home.path());
+            let _fresh_env = EnvGuard::set(&[
+                ("HOME", fresh_cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", fresh_cache_home.path().as_os_str()),
+            ]);
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7189,11 +7171,6 @@ mod tests {
                 .iter()
                 .all(|message| message.model_id == "gpt-5.5"));
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7202,11 +7179,13 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let codex_dir = source_home.path().join(".codex/sessions");
+            let codex_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&codex_dir).unwrap();
             let path = codex_dir.join("session.jsonl");
             std::fs::write(
@@ -7247,7 +7226,10 @@ mod tests {
                 &["codex".to_string()],
                 None,
             );
-            std::env::set_var("HOME", fresh_cache_home.path());
+            let _fresh_env = EnvGuard::set(&[
+                ("HOME", fresh_cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", fresh_cache_home.path().as_os_str()),
+            ]);
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7255,11 +7237,6 @@ mod tests {
             );
 
             assert_eq!(warm_messages, fresh_messages);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7269,11 +7246,13 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let codex_dir = source_home.path().join(".codex/sessions");
+            let codex_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&codex_dir).unwrap();
             let path = codex_dir.join("session.jsonl");
             std::fs::write(
@@ -7320,7 +7299,10 @@ mod tests {
                 .get(&path)
                 .is_none());
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            let _fresh_env = EnvGuard::set(&[
+                ("HOME", fresh_cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", fresh_cache_home.path().as_os_str()),
+            ]);
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7329,11 +7311,6 @@ mod tests {
 
             assert_eq!(warm_messages, fresh_messages);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7341,11 +7318,13 @@ mod tests {
     fn test_exact_hit_codex_cache_repairs_fallback_timestamps_without_incremental_state() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let session_dir = source_home.path().join(".codex/sessions");
+            let session_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&session_dir).unwrap();
             let path = session_dir.join("session.jsonl");
             std::fs::write(
@@ -7385,11 +7364,6 @@ mod tests {
 
             assert_eq!(messages, expected);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7398,11 +7372,13 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let session_dir = source_home.path().join(".codex/sessions");
+            let session_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&session_dir).unwrap();
             let path = session_dir.join("session.jsonl");
             let contents = concat!(
@@ -7429,7 +7405,10 @@ mod tests {
                 None,
             );
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            let _fresh_env = EnvGuard::set(&[
+                ("HOME", fresh_cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", fresh_cache_home.path().as_os_str()),
+            ]);
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7439,11 +7418,6 @@ mod tests {
             assert_eq!(warm_messages, fresh_messages);
             assert_ne!(warm_messages[0].timestamp, initial_messages[0].timestamp);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7451,11 +7425,13 @@ mod tests {
     fn test_full_log_parse_preserves_valid_messages_before_invalid_line_error() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let session_dir = source_home.path().join(".codex/sessions");
+            let session_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&session_dir).unwrap();
             let path = session_dir.join("session.jsonl");
 
@@ -7484,11 +7460,6 @@ mod tests {
             let cache = message_cache::SourceMessageCache::load();
             assert!(cache.get(&path).is_none());
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7497,11 +7468,13 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let session_dir = source_home.path().join(".codex/sessions");
+            let session_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&session_dir).unwrap();
             let path = session_dir.join("session.jsonl");
             std::fs::write(
@@ -7547,7 +7520,10 @@ mod tests {
                 None,
             );
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            let _fresh_env = EnvGuard::set(&[
+                ("HOME", fresh_cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", fresh_cache_home.path().as_os_str()),
+            ]);
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7558,15 +7534,10 @@ mod tests {
             assert_eq!(resumed_messages.len(), 1);
             assert_eq!(resumed_messages[0].model_id, "gpt-5.5");
 
-            std::env::set_var("HOME", cache_home.path());
+            drop(_fresh_env);
             assert!(message_cache::SourceMessageCache::load()
                 .get(&path)
                 .is_some());
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7576,11 +7547,13 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
-            let session_dir = source_home.path().join(".codex/sessions");
+            let session_dir = scanner_fixture_path(source_home.path(), ".codex/sessions");
             std::fs::create_dir_all(&session_dir).unwrap();
             let path = session_dir.join("session.jsonl");
             std::fs::write(
@@ -7625,7 +7598,10 @@ mod tests {
                 None,
             );
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            let _fresh_env = EnvGuard::set(&[
+                ("HOME", fresh_cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", fresh_cache_home.path().as_os_str()),
+            ]);
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7635,11 +7611,6 @@ mod tests {
             assert_eq!(warm_messages, fresh_messages);
             assert_eq!(warm_messages.len(), 2);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7647,8 +7618,10 @@ mod tests {
     fn test_source_cache_does_not_reuse_priced_cost_without_pricing_service() {
         let temp_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", temp_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", temp_home.path().as_os_str()),
+        ]);
         {
             let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
             std::fs::create_dir_all(&cursor_cache_dir).unwrap();
@@ -7685,11 +7658,6 @@ mod tests {
 
             assert_eq!(cached_messages.len(), 1);
             assert_eq!(cached_messages[0].cost, 0.0);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7792,7 +7760,7 @@ mod tests {
     fn test_cost_provenance_matches_materialized_and_streaming_lanes() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set(&[("HOME", cache_home.path().as_os_str())]);
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
 
         let opencode_data_dir = source_home.path().join(".local/share/opencode");
         std::fs::create_dir_all(&opencode_data_dir).unwrap();
@@ -8584,8 +8552,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_parse_all_messages_with_pricing_keeps_gateway_message_under_synthetic_filter() {
+        let cache_home = tempfile::TempDir::new().unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), temp_dir.path());
         let message_dir = temp_dir
             .path()
             .join(".local/share/opencode/storage/message/project-1");
@@ -8643,8 +8614,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_parse_all_messages_fireworks_provider_kept_under_synthetic_only_filter() {
+        let cache_home = tempfile::TempDir::new().unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), temp_dir.path());
         let message_dir = temp_dir
             .path()
             .join(".local/share/opencode/storage/message/project-1");
@@ -9096,8 +9070,10 @@ mod tests {
     fn test_streaming_antigravity_cli_keeps_colliding_response_ids_across_conversations() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             let conversations_dir = source_home
@@ -9124,11 +9100,6 @@ mod tests {
                 "both conversations reusing responseId \"SHARED\" must survive"
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     // jcode (`~/.jcode/sessions/session_*.json`) must be discovered by the
@@ -9140,8 +9111,10 @@ mod tests {
     fn test_streaming_jcode_flows_through_lane() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             let sessions_dir = source_home.path().join(".jcode/sessions");
@@ -9170,11 +9143,6 @@ mod tests {
             assert_eq!(count, 1, "the jcode assistant message must flow through the streaming lane");
             assert_eq!(input_sum, 1200);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     // micode (`$XDG_DATA_HOME/micode/*.db`, WAL-mode SQLite) must be discovered
@@ -9186,8 +9154,10 @@ mod tests {
     fn test_streaming_micode_flows_with_authoritative_cost() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             let micode_dir = source_home.path().join(".local/share/mimocode");
@@ -9230,11 +9200,6 @@ mod tests {
                 (cost_sum - 0.05).abs() < 1e-9,
                 "authoritative micode cost must survive pricing (got {cost_sum})"
             );
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -10063,8 +10028,10 @@ mod tests {
     fn test_streaming_gjc_flows_with_authoritative_cost() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             let gjc_dir = source_home.path().join(".gjc/agent/sessions");
@@ -10095,11 +10062,6 @@ mod tests {
                 (cost_sum - 0.3).abs() < 1e-9,
                 "authoritative gjc cost must reach the sink (got {cost_sum})"
             );
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -10752,8 +10714,10 @@ mod tests {
     fn test_parse_all_messages_refreshes_cc_mirror_provider_when_variant_metadata_changes() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             let variant_dir = source_home.path().join(".cc-mirror/kimi-code");
@@ -10764,10 +10728,12 @@ mod tests {
             let variant_path = variant_dir.join("variant.json");
             std::fs::write(
                 &variant_path,
-                format!(
-                    r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                    config_dir.display()
-                ),
+                serde_json::json!({
+                    "name": "kimi-code",
+                    "provider": "kimi",
+                    "configDir": config_dir,
+                })
+                .to_string(),
             )
             .unwrap();
             let session_path = project_dir.join("session.jsonl");
@@ -10789,10 +10755,12 @@ mod tests {
 
             std::fs::write(
                 &variant_path,
-                format!(
-                    r#"{{"name":"kimi-code","provider":"minimax","configDir":"{}"}}"#,
-                    config_dir.display()
-                ),
+                serde_json::json!({
+                    "name": "kimi-code",
+                    "provider": "minimax",
+                    "configDir": config_dir,
+                })
+                .to_string(),
             )
             .unwrap();
 
@@ -10805,11 +10773,6 @@ mod tests {
             assert_eq!(refreshed_messages[0].client, "cc-mirror/kimi-code");
             assert_eq!(refreshed_messages[0].provider_id, "minimax");
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -10817,8 +10780,10 @@ mod tests {
     fn test_parse_all_messages_keeps_normal_claude_when_cc_mirror_points_at_claude_config() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
 
         {
             let claude_dir = source_home.path().join(".claude");
@@ -10836,10 +10801,12 @@ mod tests {
             std::fs::create_dir_all(&variant_dir).unwrap();
             std::fs::write(
                 variant_dir.join("variant.json"),
-                format!(
-                    r#"{{"name":"plain-mirror","provider":"mirror","configDir":"{}"}}"#,
-                    claude_dir.display()
-                ),
+                serde_json::json!({
+                    "name": "plain-mirror",
+                    "provider": "mirror",
+                    "configDir": claude_dir,
+                })
+                .to_string(),
             )
             .unwrap();
 
@@ -10850,11 +10817,6 @@ mod tests {
             );
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].client, "claude");
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
