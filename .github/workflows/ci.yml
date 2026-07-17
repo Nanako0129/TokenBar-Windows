@@ -33,9 +33,11 @@ jobs:
       - name: P/Invoke smoke (all entry points)
         run: dotnet run --project src/TokenBar.Smoke -c Release --no-build
         env:
-          # No credentials on the runner; skip the network-bound entry for
-          # deterministic CI (its decode path is covered on dev machines).
+          # Keep credential-bound agent usage and live pricing refreshes out of
+          # deterministic CI; their decode paths are covered on dev machines.
           TB_SMOKE_SKIP_NETWORK: "1"
+          TOKSCALE_CONFIG_DIR: ${{ runner.temp }}\tb-smoke-config
+          TOKSCALE_PRICING_CACHE_ONLY: "1"
       # Hermetic runtime check: point HOME at a synthetic ~/.claude/projects
       # tree and assert the engine actually parses messages on Windows —
       # "compiles + doesn't crash" alone can't tell a dead parser from an
@@ -50,6 +52,8 @@ jobs:
           {"type":"assistant","timestamp":"2026-04-01T10:00:02.000Z","requestId":"req_ci2","message":{"id":"msg_ci2","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":5}}}
           '@ | Set-Content -Path "$fx\.claude\projects\ci\session.jsonl" -Encoding utf8
           $env:HOME = $fx
+          $env:TOKSCALE_CONFIG_DIR = Join-Path $fx ".config\tokscale"
+          $env:TOKSCALE_PRICING_CACHE_ONLY = "1"
           $env:TB_SMOKE_MIN_MESSAGES = "2"
           $env:TB_SMOKE_SKIP_NETWORK = "1"
           dotnet run --project src/TokenBar.Smoke -c Release --no-build
