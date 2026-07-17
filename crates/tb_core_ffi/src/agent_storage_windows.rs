@@ -161,6 +161,161 @@ pub(crate) fn open_or_create_secure_file(path: &Path) -> io::Result<File> {
     )
 }
 
+/// Open or atomically create an exact secure lock file, acquire an exclusive
+/// `fs2` lock, then revalidate its owner, DACL, type, and pathname identity.
+///
+/// The returned `File` keeps both the exclusive lock and a Windows handle that
+/// does not share delete access. Callers may explicitly use
+/// `fs2::FileExt::unlock` or drop it. The caller must anchor `path` beneath the
+/// trusted per-user data parent.
+#[allow(dead_code)] // Stage 2A3a primitive; production callers are wired later.
+pub(crate) fn open_secure_lock_file(path: &Path) -> io::Result<File> {
+    let file = open_windows_path_with_share(
+        path,
+        GENERIC_READ | GENERIC_WRITE | STORAGE_SECURITY_ACCESS,
+        OPEN_ALWAYS,
+        StorageObjectKind::RegularFile.open_flags(),
+        VALIDATION_SHARE_MODE,
+    )?;
+    fs2::FileExt::lock_exclusive(&file)?;
+
+    let verification = (|| {
+        let handle = file.as_raw_handle() as HANDLE;
+        let identity = storage_identity(handle, StorageObjectKind::RegularFile)?;
+        verify_storage_handle(handle)?;
+        verify_path_identity(path, StorageObjectKind::RegularFile, identity)
+    })();
+    if let Err(error) = verification {
+        let _ = fs2::FileExt::unlock(&file);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Atomically replace `destination_path` with `staged_path` after exact secure
+/// validation. Both paths must be distinct direct children of `directory_path`,
+/// and `directory` must name that exact secure directory.
+///
+/// The caller must hold the exclusive lock returned by `open_secure_lock_file`
+/// for the whole operation. The staged file is flushed before commit. On a
+/// replace error this helper leaves staged-file cleanup to the caller. Post-commit
+/// verification or directory flush errors are reported honestly; the completed
+/// replace cannot be rolled back here.
+#[allow(dead_code)] // Stage 2A3a primitive; production callers are wired later.
+pub(crate) fn replace_secure_file(
+    directory: &File,
+    directory_path: &Path,
+    staged_path: &Path,
+    destination_path: &Path,
+) -> io::Result<()> {
+    replace_secure_file_with(
+        directory,
+        directory_path,
+        staged_path,
+        destination_path,
+        |staged, destination| tokscale_core::fs_atomic::replace_file(staged, destination),
+    )
+}
+
+fn replace_secure_file_with(
+    directory: &File,
+    directory_path: &Path,
+    staged_path: &Path,
+    destination_path: &Path,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    validate_replace_paths(directory_path, staged_path, destination_path)?;
+
+    let directory_handle = directory.as_raw_handle() as HANDLE;
+    let directory_identity = storage_identity(directory_handle, StorageObjectKind::Directory)?;
+    verify_storage_handle(directory_handle)?;
+    verify_path_identity(
+        directory_path,
+        StorageObjectKind::Directory,
+        directory_identity,
+    )?;
+
+    let staged_identity = {
+        let staged = open_existing_secure_file(staged_path, true)?;
+        staged.sync_all()?;
+        let identity = storage_identity(
+            staged.as_raw_handle() as HANDLE,
+            StorageObjectKind::RegularFile,
+        )?;
+        if identity.volume_serial_number != directory_identity.volume_serial_number {
+            return Err(security_verification_failed());
+        }
+        identity
+    };
+
+    let destination_identity = match open_existing_secure_file(destination_path, false) {
+        Ok(destination) => {
+            let identity = storage_identity(
+                destination.as_raw_handle() as HANDLE,
+                StorageObjectKind::RegularFile,
+            )?;
+            if identity.volume_serial_number != directory_identity.volume_serial_number {
+                return Err(security_verification_failed());
+            }
+            Some(identity)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if destination_identity == Some(staged_identity) {
+        return Err(security_verification_failed());
+    }
+
+    // Every staged/destination validation handle has left scope before the
+    // pathname-based vendor helper runs, so it cannot block MoveFileExW.
+    replace(staged_path, destination_path)?;
+
+    let installed_identity = {
+        let installed = open_existing_secure_file(destination_path, false)?;
+        storage_identity(
+            installed.as_raw_handle() as HANDLE,
+            StorageObjectKind::RegularFile,
+        )?
+    };
+    if installed_identity != staged_identity {
+        return Err(security_verification_failed());
+    }
+    match std::fs::symlink_metadata(staged_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(security_verification_failed()),
+        Err(error) => return Err(error),
+    }
+
+    verify_path_identity(
+        directory_path,
+        StorageObjectKind::Directory,
+        directory_identity,
+    )?;
+    flush_secure_storage_directory(directory)
+}
+
+fn validate_replace_paths(
+    directory_path: &Path,
+    staged_path: &Path,
+    destination_path: &Path,
+) -> io::Result<()> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Windows storage replace path",
+        )
+    };
+    if staged_path == destination_path
+        || staged_path.file_name().is_none()
+        || destination_path.file_name().is_none()
+        || staged_path.parent() != Some(directory_path)
+        || destination_path.parent() != Some(directory_path)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// Verify that a currently open secure regular file names the same non-reparse
 /// object at `path` during this call. This function never mutates either object.
 /// The guarantee is point-in-time only: keep using `file`, and call this again
@@ -1234,6 +1389,31 @@ mod tests {
         Ok(bytes)
     }
 
+    fn regular_file_identity(file: &File) -> io::Result<StorageIdentity> {
+        storage_identity(
+            file.as_raw_handle() as HANDLE,
+            StorageObjectKind::RegularFile,
+        )
+    }
+
+    fn create_secure_test_file(
+        path: &Path,
+        contents: &[u8],
+    ) -> io::Result<(File, StorageIdentity)> {
+        let mut file = create_new_secure_file(path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        let identity = regular_file_identity(&file)?;
+        Ok((file, identity))
+    }
+
+    fn read_secure_test_file(path: &Path) -> io::Result<(Vec<u8>, StorageIdentity)> {
+        let mut file = open_existing_secure_file(path, false)?;
+        let identity = regular_file_identity(&file)?;
+        let bytes = read_open_file(&mut file)?;
+        Ok((bytes, identity))
+    }
+
     fn sid_string(sid: &Sid) -> io::Result<String> {
         let mut wide = null_mut();
         if unsafe { ConvertSidToStringSidW(sid.as_psid(), &mut wide) } == 0 {
@@ -1582,6 +1762,600 @@ mod tests {
 
         drop(reopened_lock);
         drop(reopened);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_lock_preserves_one_identity_and_blocks_delete_until_handles_drop() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let lock_path = storage_path.join("history.lock");
+        let renamed_path = storage_path.join("history.lock.renamed");
+
+        let first = open_secure_lock_file(&lock_path).expect("acquire secure lock");
+        let first_identity = regular_file_identity(&first).expect("read first lock identity");
+        verify_storage_handle(first.as_raw_handle() as HANDLE).expect("lock DACL is exact");
+        verify_secure_file_path(&first, &lock_path).expect("first lock path identity verifies");
+
+        let second = open_windows_path_with_share(
+            &lock_path,
+            GENERIC_READ | GENERIC_WRITE | STORAGE_SECURITY_ACCESS,
+            OPEN_EXISTING,
+            StorageObjectKind::RegularFile.open_flags(),
+            VALIDATION_SHARE_MODE,
+        )
+        .expect("open second lock handle");
+        let second_identity = regular_file_identity(&second).expect("read second lock identity");
+        verify_storage_handle(second.as_raw_handle() as HANDLE)
+            .expect("second handle DACL is exact");
+        assert!(
+            first_identity == second_identity,
+            "both lock handles name the same file identity"
+        );
+        fs2::FileExt::try_lock_exclusive(&second)
+            .expect_err("second exclusive lock attempt fails while first holds it");
+
+        fs::rename(&lock_path, &renamed_path)
+            .expect_err("live no-share-delete handles block rename");
+        fs::remove_file(&lock_path).expect_err("live no-share-delete handles block delete");
+        assert!(lock_path.exists(), "lock pathname remains installed");
+
+        fs2::FileExt::unlock(&first).expect("release first exclusive lock");
+        drop(second);
+        drop(first);
+        fs::rename(&lock_path, &renamed_path).expect("rename succeeds after lock handles drop");
+        let renamed = open_existing_secure_file(&renamed_path, false)
+            .expect("renamed lock remains an exact secure file");
+        assert!(
+            regular_file_identity(&renamed).expect("read renamed lock identity") == first_identity,
+            "rename preserves the lock identity"
+        );
+
+        drop(renamed);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_atomic_replace_existing_destination_preserves_staged_identity() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let staged_path = storage_path.join("history.tmp");
+        let destination_path = storage_path.join("history.json");
+
+        let (staged, staged_identity) =
+            create_secure_test_file(&staged_path, b"new history").expect("create staged file");
+        let (destination, old_identity) =
+            create_secure_test_file(&destination_path, b"last-good history")
+                .expect("create destination file");
+        assert!(
+            staged_identity != old_identity,
+            "staged and destination identities start distinct"
+        );
+        drop(destination);
+        drop(staged);
+
+        replace_secure_file(&directory, &storage_path, &staged_path, &destination_path)
+            .expect("replace existing destination and flush directory");
+
+        let (bytes, installed_identity) =
+            read_secure_test_file(&destination_path).expect("open exact installed destination");
+        assert!(
+            bytes == b"new history",
+            "installed bytes come from staged file"
+        );
+        assert!(
+            installed_identity == staged_identity,
+            "installed destination keeps staged file identity"
+        );
+        assert!(
+            std::fs::symlink_metadata(&staged_path)
+                .expect_err("staged pathname disappears")
+                .kind()
+                == io::ErrorKind::NotFound,
+            "staged pathname is absent after replace"
+        );
+
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_atomic_replace_absent_destination_preserves_staged_identity() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let staged_path = storage_path.join("account.tmp");
+        let destination_path = storage_path.join("account.json");
+        let (staged, staged_identity) =
+            create_secure_test_file(&staged_path, b"new account").expect("create staged file");
+        drop(staged);
+        assert!(!destination_path.exists(), "destination starts absent");
+
+        replace_secure_file(&directory, &storage_path, &staged_path, &destination_path)
+            .expect("install absent destination and flush directory");
+
+        let (bytes, installed_identity) =
+            read_secure_test_file(&destination_path).expect("open exact installed destination");
+        assert!(
+            bytes == b"new account",
+            "installed bytes come from staged file"
+        );
+        assert!(
+            installed_identity == staged_identity,
+            "new destination keeps staged file identity"
+        );
+        assert!(!staged_path.exists(), "staged pathname disappears");
+
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn injected_replace_failure_preserves_destination_and_staged_files() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let staged_path = storage_path.join("history.tmp");
+        let destination_path = storage_path.join("history.json");
+        let (staged, staged_identity) =
+            create_secure_test_file(&staged_path, b"staged bytes").expect("create staged file");
+        let (destination, destination_identity) =
+            create_secure_test_file(&destination_path, b"last-good bytes")
+                .expect("create destination file");
+        drop(destination);
+        drop(staged);
+
+        let mut replace_called = false;
+        replace_secure_file_with(
+            &directory,
+            &storage_path,
+            &staged_path,
+            &destination_path,
+            |_, _| {
+                replace_called = true;
+                Err(io::Error::other("injected replace failure"))
+            },
+        )
+        .expect_err("injected replace failure is returned");
+        assert!(replace_called, "replace seam was reached");
+
+        let (destination_bytes, destination_after) =
+            read_secure_test_file(&destination_path).expect("reopen last-good destination");
+        assert!(
+            destination_bytes == b"last-good bytes" && destination_after == destination_identity,
+            "failed replace preserves destination bytes and identity"
+        );
+        let (staged_bytes, staged_after) =
+            read_secure_test_file(&staged_path).expect("reopen caller-owned staged file");
+        assert!(
+            staged_bytes == b"staged bytes" && staged_after == staged_identity,
+            "failed replace leaves staged bytes and identity for caller cleanup"
+        );
+
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_replace_rejects_permissive_staged_and_destination_without_mutation() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+
+        let staged_for_destination = storage_path.join("destination-check.tmp");
+        let permissive_destination_path = storage_path.join("permissive-destination.json");
+        let (staged, staged_identity) =
+            create_secure_test_file(&staged_for_destination, b"new bytes")
+                .expect("create secure staged file");
+        let permissive_destination =
+            create_permissive_test_file(&permissive_destination_path, b"permissive last-good")
+                .expect("create permissive destination");
+        let permissive_destination_identity =
+            regular_file_identity(&permissive_destination).expect("read permissive identity");
+        let permissive_destination_acl =
+            read_acl_snapshot(permissive_destination.as_raw_handle() as HANDLE)
+                .expect("snapshot permissive destination DACL");
+        drop(staged);
+
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &staged_for_destination,
+            &permissive_destination_path,
+        )
+        .expect_err("permissive destination is rejected before replace");
+        assert!(
+            fs::read(&permissive_destination_path).expect("read permissive destination")
+                == b"permissive last-good"
+                && regular_file_identity(&permissive_destination)
+                    .expect("reread permissive destination identity")
+                    == permissive_destination_identity
+                && read_acl_snapshot(permissive_destination.as_raw_handle() as HANDLE)
+                    .expect("reread permissive destination DACL")
+                    == permissive_destination_acl,
+            "destination rejection preserves bytes, identity, and DACL"
+        );
+        let (staged_bytes, staged_after) = read_secure_test_file(&staged_for_destination)
+            .expect("reopen rejected secure staged file");
+        assert!(
+            staged_bytes == b"new bytes" && staged_after == staged_identity,
+            "destination rejection preserves staged file"
+        );
+
+        let permissive_staged_path = storage_path.join("permissive-staged.tmp");
+        let destination_for_staged = storage_path.join("staged-check.json");
+        let permissive_staged =
+            create_permissive_test_file(&permissive_staged_path, b"permissive staged")
+                .expect("create permissive staged file");
+        let permissive_staged_identity =
+            regular_file_identity(&permissive_staged).expect("read permissive staged identity");
+        let permissive_staged_acl = read_acl_snapshot(permissive_staged.as_raw_handle() as HANDLE)
+            .expect("snapshot permissive staged DACL");
+        let (destination, destination_identity) =
+            create_secure_test_file(&destination_for_staged, b"secure last-good")
+                .expect("create secure destination");
+        drop(destination);
+
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &permissive_staged_path,
+            &destination_for_staged,
+        )
+        .expect_err("permissive staged file is rejected before replace");
+        assert!(
+            fs::read(&permissive_staged_path).expect("read permissive staged file")
+                == b"permissive staged"
+                && regular_file_identity(&permissive_staged)
+                    .expect("reread permissive staged identity")
+                    == permissive_staged_identity
+                && read_acl_snapshot(permissive_staged.as_raw_handle() as HANDLE)
+                    .expect("reread permissive staged DACL")
+                    == permissive_staged_acl,
+            "staged rejection preserves permissive bytes, identity, and DACL"
+        );
+        let (destination_bytes, destination_after) =
+            read_secure_test_file(&destination_for_staged).expect("reopen secure last-good");
+        assert!(
+            destination_bytes == b"secure last-good" && destination_after == destination_identity,
+            "staged rejection preserves destination bytes and identity"
+        );
+
+        drop(permissive_staged);
+        drop(permissive_destination);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_replace_rejects_final_reparse_points_without_touching_targets() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+
+        let destination_target_path = storage_path.join("destination-target.json");
+        let destination_link_path = storage_path.join("destination-link.json");
+        let staged_for_link = storage_path.join("destination-link.tmp");
+        let (target, target_identity) =
+            create_secure_test_file(&destination_target_path, b"destination target")
+                .expect("create destination link target");
+        let (staged, staged_identity) =
+            create_secure_test_file(&staged_for_link, b"staged for destination link")
+                .expect("create staged file");
+        drop(target);
+        drop(staged);
+        symlink_file(&destination_target_path, &destination_link_path)
+            .expect("create final destination symlink");
+
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &staged_for_link,
+            &destination_link_path,
+        )
+        .expect_err("final destination reparse point is rejected");
+        assert!(
+            fs::symlink_metadata(&destination_link_path)
+                .expect("destination link remains")
+                .file_type()
+                .is_symlink(),
+            "destination reparse point is not replaced"
+        );
+        let (target_bytes, target_after) = read_secure_test_file(&destination_target_path)
+            .expect("reopen destination link target");
+        assert!(
+            target_bytes == b"destination target" && target_after == target_identity,
+            "destination link target remains unchanged"
+        );
+        let (staged_bytes, staged_after) =
+            read_secure_test_file(&staged_for_link).expect("reopen staged file");
+        assert!(
+            staged_bytes == b"staged for destination link" && staged_after == staged_identity,
+            "rejected destination link leaves staged file unchanged"
+        );
+
+        let staged_target_path = storage_path.join("staged-target.json");
+        let staged_link_path = storage_path.join("staged-link.tmp");
+        let destination_for_link = storage_path.join("staged-link-destination.json");
+        let (staged_target, staged_target_identity) =
+            create_secure_test_file(&staged_target_path, b"staged target")
+                .expect("create staged link target");
+        let (destination, destination_identity) =
+            create_secure_test_file(&destination_for_link, b"last-good for staged link")
+                .expect("create destination for staged link");
+        drop(staged_target);
+        drop(destination);
+        symlink_file(&staged_target_path, &staged_link_path).expect("create final staged symlink");
+
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &staged_link_path,
+            &destination_for_link,
+        )
+        .expect_err("final staged reparse point is rejected");
+        assert!(
+            fs::symlink_metadata(&staged_link_path)
+                .expect("staged link remains")
+                .file_type()
+                .is_symlink(),
+            "staged reparse point remains untouched"
+        );
+        let (staged_target_bytes, staged_target_after) =
+            read_secure_test_file(&staged_target_path).expect("reopen staged link target");
+        assert!(
+            staged_target_bytes == b"staged target"
+                && staged_target_after == staged_target_identity,
+            "staged link target remains unchanged"
+        );
+        let (destination_bytes, destination_after) =
+            read_secure_test_file(&destination_for_link).expect("reopen last-good destination");
+        assert!(
+            destination_bytes == b"last-good for staged link"
+                && destination_after == destination_identity,
+            "rejected staged link preserves last-good destination"
+        );
+
+        fs::remove_file(&destination_link_path).expect("remove destination symlink");
+        fs::remove_file(&staged_link_path).expect("remove staged symlink");
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_replace_rejects_wrong_types_without_touching_last_good() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+
+        let staged_directory_path = storage_path.join("staged-directory");
+        let staged_directory = ensure_secure_storage_directory(&staged_directory_path)
+            .expect("create wrong-type staged directory");
+        let staged_marker = staged_directory_path.join("marker.bin");
+        fs::write(&staged_marker, b"staged directory marker").expect("write staged marker");
+        let destination_path = storage_path.join("wrong-staged.json");
+        let (destination, destination_identity) =
+            create_secure_test_file(&destination_path, b"last-good wrong staged")
+                .expect("create last-good destination");
+        drop(destination);
+
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &staged_directory_path,
+            &destination_path,
+        )
+        .expect_err("directory staged object is rejected");
+        assert!(
+            fs::read(&staged_marker).expect("read staged directory marker")
+                == b"staged directory marker",
+            "wrong-type staged directory remains unchanged"
+        );
+        let (destination_bytes, destination_after) =
+            read_secure_test_file(&destination_path).expect("reopen last-good destination");
+        assert!(
+            destination_bytes == b"last-good wrong staged"
+                && destination_after == destination_identity,
+            "wrong-type staged rejection preserves last-good destination"
+        );
+
+        let destination_directory_path = storage_path.join("destination-directory");
+        let destination_directory = ensure_secure_storage_directory(&destination_directory_path)
+            .expect("create wrong-type destination directory");
+        let destination_marker = destination_directory_path.join("marker.bin");
+        fs::write(&destination_marker, b"destination directory marker")
+            .expect("write destination marker");
+        let staged_path = storage_path.join("wrong-destination.tmp");
+        let (staged, staged_identity) =
+            create_secure_test_file(&staged_path, b"staged wrong destination")
+                .expect("create staged file");
+        drop(staged);
+
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &staged_path,
+            &destination_directory_path,
+        )
+        .expect_err("directory destination object is rejected");
+        assert!(
+            fs::read(&destination_marker).expect("read destination directory marker")
+                == b"destination directory marker",
+            "wrong-type destination directory remains unchanged"
+        );
+        let (staged_bytes, staged_after) =
+            read_secure_test_file(&staged_path).expect("reopen rejected staged file");
+        assert!(
+            staged_bytes == b"staged wrong destination" && staged_after == staged_identity,
+            "wrong-type destination rejection preserves staged file"
+        );
+
+        drop(destination_directory);
+        drop(staged_directory);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_replace_rejects_invalid_cross_directory_and_same_identity_paths() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let other_storage_path = root.join("other-storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let other_directory = ensure_secure_storage_directory(&other_storage_path)
+            .expect("create second secure directory");
+
+        let cross_staged_path = other_storage_path.join("cross-staged.tmp");
+        let destination_path = storage_path.join("cross-staged.json");
+        let (cross_staged, cross_staged_identity) =
+            create_secure_test_file(&cross_staged_path, b"cross staged")
+                .expect("create cross-directory staged file");
+        let (destination, destination_identity) =
+            create_secure_test_file(&destination_path, b"cross staged last-good")
+                .expect("create destination");
+        drop(cross_staged);
+        drop(destination);
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &cross_staged_path,
+            &destination_path,
+        )
+        .expect_err("cross-directory staged path is rejected");
+        assert!(
+            read_secure_test_file(&cross_staged_path).expect("reopen cross-directory staged file")
+                == (b"cross staged".to_vec(), cross_staged_identity),
+            "cross-directory staged file remains unchanged"
+        );
+        assert!(
+            read_secure_test_file(&destination_path).expect("reopen cross-staged destination")
+                == (b"cross staged last-good".to_vec(), destination_identity),
+            "cross-directory staged rejection preserves destination"
+        );
+
+        let staged_path = storage_path.join("cross-destination.tmp");
+        let cross_destination_path = other_storage_path.join("cross-destination.json");
+        let (staged, staged_identity) = create_secure_test_file(&staged_path, b"local staged")
+            .expect("create local staged file");
+        let (cross_destination, cross_destination_identity) =
+            create_secure_test_file(&cross_destination_path, b"remote last-good")
+                .expect("create cross-directory destination");
+        drop(staged);
+        drop(cross_destination);
+        replace_secure_file(
+            &directory,
+            &storage_path,
+            &staged_path,
+            &cross_destination_path,
+        )
+        .expect_err("cross-directory destination path is rejected");
+        assert!(
+            read_secure_test_file(&staged_path).expect("reopen local staged file")
+                == (b"local staged".to_vec(), staged_identity),
+            "cross-directory destination rejection preserves staged file"
+        );
+        assert!(
+            read_secure_test_file(&cross_destination_path)
+                .expect("reopen cross-directory destination")
+                == (b"remote last-good".to_vec(), cross_destination_identity),
+            "cross-directory destination remains unchanged"
+        );
+
+        assert!(
+            validate_replace_paths(&storage_path, Path::new(""), &destination_path).is_err(),
+            "missing staged filename is rejected"
+        );
+        replace_secure_file(&directory, &storage_path, &staged_path, &staged_path)
+            .expect_err("identical staged and destination paths are rejected");
+        assert!(
+            read_secure_test_file(&staged_path).expect("reopen identical-path file")
+                == (b"local staged".to_vec(), staged_identity),
+            "identical path rejection leaves file unchanged"
+        );
+
+        let hard_link_path = storage_path.join("same-identity.json");
+        fs::hard_link(&staged_path, &hard_link_path).expect("create same-identity hard link");
+        replace_secure_file(&directory, &storage_path, &staged_path, &hard_link_path)
+            .expect_err("distinct paths with the same file identity are rejected");
+        assert!(
+            read_secure_test_file(&staged_path)
+                .expect("reopen staged hard-link identity")
+                .1
+                == staged_identity
+                && read_secure_test_file(&hard_link_path)
+                    .expect("reopen destination hard-link identity")
+                    .1
+                    == staged_identity,
+            "same-identity rejection preserves both hard-link pathnames"
+        );
+
+        drop(other_directory);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn injected_post_replace_identity_mismatch_is_detected() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let staged_path = storage_path.join("history.tmp");
+        let destination_path = storage_path.join("history.json");
+        let alternate_path = storage_path.join("alternate.tmp");
+        let displaced_path = storage_path.join("displaced-staged.json");
+        let (staged, staged_identity) =
+            create_secure_test_file(&staged_path, b"expected staged bytes")
+                .expect("create expected staged file");
+        let (destination, _) = create_secure_test_file(&destination_path, b"old destination")
+            .expect("create old destination");
+        let (alternate, alternate_identity) =
+            create_secure_test_file(&alternate_path, b"unexpected secure bytes")
+                .expect("create alternate secure file");
+        drop(alternate);
+        drop(destination);
+        drop(staged);
+
+        replace_secure_file_with(
+            &directory,
+            &storage_path,
+            &staged_path,
+            &destination_path,
+            |staged, destination| {
+                tokscale_core::fs_atomic::replace_file(staged, &displaced_path)?;
+                tokscale_core::fs_atomic::replace_file(&alternate_path, destination)
+            },
+        )
+        .expect_err("post-replace identity mismatch is detected");
+
+        let (installed_bytes, installed_identity) =
+            read_secure_test_file(&destination_path).expect("reopen injected destination");
+        assert!(
+            installed_bytes == b"unexpected secure bytes"
+                && installed_identity == alternate_identity
+                && installed_identity != staged_identity,
+            "injected alternate file is present and visibly has the wrong identity"
+        );
+        let (displaced_bytes, displaced_identity) =
+            read_secure_test_file(&displaced_path).expect("reopen displaced expected staged file");
+        assert!(
+            displaced_bytes == b"expected staged bytes" && displaced_identity == staged_identity,
+            "expected staged identity is distinct and retained by the injected seam"
+        );
+        assert!(!staged_path.exists(), "original staged pathname is absent");
+
         drop(directory);
         root.cleanup().expect("remove temporary root");
     }
