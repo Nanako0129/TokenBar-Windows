@@ -439,16 +439,16 @@ public sealed partial class FlyoutWindow : Window
         _acrylicConfig = new SystemBackdropConfiguration
         {
             IsInputActive = true,
-            Theme = SystemBackdropTheme.Default,
         };
         _acrylic = new DesktopAcrylicController
         {
-            // Default acrylic reads nearly opaque-black; thin it out so the
-            // desktop shows through (closer to the macOS popover glass).
-            TintColor = Windows.UI.Color.FromArgb(255, 28, 28, 34),
+            // Default acrylic reads nearly opaque; thin it out so the desktop
+            // shows through (closer to the macOS popover glass).
             TintOpacity = 0.25f,
             LuminosityOpacity = 0.55f,
         };
+        ApplyAcrylicTheme();
+        Dashboard.ActualThemeChanged += (_, _) => ApplyAcrylicTheme();
         _acrylic.AddSystemBackdropTarget(
             WinRT.CastExtensions.As<Microsoft.UI.Composition.ICompositionSupportsSystemBackdrop>(this));
         _acrylic.SetSystemBackdropConfiguration(_acrylicConfig);
@@ -457,6 +457,23 @@ public sealed partial class FlyoutWindow : Window
             _acrylic?.Dispose();
             _acrylic = null;
         };
+    }
+
+    private void ApplyAcrylicTheme()
+    {
+        if (_acrylic is null || _acrylicConfig is null)
+        {
+            return;
+        }
+
+        var dark = Dashboard.ActualTheme == ElementTheme.Dark;
+        _acrylicConfig.Theme = dark
+            ? SystemBackdropTheme.Dark
+            : SystemBackdropTheme.Light;
+        _acrylic.TintColor = dark
+            ? Windows.UI.Color.FromArgb(255, 28, 28, 34)
+            : Windows.UI.Color.FromArgb(255, 243, 243, 243);
+        DevLog.Write($"acrylic: theme={(dark ? "dark" : "light")}");
     }
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
