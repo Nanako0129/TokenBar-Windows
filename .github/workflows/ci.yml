@@ -26,6 +26,8 @@ jobs:
         run: cargo test --workspace --release
       - name: dotnet build
         run: dotnet build src/TokenBar.slnx -c Release
+      - name: dotnet build (WinUI App x64)
+        run: dotnet build src/TokenBar.App -c Release -p:Platform=x64
       - name: dotnet test
         run: dotnet test src/TokenBar.slnx -c Release --no-build
       - name: P/Invoke smoke (all entry points)
