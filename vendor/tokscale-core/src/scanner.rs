@@ -1264,6 +1264,12 @@ mod tests {
         }
     }
 
+    fn scan_without_extra_dirs(home_dir: &str, clients: &[String]) -> ScanResult {
+        let mut extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+        extra.remove("TOKSCALE_EXTRA_DIRS");
+        scan_all_clients(home_dir, clients)
+    }
+
     struct CwdGuard(PathBuf);
 
     impl CwdGuard {
@@ -1763,7 +1769,7 @@ mod tests {
         // Set XDG_DATA_HOME for the test
         _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["opencode".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["opencode".to_string()]);
         assert_eq!(result.get(ClientId::OpenCode).len(), 1);
         assert!(result.get(ClientId::Claude).is_empty());
         assert!(result.get(ClientId::Codex).is_empty());
@@ -2466,7 +2472,7 @@ mod tests {
 
         _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["opencode".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["opencode".to_string()]);
 
         let names: Vec<String> = result
             .opencode_dbs
@@ -2541,7 +2547,7 @@ mod tests {
         let zed_db = setup_mock_zed_xdg_db(home);
         _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["zed".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["zed".to_string()]);
 
         assert_eq!(result.zed_db.as_ref(), Some(&zed_db));
     }
@@ -2557,7 +2563,7 @@ mod tests {
         let zed_db = setup_mock_zed_macos_db(home);
         _xdg.remove("XDG_DATA_HOME");
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["zed".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["zed".to_string()]);
 
         assert_eq!(result.zed_db.as_ref(), Some(&zed_db));
     }
@@ -2786,7 +2792,7 @@ mod tests {
 
         _exporter.set("COPILOT_OTEL_FILE_EXPORTER_PATH", &explicit_file);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["copilot".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["copilot".to_string()]);
 
         assert_eq!(result.get(ClientId::Copilot), &vec![explicit_file]);
     }
@@ -2986,7 +2992,7 @@ mod tests {
 
         _xdg.set("XDG_DATA_HOME", &xdg);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["crush".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["crush".to_string()]);
         assert_eq!(
             result.crush_dbs,
             vec![CrushDbSource {
@@ -3016,7 +3022,7 @@ mod tests {
         fs::create_dir_all(mac_root.join("codex")).unwrap();
         File::create(mac_root.join("codex").join("codex.jsonl")).unwrap();
 
-        let result = scan_all_clients(
+        let result = scan_without_extra_dirs(
             home.to_str().unwrap(),
             &[
                 "claude".to_string(),
@@ -3042,7 +3048,7 @@ mod tests {
         // Set CODEX_HOME environment variable
         _codex.set("CODEX_HOME", home.join(".codex"));
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["codex".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
         assert_eq!(result.get(ClientId::Codex).len(), 1);
     }
 
@@ -3080,7 +3086,7 @@ mod tests {
 
         _codex.set("CODEX_HOME", home.join(".codex"));
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["codex".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
         assert_eq!(result.get(ClientId::Codex).len(), 1);
         assert!(result.get(ClientId::Codex)[0].ends_with("archived.jsonl"));
     }
@@ -3097,7 +3103,7 @@ mod tests {
 
         _codex.set("CODEX_HOME", home.join(".codex"));
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["codex".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
         assert_eq!(result.get(ClientId::Codex).len(), 2);
     }
 
@@ -3309,7 +3315,7 @@ mod tests {
         setup_mock_codebuff_chat(home, "manicode-dev", "2025-12-14T11-00-00.000Z");
         setup_mock_codebuff_chat(home, "manicode-staging", "2025-12-14T12-00-00.000Z");
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["codebuff".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codebuff".to_string()]);
         assert_eq!(result.get(ClientId::Codebuff).len(), 3);
     }
 
@@ -3326,7 +3332,7 @@ mod tests {
         setup_mock_codebuff_chat(home, "manicode", "2025-12-14T10-00-00.000Z");
         setup_mock_codebuff_chat(home, "manicode-dev", "2025-12-14T11-00-00.000Z");
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["codebuff".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codebuff".to_string()]);
         assert_eq!(result.get(ClientId::Codebuff).len(), 2);
     }
 
@@ -3351,7 +3357,7 @@ mod tests {
 
         _codebuff.set("CODEBUFF_DATA_DIR", &override_root);
 
-        let result = scan_all_clients(home.to_str().unwrap(), &["codebuff".to_string()]);
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codebuff".to_string()]);
         assert_eq!(result.get(ClientId::Codebuff).len(), 1);
         assert!(result.get(ClientId::Codebuff)[0]
             .to_string_lossy()
