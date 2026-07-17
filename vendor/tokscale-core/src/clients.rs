@@ -33,17 +33,10 @@ impl PathRoot {
                     if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
                         return format!("{xdg_config_home}/tokscale");
                     }
-                }
 
-                // Match paths::get_config_dir() platform branches so the
-                // scanner reads from the same root the writer (e.g.
-                // get_antigravity_cache_dir) targets. Hardcoding
-                // `{home}/.config/tokscale` everywhere would diverge from
-                // dirs::config_dir() on Windows (where it resolves to
-                // %APPDATA%\tokscale), causing synced data to land in
-                // %APPDATA% while the scanner looks in %USERPROFILE%.
-                #[cfg(target_os = "windows")]
-                {
+                    // Match paths::get_config_dir() so default Windows scans
+                    // read the same %APPDATA% root used by cache writers.
+                    #[cfg(target_os = "windows")]
                     if let Some(dir) = dirs::config_dir() {
                         return dir.join("tokscale").to_string_lossy().into_owned();
                     }
@@ -698,7 +691,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[cfg(not(target_os = "windows"))]
     fn test_path_root_config_ignores_env_when_disabled() {
         let mut _env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR", "XDG_CONFIG_HOME"]);
         _env.set("TOKSCALE_CONFIG_DIR", "/tmp/custom-config-root");
