@@ -37,6 +37,7 @@ public sealed partial class DashboardView : UserControl
     private HashSet<string> _selectedSet = new(StringComparer.Ordinal);
     private UsageStats? _selectedStats;
     private string _activeClientTab = ClientRegistry.OverviewTab;
+    private string _clientTabsSignature = "";
     private string? _expandedDay; // Daily drill-down state
     private bool _hourlyProfileMode;
     private int _hourlyWindow = 48; // Timeline rows shown; +48 per "Show more"
@@ -379,6 +380,7 @@ public sealed partial class DashboardView : UserControl
         _selectedSet = new HashSet<string>(selection.SelectedClients, StringComparer.Ordinal);
         _selectedStats = new UsageStats(snapshot.Graph, _selectedSet);
         _activeClientTab = selection.ActiveTab;
+        UpdateClientTabs();
 
         if (_model?.SetClientSelection(selection.SelectedClients) == true
             && _model.Current is { } current)
@@ -546,6 +548,51 @@ public sealed partial class DashboardView : UserControl
                 ? (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"]
                 : new SolidColorBrush(Colors.Transparent);
         }
+    }
+
+    private void UpdateClientTabs()
+    {
+        var signature = $"{_activeClientTab}|{string.Join(',', _displayClients)}";
+        if (signature == _clientTabsSignature)
+        {
+            return;
+        }
+
+        _clientTabsSignature = signature;
+        ClientTabsPanel.Children.Clear();
+        AddClientTab(ClientRegistry.OverviewTab, "Overview");
+        foreach (var id in _displayClients)
+        {
+            AddClientTab(id, ClientRegistry.ShortName(id));
+        }
+    }
+
+    private void AddClientTab(string id, string label)
+    {
+        var active = id == _activeClientTab;
+        var button = new Button
+        {
+            Content = label,
+            FontSize = 11,
+            Padding = new Thickness(9, 4, 9, 4),
+            FontWeight = active
+                ? Microsoft.UI.Text.FontWeights.SemiBold
+                : Microsoft.UI.Text.FontWeights.Normal,
+            Opacity = active ? 1.0 : 0.6,
+            Background = active
+                ? (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"]
+                : new SolidColorBrush(Colors.Transparent),
+            BorderThickness = new Thickness(0),
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            button, $"ClientTab_{id}");
+        button.Click += (_, _) => SelectClientTab(id);
+        if (id != ClientRegistry.OverviewTab)
+        {
+            HoverTip.Attach(button, () => ClientRegistry.Style(id).DisplayName);
+        }
+
+        ClientTabsPanel.Children.Add(button);
     }
 
     private void RenderContent(bool animated)

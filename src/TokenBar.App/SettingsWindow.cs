@@ -22,6 +22,7 @@ public sealed class SettingsWindow : Window
 {
     private static SettingsWindow? _shared;
     private readonly Func<AgentUsagePayload?> _quota;
+    private readonly Func<UsagePayload?> _graph;
     private readonly ScrollViewer _scroll = new()
     {
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
@@ -39,9 +40,10 @@ public sealed class SettingsWindow : Window
         VerticalAlignment = VerticalAlignment.Top,
     };
 
-    public static void Present(Func<AgentUsagePayload?> quota)
+    public static void Present(
+        Func<AgentUsagePayload?> quota, Func<UsagePayload?> graph)
     {
-        _shared ??= new SettingsWindow(quota);
+        _shared ??= new SettingsWindow(quota, graph);
         _shared.Rebuild();
         _shared.AppWindow.Show();
         // Activate() alone cannot bring the window forward when the opener
@@ -59,9 +61,11 @@ public sealed class SettingsWindow : Window
                 $"{(_shared._scroll.Content as StackPanel)?.Children.Count ?? -1}"));
     }
 
-    private SettingsWindow(Func<AgentUsagePayload?> quota)
+    private SettingsWindow(
+        Func<AgentUsagePayload?> quota, Func<UsagePayload?> graph)
     {
         _quota = quota;
+        _graph = graph;
         Title = "TokenBar Settings";
         SystemBackdrop = new MicaBackdrop();
         var root = new Grid();
@@ -107,7 +111,10 @@ public sealed class SettingsWindow : Window
             // full rebuild drops keyboard focus and scroll position, breaking
             // arrow-key radio navigation); everything else refreshes the
             // preview column in place.
-            var rebuildAll = key is "tokenbar.tray.animationStyle" or "tokenbar.limits.layout";
+            var rebuildAll = key is "tokenbar.tray.animationStyle"
+                or "tokenbar.limits.layout"
+                or ClientRegistry.TabHiddenKey
+                or ClientRegistry.TabOrderKey;
             _ = DispatcherQueue.TryEnqueue(() =>
             {
                 if (!AppWindow.IsVisible)
@@ -213,6 +220,9 @@ public sealed class SettingsWindow : Window
         }
 
         panel.Children.Add(Section("Tray icon", icon));
+
+        // ── Client tabs ────────────────────────────────────────────────
+        panel.Children.Add(Section("Client tabs", BuildClientTabs(store)));
 
         // ── Quota source ───────────────────────────────────────────────
         var selection = store.GetString("tokenbar.quota.source", "auto") ?? "auto";
@@ -363,6 +373,132 @@ public sealed class SettingsWindow : Window
 
         _scroll.Content = panel;
         RebuildPreview();
+    }
+
+    private StackPanel BuildClientTabs(SettingsStore store)
+    {
+        var panel = new StackPanel { Spacing = 6 };
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var present = (_graph()?.Summary.Clients ?? [])
+            .Select(ClientRegistry.CanonicalClient)
+            .Where(seen.Add)
+            .ToList();
+        var ordered = ClientRegistry.OrderedClients(present, store);
+        if (ordered.Count == 0)
+        {
+            panel.Children.Add(Hint("No usage clients discovered yet."));
+            return panel;
+        }
+
+        var hidden = ClientRegistry.HiddenClients(store);
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            var id = ordered[i];
+            var row = new Grid { ColumnSpacing = 4 };
+            row.ColumnDefinitions.Add(new ColumnDefinition
+            {
+                Width = new GridLength(1, GridUnitType.Star),
+            });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var name = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            name.Children.Add(Ui.Disc(ClientRegistry.Style(id).Color));
+            name.Children.Add(Ui.Text(ClientRegistry.Style(id).DisplayName, 12));
+            row.Children.Add(name);
+
+            var up = new Button
+            {
+                Content = "↑",
+                FontSize = 11,
+                Padding = new Thickness(7, 2, 7, 3),
+                IsEnabled = i > 0,
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+                up, $"ClientTabUp_{id}");
+            if (i > 0)
+            {
+                var target = ordered[i - 1];
+                up.Click += (_, _) => MoveClientTab(store, present, id, target);
+            }
+            Grid.SetColumn(up, 1);
+            row.Children.Add(up);
+
+            var down = new Button
+            {
+                Content = "↓",
+                FontSize = 11,
+                Padding = new Thickness(7, 2, 7, 3),
+                IsEnabled = i < ordered.Count - 1,
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+                down, $"ClientTabDown_{id}");
+            if (i < ordered.Count - 1)
+            {
+                var target = ordered[i + 1];
+                down.Click += (_, _) => MoveClientTab(store, present, id, target);
+            }
+            Grid.SetColumn(down, 2);
+            row.Children.Add(down);
+
+            var shown = new ToggleSwitch
+            {
+                IsOn = !hidden.Contains(id),
+                OnContent = null,
+                OffContent = null,
+                MinWidth = 0,
+                Margin = new Thickness(2, -4, 0, -4),
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+                shown, $"ClientTabVisibility_{id}");
+            shown.Toggled += (_, _) => SetClientTabVisible(store, id, shown.IsOn);
+            Grid.SetColumn(shown, 3);
+            row.Children.Add(shown);
+            HoverTip.Attach(up, () => $"Move {ClientRegistry.ShortName(id)} up");
+            HoverTip.Attach(down, () => $"Move {ClientRegistry.ShortName(id)} down");
+            HoverTip.Attach(shown, () => shown.IsOn ? "Shown in client tabs" : "Hidden from client tabs");
+            panel.Children.Add(row);
+        }
+
+        panel.Children.Add(Hint(
+            "Overview includes every shown client. Hidden clients stay available in this list."));
+        return panel;
+    }
+
+    private static void MoveClientTab(
+        SettingsStore store, IReadOnlyList<string> present, string from, string to)
+    {
+        var orderRaw = store.GetString(ClientRegistry.TabOrderKey) ?? "";
+        var visible = ClientRegistry.OrderedClients(present, orderRaw);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var full = ClientRegistry.ParseIdList(orderRaw)
+            .Select(ClientRegistry.CanonicalClient)
+            .Concat(visible)
+            .Where(seen.Add)
+            .ToList();
+        var merged = ClientRegistry.MergeReorder(full, visible, from, to);
+        store.SetString(ClientRegistry.TabOrderKey, string.Join(',', merged));
+    }
+
+    private static void SetClientTabVisible(SettingsStore store, string id, bool visible)
+    {
+        var hidden = ClientRegistry.ParseIdList(
+                store.GetString(ClientRegistry.TabHiddenKey) ?? "")
+            .Select(ClientRegistry.CanonicalClient)
+            .ToList();
+        hidden.RemoveAll(value => value == id);
+        if (!visible)
+        {
+            hidden.Add(id);
+        }
+
+        store.SetString(ClientRegistry.TabHiddenKey, string.Join(',', hidden));
     }
 
     /// <summary>Sample titles for the tray preview — the macOS mock menubar

@@ -86,7 +86,8 @@ public sealed class TrayService : IDisposable
     /// the view layer never sees the tray feed.</summary>
     public static Action? OpenSettings { get; private set; }
 
-    public void ShowSettings() => SettingsWindow.Present(() => _feed.Quota);
+    public void ShowSettings() => SettingsWindow.Present(
+        () => _feed.Quota, () => _feed.Graph);
 
     /// <summary>The full context menu (macOS splits this between the
     /// status-item right-click quota menu and the settings panel; Windows

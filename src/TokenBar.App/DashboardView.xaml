@@ -70,12 +70,23 @@
             <TextBlock x:Name="CostLine" Opacity="0.8" FontSize="11" Text="" />
         </StackPanel>
 
-        <!-- Lens switch -->
-        <StackPanel
-            Grid.Row="1"
-            x:Name="TabsPanel"
-            Orientation="Horizontal"
-            Spacing="4" />
+        <!-- Client selection above the independent lens switch. -->
+        <StackPanel Grid.Row="1" Spacing="6">
+            <ScrollViewer
+                HorizontalScrollBarVisibility="Auto"
+                HorizontalScrollMode="Enabled"
+                VerticalScrollBarVisibility="Disabled"
+                VerticalScrollMode="Disabled">
+                <StackPanel
+                    x:Name="ClientTabsPanel"
+                    Orientation="Horizontal"
+                    Spacing="4" />
+            </ScrollViewer>
+            <StackPanel
+                x:Name="TabsPanel"
+                Orientation="Horizontal"
+                Spacing="4" />
+        </StackPanel>
 
         <!-- Lens content -->
         <ScrollViewer
