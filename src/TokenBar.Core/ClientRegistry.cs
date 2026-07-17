@@ -6,6 +6,11 @@ namespace TokenBar.Core;
 
 public sealed record ClientStyle(string Id, string DisplayName, string Color);
 
+public sealed record ClientSelection(
+    IReadOnlyList<string> DisplayClients,
+    IReadOnlyList<string> SelectedClients,
+    string ActiveTab);
+
 public static class ClientRegistry
 {
     private static readonly Dictionary<string, (string DisplayName, string Color)> Entries = new()
@@ -94,6 +99,8 @@ public static class ClientRegistry
 
     public const string TabOrderKey = "tokenbar.tabs.order";
     public const string TabHiddenKey = "tokenbar.tabs.hidden";
+    public const string ActiveTabKey = "tokenbar.activeTab";
+    public const string OverviewTab = "overview";
 
     /// <summary>Independent from <see cref="TabHiddenKey"/>: hides a client's
     /// Agent-limits quota card only, leaving its top tab (and cost/token/model
@@ -221,6 +228,33 @@ public static class ClientRegistry
         var hidden = ParseIdSet(hiddenRaw);
         return OrderedClients(present.Where(id => !hidden.Contains(id)).ToList(), orderRaw);
     }
+
+    public static ClientSelection ResolveSelection(
+        IReadOnlyList<string> present, string hiddenRaw, string orderRaw, string? activeTab)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var canonicalPresent = present
+            .Select(CanonicalClient)
+            .Where(seen.Add)
+            .ToList();
+        var display = DisplayClients(canonicalPresent, hiddenRaw, orderRaw);
+        var requested = string.IsNullOrWhiteSpace(activeTab)
+            ? OverviewTab
+            : CanonicalClient(activeTab.Trim());
+        var normalized = requested != OverviewTab
+            && display.Contains(requested, StringComparer.Ordinal)
+                ? requested
+                : OverviewTab;
+        IReadOnlyList<string> selected = normalized == OverviewTab ? display : [normalized];
+        return new ClientSelection(display, selected, normalized);
+    }
+
+    public static ClientSelection ResolveSelection(IReadOnlyList<string> present, SettingsStore store) =>
+        ResolveSelection(
+            present,
+            store.GetString(TabHiddenKey) ?? "",
+            store.GetString(TabOrderKey) ?? "",
+            store.GetString(ActiveTabKey));
 
     /// <summary>Direction-aware reorder helper (drag down inserts after, up
     /// before). Mirrors the logic used in AgentLimitsCard.</summary>

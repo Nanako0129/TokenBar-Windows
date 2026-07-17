@@ -140,6 +140,98 @@ public class ClientRegistryTests : IDisposable
             ClientRegistry.DisplayClients(["gemini", "claude", "codex"], store));
     }
 
+    [Fact]
+    public void ResolveSelectionCanonicalizesPresentAndDefaultsToOverview()
+    {
+        var selection = ClientRegistry.ResolveSelection(
+            present: ["claude-code", "claude", "codex-cli"],
+            hiddenRaw: "",
+            orderRaw: "codex,claude",
+            activeTab: null);
+
+        Assert.Equal(ClientRegistry.OverviewTab, selection.ActiveTab);
+        Assert.Equal(["codex", "claude"], selection.DisplayClients);
+        Assert.Equal(selection.DisplayClients, selection.SelectedClients);
+    }
+
+    [Fact]
+    public void ResolveSelectionKeepsVisibleCanonicalActiveClient()
+    {
+        var selection = ClientRegistry.ResolveSelection(
+            present: ["claude", "codex"],
+            hiddenRaw: "",
+            orderRaw: "",
+            activeTab: "codex-cli");
+
+        Assert.Equal("codex", selection.ActiveTab);
+        Assert.Equal(["codex"], selection.SelectedClients);
+    }
+
+    [Fact]
+    public void ResolveSelectionNormalizesHiddenOrMissingActiveClientToOverview()
+    {
+        var hidden = ClientRegistry.ResolveSelection(
+            present: ["claude", "codex"],
+            hiddenRaw: "codex",
+            orderRaw: "",
+            activeTab: "codex");
+        var missing = ClientRegistry.ResolveSelection(
+            present: ["claude", "codex"],
+            hiddenRaw: "",
+            orderRaw: "",
+            activeTab: "gemini");
+
+        Assert.Equal(ClientRegistry.OverviewTab, hidden.ActiveTab);
+        Assert.Equal(["claude"], hidden.SelectedClients);
+        Assert.Equal(ClientRegistry.OverviewTab, missing.ActiveTab);
+        Assert.Equal(["claude", "codex"], missing.SelectedClients);
+    }
+
+    [Fact]
+    public void ResolveSelectionKeepsAllHiddenAsEmptyOverview()
+    {
+        var selection = ClientRegistry.ResolveSelection(
+            present: ["claude", "codex"],
+            hiddenRaw: "claude,codex",
+            orderRaw: "",
+            activeTab: "codex");
+
+        Assert.Equal(ClientRegistry.OverviewTab, selection.ActiveTab);
+        Assert.Empty(selection.DisplayClients);
+        Assert.Empty(selection.SelectedClients);
+    }
+
+    [Fact]
+    public void ResolveSelectionReorderDoesNotChangeActiveMembership()
+    {
+        var selection = ClientRegistry.ResolveSelection(
+            present: ["claude", "codex", "gemini"],
+            hiddenRaw: "",
+            orderRaw: "gemini,claude,codex",
+            activeTab: "codex");
+
+        Assert.Equal(["gemini", "claude", "codex"], selection.DisplayClients);
+        Assert.Equal("codex", selection.ActiveTab);
+        Assert.Equal(["codex"], selection.SelectedClients);
+    }
+
+    [Fact]
+    public void ResolveSelectionStoreOverloadReadsOnlyTabKeys()
+    {
+        var store = NewStore();
+        store.SetString(ClientRegistry.TabHiddenKey, "gemini");
+        store.SetString(ClientRegistry.TabOrderKey, "codex,claude");
+        store.SetString(ClientRegistry.ActiveTabKey, "codex");
+        store.SetString(ClientRegistry.LimitsHiddenKey, "codex");
+
+        var selection = ClientRegistry.ResolveSelection(
+            ["gemini", "claude", "codex"], store);
+
+        Assert.Equal(["codex", "claude"], selection.DisplayClients);
+        Assert.Equal("codex", selection.ActiveTab);
+        Assert.Equal(["codex"], selection.SelectedClients);
+    }
+
     [Theory]
     [InlineData("a", "c", "b,c,a,d")] // drag down: insert after target
     [InlineData("d", "b", "a,d,b,c")] // drag up: insert before target
