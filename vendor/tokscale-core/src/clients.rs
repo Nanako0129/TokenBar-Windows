@@ -869,7 +869,9 @@ mod tests {
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert_eq!(
-            client.data().resolve_path("/tmp/home"),
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
             "/tmp/home/.grok/sessions"
         );
     }
