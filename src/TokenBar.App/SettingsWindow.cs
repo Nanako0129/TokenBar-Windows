@@ -589,14 +589,32 @@ public sealed class SettingsWindow : Window
                     "yyyy-MM-dd'T'HH:mm:ss'Z'",
                     System.Globalization.CultureInfo.InvariantCulture),
                 ResetText: "Resets in 1h 35m", WindowMinutes: 300,
-                HistoricalExpectedPercent: 48, RunOutProbability: 0.35),
+                CardId: "session.v3",
+                PaceStatus: new(
+                    State: UsagePaceState.Available,
+                    WindowKey: "session.v3",
+                    DurationSeconds: 300 * 60,
+                    DurationSource: UsagePaceDurationSource.Contract,
+                    CompleteCycles: 5),
+                HistoricalPace: new(
+                    ExpectedUsedPercent: 48, EtaSeconds: 1_800,
+                    WillLastToReset: false, RunOutProbability: 0.65)),
             new(
                 Label: "Weekly", UsedPercent: 31, RemainingPercent: 69,
                 ResetsAt: now.AddDays(4).UtcDateTime.ToString(
                     "yyyy-MM-dd'T'HH:mm:ss'Z'",
                     System.Globalization.CultureInfo.InvariantCulture),
                 ResetText: "Resets in 4d", WindowMinutes: 10080,
-                HistoricalExpectedPercent: 45, RunOutProbability: 0.02),
+                CardId: "weekly.v3",
+                PaceStatus: new(
+                    State: UsagePaceState.Available,
+                    WindowKey: "weekly.v3",
+                    DurationSeconds: 10080 * 60,
+                    DurationSource: UsagePaceDurationSource.Contract,
+                    CompleteCycles: 5),
+                HistoricalPace: new(
+                    ExpectedUsedPercent: 45, EtaSeconds: null,
+                    WillLastToReset: true, RunOutProbability: 0.02)),
         ];
         foreach (var window in mocks)
         {
