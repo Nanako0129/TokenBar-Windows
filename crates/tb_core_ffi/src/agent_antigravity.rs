@@ -15,6 +15,7 @@
 //!
 //! Both yield per-model "remaining fraction + reset" which map to `UsageWindow`s.
 
+use crate::agent_account_scope::{self, AccountScope, AccountScopeError, AuthoritativeIdKind};
 use crate::agent_usage::{clean_plan, parse_datetime, percent_encode, AgentIdentity, UsageWindow};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -32,6 +33,7 @@ const REFRESH_SAFETY_SECS: i64 = 60;
 pub(crate) struct Fetched {
     pub source: String,
     pub identity: Option<AgentIdentity>,
+    pub account_scope: Result<AccountScope, AccountScopeError>,
     pub windows: Vec<UsageWindow>,
 }
 
@@ -115,14 +117,19 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
             continue;
         };
         match parse_user_status(&text, now) {
-            Ok(fetched) if !fetched.windows.is_empty() || fetched.identity.is_some() => {
-                return Ok(fetched)
+            Ok(mut fetched) if local_result_is_acceptable(&fetched) => {
+                fetched.account_scope = resolve_local_account_scope(fetched.identity.as_ref());
+                return Ok(fetched);
             }
             Ok(_) => last_err = "local API returned no model quotas".to_string(),
             Err(e) => last_err = e,
         }
     }
     Err(last_err)
+}
+
+fn local_result_is_acceptable(fetched: &Fetched) -> bool {
+    !fetched.windows.is_empty()
 }
 
 fn detect_process() -> Result<ProcInfo, String> {
@@ -339,8 +346,30 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
             email: status.email.filter(|s| !s.trim().is_empty()),
             plan,
         }),
+        // Parsing stays pure. The authenticated loopback fetch resolves this only
+        // after accepting the response row.
+        account_scope: Err(AccountScopeError::NoTrustedEvidence),
         windows,
     })
+}
+
+fn resolve_local_account_scope(
+    identity: Option<&AgentIdentity>,
+) -> Result<AccountScope, AccountScopeError> {
+    resolve_local_account_scope_with(identity, |email| {
+        agent_account_scope::resolve_authoritative("antigravity", AuthoritativeIdKind::Email, email)
+    })
+}
+
+fn resolve_local_account_scope_with<T>(
+    identity: Option<&AgentIdentity>,
+    resolve: impl FnOnce(&str) -> Result<T, AccountScopeError>,
+) -> Result<T, AccountScopeError> {
+    let email = identity
+        .and_then(|identity| identity.email.as_deref())
+        .filter(|email| !email.trim().is_empty())
+        .ok_or(AccountScopeError::NoTrustedEvidence)?;
+    resolve(email)
 }
 
 fn local_plan_name(info: LocalPlanInfo) -> Option<String> {
@@ -409,6 +438,7 @@ async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
     Ok(Fetched {
         source: "oauth".to_string(),
         identity: Some(AgentIdentity { email, plan }),
+        account_scope: Err(AccountScopeError::NoTrustedEvidence),
         windows,
     })
 }
@@ -862,6 +892,10 @@ mod tests {
         assert_eq!(fetched.source, "cli");
         assert_eq!(fetched.identity.as_ref().unwrap().email.as_deref(), Some("me@gmail.com"));
         assert_eq!(fetched.identity.as_ref().unwrap().plan.as_deref(), Some("Pro"));
+        assert_eq!(
+            fetched.account_scope,
+            Err(AccountScopeError::NoTrustedEvidence)
+        );
         assert_eq!(fetched.windows.len(), 1);
         assert_eq!(fetched.windows[0].label_for_test(), "Gemini 3 Pro");
         assert_eq!(fetched.windows[0].card_id_for_test(), "model.gemini-3-pro.v1");
@@ -870,6 +904,67 @@ mod tests {
             Some("model.gemini-3-pro.v1")
         );
         assert!((fetched.windows[0].remaining_for_test() - 42.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn identity_only_local_response_is_not_accepted_for_scope_resolution() {
+        let fetched = parse_user_status(
+            r#"{
+                "userStatus": {
+                    "email": "user@example.com",
+                    "cascadeModelConfigData": { "clientModelConfigs": [] }
+                }
+            }"#,
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert!(fetched.identity.is_some());
+        assert!(fetched.windows.is_empty());
+        assert!(!local_result_is_acceptable(&fetched));
+    }
+
+    #[test]
+    fn local_scope_resolver_uses_only_exact_non_empty_email() {
+        let identity = AgentIdentity {
+            email: Some("Exact.Email+tag@Example.COM".to_string()),
+            plan: None,
+        };
+        assert_eq!(
+            resolve_local_account_scope_with(Some(&identity), |email| {
+                assert_eq!(email, "Exact.Email+tag@Example.COM");
+                Ok("resolved")
+            }),
+            Ok("resolved")
+        );
+
+        let calls = std::cell::Cell::new(0);
+        for email in [None, Some(" \t ")] {
+            let identity = AgentIdentity {
+                email: email.map(str::to_string),
+                plan: None,
+            };
+            assert_eq!(
+                resolve_local_account_scope_with(Some(&identity), |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                }),
+                Err(AccountScopeError::NoTrustedEvidence)
+            );
+        }
+        assert_eq!(calls.get(), 0);
+
+        let identity = AgentIdentity {
+            email: Some("failure@example.com".to_string()),
+            plan: None,
+        };
+        assert_eq!(
+            resolve_local_account_scope_with(Some(&identity), |email| {
+                assert_eq!(email, "failure@example.com");
+                Err::<(), _>(AccountScopeError::MetadataWrite)
+            }),
+            Err(AccountScopeError::MetadataWrite)
+        );
     }
 
     #[test]

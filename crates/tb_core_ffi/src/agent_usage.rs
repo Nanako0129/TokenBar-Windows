@@ -1055,7 +1055,7 @@ async fn fetch_antigravity() -> AgentUsageSnapshot {
             source: fetched.source,
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: fetched.identity,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
+            account_scope: fetched.account_scope,
             windows: fetched.windows,
             credits: None,
             error: None,
