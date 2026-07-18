@@ -1120,14 +1120,16 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
         crate::opencode_integrations::github_copilot_credential(),
         Utc::now(),
         agent_copilot::fetch,
+        enrich_snapshot,
     )
     .await
 }
 
-async fn fetch_copilot_with<Fetch, FetchFuture>(
+async fn fetch_copilot_with<Fetch, FetchFuture, Enrich>(
     credential: Option<crate::opencode_integrations::GitHubCopilotCredential>,
     now: DateTime<Utc>,
     fetch: Fetch,
+    enrich: Enrich,
 ) -> Option<AgentUsageSnapshot>
 where
     Fetch: FnOnce(
@@ -1135,17 +1137,26 @@ where
         crate::opencode_integrations::GitHubCopilotCredential,
     ) -> FetchFuture,
     FetchFuture: std::future::Future<Output = Result<agent_copilot::CopilotData, String>>,
+    Enrich: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
 {
     // No exact opencode github-copilot OAuth credential means no card and no network.
     let credential = credential?;
-    Some(finalize_copilot_snapshot(fetch(now, credential).await, now))
+    Some(finalize_copilot_snapshot_with(
+        fetch(now, credential).await,
+        now,
+        enrich,
+    ))
 }
 
-fn finalize_copilot_snapshot(
+fn finalize_copilot_snapshot_with<F>(
     fetched: Result<agent_copilot::CopilotData, String>,
     now: DateTime<Utc>,
-) -> AgentUsageSnapshot {
-    match fetched {
+    mut enrich: F,
+) -> AgentUsageSnapshot
+where
+    F: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
+{
+    let mut snapshot = match fetched {
         Ok(data) => AgentUsageSnapshot {
             client_id: "copilot".to_string(),
             source: "oauth".to_string(),
@@ -1166,7 +1177,9 @@ fn finalize_copilot_snapshot(
             credits: None,
             error: Some(error),
         },
-    }
+    };
+    enrich(&mut snapshot, now);
+    snapshot
 }
 
 fn finalize_antigravity_snapshot_with<F>(
@@ -3454,7 +3467,9 @@ mod tests {
     async fn copilot_blank_or_missing_credential_skips_fetch() {
         let path = copilot_auth_path("no-credential");
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let calls = std::cell::Cell::new(0);
+        let fetch_calls = std::cell::Cell::new(0);
+        let enrich_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
         for json in [
             serde_json::json!({}),
             serde_json::json!({"github-copilot": {
@@ -3465,21 +3480,34 @@ mod tests {
                 "copilot": {"type": "oauth", "refresh": "foreign-token"}
             }),
         ] {
-            let snapshot = fetch_copilot_with(copilot_credential(&path, &json), now, |_, _| {
-                calls.set(calls.get() + 1);
-                std::future::ready(Err::<agent_copilot::CopilotData, String>(
-                    "network must not run".to_string(),
-                ))
-            })
+            let snapshot = fetch_copilot_with(
+                copilot_credential(&path, &json),
+                now,
+                |_, _| {
+                    fetch_calls.set(fetch_calls.get() + 1);
+                    std::future::ready(Err::<agent_copilot::CopilotData, String>(
+                        "network must not run".to_string(),
+                    ))
+                },
+                |snapshot, callback_now| {
+                    enrich_calls.set(enrich_calls.get() + 1);
+                    enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
+                        record_calls.set(record_calls.get() + 1);
+                        Ok(Vec::new())
+                    });
+                },
+            )
             .await;
             assert!(snapshot.is_none());
         }
-        assert_eq!(calls.get(), 0);
+        assert_eq!(fetch_calls.get(), 0);
+        assert_eq!(enrich_calls.get(), 0);
+        assert_eq!(record_calls.get(), 0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]
-    async fn copilot_snapshot_transmits_scope_without_enabling_history_or_wire_metadata() {
+    async fn copilot_success_enriches_distinct_series_once_without_wire_metadata() {
         let path = copilot_auth_path("snapshot");
         let credential = copilot_credential(
             &path,
@@ -3495,51 +3523,159 @@ mod tests {
         )
         .unwrap();
         let scope_store = TestRefreshScope::new("copilot", "copilot-central-snapshot");
-        let now = Utc.timestamp_opt(1_751_328_000, 0).single().unwrap();
-        let reset = now + chrono::Duration::days(30);
-        let premium = UsageWindow::from_fraction("Premium".to_string(), 0.30, Some(reset), now)
-            .with_identity(
-                "premium_interactions.v1",
-                Some("premium_interactions.v1".to_string()),
+        let now = "2026-06-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let premium_reset = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let chat_reset = premium_reset;
+        let premium_duration = 30 * 86_400;
+        let chat_duration = premium_duration;
+        let premium = UsageWindow::from_fraction(
+            "Premium".to_string(),
+            0.30,
+            Some(premium_reset),
+            now,
+        )
+        .with_identity(
+            "premium_interactions.v1",
+            Some("premium_interactions.v1".to_string()),
+        )
+        .with_contract_duration_evidence(
+            now,
+            true,
+            DurationEvidence::contract(premium_duration),
+        );
+        let chat = UsageWindow::from_fraction("Chat".to_string(), 0.75, Some(chat_reset), now)
+            .with_identity("chat.v1", Some("chat.v1".to_string()))
+            .with_contract_duration_evidence(
+                now,
+                true,
+                DurationEvidence::contract(chat_duration),
             );
-        let chat = UsageWindow::from_fraction("Chat".to_string(), 0.75, Some(reset), now)
-            .with_identity("chat.v1", Some("chat.v1".to_string()));
-        let snapshot = fetch_copilot_with(credential, now, |request_now, credential| {
-            assert_eq!(request_now, now);
-            assert_eq!(credential.request_token, "fake-copilot-marker");
-            assert_eq!(credential.marker, b"fake-copilot-marker");
-            assert_eq!(credential.semantic_source, "opencode-auth-json");
-            assert_eq!(credential.canonical_location, location);
-            let account_scope = scope_store.resolve_current(
-                credential.semantic_source,
-                &credential.canonical_location,
-                &credential.marker,
-            );
-            std::future::ready(Ok(agent_copilot::CopilotData {
-                identity: None,
-                account_scope,
-                windows: vec![premium, chat],
-            }))
-        })
+        let enrich_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
+        let snapshot = fetch_copilot_with(
+            credential,
+            now,
+            |request_now, credential| {
+                assert_eq!(request_now, now);
+                assert_eq!(credential.request_token, "fake-copilot-marker");
+                assert_eq!(credential.marker, b"fake-copilot-marker");
+                assert_eq!(credential.semantic_source, "opencode-auth-json");
+                assert_eq!(credential.canonical_location, location);
+                let account_scope = scope_store.resolve_current(
+                    credential.semantic_source,
+                    &credential.canonical_location,
+                    &credential.marker,
+                );
+                std::future::ready(Ok(agent_copilot::CopilotData {
+                    identity: None,
+                    account_scope,
+                    windows: vec![premium, chat],
+                }))
+            },
+            |snapshot, callback_now| {
+                enrich_calls.set(enrich_calls.get() + 1);
+                let account_scope = snapshot.account_scope.as_ref().unwrap().clone();
+                enrich_snapshot_with(snapshot, callback_now, |active, observations, history_now| {
+                    record_calls.set(record_calls.get() + 1);
+                    assert_eq!(history_now, now.timestamp());
+                    assert_eq!(
+                        active,
+                        &[
+                            SeriesKey::new(
+                                "copilot",
+                                account_scope.as_str(),
+                                "premium_interactions.v1",
+                            ),
+                            SeriesKey::new("copilot", account_scope.as_str(), "chat.v1"),
+                        ]
+                    );
+                    assert_eq!(observations.len(), 2);
+                    assert_eq!(observations[0].key, active[0]);
+                    assert_eq!(observations[0].reset_at, Some(premium_reset.timestamp()));
+                    assert_eq!(observations[0].used_percent, 70.0);
+                    assert_eq!(
+                        observations[0].contract,
+                        Some(DurationEvidence::contract(premium_duration))
+                    );
+                    assert!(observations[0].provider.is_none());
+                    assert_eq!(observations[1].key, active[1]);
+                    assert_eq!(observations[1].reset_at, Some(chat_reset.timestamp()));
+                    assert_eq!(observations[1].used_percent, 25.0);
+                    assert!(observations[1].provider.is_none());
+                    assert_eq!(
+                        observations[1].contract,
+                        Some(DurationEvidence::contract(chat_duration))
+                    );
+                    Ok(vec![
+                        Ok((
+                            HistoryOutcome::Ready {
+                                duration_seconds: premium_duration,
+                                source: DurationSource::Contract,
+                                sampled: true,
+                            },
+                            Some(HistoricalPace {
+                                expected_percent: 35.0,
+                                eta_seconds: Some(123.0),
+                                will_last_to_reset: false,
+                                run_out_probability: None,
+                            }),
+                            3,
+                        )),
+                        Ok((
+                            HistoryOutcome::Ready {
+                                duration_seconds: chat_duration,
+                                source: DurationSource::Contract,
+                                sampled: true,
+                            },
+                            Some(HistoricalPace {
+                                expected_percent: 26.0,
+                                eta_seconds: Some(456.0),
+                                will_last_to_reset: false,
+                                run_out_probability: None,
+                            }),
+                            3,
+                        )),
+                    ])
+                });
+            },
+        )
         .await
         .unwrap();
+        assert_eq!(enrich_calls.get(), 1);
+        assert_eq!(record_calls.get(), 1);
         let account_scope = snapshot.account_scope.as_ref().unwrap();
         let opaque_scope = account_scope.as_str().to_string();
         assert_eq!(snapshot.windows.len(), 2);
-        let premium_key = snapshot.windows[0].pace_window_key_for_test().unwrap();
-        let chat_key = snapshot.windows[1].pace_window_key_for_test().unwrap();
-        assert_eq!(premium_key, "premium_interactions.v1");
-        assert_eq!(chat_key, "chat.v1");
-        let premium_series = SeriesKey::new("copilot", account_scope.as_str(), premium_key);
-        let chat_series = SeriesKey::new("copilot", account_scope.as_str(), chat_key);
-        assert_eq!(premium_series.account_scope, chat_series.account_scope);
-        assert_ne!(premium_series.window_key, chat_series.window_key);
-        for window in &snapshot.windows {
-            assert_eq!(window.pace_status.state, PaceState::LearningDuration);
-            assert!(window.pace_status.duration_seconds.is_none());
-            assert!(window.pace_status.duration_source.is_none());
-            assert!(window.historical_pace.is_none());
-        }
+        assert_eq!(
+            snapshot.windows[0].pace_window_key_for_test(),
+            Some("premium_interactions.v1")
+        );
+        assert_eq!(snapshot.windows[1].pace_window_key_for_test(), Some("chat.v1"));
+        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Available);
+        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 3);
+        assert_eq!(
+            snapshot.windows[0].pace_status.duration_source,
+            Some(DurationSource::Contract)
+        );
+        assert!(snapshot.windows[0].historical_pace.is_some());
+        assert_eq!(snapshot.windows[1].pace_status.state, PaceState::Available);
+        assert_eq!(snapshot.windows[1].pace_status.complete_cycles, 3);
+        assert_eq!(
+            snapshot.windows[1].pace_status.duration_seconds,
+            Some(chat_duration)
+        );
+        assert_eq!(
+            snapshot.windows[1].pace_status.duration_source,
+            Some(DurationSource::Contract)
+        );
+        assert_eq!(
+            snapshot.windows[1]
+                .historical_pace
+                .as_ref()
+                .map(|pace| pace.expected_used_percent),
+            Some(26.0)
+        );
+
         let wire = serde_json::to_string(&snapshot).unwrap();
         assert!(!wire.contains("accountScope"));
         assert!(!wire.contains("fake-copilot-marker"));
@@ -3547,36 +3683,239 @@ mod tests {
         assert!(!wire.contains(path.to_string_lossy().as_ref()));
         assert!(!wire.contains(&location));
         assert!(!wire.contains(&opaque_scope));
+        scope_store.cleanup();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 
-        let mut failed_scope = finalize_copilot_snapshot(
+    #[test]
+    fn copilot_one_cycle_stays_in_learning_history_without_historical_pace() {
+        let (scope, account_scope) = enrichment_scope("copilot-one-cycle");
+        let now = "2026-06-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reset = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let duration = 30 * 86_400;
+        let window = UsageWindow::from_fraction("Premium".to_string(), 0.30, Some(reset), now)
+            .with_identity(
+                "premium_interactions.v1",
+                Some("premium_interactions.v1".to_string()),
+            )
+            .with_contract_duration_evidence(
+                now,
+                true,
+                DurationEvidence::contract(duration),
+            );
+        let enrich_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
+        let snapshot = finalize_copilot_snapshot_with(
+            Ok(agent_copilot::CopilotData {
+                identity: None,
+                account_scope: Ok(account_scope),
+                windows: vec![window],
+            }),
+            now,
+            |snapshot, callback_now| {
+                enrich_calls.set(enrich_calls.get() + 1);
+                enrich_snapshot_with(snapshot, callback_now, |_, observations, _| {
+                    record_calls.set(record_calls.get() + 1);
+                    assert_eq!(observations.len(), 1);
+                    Ok(vec![Ok((
+                        HistoryOutcome::Ready {
+                            duration_seconds: duration,
+                            source: DurationSource::Contract,
+                            sampled: true,
+                        },
+                        None,
+                        1,
+                    ))])
+                });
+            },
+        );
+        assert_eq!(enrich_calls.get(), 1);
+        assert_eq!(record_calls.get(), 1);
+        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 1);
+        assert_eq!(snapshot.windows[0].pace_status.duration_seconds, Some(duration));
+        assert_eq!(
+            snapshot.windows[0].pace_status.duration_source,
+            Some(DurationSource::Contract)
+        );
+        assert!(snapshot.windows[0].historical_pace.is_none());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn copilot_non_month_reset_enters_observed_history_learning() {
+        let (scope, account_scope) = enrichment_scope("copilot-observed");
+        let now = "2026-07-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reset = "2026-07-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let window = UsageWindow::from_fraction("Chat".to_string(), 0.40, Some(reset), now)
+            .with_identity("chat.v1", Some("chat.v1".to_string()))
+            .with_observed_duration_evidence(now, true);
+        let record_calls = std::cell::Cell::new(0);
+        let snapshot = finalize_copilot_snapshot_with(
+            Ok(agent_copilot::CopilotData {
+                identity: None,
+                account_scope: Ok(account_scope),
+                windows: vec![window],
+            }),
+            now,
+            |snapshot, callback_now| {
+                enrich_snapshot_with(snapshot, callback_now, |_, observations, _| {
+                    record_calls.set(record_calls.get() + 1);
+                    assert_eq!(observations.len(), 1);
+                    assert_eq!(observations[0].reset_at, Some(reset.timestamp()));
+                    assert_eq!(observations[0].used_percent, 60.0);
+                    assert!(observations[0].provider.is_none());
+                    assert!(observations[0].contract.is_none());
+                    Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
+                });
+            },
+        );
+        assert_eq!(record_calls.get(), 1);
+        assert_eq!(snapshot.windows[0].used_percent, 60.0);
+        assert_eq!(snapshot.windows[0].reset_at_evidence, Some(reset));
+        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::LearningDuration);
+        assert_eq!(
+            snapshot.windows[0].pace_status.duration_source,
+            Some(DurationSource::Observed)
+        );
+        assert!(snapshot.windows[0].pace_status.duration_seconds.is_none());
+        assert!(snapshot.windows[0].historical_pace.is_none());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn copilot_scope_error_enriches_once_without_recording() {
+        let (scope_store, _) = enrichment_scope("copilot-scope-error");
+        let now = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reset = now + chrono::Duration::days(1);
+        let windows = vec![
+            UsageWindow::from_used_percent("Premium".to_string(), 30.0, Some(reset), now)
+                .with_identity(
+                    "premium_interactions.v1",
+                    Some("premium_interactions.v1".to_string()),
+                ),
+            UsageWindow::from_used_percent("Chat".to_string(), 40.0, Some(reset), now)
+                .with_identity("chat.v1", Some("chat.v1".to_string())),
+        ];
+        let enrich_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
+        let snapshot = finalize_copilot_snapshot_with(
             Ok(agent_copilot::CopilotData {
                 identity: None,
                 account_scope: Err(AccountScopeError::MetadataWrite),
-                windows: snapshot.windows.clone(),
+                windows,
             }),
             now,
+            |snapshot, callback_now| {
+                enrich_calls.set(enrich_calls.get() + 1);
+                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
+                    record_calls.set(record_calls.get() + 1);
+                    Ok(Vec::new())
+                });
+            },
         );
-        let history_calls = std::cell::Cell::new(0);
-        enrich_snapshot_with(&mut failed_scope, now, |_, _, _| {
-            history_calls.set(history_calls.get() + 1);
-            Ok(Vec::new())
-        });
-        assert_eq!(history_calls.get(), 0);
-        assert_eq!(failed_scope.windows.len(), 2);
-        assert!(failed_scope
+        assert_eq!(enrich_calls.get(), 1);
+        assert_eq!(record_calls.get(), 0);
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(snapshot.windows[0].used_percent, 30.0);
+        assert_eq!(snapshot.windows[0].remaining_percent, 70.0);
+        assert_eq!(snapshot.windows[1].used_percent, 40.0);
+        assert_eq!(snapshot.windows[1].remaining_percent, 60.0);
+        assert!(snapshot
             .windows
             .iter()
             .all(|window| window.pace_reason_for_test() == Some("accountScope")));
+        scope_store.cleanup();
+    }
 
-        let api_error = finalize_copilot_snapshot(
+    #[test]
+    fn copilot_api_error_and_empty_success_enrich_once_without_recording() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let api_enrich_calls = std::cell::Cell::new(0);
+        let api_record_calls = std::cell::Cell::new(0);
+        let api_error = finalize_copilot_snapshot_with(
             Err("Copilot usage API returned 503.".to_string()),
             now,
+            |snapshot, callback_now| {
+                api_enrich_calls.set(api_enrich_calls.get() + 1);
+                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
+                    api_record_calls.set(api_record_calls.get() + 1);
+                    Ok(Vec::new())
+                });
+            },
         );
+        assert_eq!(api_enrich_calls.get(), 1);
+        assert_eq!(api_record_calls.get(), 0);
         assert_eq!(api_error.account_scope, Err(AccountScopeError::NoTrustedEvidence));
         assert!(api_error.windows.is_empty());
         assert_eq!(api_error.error.as_deref(), Some("Copilot usage API returned 503."));
+
+        let (scope_store, account_scope) = enrichment_scope("copilot-empty-success");
+        let empty_enrich_calls = std::cell::Cell::new(0);
+        let empty_record_calls = std::cell::Cell::new(0);
+        let empty = finalize_copilot_snapshot_with(
+            Ok(agent_copilot::CopilotData {
+                identity: None,
+                account_scope: Ok(account_scope),
+                windows: Vec::new(),
+            }),
+            now,
+            |snapshot, callback_now| {
+                empty_enrich_calls.set(empty_enrich_calls.get() + 1);
+                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
+                    empty_record_calls.set(empty_record_calls.get() + 1);
+                    Ok(Vec::new())
+                });
+            },
+        );
+        assert_eq!(empty_enrich_calls.get(), 1);
+        assert_eq!(empty_record_calls.get(), 0);
+        assert!(empty.windows.is_empty());
         scope_store.cleanup();
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn copilot_unknown_and_non_recurring_successes_do_not_record_history() {
+        let (scope, account_scope) = enrichment_scope("copilot-no-stable-window");
+        let now = "2026-06-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reset = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let windows = [
+            vec![UsageWindow::from_used_percent("Unknown".to_string(), 10.0, Some(reset), now)
+                .with_identity("row.copilot.unknown.v1", None)],
+            vec![UsageWindow::from_used_percent(
+                "Non-recurring".to_string(),
+                20.0,
+                Some(reset),
+                now,
+            )
+            .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
+            .with_unavailable_reason("nonRecurring")],
+        ];
+        let enrich_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
+        for windows in windows {
+            let snapshot = finalize_copilot_snapshot_with(
+                Ok(agent_copilot::CopilotData {
+                    identity: None,
+                    account_scope: Ok(account_scope.clone()),
+                    windows,
+                }),
+                now,
+                |snapshot, callback_now| {
+                    enrich_calls.set(enrich_calls.get() + 1);
+                    enrich_snapshot_with(snapshot, callback_now, |active, observations, _| {
+                        record_calls.set(record_calls.get() + 1);
+                        assert!(active.is_empty());
+                        assert!(observations.is_empty());
+                        Ok(Vec::new())
+                    });
+                },
+            );
+            assert_eq!(snapshot.windows.len(), 1);
+        }
+        assert_eq!(enrich_calls.get(), 2);
+        assert_eq!(record_calls.get(), 0);
+        scope.cleanup();
     }
 
     #[test]
