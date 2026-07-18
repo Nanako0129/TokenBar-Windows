@@ -41,6 +41,18 @@ static HISTORY_PROCESS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new((
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageMode {
+    System,
+    Generic,
+}
+
+impl StorageMode {
+    fn uses_windows_secure_storage(self) -> bool {
+        cfg!(target_os = "windows") && matches!(self, Self::System)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryError {
     StorageUnavailable,
     LockOpen,
@@ -269,7 +281,7 @@ pub(crate) fn record_observation_and_evaluate(
     contract: Option<DurationEvidence>,
 ) -> Result<(HistoryOutcome, Option<HistoricalPace>), HistoryError> {
     let path = production_history_path().ok_or(HistoryError::StorageUnavailable)?;
-    record_observation_at_path_and_evaluate(
+    record_observation_at_path_and_evaluate_with_clock_and_mode(
         key,
         reset_at,
         used_percent,
@@ -277,6 +289,8 @@ pub(crate) fn record_observation_and_evaluate(
         provider,
         contract,
         &path,
+        StorageMode::System,
+        unix_now,
     )
 }
 
@@ -300,12 +314,14 @@ pub(crate) fn migrate_codex_v2(
     else {
         return Err(HistoryError::StorageUnavailable);
     };
-    migrate_codex_v2_at_paths(
+    migrate_codex_v2_at_paths_with_clock_and_mode(
         request_account_id,
         account_scope,
         now,
         &directory.join(LEGACY_V2_FILE_NAME),
         &directory.join(HISTORY_FILE_NAME),
+        StorageMode::System,
+        unix_now,
     )
 }
 
@@ -316,22 +332,24 @@ pub(crate) fn migrate_codex_v2_at_paths(
     v2_path: &Path,
     v3_path: &Path,
 ) -> Result<MigrationOutcome, HistoryError> {
-    migrate_codex_v2_at_paths_with_clock(
+    migrate_codex_v2_at_paths_with_clock_and_mode(
         request_account_id,
         account_scope,
         now,
         v2_path,
         v3_path,
+        StorageMode::Generic,
         unix_now,
     )
 }
 
-fn migrate_codex_v2_at_paths_with_clock(
+fn migrate_codex_v2_at_paths_with_clock_and_mode(
     request_account_id: &str,
     account_scope: &str,
     now: i64,
     v2_path: &Path,
     v3_path: &Path,
+    mode: StorageMode,
     transaction_clock: impl FnOnce() -> i64,
 ) -> Result<MigrationOutcome, HistoryError> {
     let accepted_account = request_account_id.trim();
@@ -341,15 +359,9 @@ fn migrate_codex_v2_at_paths_with_clock(
             skipped_samples: 0,
         });
     }
-    let bytes = match fs::read(v2_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(MigrationOutcome {
-                imported_samples: 0,
-                skipped_samples: 0,
-            })
-        }
-        Err(_) => {
+    let bytes = match read_legacy_v2_with_mode(mode, v2_path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) | Err(_) => {
             return Ok(MigrationOutcome {
                 imported_samples: 0,
                 skipped_samples: 0,
@@ -406,7 +418,7 @@ fn migrate_codex_v2_at_paths_with_clock(
     if !key.is_valid() {
         return Err(HistoryError::InvalidSeriesKey);
     }
-    let imported = with_locked_transaction(v3_path, now, transaction_clock, |store| {
+    let transaction = |store: &mut Store| {
         let merge = match store
             .series
             .binary_search_by(|series| series.key().cmp(&key))
@@ -436,7 +448,9 @@ fn migrate_codex_v2_at_paths_with_clock(
         let active_keys = BTreeSet::from([key.clone()]);
         retain_store(store, now, &active_keys)?;
         Ok(merge.imported_samples)
-    })?;
+    };
+    let imported =
+        with_locked_transaction_with_mode(mode, v3_path, now, transaction_clock, transaction)?;
     Ok(MigrationOutcome {
         imported_samples: imported,
         skipped_samples: skipped,
@@ -518,7 +532,14 @@ pub(crate) fn record_observations_and_evaluate(
     now: i64,
 ) -> Result<Vec<BatchObservationResult>, HistoryError> {
     let path = production_history_path().ok_or(HistoryError::StorageUnavailable)?;
-    record_observations_at_path_and_evaluate(emitted_active_keys, observations, now, &path)
+    record_observations_at_path_and_evaluate_with_clock_and_mode(
+        emitted_active_keys,
+        observations,
+        now,
+        &path,
+        StorageMode::System,
+        unix_now,
+    )
 }
 
 /// Testable path-injected batch variant. Load, admission, mutation, retention,
@@ -529,11 +550,12 @@ pub(crate) fn record_observations_at_path_and_evaluate(
     now: i64,
     path: &Path,
 ) -> Result<Vec<BatchObservationResult>, HistoryError> {
-    record_observations_at_path_and_evaluate_with_clock(
+    record_observations_at_path_and_evaluate_with_clock_and_mode(
         emitted_active_keys,
         observations,
         now,
         path,
+        StorageMode::Generic,
         unix_now,
     )
 }
@@ -569,7 +591,7 @@ pub(crate) fn record_observation_at_path_and_evaluate(
     contract: Option<DurationEvidence>,
     path: &Path,
 ) -> Result<(HistoryOutcome, Option<HistoricalPace>), HistoryError> {
-    record_observation_at_path_and_evaluate_with_clock(
+    record_observation_at_path_and_evaluate_with_clock_and_mode(
         key,
         reset_at,
         used_percent,
@@ -577,6 +599,7 @@ pub(crate) fn record_observation_at_path_and_evaluate(
         provider,
         contract,
         path,
+        StorageMode::Generic,
         unix_now,
     )
 }
@@ -592,7 +615,7 @@ fn record_observation_at_path_with_clock(
     path: &Path,
     transaction_clock: impl FnOnce() -> i64,
 ) -> Result<HistoryOutcome, HistoryError> {
-    record_observation_at_path_and_evaluate_with_clock(
+    record_observation_at_path_and_evaluate_with_clock_and_mode(
         key,
         reset_at,
         used_percent,
@@ -600,13 +623,14 @@ fn record_observation_at_path_with_clock(
         provider,
         contract,
         path,
+        StorageMode::Generic,
         transaction_clock,
     )
     .map(|(outcome, _)| outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_observation_at_path_and_evaluate_with_clock(
+fn record_observation_at_path_and_evaluate_with_clock_and_mode(
     key: SeriesKey,
     reset_at: Option<i64>,
     used_percent: f64,
@@ -614,6 +638,7 @@ fn record_observation_at_path_and_evaluate_with_clock(
     provider: Option<DurationEvidence>,
     contract: Option<DurationEvidence>,
     path: &Path,
+    mode: StorageMode,
     transaction_clock: impl FnOnce() -> i64,
 ) -> Result<(HistoryOutcome, Option<HistoricalPace>), HistoryError> {
     let observation = QuotaObservation {
@@ -628,11 +653,12 @@ fn record_observation_at_path_and_evaluate_with_clock(
     }
     let active_keys = [observation.key.clone()];
     let observations = [observation];
-    let mut results = record_observations_at_path_and_evaluate_with_clock(
+    let mut results = record_observations_at_path_and_evaluate_with_clock_and_mode(
         &active_keys,
         &observations,
         now,
         path,
+        mode,
         transaction_clock,
     )?;
     let (outcome, historical, _) = results.pop().ok_or(HistoryError::Serialize)??;
@@ -674,29 +700,32 @@ fn prepare_observation(observation: &QuotaObservation, now: i64) -> PreparedObse
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_observations_at_path_and_evaluate_with_clock(
+fn record_observations_at_path_and_evaluate_with_clock_and_mode(
     emitted_active_keys: &[SeriesKey],
     observations: &[QuotaObservation],
     now: i64,
     path: &Path,
+    mode: StorageMode,
     transaction_clock: impl FnOnce() -> i64,
 ) -> Result<Vec<BatchObservationResult>, HistoryError> {
-    record_observations_at_path_and_evaluate_with_clock_and_save(
+    record_observations_at_path_and_evaluate_with_clock_and_mode_and_save(
         emitted_active_keys,
         observations,
         now,
         path,
+        mode,
         transaction_clock,
-        save_store_atomic,
+        |path, store| save_store_atomic_with_mode(mode, path, store),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_observations_at_path_and_evaluate_with_clock_and_save(
+fn record_observations_at_path_and_evaluate_with_clock_and_mode_and_save(
     emitted_active_keys: &[SeriesKey],
     observations: &[QuotaObservation],
     now: i64,
     path: &Path,
+    mode: StorageMode,
     transaction_clock: impl FnOnce() -> i64,
     save: impl Fn(&Path, &Store) -> io::Result<()>,
 ) -> Result<Vec<BatchObservationResult>, HistoryError> {
@@ -714,7 +743,7 @@ fn record_observations_at_path_and_evaluate_with_clock_and_save(
         }
     }
 
-    with_locked_transaction_with_save(path, now, transaction_clock, save, |store| {
+    let transaction = |store: &mut Store| {
         retain_store(store, now, &active_keys)?;
         let admitted = admit_observation_keys(store, &active_keys, &candidate_keys, now)?;
         for admission in &admissions {
@@ -790,7 +819,15 @@ fn record_observations_at_path_and_evaluate_with_clock_and_save(
             results[admission.index] = Some(Ok((*outcome, pace, complete_cycles)));
         }
         Ok(())
-    })?;
+    };
+    with_locked_transaction_with_save_and_mode(
+        mode,
+        path,
+        now,
+        transaction_clock,
+        save,
+        transaction,
+    )?;
 
     results
         .into_iter()
@@ -1831,22 +1868,25 @@ fn evaluate_current(
     })
 }
 
-fn with_locked_transaction<T>(
+fn with_locked_transaction_with_mode<T>(
+    mode: StorageMode,
     path: &Path,
     observation_now: i64,
     transaction_clock: impl FnOnce() -> i64,
     body: impl FnOnce(&mut Store) -> Result<T, HistoryError>,
 ) -> Result<T, HistoryError> {
-    with_locked_transaction_with_save(
+    with_locked_transaction_with_save_and_mode(
+        mode,
         path,
         observation_now,
         transaction_clock,
-        save_store_atomic,
+        |path, store| save_store_atomic_with_mode(mode, path, store),
         body,
     )
 }
 
-fn with_locked_transaction_with_save<T>(
+fn with_locked_transaction_with_save_and_mode<T>(
+    mode: StorageMode,
     path: &Path,
     observation_now: i64,
     transaction_clock: impl FnOnce() -> i64,
@@ -1854,20 +1894,17 @@ fn with_locked_transaction_with_save<T>(
     body: impl FnOnce(&mut Store) -> Result<T, HistoryError>,
 ) -> Result<T, HistoryError> {
     let directory = path.parent().ok_or(HistoryError::StorageUnavailable)?;
-    ensure_real_directory(directory).map_err(|_| HistoryError::StorageUnavailable)?;
+    ensure_real_directory_with_mode(mode, directory)
+        .map_err(|_| HistoryError::StorageUnavailable)?;
 
     let _process_guard = HISTORY_PROCESS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let lock_file = open_owner_only(&directory.join(HISTORY_LOCK_FILE_NAME))
-        .map_err(|_| HistoryError::LockOpen)?;
-    lock_file
-        .lock_exclusive()
-        .map_err(|_| HistoryError::LockAcquire)?;
+    let lock_file = open_history_lock(mode, &directory.join(HISTORY_LOCK_FILE_NAME))?;
     let lock_time = transaction_clock();
     let upper_bound = observation_now.max(lock_time);
 
-    let loaded = load_store_at(path, upper_bound, observation_now);
+    let loaded = load_store_at_with_mode(mode, path, upper_bound, observation_now);
     let result = match loaded {
         Ok(mut loaded) => {
             let before = loaded.store.clone();
@@ -1897,26 +1934,40 @@ fn with_locked_transaction_with_save<T>(
     }
 }
 
-fn read_owner_only(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let Some(mut file) = open_existing_owner_only(path)? else {
+fn read_legacy_v2_with_mode(_mode: StorageMode, path: &Path) -> io::Result<Option<Vec<u8>>> {
+    #[cfg(target_os = "windows")]
+    if _mode.uses_windows_secure_storage() {
+        return read_owner_only_with_mode(_mode, path);
+    }
+
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_owner_only_with_mode(mode: StorageMode, path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let Some(mut file) = open_existing_owner_only_with_mode(mode, path)? else {
         return Ok(None);
     };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    verify_open_regular_file(path, &file)?;
+    verify_open_regular_file_with_mode(mode, path, &file)?;
     Ok(Some(bytes))
 }
 
 fn load_store(path: &Path, now: i64) -> Result<LoadedStore, HistoryError> {
-    load_store_at(path, now, now)
+    load_store_at_with_mode(StorageMode::Generic, path, now, now)
 }
 
-fn load_store_at(
+fn load_store_at_with_mode(
+    mode: StorageMode,
     path: &Path,
     validation_now: i64,
     quarantine_now: i64,
 ) -> Result<LoadedStore, HistoryError> {
-    let Some(bytes) = read_owner_only(path).map_err(|_| HistoryError::Read)? else {
+    let Some(bytes) = read_owner_only_with_mode(mode, path).map_err(|_| HistoryError::Read)? else {
         return Ok(LoadedStore {
             store: Store::default(),
         });
@@ -1929,10 +1980,21 @@ fn load_store_at(
         return Ok(LoadedStore { store });
     }
 
-    quarantine_corrupt(path, quarantine_now).map_err(|_| HistoryError::CorruptQuarantine)?;
+    quarantine_corrupt_with_mode(mode, path, quarantine_now)
+        .map_err(|_| HistoryError::CorruptQuarantine)?;
     Ok(LoadedStore {
         store: Store::default(),
     })
+}
+
+fn quarantine_corrupt_with_mode(mode: StorageMode, path: &Path, now: i64) -> io::Result<PathBuf> {
+    if mode.uses_windows_secure_storage() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows secure history quarantine is not wired",
+        ));
+    }
+    quarantine_corrupt(path, now)
 }
 
 fn quarantine_corrupt(path: &Path, now: i64) -> io::Result<PathBuf> {
@@ -2001,10 +2063,19 @@ where
     ))
 }
 
-fn save_store_atomic(path: &Path, store: &Store) -> io::Result<()> {
-    save_store_atomic_with(path, store, |temp, destination| {
-        tokscale_core::fs_atomic::replace_file(temp, destination)
-    })
+fn save_store_atomic_with_mode(mode: StorageMode, path: &Path, store: &Store) -> io::Result<()> {
+    if mode.uses_windows_secure_storage() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows secure atomic history writes are not wired",
+        ));
+    }
+    save_store_atomic_with_sync(
+        path,
+        store,
+        |temp, destination| tokscale_core::fs_atomic::replace_file(temp, destination),
+        |directory| sync_directory_with_mode(mode, directory),
+    )
 }
 
 fn save_store_atomic_with<F>(path: &Path, store: &Store, replace: F) -> io::Result<()>
@@ -2066,8 +2137,28 @@ where
     Ok(())
 }
 
+fn sync_directory_with_mode(_mode: StorageMode, directory: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if _mode.uses_windows_secure_storage() {
+        let directory = crate::agent_storage_windows::ensure_secure_storage_directory(directory)?;
+        return crate::agent_storage_windows::flush_secure_storage_directory(&directory);
+    }
+
+    sync_directory(directory)
+}
+
 fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
+}
+
+fn ensure_real_directory_with_mode(_mode: StorageMode, directory: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if _mode.uses_windows_secure_storage() {
+        drop(crate::agent_storage_windows::ensure_secure_storage_directory(directory)?);
+        return Ok(());
+    }
+
+    ensure_real_directory(directory)
 }
 
 fn ensure_real_directory(directory: &Path) -> io::Result<()> {
@@ -2104,6 +2195,19 @@ fn ensure_real_directory(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn open_history_lock(_mode: StorageMode, path: &Path) -> Result<File, HistoryError> {
+    #[cfg(target_os = "windows")]
+    if _mode.uses_windows_secure_storage() {
+        return crate::agent_storage_windows::open_secure_lock_file(path)
+            .map_err(|_| HistoryError::LockOpen);
+    }
+
+    let file = open_owner_only(path).map_err(|_| HistoryError::LockOpen)?;
+    file.lock_exclusive()
+        .map_err(|_| HistoryError::LockAcquire)?;
+    Ok(file)
+}
+
 fn open_owner_only(path: &Path) -> io::Result<File> {
     let mut create = OpenOptions::new();
     create.read(true).write(true).create_new(true);
@@ -2121,6 +2225,19 @@ fn open_owner_only(path: &Path) -> io::Result<File> {
         }
         Err(error) => Err(error),
     }
+}
+
+fn open_existing_owner_only_with_mode(_mode: StorageMode, path: &Path) -> io::Result<Option<File>> {
+    #[cfg(target_os = "windows")]
+    if _mode.uses_windows_secure_storage() {
+        return match crate::agent_storage_windows::open_existing_secure_file(path, false) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        };
+    }
+
+    open_existing_owner_only(path)
 }
 
 fn open_existing_owner_only(path: &Path) -> io::Result<Option<File>> {
@@ -2160,6 +2277,19 @@ fn secure_open_regular_file(path: &Path, file: File) -> io::Result<File> {
     }
     verify_open_regular_file(path, &file)?;
     Ok(file)
+}
+
+fn verify_open_regular_file_with_mode(
+    _mode: StorageMode,
+    path: &Path,
+    file: &File,
+) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if _mode.uses_windows_secure_storage() {
+        return crate::agent_storage_windows::verify_secure_file_path(file, path);
+    }
+
+    verify_open_regular_file(path, file)
 }
 
 fn verify_open_regular_file(path: &Path, file: &File) -> io::Result<()> {
@@ -2213,7 +2343,28 @@ fn rollback_quarantine_link(path: &Path, source: &File) {
 mod tests {
     use super::*;
     use chrono::Utc;
+    #[cfg(target_os = "windows")]
+    use std::mem::size_of;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::fs::{symlink_file, OpenOptionsExt as _};
+    #[cfg(target_os = "windows")]
+    use std::os::windows::io::AsRawHandle as _;
+    #[cfg(target_os = "windows")]
+    use std::ptr::{null, null_mut};
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(target_os = "windows")]
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
+    #[cfg(target_os = "windows")]
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    #[cfg(target_os = "windows")]
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    #[cfg(target_os = "windows")]
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, READ_CONTROL, WRITE_DAC,
+    };
 
     const HOUR: i64 = 3_600;
     const DAY: i64 = 86_400;
@@ -2234,6 +2385,116 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         (directory.clone(), directory.join(HISTORY_FILE_NAME))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_secure_temp_path(label: &str) -> (PathBuf, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "tokenbar-quota-v3-windows-secure-{}-{}-{label}",
+            std::process::id(),
+            nonce
+        ));
+        let handle = crate::agent_storage_windows::ensure_secure_storage_directory(&directory)
+            .expect("create exact secure history directory");
+        crate::agent_storage_windows::verify_storage_handle(handle.as_raw_handle() as HANDLE)
+            .expect("history directory DACL is exact");
+        drop(handle);
+        (directory.clone(), directory.join(HISTORY_FILE_NAME))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn write_windows_secure_file(path: &Path, bytes: &[u8]) {
+        let mut file = crate::agent_storage_windows::create_new_secure_file(path)
+            .expect("create exact secure history fixture");
+        file.write_all(bytes).expect("write secure history fixture");
+        file.flush().expect("flush secure history fixture");
+        file.sync_all().expect("sync secure history fixture");
+        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)
+            .expect("fixture DACL is exact");
+        crate::agent_storage_windows::verify_secure_file_path(&file, path)
+            .expect("fixture path identity is exact");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_secure_file_snapshot(path: &Path) -> (Vec<u8>, u64, [u8; 16]) {
+        let mut file = crate::agent_storage_windows::open_existing_secure_file(path, false)
+            .expect("open exact secure history fixture");
+        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)
+            .expect("secure file DACL is exact");
+        crate::agent_storage_windows::verify_secure_file_path(&file, path)
+            .expect("secure file path identity is exact");
+        let mut identity = FILE_ID_INFO::default();
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle() as HANDLE,
+                    FileIdInfo,
+                    (&mut identity as *mut FILE_ID_INFO).cast(),
+                    size_of::<FILE_ID_INFO>() as u32,
+                )
+            },
+            0
+        );
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).expect("read secure fixture");
+        crate::agent_storage_windows::verify_secure_file_path(&file, path)
+            .expect("secure file identity is stable after read");
+        (
+            bytes,
+            identity.VolumeSerialNumber,
+            identity.FileId.Identifier,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn make_windows_path_permissive(path: &Path, is_directory: bool) {
+        let mut options = OpenOptions::new();
+        options.access_mode(READ_CONTROL | WRITE_DAC);
+        if is_directory {
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options
+            .open(path)
+            .expect("open fixture security descriptor");
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null(),
+                null(),
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_no_windows_secure_temp(directory: &Path) {
+        let prefix = format!(".{HISTORY_FILE_NAME}.tmp-");
+        assert!(!fs::read_dir(directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        }));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_no_windows_corrupt_candidate(directory: &Path) {
+        assert!(!fs::read_dir(directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("quota-pace-history-v3.corrupt-")
+        }));
     }
 
     #[cfg(unix)]
@@ -2425,6 +2686,366 @@ mod tests {
                 consecutive_count: 1,
             }),
             samples,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_read_only_transaction_verifies_directory_history_and_lock() {
+        let (directory, path) = windows_secure_temp_path("read-only");
+        let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
+        write_windows_secure_file(&path, &bytes);
+        let before = windows_secure_file_snapshot(&path);
+        let now = 4_000_000_000_i64;
+
+        with_locked_transaction_with_mode(
+            StorageMode::System,
+            &path,
+            now,
+            || now,
+            |store| {
+                assert_eq!(store, &Store::default());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(windows_secure_file_snapshot(&path), before);
+        assert_no_windows_secure_temp(&directory);
+        assert_no_windows_corrupt_candidate(&directory);
+        let directory_handle =
+            crate::agent_storage_windows::ensure_secure_storage_directory(&directory).unwrap();
+        crate::agent_storage_windows::verify_storage_handle(
+            directory_handle.as_raw_handle() as HANDLE
+        )
+        .unwrap();
+        drop(directory_handle);
+        sync_directory_with_mode(StorageMode::System, &directory).unwrap();
+
+        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
+        let first_lock = windows_secure_file_snapshot(&lock_path);
+        let second_lock = windows_secure_file_snapshot(&lock_path);
+        assert_eq!(first_lock, second_lock);
+        assert!(first_lock.0.is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_rejects_permissive_directory_reparse_history_and_permissive_lock() {
+        {
+            let (directory, path) = windows_secure_temp_path("permissive-directory");
+            let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
+            write_windows_secure_file(&path, &bytes);
+            let before = windows_secure_file_snapshot(&path);
+            make_windows_path_permissive(&directory, true);
+
+            assert_eq!(
+                with_locked_transaction_with_mode(
+                    StorageMode::System,
+                    &path,
+                    4_100_000_000,
+                    || 4_100_000_000,
+                    |_| Ok(()),
+                ),
+                Err(HistoryError::StorageUnavailable)
+            );
+            assert_eq!(windows_secure_file_snapshot(&path), before);
+            assert!(
+                crate::agent_storage_windows::ensure_secure_storage_directory(&directory).is_err()
+            );
+            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
+            assert_no_windows_secure_temp(&directory);
+            assert_no_windows_corrupt_candidate(&directory);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        {
+            let (directory, path) = windows_secure_temp_path("reparse-history");
+            let target = directory.join("history-target.json");
+            let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
+            write_windows_secure_file(&target, &bytes);
+            let before = windows_secure_file_snapshot(&target);
+            symlink_file(&target, &path).unwrap();
+
+            assert_eq!(
+                with_locked_transaction_with_mode(
+                    StorageMode::System,
+                    &path,
+                    4_200_000_000,
+                    || 4_200_000_000,
+                    |_| Ok(()),
+                ),
+                Err(HistoryError::Read)
+            );
+            assert_eq!(windows_secure_file_snapshot(&target), before);
+            assert!(fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_no_windows_secure_temp(&directory);
+            assert_no_windows_corrupt_candidate(&directory);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        {
+            let (directory, path) = windows_secure_temp_path("permissive-lock");
+            let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
+            write_windows_secure_file(&path, &bytes);
+            let before = windows_secure_file_snapshot(&path);
+            let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
+            write_windows_secure_file(&lock_path, b"lock-sentinel");
+            make_windows_path_permissive(&lock_path, false);
+            let lock_bytes = fs::read(&lock_path).unwrap();
+
+            assert_eq!(
+                with_locked_transaction_with_mode(
+                    StorageMode::System,
+                    &path,
+                    4_300_000_000,
+                    || 4_300_000_000,
+                    |_| Ok(()),
+                ),
+                Err(HistoryError::LockOpen)
+            );
+            assert_eq!(windows_secure_file_snapshot(&path), before);
+            assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+            assert!(
+                crate::agent_storage_windows::open_existing_secure_file(&lock_path, false).is_err()
+            );
+            assert_no_windows_secure_temp(&directory);
+            assert_no_windows_corrupt_candidate(&directory);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_mutation_stops_at_atomic_save_without_touching_last_good_file() {
+        let (directory, path) = windows_secure_temp_path("atomic-save-guard");
+        let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
+        write_windows_secure_file(&path, &bytes);
+        let before = windows_secure_file_snapshot(&path);
+        let now = 4_400_000_000_i64;
+        let reset = now + DAY;
+
+        assert_eq!(
+            record_observation_at_path_and_evaluate_with_clock_and_mode(
+                key("secure-save"),
+                Some(reset),
+                10.0,
+                now,
+                provider(reset, DAY),
+                None,
+                &path,
+                StorageMode::System,
+                || now,
+            ),
+            Err(HistoryError::AtomicSave)
+        );
+        assert_eq!(windows_secure_file_snapshot(&path), before);
+        assert_no_windows_secure_temp(&directory);
+        assert_no_windows_corrupt_candidate(&directory);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_corrupt_history_stops_before_quarantine_and_preserves_identity() {
+        let (directory, path) = windows_secure_temp_path("quarantine-guard");
+        write_windows_secure_file(&path, b"corrupt-secure-v3");
+        let before = windows_secure_file_snapshot(&path);
+        let body_called = std::cell::Cell::new(false);
+        let now = 4_500_000_000_i64;
+
+        assert_eq!(
+            with_locked_transaction_with_mode(
+                StorageMode::System,
+                &path,
+                now,
+                || now,
+                |_| {
+                    body_called.set(true);
+                    Ok(())
+                }
+            ),
+            Err(HistoryError::CorruptQuarantine)
+        );
+        assert!(!body_called.get());
+        assert_eq!(windows_secure_file_snapshot(&path), before);
+        assert_no_windows_corrupt_candidate(&directory);
+        assert_no_windows_secure_temp(&directory);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_v2_reads_are_read_only_and_valid_import_stops_at_v3_save() {
+        let now = 6_000_000_000_i64;
+        let duration = 10_080 * 60;
+        let reset = now - 2 * duration;
+        let valid_v2 = serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 2,
+            "samples": [{
+                "accountKey": "acct",
+                "resetsAt": reset,
+                "windowMinutes": 10080,
+                "usedPercent": 40.0,
+                "sampledAt": reset - duration / 2
+            }]
+        }))
+        .unwrap();
+
+        {
+            let (directory, v3_path) = windows_secure_temp_path("migration-valid");
+            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
+            write_windows_secure_file(&v2_path, &valid_v2);
+            write_windows_secure_file(
+                &v3_path,
+                &serde_json::to_vec_pretty(&Store::default()).unwrap(),
+            );
+            let v2_before = windows_secure_file_snapshot(&v2_path);
+            let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
+            let v3_before = windows_secure_file_snapshot(&v3_path);
+
+            assert_eq!(
+                migrate_codex_v2_at_paths_with_clock_and_mode(
+                    "acct",
+                    "opaque-scope",
+                    now,
+                    &v2_path,
+                    &v3_path,
+                    StorageMode::System,
+                    || now,
+                ),
+                Err(HistoryError::AtomicSave)
+            );
+            assert_eq!(windows_secure_file_snapshot(&v2_path), v2_before);
+            assert_eq!(
+                fs::metadata(&v2_path).unwrap().modified().unwrap(),
+                v2_mtime
+            );
+            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_before);
+            assert_no_windows_secure_temp(&directory);
+            assert_no_windows_corrupt_candidate(&directory);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        {
+            let (directory, v3_path) = windows_secure_temp_path("migration-permissive-v2");
+            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
+            write_windows_secure_file(&v2_path, &valid_v2);
+            make_windows_path_permissive(&v2_path, false);
+            write_windows_secure_file(
+                &v3_path,
+                &serde_json::to_vec_pretty(&Store::default()).unwrap(),
+            );
+            let v2_before = fs::read(&v2_path).unwrap();
+            let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
+            let v3_before = windows_secure_file_snapshot(&v3_path);
+
+            assert_eq!(
+                migrate_codex_v2_at_paths_with_clock_and_mode(
+                    "acct",
+                    "opaque-scope",
+                    now,
+                    &v2_path,
+                    &v3_path,
+                    StorageMode::System,
+                    || now,
+                ),
+                Ok(MigrationOutcome {
+                    imported_samples: 0,
+                    skipped_samples: 0,
+                })
+            );
+            assert_eq!(fs::read(&v2_path).unwrap(), v2_before);
+            assert_eq!(
+                fs::metadata(&v2_path).unwrap().modified().unwrap(),
+                v2_mtime
+            );
+            assert!(
+                crate::agent_storage_windows::open_existing_secure_file(&v2_path, false).is_err()
+            );
+            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_before);
+            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
+            assert_no_windows_secure_temp(&directory);
+            assert_no_windows_corrupt_candidate(&directory);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        {
+            let (directory, v3_path) = windows_secure_temp_path("migration-corrupt-v2");
+            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
+            write_windows_secure_file(&v2_path, b"corrupt-secure-v2");
+            write_windows_secure_file(
+                &v3_path,
+                &serde_json::to_vec_pretty(&Store::default()).unwrap(),
+            );
+            let v2_before = windows_secure_file_snapshot(&v2_path);
+            let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
+            let v3_before = windows_secure_file_snapshot(&v3_path);
+
+            assert_eq!(
+                migrate_codex_v2_at_paths_with_clock_and_mode(
+                    "acct",
+                    "opaque-scope",
+                    now,
+                    &v2_path,
+                    &v3_path,
+                    StorageMode::System,
+                    || now,
+                ),
+                Ok(MigrationOutcome {
+                    imported_samples: 0,
+                    skipped_samples: 0,
+                })
+            );
+            assert_eq!(windows_secure_file_snapshot(&v2_path), v2_before);
+            assert_eq!(
+                fs::metadata(&v2_path).unwrap().modified().unwrap(),
+                v2_mtime
+            );
+            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_before);
+            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
+            assert_no_windows_secure_temp(&directory);
+            assert_no_windows_corrupt_candidate(&directory);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        {
+            let (directory, v3_path) = windows_secure_temp_path("migration-missing-v2");
+            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
+            write_windows_secure_file(
+                &v3_path,
+                &serde_json::to_vec_pretty(&Store::default()).unwrap(),
+            );
+            let v3_before = windows_secure_file_snapshot(&v3_path);
+
+            assert_eq!(
+                migrate_codex_v2_at_paths_with_clock_and_mode(
+                    "acct",
+                    "opaque-scope",
+                    now,
+                    &v2_path,
+                    &v3_path,
+                    StorageMode::System,
+                    || now,
+                ),
+                Ok(MigrationOutcome {
+                    imported_samples: 0,
+                    skipped_samples: 0,
+                })
+            );
+            assert!(!v2_path.exists());
+            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_before);
+            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
+            assert_no_windows_secure_temp(&directory);
+            assert_no_windows_corrupt_candidate(&directory);
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -4544,11 +5165,12 @@ mod tests {
                 DAY,
             ),
         ];
-        let result = record_observations_at_path_and_evaluate_with_clock_and_save(
+        let result = record_observations_at_path_and_evaluate_with_clock_and_mode_and_save(
             &[],
             &observations,
             now,
             &path,
+            StorageMode::Generic,
             || now,
             |_path, _store| Err(io::Error::other("injected batch save failure")),
         );
@@ -4821,12 +5443,13 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = migrate_codex_v2_at_paths_with_clock(
+        let outcome = migrate_codex_v2_at_paths_with_clock_and_mode(
             "acct",
             "scope",
             stale_now,
             &v2_path,
             &v3_path,
+            StorageMode::Generic,
             || committed_now + 1,
         )
         .unwrap();
