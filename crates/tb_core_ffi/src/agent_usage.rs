@@ -1063,11 +1063,15 @@ fn historical_pace_payload(pace: HistoricalPace) -> HistoricalPacePayload {
     }
 }
 
-fn finalize_grok_snapshot(
+fn finalize_grok_snapshot_with<F>(
     fetched: Result<agent_grok::GrokData, String>,
     now: DateTime<Utc>,
-) -> AgentUsageSnapshot {
-    match fetched {
+    mut enrich: F,
+) -> AgentUsageSnapshot
+where
+    F: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
+{
+    let mut snapshot = match fetched {
         Ok(data) => AgentUsageSnapshot {
             client_id: "grok".to_string(),
             source: "oauth".to_string(),
@@ -1088,12 +1092,18 @@ fn finalize_grok_snapshot(
             credits: None,
             error: Some(error),
         },
-    }
+    };
+    enrich(&mut snapshot, now);
+    snapshot
 }
 
 async fn fetch_grok() -> Option<AgentUsageSnapshot> {
     let now = Utc::now();
-    Some(finalize_grok_snapshot(agent_grok::fetch(now).await?, now))
+    Some(finalize_grok_snapshot_with(
+        agent_grok::fetch(now).await?,
+        now,
+        enrich_snapshot,
+    ))
 }
 
 async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
@@ -3385,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    fn finalizes_grok_scope_without_history_enrichment_and_errors_fail_closed() {
+    fn finalizes_grok_scope_and_enriches_success_but_errors_fail_closed() {
         let scope_store = TestRefreshScope::new("grok", "grok-finalize");
         let marker = b"grok-sensitive-refresh-marker";
         let account_scope = scope_store
@@ -3395,16 +3405,101 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-07-18T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-
-        let success = finalize_grok_snapshot(
+        let reset = now + chrono::Duration::days(7);
+        let weekly = UsageWindow::from_used_percent(
+            "Weekly".to_string(),
+            25.0,
+            Some(reset),
+            now,
+        )
+        .with_identity(
+            "billing.weekly.v1",
+            Some("billing.weekly.v1".to_string()),
+        )
+        .with_provider_duration_evidence(
+            now,
+            true,
+            Some(DurationEvidence::provider(reset.timestamp(), 604_800)),
+        );
+        let callback_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
+        let success = finalize_grok_snapshot_with(
             Ok(agent_grok::GrokData {
                 identity: None,
                 account_scope: Ok(account_scope.clone()),
-                windows: Vec::new(),
+                windows: vec![weekly],
             }),
             now,
+            |snapshot, callback_now| {
+                callback_calls.set(callback_calls.get() + 1);
+                assert_eq!(callback_now, now);
+                assert_eq!(snapshot.client_id, "grok");
+                assert_eq!(snapshot.account_scope.as_ref().unwrap(), &account_scope);
+                enrich_snapshot_with(
+                    snapshot,
+                    callback_now,
+                    |active, observations, history_now| {
+                        record_calls.set(record_calls.get() + 1);
+                        assert_eq!(history_now, now.timestamp());
+                        assert_eq!(
+                            active,
+                            &[SeriesKey::new(
+                                "grok",
+                                account_scope.as_str(),
+                                "billing.weekly.v1",
+                            )]
+                        );
+                        assert_eq!(observations.len(), 1);
+                        assert_eq!(
+                            observations[0].key,
+                            SeriesKey::new(
+                                "grok",
+                                account_scope.as_str(),
+                                "billing.weekly.v1",
+                            )
+                        );
+                        assert_eq!(observations[0].reset_at, Some(reset.timestamp()));
+                        assert_eq!(observations[0].used_percent, 25.0);
+                        assert_eq!(
+                            observations[0].provider,
+                            Some(DurationEvidence::provider(reset.timestamp(), 604_800))
+                        );
+                        assert!(observations[0].contract.is_none());
+                        Ok(vec![Ok((
+                            HistoryOutcome::Ready {
+                                duration_seconds: 604_800,
+                                source: DurationSource::Provider,
+                                sampled: true,
+                            },
+                            Some(HistoricalPace {
+                                expected_percent: 27.5,
+                                eta_seconds: Some(123.0),
+                                will_last_to_reset: false,
+                                run_out_probability: Some(0.25),
+                            }),
+                            3,
+                        ))])
+                    },
+                );
+            },
         );
+        assert_eq!(callback_calls.get(), 1);
+        assert_eq!(record_calls.get(), 1);
         assert_eq!(success.account_scope, Ok(account_scope));
+        assert_eq!(success.windows[0].pace_status.state, PaceState::Available);
+        assert_eq!(success.windows[0].pace_status.duration_seconds, Some(604_800));
+        assert_eq!(
+            success.windows[0].pace_status.duration_source,
+            Some(DurationSource::Provider)
+        );
+        assert_eq!(success.windows[0].pace_status.complete_cycles, 3);
+        assert_eq!(
+            success.windows[0]
+                .historical_pace
+                .as_ref()
+                .map(|pace| pace.expected_used_percent),
+            Some(27.5)
+        );
         let wire = serde_json::to_string(&success).unwrap();
         assert!(!wire.contains("accountScope"));
         assert!(!wire.contains(String::from_utf8_lossy(marker).as_ref()));
@@ -3417,18 +3512,45 @@ mod tests {
             now,
         )
         .with_identity("billing.weekly.v1", Some("billing.weekly.v1".to_string()));
-        let unscoped = finalize_grok_snapshot(
+        let unscoped = finalize_grok_snapshot_with(
             Ok(agent_grok::GrokData {
                 identity: None,
                 account_scope: Err(AccountScopeError::NoTrustedEvidence),
                 windows: vec![learning],
             }),
             now,
+            enrich_snapshot,
         );
-        assert_eq!(unscoped.windows[0].pace_status.state, PaceState::LearningDuration);
-        assert!(unscoped.windows[0].pace_status.reason.is_none());
+        assert_eq!(
+            unscoped.windows[0].pace_status.state,
+            PaceState::Unavailable
+        );
+        assert_eq!(
+            unscoped.windows[0].pace_status.reason.as_deref(),
+            Some("accountScope")
+        );
 
-        let failed = finalize_grok_snapshot(Err("Grok billing failed".to_string()), now);
+        let callback_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
+        let failed = finalize_grok_snapshot_with(
+            Err("Grok billing failed".to_string()),
+            now,
+            |snapshot, callback_now| {
+                callback_calls.set(callback_calls.get() + 1);
+                assert_eq!(callback_now, now);
+                assert!(snapshot.windows.is_empty());
+                assert!(matches!(
+                    snapshot.account_scope,
+                    Err(AccountScopeError::NoTrustedEvidence)
+                ));
+                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
+                    record_calls.set(record_calls.get() + 1);
+                    Ok(Vec::new())
+                });
+            },
+        );
+        assert_eq!(callback_calls.get(), 1);
+        assert_eq!(record_calls.get(), 0);
         assert_eq!(
             failed.account_scope,
             Err(AccountScopeError::NoTrustedEvidence)
@@ -3436,6 +3558,81 @@ mod tests {
         assert!(failed.windows.is_empty());
         assert_eq!(failed.error.as_deref(), Some("Grok billing failed"));
         scope_store.cleanup();
+    }
+
+    #[test]
+    fn finalizes_grok_same_second_provider_reset_as_coherent_history_observation() {
+        let (scope, account_scope) = enrichment_scope("grok-finalize-normalized-reset");
+        let now = DateTime::parse_from_rfc3339("2026-07-18T00:00:00.000500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset = DateTime::parse_from_rfc3339("2026-07-18T00:00:00.000900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = UsageWindow::from_used_percent(
+            "Weekly".to_string(),
+            33.0,
+            Some(reset),
+            now,
+        )
+        .with_identity(
+            "billing.weekly.v1",
+            Some("billing.weekly.v1".to_string()),
+        )
+        .with_provider_duration_evidence(
+            now,
+            true,
+            Some(DurationEvidence::provider(now.timestamp() + 1, 604_800)),
+        );
+        assert!(window.provider_reset_normalized);
+
+        let record_calls = std::cell::Cell::new(0);
+        let snapshot = finalize_grok_snapshot_with(
+            Ok(agent_grok::GrokData {
+                identity: None,
+                account_scope: Ok(account_scope.clone()),
+                windows: vec![window],
+            }),
+            now,
+            |snapshot, callback_now| {
+                enrich_snapshot_with(
+                    snapshot,
+                    callback_now,
+                    |_, observations, _| {
+                        record_calls.set(record_calls.get() + 1);
+                        assert_eq!(observations.len(), 1);
+                        assert_eq!(observations[0].reset_at, Some(now.timestamp() + 1));
+                        assert_eq!(observations[0].used_percent, 33.0);
+                        assert_eq!(
+                            observations[0].provider,
+                            Some(DurationEvidence::provider(now.timestamp() + 1, 604_800))
+                        );
+                        Ok(vec![Ok((
+                            HistoryOutcome::Ready {
+                                duration_seconds: 604_800,
+                                source: DurationSource::Provider,
+                                sampled: true,
+                            },
+                            None,
+                            1,
+                        ))])
+                    },
+                );
+            },
+        );
+        assert_eq!(record_calls.get(), 1);
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::LearningHistory
+        );
+        assert_eq!(snapshot.windows[0].pace_status.reason, None);
+        assert!(snapshot.windows[0].provider_reset_normalized);
+        assert_eq!(snapshot.windows[0].pace_status.duration_seconds, Some(604_800));
+        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 1);
+        assert!(snapshot.windows[0].historical_pace.is_none());
+        let wire = serde_json::to_value(&snapshot.windows[0]).unwrap();
+        assert_eq!(wire["resetsAt"], "2026-07-18T00:00:00.000Z");
+        scope.cleanup();
     }
 
     #[test]
