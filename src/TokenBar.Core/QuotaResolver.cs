@@ -8,18 +8,57 @@ public sealed record QuotaPick(string ClientId, UsageWindow Window);
 /// Picks which quota window the tray displays (port of
 /// TokenBarCore/QuotaResolver.swift). The selection string is "auto" (the
 /// tightest window — lowest remaining percent — across every agent) or
-/// "&lt;clientId&gt;|&lt;windowLabel&gt;" for an explicit pick.
+/// "&lt;clientId&gt;|&lt;cardId&gt;" for an explicit pick.
 /// </summary>
 public static class QuotaResolver
 {
     public const string Auto = "auto";
 
-    public static string Selection(string clientId, string label) => $"{clientId}|{label}";
+    /// <summary>Builds the canonical persisted selection for one quota card.</summary>
+    public static string Selection(string clientId, string cardId) => $"{clientId}|{cardId}";
+
+    /// <summary>
+    /// Canonicalizes a persisted selection against the current payload. Empty,
+    /// Auto, and malformed explicit selections become Auto. A legacy label is
+    /// migrated only when it identifies exactly one unique card; unmatched
+    /// explicit selections remain unchanged.
+    /// </summary>
+    public static string CanonicalSelection(AgentUsagePayload? payload, string selection)
+    {
+        var parsed = ParseExplicitSelection(selection);
+        if (parsed is null)
+        {
+            return Auto;
+        }
+
+        if (payload is null)
+        {
+            return selection;
+        }
+
+        var agent = payload.Agents.FirstOrDefault(a => a.ClientId == parsed.Value.ClientId);
+        if (agent is null)
+        {
+            return selection;
+        }
+
+        var windows = agent.UniqueCardWindows;
+        var exact = windows.FirstOrDefault(w => w.CardId == parsed.Value.Value);
+        if (exact is not null)
+        {
+            return Selection(agent.ClientId, exact.CardId);
+        }
+
+        var labelMatches = windows.Where(w => w.Label == parsed.Value.Value).ToArray();
+        return labelMatches.Length == 1
+            ? Selection(agent.ClientId, labelMatches[0].CardId)
+            : selection;
+    }
 
     /// <summary><paramref name="excluding"/> is the set of client ids to skip in
     /// AUTO mode only (the user's tab-hidden ∪ limits-hidden clients) — so the
     /// menu-bar quota can't surface a client the popover hides. An EXPLICIT
-    /// <c>clientId|window</c> selection is always honored, even for an excluded
+    /// <c>clientId|cardId</c> selection is always honored, even for an excluded
     /// client (the user deliberately picked it as the tray source). Null/empty
     /// set = pre-hide behavior, byte-identical.</summary>
     public static QuotaPick? Resolve(
@@ -30,40 +69,21 @@ public static class QuotaResolver
             return null;
         }
 
-        if (selection.Length == 0 || selection == Auto)
+        var canonical = CanonicalSelection(payload, selection);
+        if (canonical == Auto)
         {
-            QuotaPick? best = null;
-            foreach (var agent in payload.Agents.Where(
-                a => a.Error is null && !(excluding?.Contains(a.ClientId) ?? false)))
-            {
-                foreach (var window in agent.Windows.Where(w => double.IsFinite(w.RemainingPercent)))
-                {
-                    if (best is null || window.RemainingPercent < best.Window.RemainingPercent)
-                    {
-                        best = new QuotaPick(agent.ClientId, window);
-                    }
-                }
-            }
-
-            return best;
+            return AutoCandidate(payload, excluding);
         }
 
-        // Empty-segment check mirrors Swift split's omittingEmptySubsequences:
-        // "claude|" / "|label" resolve to nothing there and must here too.
-        var parts = selection.Split('|', 2);
-        if (parts.Length != 2 || parts[0].Length == 0 || parts[1].Length == 0)
+        var parsed = ParseExplicitSelection(canonical);
+        if (parsed is null)
         {
             return null;
         }
 
-        // Same health filter as the auto path: an errored agent, or a window
-        // with a non-finite RemainingPercent, is not a usable source even when
-        // the user pinned it explicitly — otherwise the tray surfaces a stale
-        // or NaN window that auto mode would have skipped.
-        var picked = payload.Agents.FirstOrDefault(a => a.ClientId == parts[0] && a.Error is null);
-        var pickedWindow = picked?.Windows.FirstOrDefault(
-            w => w.Label == parts[1] && double.IsFinite(w.RemainingPercent));
-        return pickedWindow is null ? null : new QuotaPick(picked!.ClientId, pickedWindow);
+        var agent = payload.Agents.FirstOrDefault(a => a.ClientId == parsed.Value.ClientId);
+        var window = agent?.UniqueCardWindows.FirstOrDefault(w => w.CardId == parsed.Value.Value);
+        return window is null ? null : new QuotaPick(agent!.ClientId, window);
     }
 
     /// <summary>True when <see cref="Resolve"/> returned null ONLY because the
@@ -78,12 +98,69 @@ public static class QuotaResolver
     public static bool ExcludedAllCandidates(
         AgentUsagePayload? payload, string selection, IReadOnlySet<string> excluding)
     {
-        if (!(selection.Length == 0 || selection == Auto) || excluding.Count == 0)
+        if (payload is null || excluding.Count == 0)
         {
             return false;
         }
 
-        return Resolve(payload, selection) is not null
-            && Resolve(payload, selection, excluding) is null;
+        if (CanonicalSelection(payload, selection) != Auto)
+        {
+            return false;
+        }
+
+        if (AutoCandidate(payload, excluding: null) is null)
+        {
+            return false;
+        }
+
+        return AutoCandidate(payload, excluding) is null;
+    }
+
+    private static QuotaPick? AutoCandidate(
+        AgentUsagePayload payload, IReadOnlySet<string>? excluding)
+    {
+        QuotaPick? best = null;
+        foreach (var agent in payload.Agents)
+        {
+            if (agent.Error is not null || excluding?.Contains(agent.ClientId) == true)
+            {
+                continue;
+            }
+
+            foreach (var window in agent.UniqueCardWindows)
+            {
+                if (!double.IsFinite(window.RemainingPercent))
+                {
+                    continue;
+                }
+
+                if (best is null || window.RemainingPercent < best.Window.RemainingPercent)
+                {
+                    best = new QuotaPick(agent.ClientId, window);
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private static (string ClientId, string Value)? ParseExplicitSelection(string raw)
+    {
+        if (raw.Length == 0 || raw == Auto)
+        {
+            return null;
+        }
+
+        var separator = raw.IndexOf('|');
+        if (separator < 0)
+        {
+            return null;
+        }
+
+        var clientId = raw[..separator];
+        var value = raw[(separator + 1)..];
+        return string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(value)
+            ? null
+            : (clientId, value);
     }
 }

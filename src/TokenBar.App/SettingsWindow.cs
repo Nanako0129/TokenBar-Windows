@@ -231,10 +231,10 @@ public sealed class SettingsWindow : Window
         {
             foreach (var agent in payload.Agents.Where(a => a.Error is null))
             {
-                foreach (var window in agent.Windows)
+                foreach (var window in agent.UniqueCardWindows)
                 {
                     choices.Add((
-                        QuotaResolver.Selection(agent.ClientId, window.Label),
+                        QuotaResolver.Selection(agent.ClientId, window.CardId),
                         $"{ClientRegistry.ShortName(agent.ClientId)} · {window.Label}"));
                 }
             }

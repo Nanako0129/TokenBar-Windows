@@ -144,7 +144,7 @@ public sealed class TrayService : IDisposable
         else
         {
             foreach (var agent in payload.Agents.Where(
-                a => a.Error is null && a.Windows.Count > 0))
+                a => a.Error is null && a.UniqueCardWindows.Count > 0))
             {
                 source.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
                 source.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
@@ -152,14 +152,14 @@ public sealed class TrayService : IDisposable
                     Text = ClientRegistry.ShortName(agent.ClientId),
                     IsEnabled = false,
                 });
-                foreach (var window in agent.Windows)
+                foreach (var window in agent.UniqueCardWindows)
                 {
                     var left = (int)Math.Round(
                         Math.Clamp(window.RemainingPercent, 0, 100),
                         MidpointRounding.AwayFromZero);
                     AddQuotaChoice(
                         source, $"{window.Label} — {left}% left",
-                        QuotaResolver.Selection(agent.ClientId, window.Label), selection);
+                        QuotaResolver.Selection(agent.ClientId, window.CardId), selection);
                 }
             }
         }
