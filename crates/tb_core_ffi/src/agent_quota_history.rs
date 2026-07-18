@@ -2427,13 +2427,19 @@ mod tests {
     use super::*;
     use chrono::Utc;
     #[cfg(target_os = "windows")]
+    use std::ffi::OsStr;
+    #[cfg(target_os = "windows")]
     use std::mem::size_of;
     #[cfg(target_os = "windows")]
     use std::os::windows::fs::{symlink_file, OpenOptionsExt as _};
     #[cfg(target_os = "windows")]
     use std::os::windows::io::AsRawHandle as _;
     #[cfg(target_os = "windows")]
+    use std::process::{Child, Command, Stdio};
+    #[cfg(target_os = "windows")]
     use std::ptr::{null, null_mut};
+    #[cfg(target_os = "windows")]
+    use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
     #[cfg(target_os = "windows")]
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
@@ -2451,6 +2457,36 @@ mod tests {
 
     const HOUR: i64 = 3_600;
     const DAY: i64 = 86_400;
+
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_WORKER_TEST: &str =
+        "agent_quota_history::tests::windows_secure_cross_process_worker";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_V3_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_V3_PATH";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_ACCOUNT_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_ACCOUNT";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_USED_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_USED";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_READY_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_READY_PATH";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_START_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_START_PATH";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_NOW_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_NOW";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_RESET_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_RESET_AT";
+    #[cfg(target_os = "windows")]
+    const CROSS_PROCESS_START_FILE: &str = "tokenbar-test-quota-history-start.marker";
+
+    #[cfg(target_os = "windows")]
+    struct WindowsSecureTempCleanup(PathBuf);
+
+    #[cfg(target_os = "windows")]
+    impl Drop for WindowsSecureTempCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn key(account: &str) -> SeriesKey {
         SeriesKey::new("copilot", account, "premium_interactions.v1")
@@ -2578,6 +2614,135 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("quota-pace-history-v3.corrupt-")
         }));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn create_windows_secure_marker(path: &Path) -> io::Result<()> {
+        let file = crate::agent_storage_windows::create_new_secure_file(path)?;
+        file.sync_all()?;
+        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)?;
+        crate::agent_storage_windows::verify_secure_file_path(&file, path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_secure_marker_exists(path: &Path) -> io::Result<bool> {
+        let file = match crate::agent_storage_windows::open_existing_secure_file(path, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)?;
+        crate::agent_storage_windows::verify_secure_file_path(&file, path)?;
+        Ok(true)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn validate_cross_process_child_paths(path: &Path, ready: &Path, start: &Path) {
+        let directory = path.parent().expect("cross-process v3 path has a parent");
+        let temp = std::env::temp_dir();
+        assert!(path.is_absolute());
+        assert_eq!(directory.parent(), Some(temp.as_path()));
+        assert!(directory
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("tokenbar-quota-v3-windows-secure-")));
+        assert_eq!(path.file_name(), Some(OsStr::new(HISTORY_FILE_NAME)));
+        assert_eq!(ready.parent(), Some(directory));
+        assert_eq!(start.parent(), Some(directory));
+        assert!(matches!(
+            ready.file_name().and_then(OsStr::to_str),
+            Some(
+                "tokenbar-test-quota-history-ready-a.marker"
+                    | "tokenbar-test-quota-history-ready-b.marker"
+            )
+        ));
+        assert_eq!(
+            start.file_name(),
+            Some(OsStr::new(CROSS_PROCESS_START_FILE))
+        );
+        assert_ne!(ready, start);
+        assert_ne!(ready, path);
+        assert_ne!(start, path);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_windows_cross_process_worker(
+        path: &Path,
+        account: &str,
+        used_percent: f64,
+        ready: &Path,
+        start: &Path,
+        now: i64,
+        reset_at: i64,
+    ) -> io::Result<Child> {
+        Command::new(std::env::current_exe()?)
+            .arg(CROSS_PROCESS_WORKER_TEST)
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env(CROSS_PROCESS_V3_ENV, path)
+            .env(CROSS_PROCESS_ACCOUNT_ENV, account)
+            .env(CROSS_PROCESS_USED_ENV, used_percent.to_string())
+            .env(CROSS_PROCESS_READY_ENV, ready)
+            .env(CROSS_PROCESS_START_ENV, start)
+            .env(CROSS_PROCESS_NOW_ENV, now.to_string())
+            .env(CROSS_PROCESS_RESET_ENV, reset_at.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_windows_test_children(
+        children: Vec<Child>,
+        terminate_running: bool,
+    ) -> (bool, String) {
+        let mut all_success = true;
+        let mut diagnostics = String::new();
+        for (index, mut child) in children.into_iter().enumerate() {
+            if terminate_running {
+                let running = match child.try_wait() {
+                    Ok(status) => status.is_none(),
+                    Err(error) => {
+                        all_success = false;
+                        diagnostics.push_str(&format!(
+                            "child {index} try_wait before termination failed: {error}\n"
+                        ));
+                        true
+                    }
+                };
+                if running {
+                    if let Err(error) = child.kill() {
+                        all_success = false;
+                        diagnostics
+                            .push_str(&format!("child {index} termination failed: {error}\n"));
+                    }
+                }
+            }
+            match child.wait_with_output() {
+                Ok(output) => {
+                    all_success &= output.status.success();
+                    diagnostics.push_str(&format!(
+                        "child {index} status={}\nstdout:\n{}\nstderr:\n{}\n",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Err(error) => {
+                    all_success = false;
+                    diagnostics.push_str(&format!("child {index} wait failed: {error}\n"));
+                }
+            }
+        }
+        (all_success, diagnostics)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn fail_windows_cross_process(children: Vec<Child>, reason: impl AsRef<str>) -> ! {
+        let (_, diagnostics) = finish_windows_test_children(children, true);
+        panic!("{}\n{}", reason.as_ref(), diagnostics);
     }
 
     #[cfg(unix)]
@@ -2770,6 +2935,362 @@ mod tests {
             }),
             samples,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_cross_process_worker() {
+        let Some(path) = std::env::var_os(CROSS_PROCESS_V3_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let account = std::env::var(CROSS_PROCESS_ACCOUNT_ENV)
+            .expect("cross-process worker account is present");
+        let used_percent = std::env::var(CROSS_PROCESS_USED_ENV)
+            .expect("cross-process worker usage is present")
+            .parse::<f64>()
+            .expect("cross-process worker usage is numeric");
+        let ready = PathBuf::from(
+            std::env::var_os(CROSS_PROCESS_READY_ENV)
+                .expect("cross-process worker ready path is present"),
+        );
+        let start = PathBuf::from(
+            std::env::var_os(CROSS_PROCESS_START_ENV)
+                .expect("cross-process worker start path is present"),
+        );
+        let now = std::env::var(CROSS_PROCESS_NOW_ENV)
+            .expect("cross-process worker now is present")
+            .parse::<i64>()
+            .expect("cross-process worker now is numeric");
+        let reset_at = std::env::var(CROSS_PROCESS_RESET_ENV)
+            .expect("cross-process worker reset is present")
+            .parse::<i64>()
+            .expect("cross-process worker reset is numeric");
+
+        assert!(account.starts_with("tokenbar-test-cross-process-"));
+        assert!(used_percent.is_finite() && (0.0 < used_percent && used_percent <= 100.0));
+        assert_eq!(reset_at.checked_sub(now), Some(DAY));
+        validate_cross_process_child_paths(&path, &ready, &start);
+        create_windows_secure_marker(&ready).expect("create exact secure ready marker");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match windows_secure_marker_exists(&start) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => panic!("secure start marker verification failed: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for secure start marker"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(matches!(
+            record_observation_at_path_and_evaluate_with_clock_and_mode(
+                key(&account),
+                Some(reset_at),
+                used_percent,
+                now,
+                provider(reset_at, DAY),
+                None,
+                &path,
+                StorageMode::System,
+                || now,
+            ),
+            Ok((HistoryOutcome::Ready { sampled: true, .. }, None))
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_cross_process_lock_preserves_both_samples() {
+        let (directory, path) = windows_secure_temp_path("cross-process-lock");
+        let cleanup = WindowsSecureTempCleanup(directory.clone());
+        let ready_paths = [
+            directory.join("tokenbar-test-quota-history-ready-a.marker"),
+            directory.join("tokenbar-test-quota-history-ready-b.marker"),
+        ];
+        let start_path = directory.join(CROSS_PROCESS_START_FILE);
+        let workers = [
+            ("tokenbar-test-cross-process-a", 17.0),
+            ("tokenbar-test-cross-process-b", 43.0),
+        ];
+        let now = 12_000_000_000_i64;
+        let reset_at = now + DAY;
+        let mut children = Vec::with_capacity(workers.len());
+        for ((account, used_percent), ready) in workers.iter().zip(&ready_paths) {
+            match spawn_windows_cross_process_worker(
+                &path,
+                account,
+                *used_percent,
+                ready,
+                &start_path,
+                now,
+                reset_at,
+            ) {
+                Ok(child) => children.push(child),
+                Err(error) => fail_windows_cross_process(
+                    children,
+                    format!("spawn cross-process secure history worker failed: {error}"),
+                ),
+            }
+        }
+
+        let ready_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut all_ready = true;
+            for ready in &ready_paths {
+                match windows_secure_marker_exists(ready) {
+                    Ok(true) => {}
+                    Ok(false) => all_ready = false,
+                    Err(error) => fail_windows_cross_process(
+                        children,
+                        format!("secure ready marker verification failed: {error}"),
+                    ),
+                }
+            }
+            if all_ready {
+                break;
+            }
+
+            let mut early_exit = None;
+            for (index, child) in children.iter_mut().enumerate() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        early_exit = Some(format!(
+                            "child {index} exited before both secure ready markers: {status}"
+                        ));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        early_exit = Some(format!("child {index} try_wait failed: {error}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = early_exit {
+                fail_windows_cross_process(children, reason);
+            }
+            if Instant::now() >= ready_deadline {
+                fail_windows_cross_process(children, "timed out waiting for secure ready markers");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        if let Err(error) = create_windows_secure_marker(&start_path) {
+            fail_windows_cross_process(
+                children,
+                format!("create exact secure start marker failed: {error}"),
+            );
+        }
+
+        let exit_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut all_exited = true;
+            let mut child_failure = None;
+            for (index, child) in children.iter_mut().enumerate() {
+                match child.try_wait() {
+                    Ok(Some(status)) if status.success() => {}
+                    Ok(Some(status)) => {
+                        child_failure = Some(format!("child {index} failed: {status}"));
+                        break;
+                    }
+                    Ok(None) => all_exited = false,
+                    Err(error) => {
+                        child_failure = Some(format!("child {index} try_wait failed: {error}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = child_failure {
+                fail_windows_cross_process(children, reason);
+            }
+            if all_exited {
+                break;
+            }
+            if Instant::now() >= exit_deadline {
+                fail_windows_cross_process(children, "timed out waiting for history workers");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let (all_success, diagnostics) = finish_windows_test_children(children, false);
+        assert!(all_success, "cross-process workers failed:\n{diagnostics}");
+
+        let final_snapshot = windows_secure_file_snapshot(&path);
+        assert_eq!(final_snapshot, windows_secure_file_snapshot(&path));
+        let store = serde_json::from_slice::<Store>(&final_snapshot.0).unwrap();
+        assert!(validate_store_at(&store, now));
+        assert_eq!(store.series.len(), 2);
+        for (account, used_percent) in workers {
+            let expected_key = key(account);
+            let series = store
+                .series
+                .iter()
+                .find(|series| series.key() == expected_key)
+                .unwrap();
+            assert_eq!(series.samples.len(), 1);
+            let sample = &series.samples[0];
+            assert_eq!(sample.origin, SampleOrigin::LiveV3);
+            assert_eq!(sample.used_percent, used_percent);
+            assert_eq!(sample.sampled_at, now);
+            assert_eq!(sample.reset_at, reset_at);
+        }
+        assert_no_windows_secure_temp(&directory);
+        assert_no_windows_corrupt_candidate(&directory);
+        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
+        let lock = windows_secure_file_snapshot(&lock_path);
+        assert!(lock.0.is_empty());
+        assert_eq!(lock, windows_secure_file_snapshot(&lock_path));
+
+        drop(cleanup);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_active_series_capacity_fails_closed_without_replacement() {
+        let (directory, path) = windows_secure_temp_path("capacity-fail-closed");
+        let cleanup = WindowsSecureTempCleanup(directory.clone());
+        let now = 12_100_000_200_i64;
+        let reset_at = now + DAY;
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: (0..MAX_SERIES)
+                .map(|index| {
+                    rollover_only_series(
+                        key(&format!("secure-capacity-active-{index:04}")),
+                        now,
+                        reset_at,
+                        false,
+                    )
+                })
+                .collect(),
+        };
+        store.series.sort_by(series_order);
+        assert!(validate_store_at(&store, now));
+        write_windows_secure_file(&path, &serialize_store_canonical(&store).unwrap());
+        let before = windows_secure_file_snapshot(&path);
+
+        assert_eq!(
+            record_observation_at_path_and_evaluate_with_clock_and_mode(
+                key("secure-capacity-new"),
+                Some(reset_at),
+                25.0,
+                now,
+                provider(reset_at, DAY),
+                None,
+                &path,
+                StorageMode::System,
+                || now,
+            ),
+            Err(HistoryError::StoreCapacity)
+        );
+
+        let after = windows_secure_file_snapshot(&path);
+        assert_eq!(after, before);
+        let decoded = serde_json::from_slice::<Store>(&after.0).unwrap();
+        assert!(validate_store_at(&decoded, now));
+        assert_eq!(decoded.series.len(), MAX_SERIES);
+        assert!(!decoded
+            .series
+            .iter()
+            .any(|series| series.key() == key("secure-capacity-new")));
+        assert_no_windows_secure_temp(&directory);
+        assert_no_windows_corrupt_candidate(&directory);
+        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
+        let lock = windows_secure_file_snapshot(&lock_path);
+        assert!(lock.0.is_empty());
+        assert_eq!(lock, windows_secure_file_snapshot(&lock_path));
+
+        drop(cleanup);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_stale_rollover_eviction_admits_new_series_atomically() {
+        let (directory, path) = windows_secure_temp_path("retention-admission");
+        let cleanup = WindowsSecureTempCleanup(directory.clone());
+        let now = 12_200_000_100_i64;
+        let reset_at = now + DAY;
+        let stale_key = key("secure-retention-stale");
+        let new_key = key("secure-retention-new");
+        let mut series = vec![rollover_only_series(
+            stale_key.clone(),
+            now - 57 * DAY,
+            now + 90 * DAY,
+            false,
+        )];
+        series.extend((0..MAX_SERIES - 1).map(|index| {
+            rollover_only_series(
+                key(&format!("secure-retention-active-{index:04}")),
+                now,
+                reset_at,
+                false,
+            )
+        }));
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series,
+        };
+        store.series.sort_by(series_order);
+        assert!(validate_store_at(&store, now));
+        write_windows_secure_file(&path, &serialize_store_canonical(&store).unwrap());
+        let before = windows_secure_file_snapshot(&path);
+
+        assert!(matches!(
+            record_observation_at_path_and_evaluate_with_clock_and_mode(
+                new_key.clone(),
+                Some(reset_at),
+                35.0,
+                now,
+                provider(reset_at, DAY),
+                None,
+                &path,
+                StorageMode::System,
+                || now,
+            ),
+            Ok((HistoryOutcome::Ready { sampled: true, .. }, None))
+        ));
+
+        let after = windows_secure_file_snapshot(&path);
+        assert_ne!(after.0, before.0);
+        assert_ne!((after.1, after.2), (before.1, before.2));
+        assert_eq!(after, windows_secure_file_snapshot(&path));
+        let retained = serde_json::from_slice::<Store>(&after.0).unwrap();
+        assert!(validate_store_at(&retained, now));
+        assert_eq!(retained.series.len(), MAX_SERIES);
+        assert!(!retained
+            .series
+            .iter()
+            .any(|series| series.key() == stale_key));
+        assert_eq!(
+            retained
+                .series
+                .iter()
+                .filter(|series| { series.account_scope.starts_with("secure-retention-active-") })
+                .count(),
+            MAX_SERIES - 1
+        );
+        let admitted = retained
+            .series
+            .iter()
+            .find(|series| series.key() == new_key)
+            .unwrap();
+        assert_eq!(admitted.samples.len(), 1);
+        assert_eq!(admitted.samples[0].origin, SampleOrigin::LiveV3);
+        assert_eq!(admitted.samples[0].used_percent, 35.0);
+        assert_eq!(admitted.samples[0].sampled_at, now);
+        assert_eq!(admitted.samples[0].reset_at, reset_at);
+        assert_no_windows_secure_temp(&directory);
+        assert_no_windows_corrupt_candidate(&directory);
+        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
+        let lock = windows_secure_file_snapshot(&lock_path);
+        assert!(lock.0.is_empty());
+        assert_eq!(lock, windows_secure_file_snapshot(&lock_path));
+
+        drop(cleanup);
     }
 
     #[cfg(target_os = "windows")]
