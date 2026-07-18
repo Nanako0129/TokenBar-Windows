@@ -121,6 +121,8 @@ pub struct UsageWindow {
     reset_text: Option<String>,
     /// Resolved provider/contract evidence retained only to validate the nested wire state.
     duration_evidence: Option<(DurationEvidence, DurationSource)>,
+    /// True only when a subsecond future reset was normalized into the next integer second.
+    provider_reset_normalized: bool,
     pace_status: PaceStatusPayload,
     historical_pace: Option<HistoricalPacePayload>,
 }
@@ -223,6 +225,7 @@ impl UsageWindow {
             reset_at_evidence: resets_at,
             reset_text: resets_at.map(|d| reset_text(d, now)),
             duration_evidence: None,
+            provider_reset_normalized: false,
             pace_status: PaceStatusPayload {
                 state: PaceState::Unavailable,
                 window_key: None,
@@ -242,6 +245,7 @@ impl UsageWindow {
     ) -> Self {
         self.card_id = card_id.into();
         self.duration_evidence = None;
+        self.provider_reset_normalized = false;
         self.pace_status = match (window_key, self.resets_at.is_some()) {
             (None, _) => PaceStatusPayload {
                 state: PaceState::Unavailable,
@@ -284,11 +288,22 @@ impl UsageWindow {
         if self.pace_status.window_key.is_none() {
             return self;
         }
+        self.provider_reset_normalized = false;
         let had_wire_reset = self.resets_at.is_some();
+        let exact_reset = self.reset_at_evidence;
         let reset_at = normalized_reset_at(&mut self, now);
         if reset_was_supplied != reset_at.is_some() || had_wire_reset != reset_at.is_some() {
             return self.with_unavailable_reason("invalidEvidence");
         }
+        let provider_reset_normalized = provider.is_some_and(|evidence| {
+            let Some(exact_reset) = exact_reset else {
+                return false;
+            };
+            exact_reset > now
+                && exact_reset.timestamp() == now.timestamp()
+                && evidence.reset_at == reset_at
+                && evidence.reset_at == Some(exact_reset.timestamp().saturating_add(1))
+        });
         match resolve_duration(now.timestamp(), reset_at, provider, contract, None) {
             DurationResolution::Ready {
                 duration_seconds,
@@ -303,6 +318,8 @@ impl UsageWindow {
                     return self.with_unavailable_reason("invalidEvidence");
                 };
                 self.duration_evidence = Some((evidence, source));
+                self.provider_reset_normalized =
+                    source == DurationSource::Provider && provider_reset_normalized;
                 self.pace_status.state = PaceState::LearningHistory;
                 self.pace_status.duration_seconds = Some(duration_seconds);
                 self.pace_status.duration_source = Some(source);
@@ -317,6 +334,15 @@ impl UsageWindow {
                 DurationUnavailableReason::InvalidEvidence => "invalidEvidence",
             }),
         }
+    }
+
+    pub(crate) fn with_provider_duration_evidence(
+        self,
+        now: DateTime<Utc>,
+        reset_was_supplied: bool,
+        provider: Option<DurationEvidence>,
+    ) -> Self {
+        self.with_duration_evidence(now, reset_was_supplied, provider, None)
     }
 
     pub(crate) fn with_observed_duration_evidence(
@@ -338,6 +364,7 @@ impl UsageWindow {
 
     fn unavailable(&mut self, reason: &str) {
         self.duration_evidence = None;
+        self.provider_reset_normalized = false;
         self.pace_status = PaceStatusPayload {
             state: PaceState::Unavailable,
             window_key: self.pace_status.window_key.clone(),
@@ -395,10 +422,28 @@ impl UsageWindow {
         {
             return Err("pace duration invariant failed".to_string());
         }
+        if self.provider_reset_normalized
+            && !matches!(
+                self.duration_evidence,
+                Some((_, DurationSource::Provider))
+            )
+        {
+            return Err("pace normalized provider reset lacks provider evidence".to_string());
+        }
         match self.duration_evidence {
             Some((evidence, source)) => {
                 let reset_is_coherent = match source {
-                    DurationSource::Provider => evidence.reset_at == reset_at,
+                    DurationSource::Provider => {
+                        let Some(evidence_reset) = evidence.reset_at else {
+                            return Err("pace provider evidence lacks reset".to_string());
+                        };
+                        let Some(wire_reset) = reset_at else {
+                            return Err("pace provider evidence lacks wire reset".to_string());
+                        };
+                        evidence_reset == wire_reset
+                            || (self.provider_reset_normalized
+                                && wire_reset.checked_add(1) == Some(evidence_reset))
+                    }
                     DurationSource::Contract => evidence.reset_at.is_none(),
                     DurationSource::Observed => false,
                 };
@@ -3567,6 +3612,55 @@ mod tests {
         assert_eq!(past_window.pace_reason_for_test(), Some("invalidEvidence"));
         assert!(past_window.reset_at_evidence.is_some());
         scope.cleanup();
+    }
+
+    #[test]
+    fn provider_duration_wrapper_accepts_subsecond_future_reset() {
+        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.100Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = UsageWindow::from_used_percent(
+            "Weekly".to_string(),
+            20.0,
+            Some(reset),
+            now,
+        )
+        .with_identity("weekly.v1", Some("weekly.v1".to_string()))
+        .with_provider_duration_evidence(
+            now,
+            true,
+            Some(DurationEvidence::provider(now.timestamp() + 1, 604_800)),
+        );
+        let wire = serde_json::to_value(&window).unwrap();
+        assert_eq!(wire["resetsAt"], "2026-07-10T00:00:00.900Z");
+        assert_eq!(wire["paceStatus"]["state"], "learningHistory");
+        assert_eq!(wire["paceStatus"]["durationSeconds"], 604_800);
+        assert_eq!(wire["paceStatus"]["durationSource"], "provider");
+
+        let earlier_now = DateTime::parse_from_rfc3339("2026-07-09T00:00:00.100Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mismatched = UsageWindow::from_used_percent(
+            "Mismatched".to_string(),
+            20.0,
+            Some(reset),
+            earlier_now,
+        )
+        .with_identity("mismatched.v1", Some("mismatched.v1".to_string()))
+        .with_provider_duration_evidence(
+            earlier_now,
+            true,
+            Some(DurationEvidence::provider(reset.timestamp() + 1, 604_800)),
+        );
+        let mismatched_wire = serde_json::to_value(&mismatched).unwrap();
+        assert_eq!(mismatched_wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(
+            mismatched_wire["paceStatus"]["reason"],
+            "invalidEvidence"
+        );
     }
 
     #[test]
