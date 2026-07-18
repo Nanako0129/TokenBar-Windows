@@ -148,6 +148,43 @@ public sealed record UsagePace(
         return new UsagePacePresentation(eta, risk);
     }
 
+    /// <summary>Build the pure display data shared by quota rows. Pace is
+    /// intentionally delegated to <see cref="Compute(UsageWindow, PaceMode,
+    /// DateTimeOffset)"/> and <see cref="Presentation"/>.</summary>
+    public static UsagePaceRowPresentation RowPresentation(
+        UsageWindow window,
+        PaceMode mode,
+        bool asUsed,
+        bool classic,
+        DateTimeOffset now)
+    {
+        var used = Clamp(window.UsedPercent, 0, 100);
+        var remaining = Clamp(window.RemainingPercent, 0, 100);
+        var fill = asUsed ? used : remaining;
+        var amount = FormatAmount(asUsed ? used : remaining, asUsed);
+
+        if (classic || mode == PaceMode.Off)
+        {
+            return new UsagePaceRowPresentation(
+                remaining, fill, amount, null, null, null, null, false);
+        }
+
+        var pace = Compute(window, mode, now);
+        var projection = pace is null ? null : Presentation(window, mode, pace);
+        var status = StatusText(window, mode);
+        return new UsagePaceRowPresentation(
+            remaining,
+            fill,
+            amount,
+            JoinText(status, pace?.Label),
+            projection is null ? null : JoinText(projection.EtaText, projection.RiskText),
+            pace is null
+                ? null
+                : Clamp(asUsed ? pace.ExpectedUsedPercent : 100 - pace.ExpectedUsedPercent, 0, 100),
+            pace?.ExpectedUsedPercent,
+            pace?.IsHistoricalDeficit == true);
+    }
+
     /// <summary>codexbar-style historical run-out risk, e.g.
     /// "≈ 30% run-out risk", or null. A supplied pace suppresses risk for a
     /// Linear result.</summary>
@@ -163,6 +200,51 @@ public sealed record UsagePace(
         var pct = (int)Math.Round(Clamp(probability, 0, 1) * 100,
             MidpointRounding.AwayFromZero);
         return pct <= 0 ? null : $"≈ {pct}% run-out risk";
+    }
+
+    private static string? StatusText(UsageWindow window, PaceMode mode) =>
+        window.PaceStatus.State switch
+        {
+            UsagePaceState.LearningHistory when mode == PaceMode.Historical =>
+                "Learning history · Linear estimate",
+            UsagePaceState.LearningHistory when mode == PaceMode.Linear => "Linear",
+            UsagePaceState.LearningDuration => "Learning reset duration",
+            UsagePaceState.Available when mode == PaceMode.Linear => "Linear",
+            UsagePaceState.Available => null,
+            UsagePaceState.LegacyMissing => "Pace unavailable · legacy data",
+            UsagePaceState.Unavailable => UnavailableStatusText(window.PaceStatus.Reason),
+            _ => null,
+        };
+
+    private static string UnavailableStatusText(UsagePaceUnavailableReason? reason) =>
+        reason switch
+        {
+            null => "Pace unavailable · unavailable reason",
+            UsagePaceUnavailableReason.WindowIdentity =>
+                "Pace unavailable · unknown quota window",
+            UsagePaceUnavailableReason.MissingReset => "Pace unavailable · missing reset",
+            UsagePaceUnavailableReason.InvalidEvidence =>
+                "Pace unavailable · invalid quota data",
+            UsagePaceUnavailableReason.AccountScope =>
+                "Pace unavailable · account identity unavailable",
+            UsagePaceUnavailableReason.StoreCapacity =>
+                "Pace unavailable · history storage full",
+            UsagePaceUnavailableReason.History => "Pace unavailable · history unavailable",
+            UsagePaceUnavailableReason.NonRecurring =>
+                "Pace unavailable · non-recurring quota",
+            _ => "Pace unavailable · unavailable reason",
+        };
+
+    private static string FormatAmount(double amount, bool asUsed)
+    {
+        var rounded = (int)Math.Round(amount, MidpointRounding.AwayFromZero);
+        return $"{rounded}% {(asUsed ? "used" : "left")}";
+    }
+
+    private static string? JoinText(params string?[] values)
+    {
+        var parts = values.Where(static value => !string.IsNullOrEmpty(value)).ToArray();
+        return parts.Length == 0 ? null : string.Join(" · ", parts);
     }
 
     private static bool IsDurationReady(UsagePaceState state) =>
@@ -328,3 +410,14 @@ public sealed record UsagePace(
 /// <summary>Display-only presentation assembled from one pace result and its
 /// optional historical risk.</summary>
 public sealed record UsagePacePresentation(string? EtaText, string? RiskText);
+
+/// <summary>Pure display values for one quota row.</summary>
+public sealed record UsagePaceRowPresentation(
+    double RemainingPercent,
+    double FillPercent,
+    string AmountText,
+    string? PaceText,
+    string? ProjectionText,
+    double? MarkerPercent,
+    double? ExpectedUsedPercent,
+    bool IsHistoricalDeficit);
