@@ -275,6 +275,19 @@ struct QuotaInfo {
     reset_time: Option<String>,
 }
 
+fn quota_window(
+    label: String,
+    fraction: f64,
+    reset: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    card_id: String,
+    window_key: Option<String>,
+) -> Option<UsageWindow> {
+    (fraction.is_finite() && (0.0..=1.0).contains(&fraction)).then(|| {
+        UsageWindow::from_fraction(label, fraction, reset, now).with_identity(card_id, window_key)
+    })
+}
+
 fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> {
     let response: UserStatusResponse =
         serde_json::from_str(body).map_err(|e| format!("decode GetUserStatus: {e}"))?;
@@ -288,16 +301,29 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
         .unwrap_or_default();
     let windows: Vec<UsageWindow> = configs
         .into_iter()
-        .filter_map(|config| {
+        .enumerate()
+        .filter_map(|(source_index, config)| {
             let quota = config.quota_info?;
             let fraction = quota.remaining_fraction?;
             let reset = quota.reset_time.as_deref().and_then(parse_datetime);
+            let model_id = config
+                .model_or_alias
+                .and_then(|model| model.model)
+                .map(|model| model.trim().to_string())
+                .filter(|model| !model.is_empty());
             let label = config
                 .label
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| config.model_or_alias.and_then(|m| m.model))
+                .filter(|label| !label.trim().is_empty())
+                .or_else(|| model_id.clone())
                 .unwrap_or_else(|| "Model".to_string());
-            Some(UsageWindow::from_fraction(label, fraction, reset, now))
+            let (card_id, window_key) = match model_id {
+                Some(model_id) => {
+                    let key = format!("model.{model_id}.v1");
+                    (key.clone(), Some(key))
+                }
+                None => (format!("row.cli.config.{source_index}.v1"), None),
+            };
+            quota_window(label, fraction, reset, now, card_id, window_key)
         })
         .collect();
 
@@ -561,13 +587,15 @@ fn models_from_available(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> 
     };
     models
         .iter()
-        .filter_map(|(id, model)| {
+        .enumerate()
+        .filter_map(|(source_index, (id, model))| {
             let quota = model.get("quotaInfo")?;
             let fraction = quota.get("remainingFraction").and_then(Value::as_f64)?;
             let reset = quota
                 .get("resetTime")
                 .and_then(Value::as_str)
                 .and_then(parse_datetime);
+            let model_id = id.trim();
             let label = model
                 .get("displayName")
                 .and_then(Value::as_str)
@@ -578,9 +606,16 @@ fn models_from_available(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> 
                         .and_then(Value::as_str)
                         .filter(|s| !s.trim().is_empty())
                 })
-                .unwrap_or(id.as_str())
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or(model_id)
                 .to_string();
-            Some(UsageWindow::from_fraction(label, fraction, reset, now))
+            let (card_id, window_key) = if model_id.is_empty() {
+                (format!("row.models.{source_index}.v1"), None)
+            } else {
+                let key = format!("model.{model_id}.v1");
+                (key.clone(), Some(key))
+            };
+            quota_window(label, fraction, reset, now, card_id, window_key)
         })
         .collect()
 }
@@ -619,7 +654,10 @@ fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
     }
     by_model
         .into_iter()
-        .map(|(model, (fraction, reset))| UsageWindow::from_fraction(model, fraction, reset, now))
+        .filter_map(|(model, (fraction, reset))| {
+            let key = format!("model.{model}.v1");
+            quota_window(model, fraction, reset, now, key.clone(), Some(key))
+        })
         .collect()
 }
 
@@ -826,7 +864,31 @@ mod tests {
         assert_eq!(fetched.identity.as_ref().unwrap().plan.as_deref(), Some("Pro"));
         assert_eq!(fetched.windows.len(), 1);
         assert_eq!(fetched.windows[0].label_for_test(), "Gemini 3 Pro");
+        assert_eq!(fetched.windows[0].card_id_for_test(), "model.gemini-3-pro.v1");
+        assert_eq!(
+            fetched.windows[0].pace_window_key_for_test(),
+            Some("model.gemini-3-pro.v1")
+        );
         assert!((fetched.windows[0].remaining_for_test() - 42.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn local_config_without_model_has_row_identity() {
+        let now = Utc::now();
+        let body = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        { "label": "Unnamed", "quotaInfo": { "remainingFraction": 0.5 } }
+                    ]
+                }
+            }
+        }"#;
+        let fetched = parse_user_status(body, now).unwrap();
+        assert_eq!(fetched.windows.len(), 1);
+        assert_eq!(fetched.windows[0].card_id_for_test(), "row.cli.config.0.v1");
+        assert!(fetched.windows[0].pace_window_key_for_test().is_none());
+        assert_eq!(fetched.windows[0].pace_reason_for_test(), Some("windowIdentity"));
     }
 
     #[test]
@@ -839,6 +901,7 @@ mod tests {
         });
         let w = models_from_available(&models, now);
         assert_eq!(w.len(), 1);
+        assert_eq!(w[0].card_id_for_test(), "model.gemini-3-pro.v1");
 
         let quota = json!({
             "buckets": [

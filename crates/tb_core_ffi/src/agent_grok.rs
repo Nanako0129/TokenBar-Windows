@@ -183,9 +183,9 @@ fn map_billing(
         "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string()
     })?;
 
-    let (label, resets_at, window_minutes) = period_meta(&config);
-    let window =
-        UsageWindow::from_used_percent(label, used_percent, resets_at, now, window_minutes);
+    let (label, card_id, window_key, resets_at) = period_meta(&config);
+    let window = UsageWindow::from_used_percent(label, used_percent, resets_at, now)
+        .with_identity(card_id, window_key);
 
     Ok(GrokData {
         identity: Some(AgentIdentity {
@@ -213,42 +213,26 @@ fn used_percent_from_config(config: &BillingConfig) -> Option<f64> {
     config.credit_usage_percent
 }
 
-fn period_meta(config: &BillingConfig) -> (String, Option<DateTime<Utc>>, Option<i64>) {
+fn period_meta(config: &BillingConfig) -> (String, String, Option<String>, Option<DateTime<Utc>>) {
     let period_type = config
         .current_period
         .as_ref()
-        .and_then(|p| p.period_type.as_deref())
+        .and_then(|period| period.period_type.as_deref())
         .unwrap_or("");
-    let label = if period_type.contains("WEEKLY") {
-        "Weekly".to_string()
+    let (label, card_id, window_key) = if period_type.contains("WEEKLY") {
+        ("Weekly", "billing.weekly.v1", Some("billing.weekly.v1".to_string()))
     } else if period_type.contains("MONTHLY") {
-        "Monthly".to_string()
+        ("Monthly", "billing.monthly.v1", Some("billing.monthly.v1".to_string()))
     } else {
-        "Weekly".to_string()
+        ("Unknown", "row.billing.unknown.v1", None)
     };
-
-    let start = config
-        .current_period
-        .as_ref()
-        .and_then(|p| p.start.as_deref())
-        .or(config.billing_period_start.as_deref())
-        .and_then(parse_timestamp);
     let end = config
         .current_period
         .as_ref()
-        .and_then(|p| p.end.as_deref())
+        .and_then(|period| period.end.as_deref())
         .or(config.billing_period_end.as_deref())
         .and_then(parse_timestamp);
-
-    let window_minutes = match (start, end) {
-        (Some(s), Some(e)) => {
-            let mins = (e - s).num_minutes();
-            (mins > 0).then_some(mins)
-        }
-        _ => None,
-    };
-
-    (label, end, window_minutes)
+    (label.to_string(), card_id.to_string(), window_key, end)
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -591,6 +575,8 @@ mod tests {
         let data = map_billing(body, &credentials, now).unwrap();
         assert_eq!(data.windows.len(), 1);
         assert_eq!(data.windows[0].label_for_test(), "Weekly");
+        assert_eq!(data.windows[0].card_id_for_test(), "billing.weekly.v1");
+        assert_eq!(data.windows[0].pace_window_key_for_test(), Some("billing.weekly.v1"));
         assert!((data.windows[0].remaining_for_test() - 96.0).abs() < 0.01);
         assert_eq!(
             data.identity.as_ref().and_then(|i| i.email.as_deref()),
@@ -600,6 +586,18 @@ mod tests {
             data.identity.as_ref().and_then(|i| i.plan.as_deref()),
             Some("X Premium+")
         );
+    }
+
+    #[test]
+    fn unknown_period_has_no_history_identity() {
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "currentPeriod": { "type": "USAGE_PERIOD_TYPE_OTHER" } }"#,
+        )
+        .unwrap();
+        let (label, card_id, window_key, _) = period_meta(&config);
+        assert_eq!(label, "Unknown");
+        assert_eq!(card_id, "row.billing.unknown.v1");
+        assert!(window_key.is_none());
     }
 
     #[test]
