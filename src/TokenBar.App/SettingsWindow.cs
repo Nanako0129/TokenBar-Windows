@@ -622,14 +622,35 @@ public sealed class SettingsWindow : Window
                 ResetText: "Resets in 4d", WindowMinutes: 10080,
                 CardId: "weekly.v3",
                 PaceStatus: new(
-                    State: UsagePaceState.Available,
+                    State: UsagePaceState.LearningHistory,
                     WindowKey: "weekly.v3",
                     DurationSeconds: 10080 * 60,
                     DurationSource: UsagePaceDurationSource.Contract,
-                    CompleteCycles: 5),
-                HistoricalPace: new(
-                    ExpectedUsedPercent: 45, EtaSeconds: null,
-                    WillLastToReset: true, RunOutProbability: 0.02)),
+                    CompleteCycles: 0)),
+            new(
+                Label: "Monthly", UsedPercent: 18, RemainingPercent: 82,
+                ResetsAt: now.AddDays(20).UtcDateTime.ToString(
+                    "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                    System.Globalization.CultureInfo.InvariantCulture),
+                ResetText: "Resets in 20d",
+                CardId: "monthly.v3",
+                PaceStatus: new(
+                    State: UsagePaceState.LearningDuration,
+                    WindowKey: "monthly.v3",
+                    DurationSource: UsagePaceDurationSource.Observed,
+                    CompleteCycles: 0)),
+            new(
+                Label: "Project", UsedPercent: 54, RemainingPercent: 46,
+                ResetsAt: now.AddDays(2).UtcDateTime.ToString(
+                    "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                    System.Globalization.CultureInfo.InvariantCulture),
+                ResetText: "Resets in 2d",
+                CardId: "project.v3",
+                PaceStatus: new(
+                    State: UsagePaceState.Unavailable,
+                    WindowKey: "project.v3",
+                    CompleteCycles: 0,
+                    Reason: UsagePaceUnavailableReason.History)),
         ];
         foreach (var window in mocks)
         {
