@@ -225,9 +225,13 @@ public sealed class SettingsWindow : Window
         panel.Children.Add(Section("Client tabs", BuildClientTabs(store)));
 
         // ── Quota source ───────────────────────────────────────────────
-        var selection = store.GetString("tokenbar.quota.source", "auto") ?? "auto";
+        var persistedSelection = store.GetString(
+            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
+        var payload = _quota();
+        var selection = QuotaSelectionPolicy.EffectiveSelection(
+            payload, persistedSelection);
         var choices = new List<(string, string)> { (QuotaResolver.Auto, "Auto (tightest window)") };
-        if (_quota() is { } payload)
+        if (payload is not null)
         {
             foreach (var agent in payload.Agents.Where(a => a.Error is null))
             {
@@ -524,9 +528,20 @@ public sealed class SettingsWindow : Window
         var styleRaw = store.GetString("tokenbar.tray.animationStyle", "cat") ?? "cat";
         var coloring = TrayIconRenderer.ParseColoring(
             store.GetString("tokenbar.icon.coloring"));
-        var selection = store.GetString("tokenbar.quota.source", "auto") ?? "auto";
-        double? remaining = QuotaResolver.Resolve(_quota(), selection) is { } pick
-            ? Math.Clamp(pick.Window.RemainingPercent, 0, 100) : null;
+        var persistedSelection = store.GetString(
+            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
+        var payload = _quota();
+        var selection = QuotaSelectionPolicy.EffectiveSelection(
+            payload, persistedSelection);
+        var hidden = ClientRegistry.QuotaExcludedClients(store);
+        var lastRemaining = store.GetDouble(
+            "tokenbar.quota.lastRemaining", double.NaN);
+        double? remaining = QuotaSelectionPolicy.Resolve(payload, selection, hidden)
+            is { } pick
+            ? Math.Clamp(pick.Window.RemainingPercent, 0, 100)
+            : QuotaResolver.ExcludedAllCandidates(payload, selection, hidden)
+                ? null
+                : double.IsFinite(lastRemaining) ? lastRemaining : null;
         var title = SampleTitle(mode, remaining);
 
         System.Drawing.Color? titleColor = mode == TrayMode.QuotaLeft

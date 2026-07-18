@@ -129,10 +129,12 @@ public sealed class TrayService : IDisposable
         // Quota source — macOS showQuotaMenu: Auto plus every error-free
         // agent's windows with live remaining percentages.
         var source = new Microsoft.UI.Xaml.Controls.MenuFlyoutSubItem { Text = "Quota source" };
-        var selection = AppSettings.Store.GetString("tokenbar.quota.source", "auto")
-            ?? QuotaResolver.Auto;
-        AddQuotaChoice(source, "Auto (tightest window)", QuotaResolver.Auto, selection);
+        var persistedSelection = AppSettings.Store.GetString(
+            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
         var payload = _feed.Quota;
+        var selection = QuotaSelectionPolicy.EffectiveSelection(
+            payload, persistedSelection);
+        AddQuotaChoice(source, "Auto (tightest window)", QuotaResolver.Auto, selection);
         if (payload is null)
         {
             source.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
@@ -209,9 +211,11 @@ public sealed class TrayService : IDisposable
             $"Today {Format.CompactTokens(totals.TodayTokens)} · {Format.Usd(totals.TodayCost)}",
             $"All time {Format.CompactTokens(totals.TotalTokens)} · {Format.Usd(totals.TotalCost)}",
         };
-        var selection = AppSettings.Store.GetString("tokenbar.quota.source", "auto")
-            ?? QuotaResolver.Auto;
-        if (QuotaResolver.Resolve(_feed.Quota, selection) is { } pick)
+        var persistedSelection = AppSettings.Store.GetString(
+            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
+        var hidden = ClientRegistry.QuotaExcludedClients(AppSettings.Store);
+        if (QuotaSelectionPolicy.Resolve(_feed.Quota, persistedSelection, hidden)
+            is { } pick)
         {
             var left = Math.Clamp(pick.Window.RemainingPercent, 0, 100);
             lines.Add($"{ClientRegistry.ShortName(pick.ClientId)} {pick.Window.Label} {left:F0}% left");
