@@ -252,7 +252,7 @@ public sealed record UsagePace(
         }
 
         var duration = durationSeconds;
-        var timeUntilReset = (resetsAt - now).TotalSeconds;
+        var timeUntilReset = UnixSeconds(resetsAt) - UnixSeconds(now);
         if (timeUntilReset <= 0 || timeUntilReset > duration)
         {
             return null;
@@ -262,6 +262,13 @@ public sealed record UsagePace(
             duration,
             timeUntilReset,
             Clamp(duration - timeUntilReset, 0, duration));
+    }
+
+    private static double UnixSeconds(DateTimeOffset value)
+    {
+        var utc = value.ToUniversalTime();
+        return utc.ToUnixTimeSeconds() +
+            utc.Ticks % TimeSpan.TicksPerSecond / (double)TimeSpan.TicksPerSecond;
     }
 
     private static PaceStage StageFor(double delta)
@@ -289,11 +296,10 @@ public sealed record UsagePace(
         }
 
         var fraction = match.Groups["fraction"].Value;
-        if (fraction.Length > 7)
+        if (fraction.Length > 3)
         {
-            // DateTimeOffset stores 100ns ticks; sub-tick digits cannot affect
-            // the displayed pace, so preserve canonical acceptance by truncating.
-            fraction = fraction[..7];
+            // Foundation's ISO8601DateFormatter keeps millisecond precision.
+            fraction = fraction[..3];
         }
 
         var zone = match.Groups["zone"].Value;
