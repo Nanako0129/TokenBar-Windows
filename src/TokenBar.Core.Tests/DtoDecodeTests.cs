@@ -7,7 +7,11 @@ namespace TokenBar.Core.Tests;
 public class DtoDecodeTests
 {
     private static readonly JsonSerializerOptions Web =
-        new(JsonSerializerDefaults.Web);
+        new(JsonSerializerDefaults.Web)
+        {
+            RespectRequiredConstructorParameters = true,
+            RespectNullableAnnotations = true,
+        };
 
     private const string AvailableJson = """
         {
@@ -98,6 +102,18 @@ public class DtoDecodeTests
         JsonSerializer.Deserialize<UsageWindow>(json, Web)
         ?? throw new InvalidOperationException("window decoded to null");
 
+    private static AgentUsagePayload DecodeAgentUsagePayload(
+        string? subscriptionsJson = null,
+        string agentsJson = """[{"clientId":"codex","source":"oauth","updatedAt":"now","windows":[]}]""")
+    {
+        var subscriptions = subscriptionsJson is null
+            ? ""
+            : $$""","opencodeSubscriptions":{{subscriptionsJson}}""";
+        return JsonSerializer.Deserialize<AgentUsagePayload>(
+            $$"""{"generatedAt":"now","agents":{{agentsJson}}{{subscriptions}}}""",
+            Web) ?? throw new InvalidOperationException("agent usage payload decoded to null");
+    }
+
     private static void AssertRejects(string json) =>
         Assert.Throws<JsonException>(() => DecodeWindow(json));
 
@@ -164,6 +180,33 @@ public class DtoDecodeTests
         Assert.Null(typeof(UsageWindow).GetProperty("RunOutProbability"));
         Assert.Null(p.OpencodeSubscriptions);
     }
+
+    [Fact]
+    public void AgentUsagePayloadDecodesStringSubscriptions()
+    {
+        var payload = DecodeAgentUsagePayload("""["Codex","Claude"]""");
+        Assert.Equal(new[] { "Codex", "Claude" }, payload.OpencodeSubscriptions);
+    }
+
+    [Fact]
+    public void AgentUsagePayloadAllowsOmittedOrNullSubscriptions()
+    {
+        Assert.Null(DecodeAgentUsagePayload().OpencodeSubscriptions);
+        Assert.Null(DecodeAgentUsagePayload("null").OpencodeSubscriptions);
+    }
+
+    [Fact]
+    public void AgentUsagePayloadRejectsNullSubscriptionElement() =>
+        Assert.Throws<JsonException>(() => DecodeAgentUsagePayload("[null]"));
+
+    [Fact]
+    public void AgentUsagePayloadRejectsNullAgentElement() =>
+        Assert.Throws<JsonException>(() => DecodeAgentUsagePayload(agentsJson: "[null]"));
+
+    [Fact]
+    public void AgentUsageSnapshotRejectsNullWindowElement() =>
+        Assert.Throws<JsonException>(() => DecodeAgentUsagePayload(
+            agentsJson: """[{"clientId":"codex","source":"oauth","updatedAt":"now","windows":[null]}]"""));
 
     [Fact]
     public void UsagePayloadDecodesNestedShape()
