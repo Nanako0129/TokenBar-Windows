@@ -175,6 +175,25 @@ pub struct CreditsSnapshot {
     unlimited: bool,
 }
 
+fn normalized_reset_at(window: &mut UsageWindow, now: DateTime<Utc>) -> Option<i64> {
+    let Some(wire_reset) = window.resets_at.as_deref() else {
+        window.reset_at_evidence = None;
+        return None;
+    };
+    if parse_datetime(wire_reset).is_none() {
+        window.resets_at = None;
+        window.reset_at_evidence = None;
+        window.reset_text = None;
+        return None;
+    }
+    let exact_reset = window.reset_at_evidence?;
+    (exact_reset > now).then(|| {
+        exact_reset
+            .timestamp()
+            .max(now.timestamp().saturating_add(1))
+    })
+}
+
 impl UsageWindow {
     /// Builds a display window before its provider assigns stable presentation
     /// identity. Stage 3A deliberately does not infer duration from a label.
@@ -265,21 +284,11 @@ impl UsageWindow {
         if self.pace_status.window_key.is_none() {
             return self;
         }
-        let parsed_reset = self.resets_at.as_deref().and_then(parse_datetime);
-        let exact_reset = match (parsed_reset, self.reset_at_evidence) {
-            (Some(_), Some(reset)) => Some(reset),
-            _ => None,
-        };
-        if reset_was_supplied != exact_reset.is_some() {
+        let had_wire_reset = self.resets_at.is_some();
+        let reset_at = normalized_reset_at(&mut self, now);
+        if reset_was_supplied != reset_at.is_some() || had_wire_reset != reset_at.is_some() {
             return self.with_unavailable_reason("invalidEvidence");
         }
-        let reset_at = match exact_reset {
-            Some(reset) if reset > now => {
-                Some(reset.timestamp().max(now.timestamp().saturating_add(1)))
-            }
-            Some(_) => return self.with_unavailable_reason("invalidEvidence"),
-            None => None,
-        };
         match resolve_duration(now.timestamp(), reset_at, provider, contract, None) {
             DurationResolution::Ready {
                 duration_seconds,
@@ -764,13 +773,13 @@ fn retain_unique_windows(windows: &mut Vec<UsageWindow>) {
     });
 }
 
-fn enrich_snapshot(snapshot: &mut AgentUsageSnapshot, now: i64) {
+fn enrich_snapshot(snapshot: &mut AgentUsageSnapshot, now: DateTime<Utc>) {
     enrich_snapshot_with(snapshot, now, |active_keys, observations, now| {
         crate::agent_quota_history::record_observations_and_evaluate(active_keys, observations, now)
     });
 }
 
-fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: i64, mut record: F)
+fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: DateTime<Utc>, mut record: F)
 where
     F: FnMut(
         &[SeriesKey],
@@ -809,12 +818,7 @@ where
             continue;
         }
 
-        let reset_at = window
-            .resets_at
-            .as_deref()
-            .and_then(parse_datetime)
-            .map(|reset| reset.timestamp());
-        let valid_reset = reset_at.is_some_and(|reset_at| reset_at > now);
+        let reset_at = normalized_reset_at(window, now);
         let valid_percent =
             window.used_percent.is_finite() && (0.0..=100.0).contains(&window.used_percent);
         if !valid_percent {
@@ -825,12 +829,7 @@ where
             };
         }
         window.remaining_percent = 100.0 - window.used_percent;
-        if window.resets_at.is_some() && reset_at.is_none() {
-            window.resets_at = None;
-            window.reset_at_evidence = None;
-            window.reset_text = None;
-        }
-        if !valid_reset || !valid_percent {
+        if !valid_percent {
             window.unavailable("invalidEvidence");
             continue;
         }
@@ -861,7 +860,7 @@ where
         return;
     }
 
-    let results = match record(&active_keys, &observations, now) {
+    let results = match record(&active_keys, &observations, now.timestamp()) {
         Ok(results) if results.len() == mapped_indices.len() => results,
         Ok(_) => {
             for index in mapped_indices {
@@ -891,14 +890,17 @@ where
                 historical,
                 complete_cycles,
             )) => {
-                let reset_at = window
-                    .resets_at
-                    .as_deref()
-                    .and_then(parse_datetime)
-                    .map(|reset| reset.timestamp());
-                if !reset_at.is_some_and(|reset_at| {
-                    history_duration_is_coherent(window, reset_at, now, duration_seconds, source)
-                }) {
+                let Some(reset_at) = normalized_reset_at(window, now) else {
+                    window.unavailable("history");
+                    continue;
+                };
+                if !history_duration_is_coherent(
+                    window,
+                    reset_at,
+                    now,
+                    duration_seconds,
+                    source,
+                ) {
                     window.unavailable("history");
                     continue;
                 }
@@ -956,7 +958,7 @@ where
 fn history_duration_is_coherent(
     window: &UsageWindow,
     reset_at: i64,
-    now: i64,
+    now: DateTime<Utc>,
     duration_seconds: i64,
     source: DurationSource,
 ) -> bool {
@@ -972,7 +974,7 @@ fn history_duration_is_coherent(
     let observed = (source == DurationSource::Observed)
         .then(|| DurationEvidence::observed(reset_at, duration_seconds));
     matches!(
-        resolve_duration(now, Some(reset_at), provider, contract, observed),
+        resolve_duration(now.timestamp(), Some(reset_at), provider, contract, observed),
         DurationResolution::Ready {
             duration_seconds: resolved,
             source: resolved_source,
@@ -1070,9 +1072,15 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
     })
 }
 
-async fn fetch_antigravity() -> AgentUsageSnapshot {
-    let now = Utc::now();
-    match agent_antigravity::fetch(now).await {
+fn finalize_antigravity_snapshot_with<F>(
+    fetched: Result<agent_antigravity::Fetched, String>,
+    now: DateTime<Utc>,
+    mut enrich: F,
+) -> AgentUsageSnapshot
+where
+    F: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
+{
+    let mut snapshot = match fetched {
         Ok(fetched) => AgentUsageSnapshot {
             client_id: "antigravity".to_string(),
             source: fetched.source,
@@ -1093,7 +1101,14 @@ async fn fetch_antigravity() -> AgentUsageSnapshot {
             credits: None,
             error: Some(error),
         },
-    }
+    };
+    enrich(&mut snapshot, now);
+    snapshot
+}
+
+async fn fetch_antigravity() -> AgentUsageSnapshot {
+    let now = Utc::now();
+    finalize_antigravity_snapshot_with(agent_antigravity::fetch(now).await, now, enrich_snapshot)
 }
 
 async fn fetch_codex() -> AgentUsageSnapshot {
@@ -1208,7 +1223,7 @@ async fn fetch_claude() -> AgentUsageSnapshot {
     }
     match fetch_claude_inner().await {
         Ok(mut snapshot) => {
-            enrich_snapshot(&mut snapshot, now.timestamp());
+            enrich_snapshot(&mut snapshot, now);
             // Cache the display-ready snapshot. A later 429 fallback returns it
             // without another enrichment pass or history write.
             claude_gate_record_success(&snapshot);
@@ -1363,7 +1378,7 @@ async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
         }),
         error: None,
     };
-    enrich_snapshot(&mut snapshot, now.timestamp());
+    enrich_snapshot(&mut snapshot, now);
     Ok(snapshot)
 }
 
@@ -1578,10 +1593,9 @@ fn refresh_cached_windows(windows: &[UsageWindow], now: DateTime<Utc>) -> Option
     let mut refreshed = Vec::with_capacity(windows.len());
     for window in windows {
         let mut window = window.clone();
-        if let Some(reset) = window.resets_at.as_deref().and_then(parse_datetime) {
-            if now >= reset {
-                return None;
-            }
+        if window.resets_at.is_some() {
+            normalized_reset_at(&mut window, now)?;
+            let reset = window.reset_at_evidence?;
             window.reset_text = Some(reset_text(reset, now));
         }
         refreshed.push(window);
@@ -3319,6 +3333,182 @@ mod tests {
     }
 
     #[test]
+    fn finalizes_antigravity_success_and_enriches_once() {
+        let (scope, account_scope) = enrichment_scope("antigravity-finalize-success");
+        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = UsageWindow::from_used_percent(
+            "Gemini".to_string(),
+            25.0,
+            Some(reset),
+            now,
+        )
+        .with_identity(
+            "model.gemini.v1",
+            Some("model.gemini.v1".to_string()),
+        )
+        .with_observed_duration_evidence(now, true);
+        assert_eq!(window.pace_status.state, PaceState::LearningDuration);
+        assert_eq!(window.pace_status.duration_source, Some(DurationSource::Observed));
+
+        let fetched = agent_antigravity::Fetched {
+            source: "cli".to_string(),
+            identity: Some(AgentIdentity {
+                email: Some("fixture@example.com".to_string()),
+                plan: Some("Pro".to_string()),
+            }),
+            account_scope: Ok(account_scope.clone()),
+            windows: vec![window],
+        };
+        let callback_calls = std::cell::Cell::new(0);
+        let snapshot = finalize_antigravity_snapshot_with(
+            Ok(fetched),
+            now,
+            |snapshot, callback_now| {
+                callback_calls.set(callback_calls.get() + 1);
+                assert_eq!(callback_now, now);
+                assert_eq!(snapshot.client_id, "antigravity");
+                assert_eq!(snapshot.source, "cli");
+                assert_eq!(snapshot.account_scope.as_ref().unwrap(), &account_scope);
+                enrich_snapshot_with(
+                    snapshot,
+                    callback_now,
+                    |active, observations, history_now| {
+                        assert_eq!(
+                            active,
+                            &[SeriesKey::new(
+                                "antigravity",
+                                account_scope.as_str(),
+                                "model.gemini.v1",
+                            )]
+                        );
+                        assert_eq!(history_now, now.timestamp());
+                        assert_eq!(observations.len(), 1);
+                        assert_eq!(
+                            observations[0].key,
+                            SeriesKey::new(
+                                "antigravity",
+                                account_scope.as_str(),
+                                "model.gemini.v1",
+                            )
+                        );
+                        assert_eq!(observations[0].reset_at, Some(now.timestamp() + 1));
+                        assert_eq!(observations[0].used_percent, 25.0);
+                        Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
+                    },
+                );
+            },
+        );
+
+        assert_eq!(callback_calls.get(), 1);
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::LearningDuration
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.duration_source,
+            Some(DurationSource::Observed)
+        );
+        assert!(snapshot.error.is_none());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn finalizes_antigravity_error_and_skips_history_recording() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let callback_calls = std::cell::Cell::new(0);
+        let record_calls = std::cell::Cell::new(0);
+        let snapshot = finalize_antigravity_snapshot_with(
+            Err("synthetic Antigravity failure".to_string()),
+            now,
+            |snapshot, callback_now| {
+                callback_calls.set(callback_calls.get() + 1);
+                assert_eq!(callback_now, now);
+                assert!(snapshot.windows.is_empty());
+                assert!(matches!(
+                    snapshot.account_scope,
+                    Err(AccountScopeError::NoTrustedEvidence)
+                ));
+                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
+                    record_calls.set(record_calls.get() + 1);
+                    Ok(Vec::new())
+                });
+            },
+        );
+
+        assert_eq!(callback_calls.get(), 1);
+        assert_eq!(record_calls.get(), 0);
+        assert_eq!(snapshot.error.as_deref(), Some("synthetic Antigravity failure"));
+        assert!(snapshot.windows.is_empty());
+    }
+
+    #[test]
+    fn exact_reset_normalization_fails_closed_and_keeps_wire_milliseconds() {
+        let (scope, account_scope) = enrichment_scope("antigravity-exact-reset");
+        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let future = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let future_window = UsageWindow::from_used_percent(
+            "Future".to_string(),
+            20.0,
+            Some(future),
+            now,
+        )
+        .with_identity("future.v1", Some("future.v1".to_string()));
+        let mut future_snapshot = enrichment_snapshot(Ok(account_scope.clone()), vec![future_window]);
+        enrich_snapshot_with(
+            &mut future_snapshot,
+            now,
+            |_, observations, history_now| {
+                assert_eq!(history_now, now.timestamp());
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].reset_at, Some(now.timestamp() + 1));
+                Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
+            },
+        );
+        assert_eq!(
+            future_snapshot.windows[0].pace_status.state,
+            PaceState::LearningDuration
+        );
+        assert_eq!(
+            future_snapshot.windows[0].pace_status.duration_source,
+            Some(DurationSource::Observed)
+        );
+        let wire = serde_json::to_value(&future_snapshot.windows[0]).unwrap();
+        assert_eq!(
+            wire["resetsAt"],
+            "2026-07-10T00:00:00.000Z"
+        );
+        let serialized = serde_json::to_string(&future_snapshot.windows[0]).unwrap();
+        assert!(!serialized.contains("reset_at_evidence"));
+        assert!(!serialized.contains("resetAtEvidence"));
+        assert!(!serialized.contains("000900Z"));
+
+        let past = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000400Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let past_window = UsageWindow::from_used_percent(
+            "Past".to_string(),
+            20.0,
+            Some(past),
+            now,
+        )
+        .with_identity("past.v1", Some("past.v1".to_string()))
+        .with_observed_duration_evidence(now, true);
+        assert_eq!(past_window.pace_reason_for_test(), Some("invalidEvidence"));
+        assert!(past_window.reset_at_evidence.is_some());
+        scope.cleanup();
+    }
+
+    #[test]
     fn serializes_stage3a_pace_states_without_legacy_scalars() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let ready = UsageWindow::from_used_percent(
@@ -3378,6 +3568,8 @@ mod tests {
         malformed.resets_at = Some("bogus".to_string());
         malformed = malformed.with_observed_duration_evidence(now, true);
         assert_eq!(malformed.pace_reason_for_test(), Some("invalidEvidence"));
+        assert!(malformed.resets_at.is_none());
+        assert!(malformed.reset_at_evidence.is_none());
 
         let past = UsageWindow::from_used_percent("Past".to_string(), 20.0, Some(past_reset), now)
             .with_identity("past.v1", Some("past.v1".to_string()))
@@ -3545,7 +3737,7 @@ mod tests {
         );
         let calls = std::cell::Cell::new(0);
 
-        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, _, _| {
+        enrich_snapshot_with(&mut snapshot, now, |_, _, _| {
             calls.set(calls.get() + 1);
             Ok(Vec::new())
         });
@@ -3582,7 +3774,7 @@ mod tests {
 
         enrich_snapshot_with(
             &mut snapshot,
-            now.timestamp(),
+            now,
             |active, observations, batch_now| {
                 assert_eq!(batch_now, now.timestamp());
                 assert_eq!(active.len(), 1);
@@ -3657,7 +3849,7 @@ mod tests {
             ],
         );
 
-        enrich_snapshot_with(&mut snapshot, now.timestamp(), |active, observations, _| {
+        enrich_snapshot_with(&mut snapshot, now, |active, observations, _| {
             assert_eq!(
                 active,
                 &[
@@ -3803,7 +3995,7 @@ mod tests {
             run_out_probability: Some(0.25),
         };
 
-        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, observations, _| {
+        enrich_snapshot_with(&mut snapshot, now, |_, observations, _| {
             assert_eq!(observations.len(), 7);
             Ok(vec![
                 Ok((
@@ -3879,7 +4071,7 @@ mod tests {
             enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
         enrich_snapshot_with(
             &mut global_capacity,
-            now.timestamp(),
+            now,
             |active, observations, _| {
                 assert_eq!(active.len(), 3);
                 assert_eq!(observations.len(), 2);
@@ -3905,7 +4097,7 @@ mod tests {
 
         let mut global_history =
             enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
-        enrich_snapshot_with(&mut global_history, now.timestamp(), |_, _, _| {
+        enrich_snapshot_with(&mut global_history, now, |_, _, _| {
             Err(HistoryError::Read)
         });
         assert_eq!(
@@ -3927,7 +4119,7 @@ mod tests {
 
         let mut count_mismatch =
             enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
-        enrich_snapshot_with(&mut count_mismatch, now.timestamp(), |_, _, _| {
+        enrich_snapshot_with(&mut count_mismatch, now, |_, _, _| {
             Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
         });
         assert_eq!(
@@ -3949,7 +4141,7 @@ mod tests {
 
         let mut row_errors =
             enrichment_snapshot(Ok(account_scope), enrichment_failure_windows(now));
-        enrich_snapshot_with(&mut row_errors, now.timestamp(), |_, _, _| {
+        enrich_snapshot_with(&mut row_errors, now, |_, _, _| {
             Ok(vec![
                 Err(HistoryError::StoreCapacity),
                 Err(HistoryError::Read),
@@ -4408,7 +4600,7 @@ mod tests {
             )],
         );
         let record_calls = std::cell::Cell::new(0);
-        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, observations, _| {
+        enrich_snapshot_with(&mut snapshot, now, |_, observations, _| {
             record_calls.set(record_calls.get() + 1);
             assert_eq!(observations.len(), 1);
             Ok(vec![Ok((
@@ -4484,7 +4676,7 @@ mod tests {
         let record_calls = std::cell::Cell::new(0);
         enrich_snapshot_with(
             &mut snapshot,
-            now.timestamp(),
+            now,
             |active, observations, batch_now| {
                 record_calls.set(record_calls.get() + 1);
                 assert_eq!(batch_now, now.timestamp());
