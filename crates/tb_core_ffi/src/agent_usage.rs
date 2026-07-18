@@ -5,7 +5,10 @@ use crate::agent_account_scope::{
 use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
-use crate::agent_quota_duration::DurationSource;
+use crate::agent_quota_duration::{
+    resolve_duration, valid_duration, DurationEvidence, DurationResolution, DurationSource,
+    DurationUnavailableReason,
+};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,6 +113,8 @@ pub struct UsageWindow {
     remaining_percent: f64,
     resets_at: Option<String>,
     reset_text: Option<String>,
+    /// Resolved provider/contract evidence retained only to validate the nested wire state.
+    duration_evidence: Option<(DurationEvidence, DurationSource)>,
     pace_status: PaceStatusPayload,
     historical_pace: Option<HistoricalPacePayload>,
 }
@@ -191,6 +196,7 @@ impl UsageWindow {
             remaining_percent: remaining,
             resets_at: resets_at.map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true)),
             reset_text: resets_at.map(|d| reset_text(d, now)),
+            duration_evidence: None,
             pace_status: PaceStatusPayload {
                 state: PaceState::Unavailable,
                 window_key: None,
@@ -209,6 +215,7 @@ impl UsageWindow {
         window_key: Option<String>,
     ) -> Self {
         self.card_id = card_id.into();
+        self.duration_evidence = None;
         self.pace_status = match (window_key, self.resets_at.is_some()) {
             (None, _) => PaceStatusPayload {
                 state: PaceState::Unavailable,
@@ -239,6 +246,70 @@ impl UsageWindow {
         self
     }
 
+    /// Resolve exact provider/contract duration only for adapters with explicit
+    /// duration semantics. Other providers keep using `with_identity`.
+    fn with_duration_evidence(
+        mut self,
+        now: DateTime<Utc>,
+        reset_was_supplied: bool,
+        provider: Option<DurationEvidence>,
+        contract: Option<DurationEvidence>,
+    ) -> Self {
+        if self.pace_status.window_key.is_none() {
+            return self;
+        }
+        let reset_at = self
+            .resets_at
+            .as_deref()
+            .and_then(parse_datetime)
+            .map(|reset| reset.timestamp());
+        if reset_was_supplied != reset_at.is_some() {
+            return self.with_unavailable_reason("invalidEvidence");
+        }
+        match resolve_duration(now.timestamp(), reset_at, provider, contract, None) {
+            DurationResolution::Ready {
+                duration_seconds,
+                source,
+            } => {
+                let evidence = match source {
+                    DurationSource::Provider => provider,
+                    DurationSource::Contract => contract,
+                    DurationSource::Observed => None,
+                };
+                let Some(evidence) = evidence else {
+                    return self.with_unavailable_reason("invalidEvidence");
+                };
+                self.duration_evidence = Some((evidence, source));
+                self.pace_status.state = PaceState::LearningHistory;
+                self.pace_status.duration_seconds = Some(duration_seconds);
+                self.pace_status.duration_source = Some(source);
+                self.pace_status.complete_cycles = 0;
+                self.pace_status.reason = None;
+                self.historical_pace = None;
+                self
+            }
+            DurationResolution::LearningDuration => self,
+            DurationResolution::Unavailable(reason) => self.with_unavailable_reason(match reason {
+                DurationUnavailableReason::MissingReset => "missingReset",
+                DurationUnavailableReason::InvalidEvidence => "invalidEvidence",
+            }),
+        }
+    }
+
+    fn with_unavailable_reason(mut self, reason: &str) -> Self {
+        self.duration_evidence = None;
+        self.pace_status = PaceStatusPayload {
+            state: PaceState::Unavailable,
+            window_key: self.pace_status.window_key.clone(),
+            duration_seconds: None,
+            duration_source: None,
+            complete_cycles: 0,
+            reason: Some(reason.to_string()),
+        };
+        self.historical_pace = None;
+        self
+    }
+
     fn validate_wire(&self) -> Result<(), String> {
         if self.card_id.trim().is_empty() {
             return Err("pace cardId must be non-empty".to_string());
@@ -264,21 +335,54 @@ impl UsageWindow {
         if has_window_key == identity_unavailable {
             return Err("pace window identity invariant failed".to_string());
         }
+        let reset_at = self
+            .resets_at
+            .as_deref()
+            .and_then(parse_datetime)
+            .map(|reset| reset.timestamp());
+        let valid_reset = reset_at.is_some();
+        if self.resets_at.is_some() && !valid_reset {
+            return Err("pace resetsAt must be a valid timestamp".to_string());
+        }
         let has_duration = self.pace_status.duration_seconds.is_some();
         let observed_learning_source = self.pace_status.state == PaceState::LearningDuration
             && self.pace_status.duration_source == Some(DurationSource::Observed);
         if self
             .pace_status
             .duration_seconds
-            .is_some_and(|duration| duration <= 0)
+            .is_some_and(|duration| !valid_duration(duration))
             || (has_duration != self.pace_status.duration_source.is_some()
                 && !observed_learning_source)
         {
             return Err("pace duration invariant failed".to_string());
         }
+        match self.duration_evidence {
+            Some((evidence, source)) => {
+                let reset_is_coherent = match source {
+                    DurationSource::Provider => evidence.reset_at == reset_at,
+                    DurationSource::Contract => evidence.reset_at.is_none(),
+                    DurationSource::Observed => false,
+                };
+                if !reset_is_coherent
+                    || self.pace_status.duration_seconds != Some(evidence.duration_seconds)
+                    || self.pace_status.duration_source != Some(source)
+                {
+                    return Err("pace duration evidence and state differ".to_string());
+                }
+            }
+            None if matches!(
+                self.pace_status.duration_source,
+                Some(DurationSource::Provider | DurationSource::Contract)
+            ) =>
+            {
+                return Err("pace duration source lacks retained evidence".to_string());
+            }
+            None => {}
+        }
         match self.pace_status.state {
             PaceState::LearningDuration => {
-                if has_duration
+                if !valid_reset
+                    || has_duration
                     || self.historical_pace.is_some()
                     || self.pace_status.reason.is_some()
                 {
@@ -286,7 +390,8 @@ impl UsageWindow {
                 }
             }
             PaceState::LearningHistory => {
-                if !has_duration
+                if !valid_reset
+                    || !has_duration
                     || self.historical_pace.is_some()
                     || self.pace_status.reason.is_some()
                 {
@@ -294,7 +399,8 @@ impl UsageWindow {
                 }
             }
             PaceState::Available => {
-                if !has_duration
+                if !valid_reset
+                    || !has_duration
                     || self.historical_pace.is_none()
                     || self.pace_status.reason.is_some()
                 {
@@ -302,7 +408,13 @@ impl UsageWindow {
                 }
             }
             PaceState::Unavailable => {
-                if self.historical_pace.is_some() || self.pace_status.reason.is_none() {
+                if has_duration
+                    || self.pace_status.duration_source.is_some()
+                    || self.historical_pace.is_some()
+                    || self.pace_status.reason.is_none()
+                    || (self.pace_status.reason.as_deref() == Some("missingReset")
+                        && self.resets_at.is_some())
+                {
                     return Err("unavailable pace invariant failed".to_string());
                 }
             }
@@ -547,6 +659,13 @@ struct ClaudeWindow {
     utilization: Option<f64>,
     #[serde(default)]
     resets_at: Option<String>,
+}
+
+impl ClaudeWindow {
+    fn has_valid_utilization(&self) -> bool {
+        self.utilization
+            .is_some_and(|used| used.is_finite() && (0.0..=100.0).contains(&used))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2255,6 +2374,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Session",
         "session.v1",
+        DurationEvidence::contract(18_000),
         usage.five_hour.as_ref(),
         now,
     );
@@ -2262,6 +2382,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Weekly",
         "weekly.v1",
+        DurationEvidence::contract(604_800),
         usage.seven_day.as_ref(),
         now,
     );
@@ -2269,6 +2390,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "OAuth Apps",
         "oauth_apps.weekly.v1",
+        DurationEvidence::contract(604_800),
         usage.seven_day_oauth_apps.as_ref(),
         now,
     );
@@ -2276,6 +2398,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Sonnet",
         "sonnet.weekly.v1",
+        DurationEvidence::contract(604_800),
         usage.seven_day_sonnet.as_ref(),
         now,
     );
@@ -2283,6 +2406,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Opus",
         "opus.weekly.v1",
+        DurationEvidence::contract(604_800),
         usage.seven_day_opus.as_ref(),
         now,
     );
@@ -2290,6 +2414,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Designs",
         "design.weekly.v1",
+        DurationEvidence::contract(604_800),
         usage.design_window(),
         now,
     );
@@ -2297,6 +2422,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Daily Routines",
         "routines.weekly.v1",
+        DurationEvidence::contract(604_800),
         usage.routines_window(),
         now,
     );
@@ -2319,7 +2445,7 @@ impl ClaudeUsageResponse {
         ]
         .into_iter()
         .flatten()
-        .next()
+        .find(|window| window.has_valid_utilization())
     }
 
     fn routines_window(&self) -> Option<&ClaudeWindow> {
@@ -2334,7 +2460,7 @@ impl ClaudeUsageResponse {
         ]
         .into_iter()
         .flatten()
-        .next()
+        .find(|window| window.has_valid_utilization())
     }
 }
 
@@ -2342,11 +2468,12 @@ fn push_claude_window(
     windows: &mut Vec<UsageWindow>,
     label: &str,
     window_key: &str,
+    contract: DurationEvidence,
     window: Option<&ClaudeWindow>,
     now: DateTime<Utc>,
 ) {
     if let Some(mapped) =
-        window.and_then(|window| map_claude_window(label, window_key, window, now))
+        window.and_then(|window| map_claude_window(label, window_key, contract, window, now))
     {
         windows.push(mapped);
     }
@@ -2355,14 +2482,20 @@ fn push_claude_window(
 fn map_claude_window(
     label: &str,
     window_key: &str,
+    contract: DurationEvidence,
     window: &ClaudeWindow,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
+    if !window.has_valid_utilization() {
+        return None;
+    }
     let used = window.utilization?;
+    let reset_was_supplied = window.resets_at.is_some();
     let resets_at = window.resets_at.as_deref().and_then(parse_datetime);
     Some(
         UsageWindow::from_used_percent(label.to_string(), used, resets_at, now)
-            .with_identity(window_key, Some(window_key.to_string())),
+            .with_identity(window_key, Some(window_key.to_string()))
+            .with_duration_evidence(now, reset_was_supplied, None, Some(contract)),
     )
 }
 
@@ -2386,8 +2519,10 @@ fn parse_unified_ratelimit_windows(
     if let Some(window) = unified_ratelimit_window_with_identity(
         "Session",
         "session.v1",
+        DurationEvidence::contract(18_000),
         read_f64("anthropic-ratelimit-unified-5h-utilization"),
         read_i64("anthropic-ratelimit-unified-5h-reset"),
+        headers.contains_key("anthropic-ratelimit-unified-5h-reset"),
         now,
     ) {
         windows.push(window);
@@ -2395,8 +2530,10 @@ fn parse_unified_ratelimit_windows(
     if let Some(window) = unified_ratelimit_window_with_identity(
         "Weekly",
         "weekly.v1",
+        DurationEvidence::contract(604_800),
         read_f64("anthropic-ratelimit-unified-7d-utilization"),
         read_i64("anthropic-ratelimit-unified-7d-reset"),
+        headers.contains_key("anthropic-ratelimit-unified-7d-reset"),
         now,
     ) {
         windows.push(window);
@@ -2411,17 +2548,24 @@ fn parse_unified_ratelimit_windows(
 fn unified_ratelimit_window_with_identity(
     label: &str,
     window_key: &str,
+    contract: DurationEvidence,
     utilization_fraction: Option<f64>,
     reset_epoch_seconds: Option<i64>,
+    reset_was_supplied: bool,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let used = utilization_fraction? * 100.0;
+    let fraction = utilization_fraction?;
+    if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+        return None;
+    }
+    let used = fraction * 100.0;
     let resets_at = reset_epoch_seconds
         .filter(|seconds| *seconds > 0)
         .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single());
     Some(
         UsageWindow::from_used_percent(label.to_string(), used, resets_at, now)
-            .with_identity(window_key, Some(window_key.to_string())),
+            .with_identity(window_key, Some(window_key.to_string()))
+            .with_duration_evidence(now, reset_was_supplied, None, Some(contract)),
     )
 }
 
@@ -2432,16 +2576,18 @@ fn unified_ratelimit_window(
     reset_epoch_seconds: Option<i64>,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let key = if label.eq_ignore_ascii_case("Session") {
-        "session.v1"
+    let (key, contract) = if label.eq_ignore_ascii_case("Session") {
+        ("session.v1", DurationEvidence::contract(18_000))
     } else {
-        "weekly.v1"
+        ("weekly.v1", DurationEvidence::contract(604_800))
     };
     unified_ratelimit_window_with_identity(
         label,
         key,
+        contract,
         utilization_fraction,
         reset_epoch_seconds,
+        reset_epoch_seconds.is_some(),
         now,
     )
 }
@@ -2463,6 +2609,9 @@ fn claude_extra_usage_window(
             None
         }
     })?;
+    if !used.is_finite() || !(0.0..=100.0).contains(&used) {
+        return None;
+    }
     let reset_text = match (extra.used_credits, extra.monthly_limit) {
         (Some(used), Some(limit)) => Some(format!(
             "Monthly cap: {} / {}",
@@ -2472,7 +2621,8 @@ fn claude_extra_usage_window(
         _ => None,
     };
     let mut window = UsageWindow::from_used_percent("Extra usage".to_string(), used, None, now)
-        .with_identity("extra_usage.v1", Some("extra_usage.v1".to_string()));
+        .with_identity("extra_usage.v1", Some("extra_usage.v1".to_string()))
+        .with_unavailable_reason("nonRecurring");
     window.reset_text = reset_text;
     Some(window)
 }
@@ -2553,9 +2703,11 @@ fn map_window_with_identity(
     let resets_at = (window.reset_at > 0)
         .then(|| Utc.timestamp_opt(window.reset_at, 0).single())
         .flatten();
+    let provider = DurationEvidence::provider(window.reset_at, window.limit_window_seconds);
     (window.used_percent.is_finite() && (0.0..=100.0).contains(&window.used_percent)).then(|| {
         UsageWindow::from_used_percent(label.to_string(), window.used_percent, resets_at, now)
             .with_identity(card_id, window_key)
+            .with_duration_evidence(now, true, Some(provider), None)
     })
 }
 
@@ -2838,6 +2990,45 @@ mod tests {
         window.card_id = "known.v1".to_string();
         window.used_percent = f64::NAN;
         assert!(serde_json::to_value(&window).is_err());
+    }
+
+    #[test]
+    fn serialized_duration_mirror_is_nested_and_state_coherent() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let window = map_window_with_identity(
+            "Session",
+            CodexWindow {
+                used_percent: 20.0,
+                reset_at: now.timestamp() + 3_600,
+                limit_window_seconds: 18_000,
+            },
+            now,
+            "main.session.v1",
+            Some("main.session.v1".to_string()),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&window).unwrap();
+        assert_eq!(wire["paceStatus"]["durationSeconds"], 18_000);
+        assert_eq!(wire["paceStatus"]["durationSource"], "provider");
+        assert_eq!(wire["windowMinutes"], 300);
+        assert_eq!(
+            wire["windowMinutes"].as_i64(),
+            wire["paceStatus"]["durationSeconds"]
+                .as_i64()
+                .map(|seconds| seconds / 60)
+        );
+
+        let mut contradictory = window;
+        contradictory.pace_status.state = PaceState::Unavailable;
+        contradictory.pace_status.reason = Some("invalidEvidence".to_string());
+        assert!(serde_json::to_value(&contradictory).is_err());
+        contradictory.pace_status.state = PaceState::LearningHistory;
+        contradictory.pace_status.reason = None;
+        contradictory.pace_status.duration_source = None;
+        assert!(serde_json::to_value(&contradictory).is_err());
+        contradictory.pace_status.duration_source = Some(DurationSource::Provider);
+        contradictory.pace_status.duration_seconds = Some(604_800);
+        assert!(serde_json::to_value(&contradictory).is_err());
     }
 
     #[test]
@@ -3298,6 +3489,12 @@ mod tests {
             Some("main.session.v1")
         );
         assert_eq!(windows[0].remaining_percent, 92.0);
+        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
+        assert_eq!(
+            windows[0].pace_status.duration_source,
+            Some(DurationSource::Provider)
+        );
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].card_id_for_test(), "main.weekly.v1");
         assert_eq!(
@@ -3305,6 +3502,12 @@ mod tests {
             Some("main.weekly.v1")
         );
         assert_eq!(windows[1].remaining_percent, 65.0);
+        assert_eq!(windows[1].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(windows[1].pace_status.duration_seconds, Some(604_800));
+        assert_eq!(
+            windows[1].pace_status.duration_source,
+            Some(DurationSource::Provider)
+        );
     }
 
     #[test]
@@ -3343,9 +3546,11 @@ mod tests {
         assert_eq!(object["cardId"], "main.weekly.v1");
         assert_eq!(object["usedPercent"], 35.0);
         assert_eq!(object["remainingPercent"], 65.0);
-        assert_eq!(object["paceStatus"]["state"], "learningDuration");
+        assert_eq!(object["paceStatus"]["state"], "learningHistory");
         assert_eq!(object["paceStatus"]["windowKey"], "main.weekly.v1");
-        assert!(!object.contains_key("windowMinutes"));
+        assert_eq!(object["paceStatus"]["durationSeconds"], 604_800);
+        assert_eq!(object["paceStatus"]["durationSource"], "provider");
+        assert_eq!(object["windowMinutes"], 10_080);
         assert!(!object.contains_key("historicalExpectedPercent"));
         assert!(!object.contains_key("runOutProbability"));
         assert!(!object.contains_key("historicalPace"));
@@ -3377,6 +3582,81 @@ mod tests {
             )
         );
         assert_eq!(windows[0].remaining_percent, 59.0);
+        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
+        assert_eq!(
+            windows[0].pace_status.duration_source,
+            Some(DurationSource::Provider)
+        );
+    }
+
+    #[test]
+    fn invalid_codex_duration_or_reset_evidence_fails_closed() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        for (case, reset_at, duration_seconds) in [
+            ("duration", now.timestamp() + 3_600, 0),
+            ("reset", 0, 3_600),
+        ] {
+            let window = map_window_with_identity(
+                "Additional",
+                CodexWindow {
+                    used_percent: 25.0,
+                    reset_at,
+                    limit_window_seconds: duration_seconds,
+                },
+                now,
+                "additional.stable.primary.v1",
+                Some("additional.stable.primary.v1".to_string()),
+            )
+            .unwrap();
+            assert_eq!(window.pace_status.state, PaceState::Unavailable, "{case}");
+            assert_eq!(
+                window.pace_status.reason.as_deref(),
+                Some("invalidEvidence"),
+                "{case}"
+            );
+            assert!(window.pace_status.duration_seconds.is_none(), "{case}");
+            assert!(window.pace_status.duration_source.is_none(), "{case}");
+            assert!(
+                serde_json::to_value(window)
+                    .unwrap()
+                    .get("windowMinutes")
+                    .is_none(),
+                "{case}"
+            );
+        }
+
+        let unknown = map_window_with_identity(
+            "Unknown",
+            CodexWindow {
+                used_percent: 25.0,
+                reset_at: 0,
+                limit_window_seconds: 0,
+            },
+            now,
+            "row.additional.unknown.primary.v1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(unknown.pace_reason_for_test(), Some("windowIdentity"));
+
+        let reset = now + chrono::Duration::hours(1);
+        let mismatched =
+            UsageWindow::from_used_percent("Additional".to_string(), 25.0, Some(reset), now)
+                .with_identity(
+                    "additional.stable.primary.v1",
+                    Some("additional.stable.primary.v1".to_string()),
+                )
+                .with_duration_evidence(
+                    now,
+                    true,
+                    Some(DurationEvidence::provider(reset.timestamp() + 1, 3_600)),
+                    None,
+                );
+        assert_eq!(
+            mismatched.pace_status.reason.as_deref(),
+            Some("invalidEvidence")
+        );
     }
 
     #[test]
@@ -3481,10 +3761,22 @@ mod tests {
         assert_eq!(windows[0].card_id_for_test(), "session.v1");
         assert_eq!(windows[0].pace_window_key_for_test(), Some("session.v1"));
         assert_eq!(windows[0].remaining_percent, 92.0);
+        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
+        assert_eq!(
+            windows[0].pace_status.duration_source,
+            Some(DurationSource::Contract)
+        );
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].card_id_for_test(), "weekly.v1");
         assert_eq!(windows[1].pace_window_key_for_test(), Some("weekly.v1"));
         assert_eq!(windows[1].remaining_percent, 77.0);
+        assert_eq!(windows[1].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(windows[1].pace_status.duration_seconds, Some(604_800));
+        assert_eq!(
+            windows[1].pace_status.duration_source,
+            Some(DurationSource::Contract)
+        );
         assert_eq!(windows[2].label, "Sonnet");
         assert_eq!(windows[2].card_id_for_test(), "sonnet.weekly.v1");
         assert_eq!(windows[2].pace_reason_for_test(), Some("missingReset"));
@@ -3492,6 +3784,119 @@ mod tests {
         assert_eq!(windows[3].label, "Designs");
         assert_eq!(windows[3].card_id_for_test(), "design.weekly.v1");
         assert_eq!(windows[3].remaining_percent, 100.0);
+    }
+
+    #[test]
+    fn claude_body_and_aliases_reject_invalid_utilization() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let reset = (now + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        for invalid in [-1.0, 150.0, f64::NAN, f64::INFINITY] {
+            assert!(map_claude_window(
+                "Session",
+                "session.v1",
+                DurationEvidence::contract(18_000),
+                &ClaudeWindow {
+                    utilization: Some(invalid),
+                    resets_at: Some(reset.clone()),
+                },
+                now,
+            )
+            .is_none());
+        }
+
+        let usage = ClaudeUsageResponse {
+            five_hour: Some(ClaudeWindow {
+                utilization: Some(150.0),
+                resets_at: Some(reset.clone()),
+            }),
+            seven_day: Some(ClaudeWindow {
+                utilization: Some(20.0),
+                resets_at: Some(reset.clone()),
+            }),
+            seven_day_design: Some(ClaudeWindow {
+                utilization: Some(f64::NAN),
+                resets_at: Some(reset.clone()),
+            }),
+            design: Some(ClaudeWindow {
+                utilization: Some(30.0),
+                resets_at: Some(reset.clone()),
+            }),
+            seven_day_routines: Some(ClaudeWindow {
+                utilization: Some(150.0),
+                resets_at: Some(reset.clone()),
+            }),
+            routines: Some(ClaudeWindow {
+                utilization: Some(40.0),
+                resets_at: Some(reset),
+            }),
+            ..Default::default()
+        };
+        let windows = claude_windows(&usage, now);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| (window.label.as_str(), window.used_percent))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Weekly", 20.0),
+                ("Designs", 30.0),
+                ("Daily Routines", 40.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_extra_usage_is_explicitly_non_recurring() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let window = claude_extra_usage_window(
+            Some(&ClaudeExtraUsage {
+                is_enabled: true,
+                monthly_limit: Some(10_000.0),
+                used_credits: Some(2_500.0),
+                utilization: None,
+                currency: Some("USD".to_string()),
+            }),
+            now,
+        )
+        .unwrap();
+        assert_eq!(window.card_id, "extra_usage.v1");
+        assert_eq!(window.used_percent, 25.0);
+        assert_eq!(
+            window.reset_text.as_deref(),
+            Some("Monthly cap: $25.00 / $100.00")
+        );
+        assert_eq!(window.pace_status.state, PaceState::Unavailable);
+        assert_eq!(window.pace_reason_for_test(), Some("nonRecurring"));
+        let wire = serde_json::to_value(window).unwrap();
+        assert_eq!(wire["paceStatus"]["reason"], "nonRecurring");
+        assert!(wire.get("windowMinutes").is_none());
+    }
+
+    #[test]
+    fn invalid_claude_extra_usage_does_not_poison_valid_windows() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let usage = ClaudeUsageResponse {
+            five_hour: Some(ClaudeWindow {
+                utilization: Some(20.0),
+                resets_at: Some(
+                    (now + chrono::Duration::hours(1))
+                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                ),
+            }),
+            extra_usage: Some(ClaudeExtraUsage {
+                is_enabled: true,
+                monthly_limit: Some(10_000.0),
+                used_credits: Some(2_500.0),
+                utilization: Some(f64::NAN),
+                currency: Some("USD".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let windows = claude_windows(&usage, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].card_id, "session.v1");
+        assert!(serde_json::to_value(windows).is_ok());
     }
 
     #[test]
@@ -3513,6 +3918,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_named_and_alias_windows_use_exact_contract_durations() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let reset = (now + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let window = |utilization| ClaudeWindow {
+            utilization: Some(utilization),
+            resets_at: Some(reset.clone()),
+        };
+        let usage = ClaudeUsageResponse {
+            five_hour: Some(window(5.0)),
+            seven_day: Some(window(10.0)),
+            seven_day_oauth_apps: Some(window(15.0)),
+            seven_day_sonnet: Some(window(20.0)),
+            seven_day_opus: Some(window(25.0)),
+            seven_day_omelette: Some(window(30.0)),
+            seven_day_cowork: Some(window(35.0)),
+            ..Default::default()
+        };
+        let windows = claude_windows(&usage, now);
+        let expected = [
+            ("session.v1", 18_000),
+            ("weekly.v1", 604_800),
+            ("oauth_apps.weekly.v1", 604_800),
+            ("sonnet.weekly.v1", 604_800),
+            ("opus.weekly.v1", 604_800),
+            ("design.weekly.v1", 604_800),
+            ("routines.weekly.v1", 604_800),
+        ];
+        assert_eq!(windows.len(), expected.len());
+        for (window, (key, duration)) in windows.iter().zip(expected) {
+            assert_eq!(window.card_id, key);
+            assert_eq!(window.pace_status.state, PaceState::LearningHistory);
+            assert_eq!(window.pace_status.duration_seconds, Some(duration));
+            assert_eq!(
+                window.pace_status.duration_source,
+                Some(DurationSource::Contract)
+            );
+        }
+
+        for (alias, label, key) in [
+            ("seven_day_design", "Designs", "design.weekly.v1"),
+            ("seven_day_claude_design", "Designs", "design.weekly.v1"),
+            ("claude_design", "Designs", "design.weekly.v1"),
+            ("design", "Designs", "design.weekly.v1"),
+            ("seven_day_omelette", "Designs", "design.weekly.v1"),
+            ("omelette", "Designs", "design.weekly.v1"),
+            ("omelette_promotional", "Designs", "design.weekly.v1"),
+            ("seven_day_routines", "Daily Routines", "routines.weekly.v1"),
+            (
+                "seven_day_claude_routines",
+                "Daily Routines",
+                "routines.weekly.v1",
+            ),
+            ("claude_routines", "Daily Routines", "routines.weekly.v1"),
+            ("routines", "Daily Routines", "routines.weekly.v1"),
+            ("routine", "Daily Routines", "routines.weekly.v1"),
+            ("seven_day_cowork", "Daily Routines", "routines.weekly.v1"),
+            ("cowork", "Daily Routines", "routines.weekly.v1"),
+        ] {
+            let raw = format!(r#"{{"{alias}":{{"utilization":12,"resets_at":"{reset}"}}}}"#);
+            let usage: ClaudeUsageResponse = serde_json::from_str(&raw).unwrap();
+            let windows = claude_windows(&usage, now);
+            assert_eq!(windows.len(), 1, "{alias}");
+            assert_eq!(windows[0].label, label, "{alias}");
+            assert_eq!(windows[0].card_id, key, "{alias}");
+            assert_eq!(
+                windows[0].pace_status.duration_seconds,
+                Some(604_800),
+                "{alias}"
+            );
+            assert_eq!(
+                windows[0].pace_status.duration_source,
+                Some(DurationSource::Contract),
+                "{alias}"
+            );
+            assert_eq!(
+                windows[0].pace_status.state,
+                PaceState::LearningHistory,
+                "{alias}"
+            );
+        }
+    }
+
     fn header_map(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in pairs {
@@ -3529,9 +4017,9 @@ mod tests {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let headers = header_map(&[
             ("anthropic-ratelimit-unified-5h-utilization", "0.11"),
-            ("anthropic-ratelimit-unified-5h-reset", "1783111200"),
+            ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
             ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
-            ("anthropic-ratelimit-unified-7d-reset", "1783504800"),
+            ("anthropic-ratelimit-unified-7d-reset", "1700172800"),
         ]);
         let windows = parse_unified_ratelimit_windows(&headers, now);
         assert_eq!(windows.len(), 2);
@@ -3542,11 +4030,23 @@ mod tests {
         assert!((windows[0].remaining_percent - 89.0).abs() < 1e-9);
         assert!(windows[0].resets_at.is_some());
         assert!(windows[0].reset_text.is_some());
+        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
+        assert_eq!(
+            windows[0].pace_status.duration_source,
+            Some(DurationSource::Contract)
+        );
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].card_id_for_test(), "weekly.v1");
         assert_eq!(windows[1].pace_window_key_for_test(), Some("weekly.v1"));
         assert!((windows[1].used_percent - 60.0).abs() < 1e-9);
         assert!((windows[1].remaining_percent - 40.0).abs() < 1e-9);
+        assert_eq!(windows[1].pace_status.state, PaceState::LearningHistory);
+        assert_eq!(windows[1].pace_status.duration_seconds, Some(604_800));
+        assert_eq!(
+            windows[1].pace_status.duration_source,
+            Some(DurationSource::Contract)
+        );
     }
 
     #[test]
@@ -3587,10 +4087,24 @@ mod tests {
         let window = unified_ratelimit_window("Weekly", Some(0.4), None, now).unwrap();
         assert!(window.resets_at.is_none());
         assert!(window.reset_text.is_none());
+        assert_eq!(window.pace_reason_for_test(), Some("missingReset"));
+
+        let invalid_reset = parse_unified_ratelimit_windows(
+            &header_map(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
+                ("anthropic-ratelimit-unified-5h-reset", "bogus"),
+            ]),
+            now,
+        );
+        assert_eq!(invalid_reset.len(), 1);
+        assert_eq!(
+            invalid_reset[0].pace_reason_for_test(),
+            Some("invalidEvidence")
+        );
     }
 
     #[test]
-    fn unified_window_scales_and_clamps_fraction() {
+    fn unified_window_accepts_boundaries_and_rejects_invalid_fraction() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let zero = unified_ratelimit_window("Session", Some(0.0), None, now).unwrap();
         assert!((zero.used_percent - 0.0).abs() < 1e-9);
@@ -3598,10 +4112,17 @@ mod tests {
         let full = unified_ratelimit_window("Session", Some(1.0), None, now).unwrap();
         assert!((full.used_percent - 100.0).abs() < 1e-9);
         assert!((full.remaining_percent - 0.0).abs() < 1e-9);
-        let over = unified_ratelimit_window("Session", Some(1.5), None, now).unwrap();
-        assert!((over.used_percent - 100.0).abs() < 1e-9);
-        assert!((over.remaining_percent - 0.0).abs() < 1e-9);
-        // None utilization -> no window
+        for invalid in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            assert!(unified_ratelimit_window("Session", Some(invalid), None, now).is_none());
+        }
+        assert!(parse_unified_ratelimit_windows(
+            &header_map(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "1.5"),
+                ("anthropic-ratelimit-unified-7d-utilization", "NaN"),
+            ]),
+            now,
+        )
+        .is_empty());
         assert!(unified_ratelimit_window("Session", None, Some(1_783_111_200), now).is_none());
     }
 
