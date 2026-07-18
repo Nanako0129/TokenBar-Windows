@@ -3999,7 +3999,7 @@ mod tests {
                                 expected_percent: 27.5,
                                 eta_seconds: Some(123.0),
                                 will_last_to_reset: false,
-                                run_out_probability: Some(0.25),
+                                run_out_probability: None,
                             }),
                             3,
                         ))])
@@ -4810,7 +4810,7 @@ mod tests {
                         expected_percent: 42.0,
                         eta_seconds: Some(900.0),
                         will_last_to_reset: false,
-                        run_out_probability: Some(0.25),
+                        run_out_probability: None,
                     }),
                     4,
                 )),
@@ -4829,7 +4829,7 @@ mod tests {
         assert_eq!(historical.expected_used_percent, 42.0);
         assert_eq!(historical.eta_seconds, Some(900.0));
         assert!(!historical.will_last_to_reset);
-        assert_eq!(historical.run_out_probability, Some(0.25));
+        assert_eq!(historical.run_out_probability, None);
         assert_eq!(
             snapshot.windows[2].pace_status.state,
             PaceState::LearningDuration
@@ -4906,7 +4906,7 @@ mod tests {
             expected_percent: 42.0,
             eta_seconds: Some(900.0),
             will_last_to_reset: false,
-            run_out_probability: Some(0.25),
+            run_out_probability: None,
         };
 
         enrich_snapshot_with(&mut snapshot, now, |_, observations, _| {
@@ -4930,7 +4930,7 @@ mod tests {
                         sampled: true,
                     },
                     Some(HistoricalPace {
-                        will_last_to_reset: true,
+                        expected_percent: f64::NAN,
                         ..historical.clone()
                     }),
                     3,
@@ -4946,8 +4946,8 @@ mod tests {
                 )),
                 Ok((
                     HistoryOutcome::Unavailable(DurationUnavailableReason::InvalidEvidence),
-                    Some(historical.clone()),
-                    0,
+                    None,
+                    3,
                 )),
                 Ok((
                     HistoryOutcome::Ready {
@@ -5604,8 +5604,8 @@ mod tests {
                     },
                     Some(HistoricalPace {
                         expected_percent: 35.0,
-                        eta_seconds: Some(1_800.0),
-                        will_last_to_reset: false,
+                        eta_seconds: None,
+                        will_last_to_reset: true,
                         run_out_probability: Some(0.42),
                     }),
                     6,
