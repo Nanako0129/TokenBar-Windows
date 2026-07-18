@@ -294,6 +294,159 @@ fn replace_secure_file_with(
     flush_secure_storage_directory(directory)
 }
 
+/// Move one exact secure regular file to one explicit quarantine candidate by
+/// creating a hard link and then unlinking the source pathname.
+///
+/// `source_path` and `candidate_path` must be distinct direct children of
+/// `directory_path`. This helper tries exactly one candidate and never chooses a
+/// collision suffix. The caller must hold the exclusive lock returned by
+/// `open_secure_lock_file` for this entire call and must anchor every path beneath
+/// the trusted per-user data parent. These pathname operations coordinate trusted
+/// callers; they do not defend against a malicious process running as the same SID.
+#[allow(dead_code)] // Stage 2A3b primitive; production callers are wired later.
+pub(crate) fn quarantine_secure_file_candidate(
+    directory: &File,
+    directory_path: &Path,
+    source_path: &Path,
+    candidate_path: &Path,
+) -> io::Result<()> {
+    quarantine_secure_file_candidate_with(
+        directory,
+        directory_path,
+        source_path,
+        candidate_path,
+        |source, candidate| std::fs::hard_link(source, candidate),
+        |path| std::fs::remove_file(path),
+        |directory| flush_secure_storage_directory(directory),
+    )
+}
+
+fn quarantine_secure_file_candidate_with(
+    directory: &File,
+    directory_path: &Path,
+    source_path: &Path,
+    candidate_path: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    mut unlink: impl FnMut(&Path) -> io::Result<()>,
+    flush: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    validate_replace_paths(directory_path, source_path, candidate_path)?;
+
+    let directory_handle = directory.as_raw_handle() as HANDLE;
+    let directory_identity = storage_identity(directory_handle, StorageObjectKind::Directory)?;
+    verify_storage_handle(directory_handle)?;
+    verify_path_identity(
+        directory_path,
+        StorageObjectKind::Directory,
+        directory_identity,
+    )?;
+
+    // Keep this handle alive through the complete hard-link/unlink transaction.
+    // It shares delete access so the pathname unlink can proceed, while retaining
+    // the original file identity for every comparison and rollback decision.
+    let source = open_existing_secure_file(source_path, false)?;
+    let source_identity = storage_identity(
+        source.as_raw_handle() as HANDLE,
+        StorageObjectKind::RegularFile,
+    )?;
+    if source_identity.volume_serial_number != directory_identity.volume_serial_number {
+        return Err(security_verification_failed());
+    }
+
+    // CreateHardLinkW, reached through std, provides create-new collision
+    // semantics. Never pre-delete or overwrite an existing candidate.
+    link(source_path, candidate_path)?;
+
+    if let Err(error) = verify_secure_file_path(&source, source_path) {
+        rollback_quarantine_candidate(
+            &source,
+            source_path,
+            candidate_path,
+            source_identity,
+            &mut unlink,
+        )?;
+        return Err(error);
+    }
+    let candidate = match open_secure_file_with_identity(candidate_path, source_identity) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            rollback_quarantine_candidate(
+                &source,
+                source_path,
+                candidate_path,
+                source_identity,
+                &mut unlink,
+            )?;
+            return Err(error);
+        }
+    };
+    drop(candidate);
+
+    if let Err(error) = unlink(source_path) {
+        rollback_quarantine_candidate(
+            &source,
+            source_path,
+            candidate_path,
+            source_identity,
+            &mut unlink,
+        )?;
+        return Err(error);
+    }
+
+    // The source unlink has committed. Verification or flush failures from here
+    // are reported honestly; removing the surviving candidate would lose data.
+    verify_path_absent(source_path)?;
+    drop(open_secure_file_with_identity(
+        candidate_path,
+        source_identity,
+    )?);
+    verify_path_identity(
+        directory_path,
+        StorageObjectKind::Directory,
+        directory_identity,
+    )?;
+    flush(directory)
+}
+
+fn open_secure_file_with_identity(path: &Path, expected: StorageIdentity) -> io::Result<File> {
+    let file = open_existing_secure_file(path, false)?;
+    let actual = storage_identity(
+        file.as_raw_handle() as HANDLE,
+        StorageObjectKind::RegularFile,
+    )?;
+    if actual == expected {
+        Ok(file)
+    } else {
+        Err(security_verification_failed())
+    }
+}
+
+fn rollback_quarantine_candidate(
+    source: &File,
+    source_path: &Path,
+    candidate_path: &Path,
+    expected: StorageIdentity,
+    unlink: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // Never delete by pathname until the candidate is securely opened and its
+    // full volume + 128-bit file identity matches the retained source handle.
+    let candidate = open_secure_file_with_identity(candidate_path, expected)?;
+    verify_secure_file_path(source, source_path)?;
+    drop(candidate);
+
+    unlink(candidate_path)?;
+    verify_secure_file_path(source, source_path)?;
+    verify_path_absent(candidate_path)
+}
+
+fn verify_path_absent(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(security_verification_failed()),
+        Err(error) => Err(error),
+    }
+}
+
 fn validate_replace_paths(
     directory_path: &Path,
     staged_path: &Path,
@@ -2356,6 +2509,699 @@ mod tests {
         );
         assert!(!staged_path.exists(), "original staged pathname is absent");
 
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_quarantine_candidate_preserves_bytes_dacl_identity_and_flushes_directory() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let source_path = storage_path.join("history.json");
+        let candidate_path = storage_path.join("history.corrupt-1.json");
+        let (source, source_identity) =
+            create_secure_test_file(&source_path, b"corrupt history bytes")
+                .expect("create quarantine source");
+        let source_acl = read_acl_snapshot(source.as_raw_handle() as HANDLE)
+            .expect("snapshot quarantine source DACL");
+        drop(source);
+
+        quarantine_secure_file_candidate(&directory, &storage_path, &source_path, &candidate_path)
+            .expect("quarantine one candidate and flush directory");
+
+        assert!(
+            fs::symlink_metadata(&source_path)
+                .expect_err("source pathname disappears")
+                .kind()
+                == io::ErrorKind::NotFound,
+            "source pathname is absent after quarantine"
+        );
+        let mut candidate =
+            open_existing_secure_file(&candidate_path, false).expect("open quarantine candidate");
+        assert!(
+            regular_file_identity(&candidate).expect("read quarantine identity") == source_identity,
+            "candidate keeps the source FILE_ID_INFO identity"
+        );
+        assert!(
+            read_open_file(&mut candidate).expect("read quarantine bytes")
+                == b"corrupt history bytes",
+            "candidate keeps source bytes"
+        );
+        assert!(
+            read_acl_snapshot(candidate.as_raw_handle() as HANDLE)
+                .expect("read quarantine candidate DACL")
+                == source_acl,
+            "candidate keeps the source DACL"
+        );
+
+        drop(candidate);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_quarantine_existing_candidate_collision_preserves_both_files() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let source_path = storage_path.join("account.json");
+        let candidate_path = storage_path.join("account.corrupt-1.json");
+        let (source, source_identity) = create_secure_test_file(&source_path, b"source evidence")
+            .expect("create quarantine source");
+        let source_acl =
+            read_acl_snapshot(source.as_raw_handle() as HANDLE).expect("snapshot source DACL");
+        let (candidate, candidate_identity) =
+            create_secure_test_file(&candidate_path, b"existing evidence")
+                .expect("create colliding candidate");
+        let candidate_acl = read_acl_snapshot(candidate.as_raw_handle() as HANDLE)
+            .expect("snapshot candidate DACL");
+        assert!(
+            source_identity != candidate_identity,
+            "source and existing candidate identities start distinct"
+        );
+        drop(candidate);
+        drop(source);
+
+        let error = quarantine_secure_file_candidate(
+            &directory,
+            &storage_path,
+            &source_path,
+            &candidate_path,
+        )
+        .expect_err("existing candidate collision is returned");
+        assert!(
+            error.kind() == io::ErrorKind::AlreadyExists,
+            "native hard-link collision keeps create-new semantics"
+        );
+
+        assert!(
+            read_secure_test_file(&source_path).expect("reopen source after collision")
+                == (b"source evidence".to_vec(), source_identity),
+            "collision preserves source bytes and identity"
+        );
+        let source_after =
+            open_existing_secure_file(&source_path, false).expect("open source after collision");
+        assert!(
+            read_acl_snapshot(source_after.as_raw_handle() as HANDLE)
+                .expect("read source DACL after collision")
+                == source_acl,
+            "collision preserves source DACL"
+        );
+        assert!(
+            read_secure_test_file(&candidate_path).expect("reopen candidate after collision")
+                == (b"existing evidence".to_vec(), candidate_identity),
+            "collision preserves candidate bytes and identity"
+        );
+        let candidate_after = open_existing_secure_file(&candidate_path, false)
+            .expect("open candidate after collision");
+        assert!(
+            read_acl_snapshot(candidate_after.as_raw_handle() as HANDLE)
+                .expect("read candidate DACL after collision")
+                == candidate_acl,
+            "collision preserves candidate DACL"
+        );
+
+        drop(candidate_after);
+        drop(source_after);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_quarantine_reparse_and_directory_collisions_touch_no_targets() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+
+        let symlink_source_path = storage_path.join("symlink-source.json");
+        let symlink_candidate_path = storage_path.join("symlink-candidate.json");
+        let symlink_target_path = storage_path.join("symlink-target.json");
+        let (symlink_source, symlink_source_identity) =
+            create_secure_test_file(&symlink_source_path, b"symlink source evidence")
+                .expect("create source for symlink collision");
+        let symlink_source_acl = read_acl_snapshot(symlink_source.as_raw_handle() as HANDLE)
+            .expect("snapshot symlink-collision source DACL");
+        let (symlink_target, symlink_target_identity) =
+            create_secure_test_file(&symlink_target_path, b"symlink target bytes")
+                .expect("create symlink collision target");
+        let symlink_target_acl = read_acl_snapshot(symlink_target.as_raw_handle() as HANDLE)
+            .expect("snapshot symlink target DACL");
+        drop(symlink_target);
+        drop(symlink_source);
+        symlink_file(&symlink_target_path, &symlink_candidate_path)
+            .expect("create colliding final symlink");
+
+        quarantine_secure_file_candidate(
+            &directory,
+            &storage_path,
+            &symlink_source_path,
+            &symlink_candidate_path,
+        )
+        .expect_err("existing symlink candidate is never overwritten");
+        assert!(
+            fs::symlink_metadata(&symlink_candidate_path)
+                .expect("symlink candidate remains")
+                .file_type()
+                .is_symlink(),
+            "candidate symlink remains installed"
+        );
+        assert!(
+            read_secure_test_file(&symlink_source_path)
+                .expect("reopen source after symlink collision")
+                == (b"symlink source evidence".to_vec(), symlink_source_identity),
+            "symlink collision preserves source bytes and identity"
+        );
+        let symlink_source_after = open_existing_secure_file(&symlink_source_path, false)
+            .expect("open source after symlink collision");
+        assert!(
+            read_acl_snapshot(symlink_source_after.as_raw_handle() as HANDLE)
+                .expect("read source DACL after symlink collision")
+                == symlink_source_acl,
+            "symlink collision preserves source DACL"
+        );
+        assert!(
+            read_secure_test_file(&symlink_target_path).expect("reopen symlink collision target")
+                == (b"symlink target bytes".to_vec(), symlink_target_identity),
+            "symlink collision does not touch target bytes or identity"
+        );
+        let symlink_target_after = open_existing_secure_file(&symlink_target_path, false)
+            .expect("open symlink target after collision");
+        assert!(
+            read_acl_snapshot(symlink_target_after.as_raw_handle() as HANDLE)
+                .expect("read symlink target DACL after collision")
+                == symlink_target_acl,
+            "symlink collision does not touch target DACL"
+        );
+
+        let directory_source_path = storage_path.join("directory-source.json");
+        let directory_candidate_path = storage_path.join("directory-candidate");
+        let directory_marker_path = directory_candidate_path.join("marker.bin");
+        let (directory_source, directory_source_identity) =
+            create_secure_test_file(&directory_source_path, b"directory source evidence")
+                .expect("create source for directory collision");
+        let candidate_directory = ensure_secure_storage_directory(&directory_candidate_path)
+            .expect("create colliding candidate directory");
+        let candidate_directory_identity = storage_identity(
+            candidate_directory.as_raw_handle() as HANDLE,
+            StorageObjectKind::Directory,
+        )
+        .expect("read candidate directory identity");
+        let candidate_directory_acl =
+            read_acl_snapshot(candidate_directory.as_raw_handle() as HANDLE)
+                .expect("snapshot candidate directory DACL");
+        fs::write(&directory_marker_path, b"directory target marker")
+            .expect("write candidate directory marker");
+        drop(directory_source);
+
+        quarantine_secure_file_candidate(
+            &directory,
+            &storage_path,
+            &directory_source_path,
+            &directory_candidate_path,
+        )
+        .expect_err("existing directory candidate is never overwritten");
+        assert!(
+            read_secure_test_file(&directory_source_path)
+                .expect("reopen source after directory collision")
+                == (
+                    b"directory source evidence".to_vec(),
+                    directory_source_identity
+                ),
+            "directory collision preserves source bytes and identity"
+        );
+        verify_path_identity(
+            &directory_candidate_path,
+            StorageObjectKind::Directory,
+            candidate_directory_identity,
+        )
+        .expect("candidate directory path and identity remain installed");
+        assert!(
+            read_acl_snapshot(candidate_directory.as_raw_handle() as HANDLE)
+                .expect("read candidate directory DACL after collision")
+                == candidate_directory_acl,
+            "directory collision preserves candidate DACL"
+        );
+        assert!(
+            fs::read(&directory_marker_path).expect("read candidate directory marker")
+                == b"directory target marker",
+            "directory collision preserves target contents"
+        );
+
+        fs::remove_file(&symlink_candidate_path).expect("remove candidate symlink");
+        drop(candidate_directory);
+        drop(symlink_target_after);
+        drop(symlink_source_after);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn injected_quarantine_unlink_failure_rolls_back_link_and_preserves_source() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let source_path = storage_path.join("history.json");
+        let candidate_path = storage_path.join("history.corrupt-2.json");
+        let (source, source_identity) =
+            create_secure_test_file(&source_path, b"retained source bytes")
+                .expect("create quarantine source");
+        let source_acl =
+            read_acl_snapshot(source.as_raw_handle() as HANDLE).expect("snapshot source DACL");
+        drop(source);
+        let mut flush_called = false;
+
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &source_path,
+            &candidate_path,
+            |source, candidate| fs::hard_link(source, candidate),
+            |path| {
+                if path == source_path.as_path() {
+                    Err(io::Error::other("injected source unlink failure"))
+                } else {
+                    fs::remove_file(path)
+                }
+            },
+            |_| {
+                flush_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("injected source unlink failure is returned");
+        assert!(!flush_called, "failed transaction never flushes as success");
+        assert!(
+            fs::symlink_metadata(&candidate_path)
+                .expect_err("rollback removes candidate link")
+                .kind()
+                == io::ErrorKind::NotFound,
+            "rollback removes only the new candidate link"
+        );
+        assert!(
+            read_secure_test_file(&source_path).expect("reopen source after rollback")
+                == (b"retained source bytes".to_vec(), source_identity),
+            "rollback preserves source bytes and identity"
+        );
+        let source_after =
+            open_existing_secure_file(&source_path, false).expect("open source after rollback");
+        assert!(
+            read_acl_snapshot(source_after.as_raw_handle() as HANDLE)
+                .expect("read source DACL after rollback")
+                == source_acl,
+            "rollback preserves source DACL"
+        );
+
+        drop(source_after);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn injected_quarantine_candidate_identity_mismatch_preserves_unrelated_candidate() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let source_path = storage_path.join("account.json");
+        let candidate_path = storage_path.join("account.corrupt-2.json");
+        let (source, source_identity) =
+            create_secure_test_file(&source_path, b"authenticated source evidence")
+                .expect("create quarantine source");
+        let source_acl =
+            read_acl_snapshot(source.as_raw_handle() as HANDLE).expect("snapshot source DACL");
+        drop(source);
+        let mut replacement_identity = None;
+
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &source_path,
+            &candidate_path,
+            |source, candidate| fs::hard_link(source, candidate),
+            |path| {
+                if path == source_path.as_path() {
+                    fs::remove_file(&candidate_path)?;
+                    let (replacement, identity) =
+                        create_secure_test_file(&candidate_path, b"unrelated candidate bytes")?;
+                    replacement_identity = Some(identity);
+                    drop(replacement);
+                    Err(io::Error::other("injected source unlink failure"))
+                } else {
+                    panic!("identity-mismatched rollback candidate must not be unlinked")
+                }
+            },
+            |_| panic!("identity-mismatched transaction must not flush"),
+        )
+        .expect_err("rollback detects candidate identity mismatch");
+
+        assert!(
+            read_secure_test_file(&source_path).expect("reopen source after mismatch")
+                == (b"authenticated source evidence".to_vec(), source_identity),
+            "identity mismatch leaves source bytes and identity intact"
+        );
+        let source_after =
+            open_existing_secure_file(&source_path, false).expect("open source after mismatch");
+        assert!(
+            read_acl_snapshot(source_after.as_raw_handle() as HANDLE)
+                .expect("read source DACL after mismatch")
+                == source_acl,
+            "identity mismatch leaves source DACL intact"
+        );
+        assert!(
+            read_secure_test_file(&candidate_path).expect("unrelated candidate remains installed")
+                == (
+                    b"unrelated candidate bytes".to_vec(),
+                    replacement_identity.expect("replacement identity was recorded")
+                ),
+            "rollback never deletes an unrelated replacement candidate"
+        );
+
+        drop(source_after);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_quarantine_rejects_unsafe_source_objects_before_link() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+
+        let permissive_source_path = storage_path.join("permissive.json");
+        let permissive_candidate_path = storage_path.join("permissive.corrupt.json");
+        let permissive =
+            create_permissive_test_file(&permissive_source_path, b"permissive evidence")
+                .expect("create permissive source");
+        let permissive_identity =
+            regular_file_identity(&permissive).expect("read permissive source identity");
+        let permissive_acl = read_acl_snapshot(permissive.as_raw_handle() as HANDLE)
+            .expect("snapshot permissive source DACL");
+        let permissive_path_text = permissive_source_path.to_string_lossy().into_owned();
+        let error = quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &permissive_source_path,
+            &permissive_candidate_path,
+            |_, _| panic!("permissive source must be rejected before link"),
+            |_| panic!("permissive source must be rejected before unlink"),
+            |_| panic!("permissive source must be rejected before flush"),
+        )
+        .expect_err("permissive source is rejected");
+        assert_generic_error(&error, &[&permissive_path_text]);
+        assert!(
+            fs::read(&permissive_source_path).expect("read rejected permissive source")
+                == b"permissive evidence"
+                && regular_file_identity(&permissive).expect("reread permissive source identity")
+                    == permissive_identity
+                && read_acl_snapshot(permissive.as_raw_handle() as HANDLE)
+                    .expect("reread permissive source DACL")
+                    == permissive_acl,
+            "permissive rejection preserves source bytes, identity, and DACL"
+        );
+        assert!(
+            !permissive_candidate_path.exists(),
+            "permissive rejection creates no candidate"
+        );
+
+        let symlink_target_path = storage_path.join("source-target.json");
+        let symlink_source_path = storage_path.join("source-link.json");
+        let symlink_candidate_path = storage_path.join("source-link.corrupt.json");
+        let (symlink_target, symlink_target_identity) =
+            create_secure_test_file(&symlink_target_path, b"source symlink target")
+                .expect("create source symlink target");
+        let symlink_target_acl = read_acl_snapshot(symlink_target.as_raw_handle() as HANDLE)
+            .expect("snapshot source symlink target DACL");
+        drop(symlink_target);
+        symlink_file(&symlink_target_path, &symlink_source_path)
+            .expect("create final source symlink");
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &symlink_source_path,
+            &symlink_candidate_path,
+            |_, _| panic!("source symlink must be rejected before link"),
+            |_| panic!("source symlink must be rejected before unlink"),
+            |_| panic!("source symlink must be rejected before flush"),
+        )
+        .expect_err("final source symlink is rejected");
+        assert!(
+            fs::symlink_metadata(&symlink_source_path)
+                .expect("source symlink remains")
+                .file_type()
+                .is_symlink(),
+            "source symlink remains untouched"
+        );
+        assert!(
+            read_secure_test_file(&symlink_target_path).expect("reopen source symlink target")
+                == (b"source symlink target".to_vec(), symlink_target_identity),
+            "source symlink rejection preserves target bytes and identity"
+        );
+        let symlink_target_after = open_existing_secure_file(&symlink_target_path, false)
+            .expect("open source symlink target after rejection");
+        assert!(
+            read_acl_snapshot(symlink_target_after.as_raw_handle() as HANDLE)
+                .expect("read source symlink target DACL")
+                == symlink_target_acl,
+            "source symlink rejection preserves target DACL"
+        );
+        assert!(
+            !symlink_candidate_path.exists(),
+            "source symlink rejection creates no candidate"
+        );
+
+        let directory_source_path = storage_path.join("source-directory");
+        let directory_candidate_path = storage_path.join("source-directory.corrupt");
+        let directory_marker_path = directory_source_path.join("marker.bin");
+        let source_directory = ensure_secure_storage_directory(&directory_source_path)
+            .expect("create wrong-type source directory");
+        let source_directory_identity = storage_identity(
+            source_directory.as_raw_handle() as HANDLE,
+            StorageObjectKind::Directory,
+        )
+        .expect("read source directory identity");
+        let source_directory_acl = read_acl_snapshot(source_directory.as_raw_handle() as HANDLE)
+            .expect("snapshot source directory DACL");
+        fs::write(&directory_marker_path, b"source directory marker")
+            .expect("write source directory marker");
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &directory_source_path,
+            &directory_candidate_path,
+            |_, _| panic!("directory source must be rejected before link"),
+            |_| panic!("directory source must be rejected before unlink"),
+            |_| panic!("directory source must be rejected before flush"),
+        )
+        .expect_err("directory source is rejected");
+        verify_path_identity(
+            &directory_source_path,
+            StorageObjectKind::Directory,
+            source_directory_identity,
+        )
+        .expect("source directory path and identity remain installed");
+        assert!(
+            read_acl_snapshot(source_directory.as_raw_handle() as HANDLE)
+                .expect("read source directory DACL after rejection")
+                == source_directory_acl,
+            "directory source rejection preserves DACL"
+        );
+        assert!(
+            fs::read(&directory_marker_path).expect("read source directory marker")
+                == b"source directory marker",
+            "directory source rejection preserves contents"
+        );
+        assert!(
+            !directory_candidate_path.exists(),
+            "directory source rejection creates no candidate"
+        );
+
+        fs::remove_file(&symlink_source_path).expect("remove source symlink");
+        drop(source_directory);
+        drop(symlink_target_after);
+        drop(permissive);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_quarantine_rejects_invalid_paths_and_directory_identity_before_link() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let other_storage_path = root.join("other-storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let other_directory = ensure_secure_storage_directory(&other_storage_path)
+            .expect("create second secure directory");
+        let local_source_path = storage_path.join("local.json");
+        let cross_source_path = other_storage_path.join("cross.json");
+        let (local_source, local_identity) =
+            create_secure_test_file(&local_source_path, b"local evidence")
+                .expect("create local source");
+        let (cross_source, cross_identity) =
+            create_secure_test_file(&cross_source_path, b"cross evidence")
+                .expect("create cross-directory source");
+        drop(cross_source);
+        drop(local_source);
+
+        let local_candidate_path = storage_path.join("cross.corrupt.json");
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &cross_source_path,
+            &local_candidate_path,
+            |_, _| panic!("cross-directory source must be rejected before link"),
+            |_| panic!("cross-directory source must be rejected before unlink"),
+            |_| panic!("cross-directory source must be rejected before flush"),
+        )
+        .expect_err("cross-directory source path is rejected");
+        assert!(
+            read_secure_test_file(&cross_source_path).expect("reopen cross-directory source")
+                == (b"cross evidence".to_vec(), cross_identity),
+            "cross-directory source remains unchanged"
+        );
+        assert!(
+            !local_candidate_path.exists(),
+            "cross-directory source creates no candidate"
+        );
+
+        let cross_candidate_path = other_storage_path.join("local.corrupt.json");
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &local_source_path,
+            &cross_candidate_path,
+            |_, _| panic!("cross-directory candidate must be rejected before link"),
+            |_| panic!("cross-directory candidate must be rejected before unlink"),
+            |_| panic!("cross-directory candidate must be rejected before flush"),
+        )
+        .expect_err("cross-directory candidate path is rejected");
+        assert!(
+            read_secure_test_file(&local_source_path).expect("reopen local source")
+                == (b"local evidence".to_vec(), local_identity),
+            "cross-directory candidate rejection preserves source"
+        );
+        assert!(
+            !cross_candidate_path.exists(),
+            "cross-directory candidate is not created"
+        );
+
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &local_source_path,
+            &local_source_path,
+            |_, _| panic!("same path must be rejected before link"),
+            |_| panic!("same path must be rejected before unlink"),
+            |_| panic!("same path must be rejected before flush"),
+        )
+        .expect_err("same source and candidate path is rejected");
+        assert!(
+            read_secure_test_file(&local_source_path).expect("reopen same-path source")
+                == (b"local evidence".to_vec(), local_identity),
+            "same-path rejection preserves source"
+        );
+
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            Path::new(""),
+            &local_candidate_path,
+            |_, _| panic!("missing filename must be rejected before link"),
+            |_| panic!("missing filename must be rejected before unlink"),
+            |_| panic!("missing filename must be rejected before flush"),
+        )
+        .expect_err("missing source filename is rejected");
+        assert!(
+            !local_candidate_path.exists(),
+            "missing filename creates no candidate"
+        );
+
+        let mismatched_candidate_path = other_storage_path.join("mismatch.corrupt.json");
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &other_storage_path,
+            &cross_source_path,
+            &mismatched_candidate_path,
+            |_, _| panic!("directory identity mismatch must be rejected before link"),
+            |_| panic!("directory identity mismatch must be rejected before unlink"),
+            |_| panic!("directory identity mismatch must be rejected before flush"),
+        )
+        .expect_err("directory handle and pathname identity mismatch is rejected");
+        assert!(
+            read_secure_test_file(&cross_source_path)
+                .expect("reopen source after directory mismatch")
+                == (b"cross evidence".to_vec(), cross_identity),
+            "directory mismatch preserves source"
+        );
+        assert!(
+            !mismatched_candidate_path.exists(),
+            "directory mismatch creates no candidate"
+        );
+
+        drop(other_directory);
+        drop(directory);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn post_unlink_flush_failure_returns_error_without_false_rollback() {
+        let root = TempRoot::create().expect("create temporary root");
+        let storage_path = root.join("storage");
+        let directory =
+            ensure_secure_storage_directory(&storage_path).expect("create secure directory");
+        let source_path = storage_path.join("history.json");
+        let candidate_path = storage_path.join("history.corrupt-3.json");
+        let (source, source_identity) =
+            create_secure_test_file(&source_path, b"committed quarantine bytes")
+                .expect("create quarantine source");
+        let source_acl =
+            read_acl_snapshot(source.as_raw_handle() as HANDLE).expect("snapshot source DACL");
+        drop(source);
+
+        quarantine_secure_file_candidate_with(
+            &directory,
+            &storage_path,
+            &source_path,
+            &candidate_path,
+            |source, candidate| fs::hard_link(source, candidate),
+            |path| fs::remove_file(path),
+            |_| Err(io::Error::other("injected directory flush failure")),
+        )
+        .expect_err("post-unlink flush failure is returned honestly");
+
+        assert!(
+            fs::symlink_metadata(&source_path)
+                .expect_err("committed source pathname remains absent")
+                .kind()
+                == io::ErrorKind::NotFound,
+            "post-commit failure does not recreate the source pathname"
+        );
+        let mut candidate = open_existing_secure_file(&candidate_path, false)
+            .expect("open sole retained quarantine candidate");
+        assert!(
+            regular_file_identity(&candidate).expect("read retained candidate identity")
+                == source_identity,
+            "post-commit failure retains the original identity at the candidate"
+        );
+        assert!(
+            read_open_file(&mut candidate).expect("read retained candidate bytes")
+                == b"committed quarantine bytes",
+            "post-commit failure retains source bytes at the candidate"
+        );
+        assert!(
+            read_acl_snapshot(candidate.as_raw_handle() as HANDLE)
+                .expect("read retained candidate DACL")
+                == source_acl,
+            "post-commit failure retains source DACL at the candidate"
+        );
+
+        drop(candidate);
         drop(directory);
         root.cleanup().expect("remove temporary root");
     }
