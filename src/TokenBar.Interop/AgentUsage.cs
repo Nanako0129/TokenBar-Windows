@@ -638,8 +638,20 @@ public sealed record AgentUsageSnapshot(
     IReadOnlyList<UsageWindow> Windows,
     AgentIdentity? Identity = null,
     CreditsSnapshot? Credits = null,
-    string? Error = null)
+    string? Error = null) : IJsonOnDeserialized
 {
+    void IJsonOnDeserialized.OnDeserialized()
+    {
+        if (ClientId is null || Source is null || UpdatedAt is null || Windows is null)
+        {
+            throw new JsonException("agent usage snapshot has null required fields");
+        }
+        if (Windows.Any(static window => window is null))
+        {
+            throw new JsonException("agent usage snapshot windows cannot contain null");
+        }
+    }
+
     /// <summary>Order-preserving unique card view; first duplicate wins.</summary>
     [JsonIgnore]
     public IReadOnlyList<UsageWindow> UniqueCardWindows
@@ -665,4 +677,21 @@ public sealed record AgentUsagePayload(
     IReadOnlyList<AgentUsageSnapshot> Agents,
     // Subscription-type providers opencode is authed against (e.g. ["Codex"]).
     // Omitted from the JSON entirely when empty.
-    IReadOnlyList<string>? OpencodeSubscriptions = null);
+    IReadOnlyList<string>? OpencodeSubscriptions = null) : IJsonOnDeserialized
+{
+    void IJsonOnDeserialized.OnDeserialized()
+    {
+        if (GeneratedAt is null || Agents is null)
+        {
+            throw new JsonException("agent usage payload has null required fields");
+        }
+        if (Agents.Any(static agent => agent is null))
+        {
+            throw new JsonException("agent usage payload agents cannot contain null");
+        }
+        if (OpencodeSubscriptions?.Any(static subscription => subscription is null) == true)
+        {
+            throw new JsonException("opencode subscriptions cannot contain null");
+        }
+    }
+}
