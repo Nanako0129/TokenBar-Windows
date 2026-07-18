@@ -7,10 +7,12 @@
 //! card appears whenever Copilot is signed in there. Maps to `UsageWindow`s.
 
 use crate::agent_account_scope::{self, AccountScope, AccountScopeError};
+use crate::agent_quota_duration::{copilot_calendar_duration, DurationEvidence};
 use crate::agent_usage::{clean_plan, AgentIdentity, UsageWindow};
 use crate::opencode_integrations::GitHubCopilotCredential;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 const COPILOT_USAGE_URL: &str = "https://api.github.com/copilot_internal/user";
 
@@ -24,13 +26,13 @@ pub(crate) struct CopilotData {
 struct CopilotUser {
     #[serde(default)]
     copilot_plan: Option<String>,
-    #[serde(default)]
-    quota_reset_date: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    quota_reset_date: Option<Box<RawValue>>,
     #[serde(default)]
     quota_snapshots: Option<QuotaSnapshots>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct QuotaSnapshots {
     #[serde(default)]
     premium_interactions: Option<QuotaSnapshot>,
@@ -38,7 +40,7 @@ struct QuotaSnapshots {
     chat: Option<QuotaSnapshot>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct QuotaSnapshot {
     #[serde(default)]
     entitlement: f64,
@@ -116,32 +118,7 @@ where
         canonical_location,
     } = credential;
     let usage = request(request_token).await?;
-    let resets_at = usage
-        .quota_reset_date
-        .as_deref()
-        .and_then(parse_reset_date);
-    let snapshots = usage.quota_snapshots;
-    let mut windows = Vec::new();
-    if let Some(snapshots) = snapshots {
-        if let Some(window) = snapshot_window_with_identity(
-            "Premium",
-            "premium_interactions.v1",
-            snapshots.premium_interactions,
-            resets_at,
-            now,
-        ) {
-            windows.push(window);
-        }
-        if let Some(window) = snapshot_window_with_identity(
-            "Chat",
-            "chat.v1",
-            snapshots.chat,
-            resets_at,
-            now,
-        ) {
-            windows.push(window);
-        }
-    }
+    let windows = snapshot_windows(&usage, now);
     let account_scope = resolve_scope(semantic_source, &canonical_location, &marker);
     Ok(CopilotData {
         identity: Some(AgentIdentity {
@@ -153,24 +130,76 @@ where
     })
 }
 
+fn snapshot_windows(usage: &CopilotUser, now: DateTime<Utc>) -> Vec<UsageWindow> {
+    let resets_at = usage.quota_reset_date.as_deref().and_then(parse_reset_raw);
+    let reset_was_supplied = usage.quota_reset_date.is_some();
+    let Some(snapshots) = usage.quota_snapshots.as_ref() else {
+        return Vec::new();
+    };
+    [
+        snapshot_window_with_identity(
+            "Premium",
+            "premium_interactions.v1",
+            Some("premium_interactions.v1".to_string()),
+            snapshots.premium_interactions.clone(),
+            resets_at,
+            reset_was_supplied,
+            now,
+        ),
+        snapshot_window_with_identity(
+            "Chat",
+            "chat.v1",
+            Some("chat.v1".to_string()),
+            snapshots.chat.clone(),
+            resets_at,
+            reset_was_supplied,
+            now,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 fn snapshot_window_with_identity(
     label: &str,
-    window_key: &str,
+    card_id: &str,
+    window_key: Option<String>,
     snapshot: Option<QuotaSnapshot>,
     resets_at: Option<DateTime<Utc>>,
+    reset_was_supplied: bool,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
     let snapshot = snapshot?;
     // Skip explicit zero-entitlement placeholders (no usable quota signal).
-    if snapshot.entitlement == 0.0 && snapshot.remaining == 0.0 && snapshot.percent_remaining.is_none() {
+    if snapshot.entitlement == 0.0
+        && snapshot.remaining == 0.0
+        && snapshot.percent_remaining.is_none()
+    {
         return None;
     }
     let percent_remaining = snapshot.percent_remaining.or_else(|| {
         (snapshot.entitlement > 0.0).then(|| (snapshot.remaining / snapshot.entitlement) * 100.0)
     })?;
-    (percent_remaining.is_finite() && (0.0..=100.0).contains(&percent_remaining)).then(|| {
-        UsageWindow::from_fraction(label.to_string(), percent_remaining / 100.0, resets_at, now)
-            .with_identity(window_key, Some(window_key.to_string()))
+    if !percent_remaining.is_finite() || !(0.0..=100.0).contains(&percent_remaining) {
+        return None;
+    }
+
+    let window = UsageWindow::from_fraction(
+        label.to_string(),
+        percent_remaining / 100.0,
+        resets_at,
+        now,
+    )
+    .with_identity(card_id, window_key);
+    let contract_duration = resets_at.and_then(|reset| copilot_calendar_duration(reset.timestamp()));
+    Some(match contract_duration {
+        Some(duration) => window.with_contract_duration_evidence(
+            now,
+            reset_was_supplied,
+            DurationEvidence::contract(duration),
+        ),
+        None => window.with_observed_duration_evidence(now, reset_was_supplied),
     })
 }
 
@@ -186,23 +215,44 @@ fn snapshot_window(
         "Chat" => ("chat.v1", Some("chat.v1".to_string())),
         _ => ("row.copilot.unknown.v1", None),
     };
-    let snapshot = snapshot?;
-    if snapshot.entitlement == 0.0 && snapshot.remaining == 0.0 && snapshot.percent_remaining.is_none() {
-        return None;
-    }
-    let percent_remaining = snapshot.percent_remaining.or_else(|| {
-        (snapshot.entitlement > 0.0).then(|| (snapshot.remaining / snapshot.entitlement) * 100.0)
-    })?;
-    (percent_remaining.is_finite() && (0.0..=100.0).contains(&percent_remaining)).then(|| {
-        UsageWindow::from_fraction(label.to_string(), percent_remaining / 100.0, resets_at, now)
-            .with_identity(card_id, window_key)
-    })
+    snapshot_window_with_identity(
+        label,
+        card_id,
+        window_key,
+        snapshot,
+        resets_at,
+        resets_at.is_some(),
+        now,
+    )
+}
+
+fn deserialize_optional_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+fn parse_reset_raw(raw: &RawValue) -> Option<DateTime<Utc>> {
+    let value = serde_json::from_str::<String>(raw.get()).ok()?;
+    parse_reset_date(&value)
 }
 
 /// Copilot reports `quota_reset_date` as a bare `YYYY-MM-DD`; treat it as UTC midnight.
 fn parse_reset_date(value: &str) -> Option<DateTime<Utc>> {
-    let date = NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()?;
-    Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?).into()
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
 }
 
 #[cfg(test)]
@@ -266,6 +316,159 @@ mod tests {
         assert!((premium.remaining_for_test() - 30.0).abs() < 0.01);
         // chat is a zero-entitlement placeholder → skipped
         assert!(snapshot_window("Chat", snaps.chat, None, now).is_none());
+    }
+
+    #[test]
+    fn maps_exact_calendar_duration_for_each_month_length_on_both_cards() {
+        let cases = [
+            ("2023-03-01", "2023-02-15T00:00:00Z", 28 * 86_400),
+            ("2024-03-01", "2024-02-15T00:00:00Z", 29 * 86_400),
+            ("2023-05-01", "2023-04-15T00:00:00Z", 30 * 86_400),
+            ("2023-08-01", "2023-07-15T00:00:00Z", 31 * 86_400),
+        ];
+        for (reset, now_text, expected_seconds) in cases {
+            let now = now_text.parse::<DateTime<Utc>>().unwrap();
+            let usage: CopilotUser = serde_json::from_value(json!({
+                "quota_reset_date": reset,
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 300, "remaining": 90, "percent_remaining": 30
+                    },
+                    "chat": {"entitlement": 100, "remaining": 75, "percent_remaining": 75}
+                }
+            }))
+            .unwrap();
+            assert!(usage.quota_reset_date.is_some());
+            let windows = snapshot_windows(&usage, now);
+            assert_eq!(windows.len(), 2, "{reset}");
+            for (window, card_id) in windows.iter().zip([
+                "premium_interactions.v1",
+                "chat.v1",
+            ]) {
+                let wire = serde_json::to_value(window).unwrap();
+                assert_eq!(wire["cardId"], card_id, "{reset}");
+                assert_eq!(wire["paceStatus"]["state"], "learningHistory", "{reset}");
+                assert_eq!(wire["paceStatus"]["durationSource"], "contract", "{reset}");
+                assert_eq!(
+                    wire["paceStatus"]["durationSeconds"],
+                    expected_seconds,
+                    "{reset}"
+                );
+                assert_eq!(wire["windowMinutes"], expected_seconds / 60, "{reset}");
+                assert!(wire.get("historicalPace").is_none(), "{reset}");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_future_non_month_start_uses_observed_duration_learning() {
+        let now = "2023-08-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let usage: CopilotUser = serde_json::from_value(json!({
+            "quota_reset_date": "2023-08-15",
+            "quota_snapshots": {
+                "premium_interactions": {"entitlement": 300, "remaining": 90},
+                "chat": {"entitlement": 100, "remaining": 75}
+            }
+        }))
+        .unwrap();
+        let windows = snapshot_windows(&usage, now);
+        assert_eq!(windows.len(), 2);
+        for window in windows {
+            let wire = serde_json::to_value(window).unwrap();
+            assert_eq!(wire["paceStatus"]["state"], "learningDuration");
+            assert_eq!(wire["paceStatus"]["durationSource"], "observed");
+            assert!(wire["paceStatus"].get("durationSeconds").is_none());
+            assert!(wire.get("windowMinutes").is_none());
+            assert!(wire.get("historicalPace").is_none());
+        }
+    }
+
+    #[test]
+    fn reset_presence_and_validity_fail_closed_without_observed_fallback() {
+        let now = "2023-08-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let cases = [
+            ("missing", json!({}), false, "missingReset"),
+            (
+                "null",
+                json!({"quota_reset_date": null}),
+                true,
+                "invalidEvidence",
+            ),
+            (
+                "object",
+                json!({"quota_reset_date": {"reset": "2023-08-01"}}),
+                true,
+                "invalidEvidence",
+            ),
+            (
+                "number",
+                json!({"quota_reset_date": 42}),
+                true,
+                "invalidEvidence",
+            ),
+            (
+                "bool",
+                json!({"quota_reset_date": true}),
+                true,
+                "invalidEvidence",
+            ),
+            (
+                "blank",
+                json!({"quota_reset_date": ""}),
+                true,
+                "invalidEvidence",
+            ),
+            (
+                "malformed",
+                json!({"quota_reset_date": "not-a-date"}),
+                true,
+                "invalidEvidence",
+            ),
+            (
+                "past",
+                json!({"quota_reset_date": "2023-08-01"}),
+                true,
+                "invalidEvidence",
+            ),
+        ];
+        for (case, reset, supplied, reason) in cases {
+            let mut body = json!({
+                "quota_snapshots": {
+                    "premium_interactions": {"entitlement": 300, "remaining": 90},
+                    "chat": {"entitlement": 100, "remaining": 75}
+                }
+            });
+            if let Some(reset) = reset.get("quota_reset_date") {
+                body["quota_reset_date"] = reset.clone();
+            }
+            let usage: CopilotUser = serde_json::from_value(body).unwrap();
+            assert_eq!(usage.quota_reset_date.is_some(), supplied, "{case}");
+            let windows = snapshot_windows(&usage, now);
+            assert_eq!(windows.len(), 2, "{case}");
+            for window in windows {
+                let wire = serde_json::to_value(window).unwrap();
+                assert_eq!(wire["paceStatus"]["state"], "unavailable", "{case}");
+                assert_eq!(wire["paceStatus"]["reason"], reason, "{case}");
+                assert!(wire["paceStatus"].get("durationSeconds").is_none(), "{case}");
+                assert!(wire.get("windowMinutes").is_none(), "{case}");
+                assert!(wire.get("historicalPace").is_none(), "{case}");
+            }
+        }
+
+        let early_now = "2023-06-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let future_calendar: CopilotUser = serde_json::from_value(json!({
+            "quota_reset_date": "2023-08-01",
+            "quota_snapshots": {
+                "premium_interactions": {"entitlement": 300, "remaining": 90},
+                "chat": {"entitlement": 100, "remaining": 75}
+            }
+        }))
+        .unwrap();
+        for window in snapshot_windows(&future_calendar, early_now) {
+            let wire = serde_json::to_value(window).unwrap();
+            assert_eq!(wire["paceStatus"]["state"], "unavailable");
+            assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence");
+        }
     }
 
     #[tokio::test]
@@ -389,8 +592,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_reset_date() {
-        assert!(parse_reset_date("2026-07-01").is_some());
-        assert!(parse_reset_date("not-a-date").is_none());
+    fn parses_only_trimmed_exact_utc_calendar_dates() {
+        assert_eq!(
+            parse_reset_date(" 2026-07-01 \t"),
+            Some("2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
+        for invalid in [
+            "not-a-date",
+            "2026-7-01",
+            "2026-07-1",
+            "2026-07-01T00:00:00Z",
+            "2026/07/01",
+            "2026-02-29",
+        ] {
+            assert!(parse_reset_date(invalid).is_none(), "{invalid}");
+        }
     }
 }

@@ -345,6 +345,15 @@ impl UsageWindow {
         self.with_duration_evidence(now, reset_was_supplied, provider, None)
     }
 
+    pub(crate) fn with_contract_duration_evidence(
+        self,
+        now: DateTime<Utc>,
+        reset_was_supplied: bool,
+        contract: DurationEvidence,
+    ) -> Self {
+        self.with_duration_evidence(now, reset_was_supplied, None, Some(contract))
+    }
+
     pub(crate) fn with_observed_duration_evidence(
         self,
         now: DateTime<Utc>,
@@ -4034,6 +4043,44 @@ mod tests {
             mismatched_wire["paceStatus"]["reason"],
             "invalidEvidence"
         );
+    }
+
+    #[test]
+    fn contract_duration_wrapper_uses_shared_resolver_and_fails_closed() {
+        let now = "2026-07-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reset = now + chrono::Duration::days(1);
+        let valid = UsageWindow::from_used_percent(
+            "Contract".to_string(),
+            20.0,
+            Some(reset),
+            now,
+        )
+        .with_identity("contract.v1", Some("contract.v1".to_string()))
+        .with_contract_duration_evidence(
+            now,
+            true,
+            DurationEvidence::contract(86_400),
+        );
+        let wire = serde_json::to_value(&valid).unwrap();
+        assert_eq!(wire["paceStatus"]["state"], "learningHistory");
+        assert_eq!(wire["paceStatus"]["durationSource"], "contract");
+        assert_eq!(wire["paceStatus"]["durationSeconds"], 86_400);
+        assert_eq!(wire["windowMinutes"], 1_440);
+
+        let invalid = UsageWindow::from_used_percent(
+            "Invalid contract".to_string(),
+            20.0,
+            Some(reset),
+            now,
+        )
+        .with_identity("invalid-contract.v1", Some("invalid-contract.v1".to_string()))
+        .with_contract_duration_evidence(now, true, DurationEvidence::contract(0));
+        let invalid_wire = serde_json::to_value(&invalid).unwrap();
+        assert_eq!(invalid_wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(invalid_wire["paceStatus"]["reason"], "invalidEvidence");
+        assert!(invalid_wire["paceStatus"].get("durationSeconds").is_none());
+        assert!(invalid_wire.get("windowMinutes").is_none());
+        assert!(invalid_wire.get("historicalPace").is_none());
     }
 
     #[test]
