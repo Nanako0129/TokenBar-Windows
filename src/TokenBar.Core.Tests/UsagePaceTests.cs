@@ -18,7 +18,8 @@ public class UsagePaceTests
         double untilReset = 1_800,
         HistoricalPace? historicalPace = null,
         string? resetsAt = null,
-        long? windowMinutes = null)
+        long? windowMinutes = null,
+        UsagePaceUnavailableReason? reason = null)
     {
         var duration = state is UsagePaceState.LearningHistory or UsagePaceState.Available
             ? durationSeconds : null;
@@ -32,8 +33,7 @@ public class UsagePaceTests
             DurationSeconds: duration,
             DurationSource: durationSource,
             CompleteCycles: state == UsagePaceState.Available ? 5 : 0,
-            Reason: state == UsagePaceState.Unavailable
-                ? UsagePaceUnavailableReason.NonRecurring : null);
+            Reason: state == UsagePaceState.Unavailable ? reason : null);
         var compatibilityMinutes = windowMinutes ??
             (duration is { } exactDuration
                 ? exactDuration / 60
@@ -366,5 +366,156 @@ public class UsagePaceTests
 
         Assert.Equal(milliseconds.ExpectedUsedPercent, higherPrecision.ExpectedUsedPercent);
         Assert.Equal(milliseconds.DeltaPercent, higherPrecision.DeltaPercent);
+    }
+
+    [Fact]
+    public void RowPresentationComposesHistoricalProjectionAndDeficit()
+    {
+        var window = Window(
+            used: 90,
+            state: UsagePaceState.Available,
+            historicalPace: new HistoricalPace(50, 120, false, 0.8));
+        var row = UsagePace.RowPresentation(
+            window, PaceMode.Historical, asUsed: true, classic: false, Now);
+
+        Assert.Equal("40% in deficit", row.PaceText);
+        Assert.Equal(
+            "Projected empty in 2m · ≈ 80% run-out risk", row.ProjectionText);
+        Assert.Equal(50, row.ExpectedUsedPercent);
+        Assert.Equal(50, row.MarkerPercent);
+        Assert.True(row.IsHistoricalDeficit);
+    }
+
+    [Fact]
+    public void RowPresentationLabelsLearningHistoryLinearFallback()
+    {
+        var row = UsagePace.RowPresentation(
+            Window(used: 80), PaceMode.Historical, asUsed: true, classic: false, Now);
+
+        Assert.Equal(
+            "Learning history · Linear estimate · 30% in deficit", row.PaceText);
+        Assert.Equal("Projected empty in 8m", row.ProjectionText);
+        Assert.False(row.IsHistoricalDeficit);
+    }
+
+    [Fact]
+    public void RowPresentationLabelsAvailableLinearWithoutRisk()
+    {
+        var row = UsagePace.RowPresentation(
+            Window(
+                used: 50,
+                state: UsagePaceState.Available,
+                historicalPace: new HistoricalPace(80, 120, false, 0.8)),
+            PaceMode.Linear,
+            asUsed: true,
+            classic: false,
+            Now);
+
+        Assert.Equal("Linear · On pace", row.PaceText);
+        Assert.Equal("Lasts until reset", row.ProjectionText);
+        Assert.DoesNotContain("risk", row.ProjectionText ?? "");
+    }
+
+    [Theory]
+    [InlineData(UsagePaceState.LearningDuration, null, "Learning reset duration")]
+    [InlineData(UsagePaceState.LegacyMissing, null, "Pace unavailable · legacy data")]
+    [InlineData(UsagePaceState.Unavailable, null, "Pace unavailable · unavailable reason")]
+    [InlineData(
+        UsagePaceState.Unavailable,
+        UsagePaceUnavailableReason.WindowIdentity,
+        "Pace unavailable · unknown quota window")]
+    [InlineData(
+        UsagePaceState.Unavailable,
+        UsagePaceUnavailableReason.MissingReset,
+        "Pace unavailable · missing reset")]
+    [InlineData(
+        UsagePaceState.Unavailable,
+        UsagePaceUnavailableReason.InvalidEvidence,
+        "Pace unavailable · invalid quota data")]
+    [InlineData(
+        UsagePaceState.Unavailable,
+        UsagePaceUnavailableReason.AccountScope,
+        "Pace unavailable · account identity unavailable")]
+    [InlineData(
+        UsagePaceState.Unavailable,
+        UsagePaceUnavailableReason.StoreCapacity,
+        "Pace unavailable · history storage full")]
+    [InlineData(
+        UsagePaceState.Unavailable,
+        UsagePaceUnavailableReason.History,
+        "Pace unavailable · history unavailable")]
+    [InlineData(
+        UsagePaceState.Unavailable,
+        UsagePaceUnavailableReason.NonRecurring,
+        "Pace unavailable · non-recurring quota")]
+    public void RowPresentationUsesCanonicalStatusCopy(
+        UsagePaceState state,
+        UsagePaceUnavailableReason? reason,
+        string expected)
+    {
+        var row = UsagePace.RowPresentation(
+            Window(50, state: state, reason: reason),
+            PaceMode.Historical,
+            asUsed: true,
+            classic: false,
+            Now);
+
+        Assert.Equal(expected, row.PaceText);
+    }
+
+    [Fact]
+    public void RowPresentationSuppressesPaceForOffAndClassic()
+    {
+        var off = UsagePace.RowPresentation(
+            Window(50), PaceMode.Off, asUsed: true, classic: false, Now);
+        Assert.Null(off.PaceText);
+        Assert.Null(off.ProjectionText);
+        Assert.Null(off.MarkerPercent);
+        Assert.Null(off.ExpectedUsedPercent);
+        Assert.False(off.IsHistoricalDeficit);
+
+        var classic = UsagePace.RowPresentation(
+            Window(50), PaceMode.Historical, asUsed: true, classic: true, Now);
+        Assert.Null(classic.PaceText);
+        Assert.Null(classic.ProjectionText);
+        Assert.Null(classic.MarkerPercent);
+        Assert.Null(classic.ExpectedUsedPercent);
+        Assert.False(classic.IsHistoricalDeficit);
+    }
+
+    [Fact]
+    public void RowPresentationUsesClampedAxesAndAwayFromZeroAmount()
+    {
+        var window = Window(
+            used: 12.5,
+            state: UsagePaceState.Available,
+            historicalPace: new HistoricalPace(12.5));
+        var used = UsagePace.RowPresentation(
+            window, PaceMode.Historical, asUsed: true, classic: false, Now);
+        var remaining = UsagePace.RowPresentation(
+            window, PaceMode.Historical, asUsed: false, classic: false, Now);
+
+        Assert.Equal(87.5, used.RemainingPercent);
+        Assert.Equal(12.5, used.FillPercent);
+        Assert.Equal("13% used", used.AmountText);
+        Assert.Equal(12.5, used.MarkerPercent);
+        Assert.Equal(12.5, used.ExpectedUsedPercent);
+
+        Assert.Equal(87.5, remaining.FillPercent);
+        Assert.Equal("88% left", remaining.AmountText);
+        Assert.Equal(87.5, remaining.MarkerPercent);
+
+        var clamped = UsagePace.RowPresentation(
+            Window(
+                used: 125,
+                state: UsagePaceState.Available,
+                historicalPace: new HistoricalPace(12.5)),
+            PaceMode.Historical,
+            asUsed: false,
+            classic: false,
+            Now);
+        Assert.Equal(0, clamped.RemainingPercent);
+        Assert.Equal(0, clamped.FillPercent);
+        Assert.Equal("0% left", clamped.AmountText);
     }
 }
