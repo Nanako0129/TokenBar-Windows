@@ -9,6 +9,10 @@ use crate::agent_quota_duration::{
     resolve_duration, valid_duration, DurationEvidence, DurationResolution, DurationSource,
     DurationUnavailableReason,
 };
+use crate::agent_quota_history::{
+    BatchObservationResult, HistoricalPace, HistoryError, HistoryOutcome, QuotaObservation,
+    SeriesKey,
+};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -297,6 +301,11 @@ impl UsageWindow {
     }
 
     fn with_unavailable_reason(mut self, reason: &str) -> Self {
+        self.unavailable(reason);
+        self
+    }
+
+    fn unavailable(&mut self, reason: &str) {
         self.duration_evidence = None;
         self.pace_status = PaceStatusPayload {
             state: PaceState::Unavailable,
@@ -307,7 +316,6 @@ impl UsageWindow {
             reason: Some(reason.to_string()),
         };
         self.historical_pace = None;
-        self
     }
 
     fn validate_wire(&self) -> Result<(), String> {
@@ -732,6 +740,252 @@ fn retain_unique_windows(windows: &mut Vec<UsageWindow>) {
         }
         true
     });
+}
+
+#[allow(dead_code)] // Stage 3B2b seam; the production caller is a later scope.
+fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: i64, mut record: F)
+where
+    F: FnMut(
+        &[SeriesKey],
+        &[QuotaObservation],
+        i64,
+    ) -> Result<Vec<BatchObservationResult>, HistoryError>,
+{
+    retain_unique_windows(&mut snapshot.windows);
+
+    let Ok(account_scope) = snapshot.account_scope.as_ref() else {
+        for window in &mut snapshot.windows {
+            if window.pace_status.window_key.is_some()
+                && window.pace_status.reason.as_deref() != Some("nonRecurring")
+            {
+                window.unavailable("accountScope");
+            }
+        }
+        return;
+    };
+    let provider_id = snapshot.client_id.clone();
+    let account_scope = account_scope.as_str().to_string();
+    let mut active_keys = Vec::new();
+    let mut observations = Vec::new();
+    let mut mapped_indices = Vec::new();
+
+    for (index, window) in snapshot.windows.iter_mut().enumerate() {
+        if window.pace_status.reason.as_deref() == Some("nonRecurring") {
+            continue;
+        }
+        let Some(window_key) = window.pace_status.window_key.as_deref() else {
+            continue;
+        };
+        let key = SeriesKey::new(provider_id.clone(), account_scope.clone(), window_key);
+        active_keys.push(key.clone());
+        if window.pace_status.state == PaceState::Unavailable {
+            continue;
+        }
+
+        let reset_at = window
+            .resets_at
+            .as_deref()
+            .and_then(parse_datetime)
+            .map(|reset| reset.timestamp());
+        let valid_reset = reset_at.is_some_and(|reset_at| reset_at > now);
+        let valid_percent =
+            window.used_percent.is_finite() && (0.0..=100.0).contains(&window.used_percent);
+        if !valid_percent {
+            window.used_percent = if window.used_percent.is_finite() {
+                window.used_percent.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+        }
+        window.remaining_percent = 100.0 - window.used_percent;
+        if window.resets_at.is_some() && reset_at.is_none() {
+            window.resets_at = None;
+            window.reset_text = None;
+        }
+        if !valid_reset || !valid_percent {
+            window.unavailable("invalidEvidence");
+            continue;
+        }
+        let Some(reset_at) = reset_at else {
+            window.unavailable("invalidEvidence");
+            continue;
+        };
+        let (provider, contract) = match window.duration_evidence {
+            Some((evidence, DurationSource::Provider)) => (Some(evidence), None),
+            Some((evidence, DurationSource::Contract)) => (None, Some(evidence)),
+            Some((_, DurationSource::Observed)) => {
+                window.unavailable("invalidEvidence");
+                continue;
+            }
+            None => (None, None),
+        };
+        observations.push(QuotaObservation {
+            key,
+            reset_at: Some(reset_at),
+            used_percent: window.used_percent,
+            provider,
+            contract,
+        });
+        mapped_indices.push(index);
+    }
+
+    if active_keys.is_empty() {
+        return;
+    }
+
+    let results = match record(&active_keys, &observations, now) {
+        Ok(results) if results.len() == mapped_indices.len() => results,
+        Ok(_) => {
+            for index in mapped_indices {
+                snapshot.windows[index].unavailable("history");
+            }
+            return;
+        }
+        Err(error) => {
+            let reason = history_error_reason(error);
+            for index in mapped_indices {
+                snapshot.windows[index].unavailable(reason);
+            }
+            return;
+        }
+    };
+
+    for (index, result) in mapped_indices.into_iter().zip(results) {
+        let window = &mut snapshot.windows[index];
+        match result {
+            Err(error) => window.unavailable(history_error_reason(error)),
+            Ok((
+                HistoryOutcome::Ready {
+                    duration_seconds,
+                    source,
+                    ..
+                },
+                historical,
+                complete_cycles,
+            )) => {
+                let reset_at = window
+                    .resets_at
+                    .as_deref()
+                    .and_then(parse_datetime)
+                    .map(|reset| reset.timestamp());
+                if !reset_at.is_some_and(|reset_at| {
+                    history_duration_is_coherent(window, reset_at, now, duration_seconds, source)
+                }) {
+                    window.unavailable("history");
+                    continue;
+                }
+                match historical {
+                    Some(pace) if historical_pace_is_coherent(&pace) => {
+                        window.pace_status = PaceStatusPayload {
+                            state: PaceState::Available,
+                            window_key: window.pace_status.window_key.clone(),
+                            duration_seconds: Some(duration_seconds),
+                            duration_source: Some(source),
+                            complete_cycles,
+                            reason: None,
+                        };
+                        window.historical_pace = Some(historical_pace_payload(pace));
+                    }
+                    Some(_) => window.unavailable("history"),
+                    None => {
+                        window.pace_status = PaceStatusPayload {
+                            state: PaceState::LearningHistory,
+                            window_key: window.pace_status.window_key.clone(),
+                            duration_seconds: Some(duration_seconds),
+                            duration_source: Some(source),
+                            complete_cycles,
+                            reason: None,
+                        };
+                        window.historical_pace = None;
+                    }
+                }
+            }
+            Ok((HistoryOutcome::LearningDuration, None, 0))
+                if window.duration_evidence.is_none() =>
+            {
+                window.pace_status = PaceStatusPayload {
+                    state: PaceState::LearningDuration,
+                    window_key: window.pace_status.window_key.clone(),
+                    duration_seconds: None,
+                    duration_source: Some(DurationSource::Observed),
+                    complete_cycles: 0,
+                    reason: None,
+                };
+                window.historical_pace = None;
+            }
+            Ok((HistoryOutcome::Unavailable(reason), None, 0)) => {
+                if reason == DurationUnavailableReason::MissingReset && window.resets_at.is_some() {
+                    window.unavailable("history");
+                } else {
+                    window.unavailable(duration_unavailable_reason(reason));
+                }
+            }
+            Ok(_) => window.unavailable("history"),
+        }
+    }
+}
+
+fn history_duration_is_coherent(
+    window: &UsageWindow,
+    reset_at: i64,
+    now: i64,
+    duration_seconds: i64,
+    source: DurationSource,
+) -> bool {
+    let (provider, contract) = match window.duration_evidence {
+        Some((evidence, DurationSource::Provider)) => (Some(evidence), None),
+        Some((evidence, DurationSource::Contract)) => (None, Some(evidence)),
+        Some((_, DurationSource::Observed)) => return false,
+        None => (None, None),
+    };
+    if source == DurationSource::Observed && window.duration_evidence.is_some() {
+        return false;
+    }
+    let observed = (source == DurationSource::Observed)
+        .then(|| DurationEvidence::observed(reset_at, duration_seconds));
+    matches!(
+        resolve_duration(now, Some(reset_at), provider, contract, observed),
+        DurationResolution::Ready {
+            duration_seconds: resolved,
+            source: resolved_source,
+        } if resolved == duration_seconds && resolved_source == source
+    )
+}
+
+fn history_error_reason(error: HistoryError) -> &'static str {
+    if error == HistoryError::StoreCapacity {
+        "storeCapacity"
+    } else {
+        "history"
+    }
+}
+
+fn duration_unavailable_reason(reason: DurationUnavailableReason) -> &'static str {
+    match reason {
+        DurationUnavailableReason::MissingReset => "missingReset",
+        DurationUnavailableReason::InvalidEvidence => "invalidEvidence",
+    }
+}
+
+fn historical_pace_is_coherent(pace: &HistoricalPace) -> bool {
+    pace.expected_percent.is_finite()
+        && (0.0..=100.0).contains(&pace.expected_percent)
+        && pace
+            .eta_seconds
+            .is_none_or(|eta| eta.is_finite() && eta >= 0.0)
+        && pace
+            .run_out_probability
+            .is_none_or(|probability| probability.is_finite() && (0.0..=1.0).contains(&probability))
+        && (pace.eta_seconds.is_none() == pace.will_last_to_reset)
+}
+
+fn historical_pace_payload(pace: HistoricalPace) -> HistoricalPacePayload {
+    HistoricalPacePayload {
+        expected_used_percent: pace.expected_percent,
+        eta_seconds: pace.eta_seconds,
+        will_last_to_reset: pace.will_last_to_reset,
+        run_out_probability: pace.run_out_probability,
+    }
 }
 
 async fn fetch_grok() -> Option<AgentUsageSnapshot> {
@@ -2936,6 +3190,71 @@ mod tests {
     use super::*;
     use crate::agent_account_scope::test_support::TestRefreshScope;
 
+    fn enrichment_scope(tag: &str) -> (TestRefreshScope, AccountScope) {
+        let scope = TestRefreshScope::new("fixture", tag);
+        let account_scope = scope
+            .resolve_current("fixture", tag, tag.as_bytes())
+            .unwrap();
+        (scope, account_scope)
+    }
+
+    fn enrichment_snapshot(
+        account_scope: Result<AccountScope, AccountScopeError>,
+        windows: Vec<UsageWindow>,
+    ) -> AgentUsageSnapshot {
+        AgentUsageSnapshot {
+            client_id: "fixture".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope,
+            windows,
+            credits: None,
+            error: None,
+        }
+    }
+
+    fn enrichment_window(
+        now: DateTime<Utc>,
+        card_id: &str,
+        window_key: &str,
+        used_percent: f64,
+        duration_source: Option<DurationSource>,
+    ) -> UsageWindow {
+        let reset = now + chrono::Duration::days(1);
+        let window =
+            UsageWindow::from_used_percent(card_id.to_string(), used_percent, Some(reset), now)
+                .with_identity(card_id, Some(window_key.to_string()));
+        match duration_source {
+            Some(DurationSource::Provider) => window.with_duration_evidence(
+                now,
+                true,
+                Some(DurationEvidence::provider(reset.timestamp(), 86_400)),
+                None,
+            ),
+            Some(DurationSource::Contract) => window.with_duration_evidence(
+                now,
+                true,
+                None,
+                Some(DurationEvidence::contract(86_400)),
+            ),
+            Some(DurationSource::Observed) => panic!("observed duration is never retained"),
+            None => window,
+        }
+    }
+
+    fn enrichment_failure_windows(now: DateTime<Utc>) -> Vec<UsageWindow> {
+        vec![
+            enrichment_window(now, "first.v1", "first.v1", 10.0, None),
+            enrichment_window(now, "second.v1", "second.v1", 20.0, None),
+            UsageWindow::from_used_percent("Missing".to_string(), 30.0, None, now)
+                .with_identity("missing.v1", Some("missing.v1".to_string())),
+            UsageWindow::from_used_percent("Non-recurring".to_string(), 40.0, None, now)
+                .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
+                .with_unavailable_reason("nonRecurring"),
+        ]
+    }
+
     #[test]
     fn serializes_stage3a_pace_states_without_legacy_scalars() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
@@ -3059,6 +3378,466 @@ mod tests {
         retain_unique_windows(&mut windows);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label_for_test(), "First");
+    }
+
+    #[test]
+    fn enrichment_scope_failure_preserves_identity_and_non_recurring_rows() {
+        let (scope, _) = enrichment_scope("enrichment-scope-failure");
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let stable = enrichment_window(
+            now,
+            "stable.v1",
+            "stable.v1",
+            20.0,
+            Some(DurationSource::Contract),
+        );
+        let identity = UsageWindow::from_used_percent(
+            "Identity".to_string(),
+            30.0,
+            Some(now + chrono::Duration::days(1)),
+            now,
+        )
+        .with_identity("identity.v1", None);
+        let non_recurring =
+            UsageWindow::from_used_percent("Non-recurring".to_string(), 40.0, None, now)
+                .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
+                .with_unavailable_reason("nonRecurring");
+        let mut snapshot = enrichment_snapshot(
+            Err(AccountScopeError::MetadataWrite),
+            vec![stable, identity, non_recurring],
+        );
+        let calls = std::cell::Cell::new(0);
+
+        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            snapshot.windows[0].pace_reason_for_test(),
+            Some("accountScope")
+        );
+        assert_eq!(
+            snapshot.windows[1].pace_reason_for_test(),
+            Some("windowIdentity")
+        );
+        assert_eq!(
+            snapshot.windows[2].pace_reason_for_test(),
+            Some("nonRecurring")
+        );
+        assert!(serde_json::to_value(&snapshot).is_ok());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn enrichment_filters_duplicate_card_and_window_keys_before_batching() {
+        let (scope, account_scope) = enrichment_scope("enrichment-duplicates");
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let mut snapshot = enrichment_snapshot(
+            Ok(account_scope),
+            vec![
+                enrichment_window(now, "shared-card.v1", "first.v1", 10.0, None),
+                enrichment_window(now, "second-card.v1", "first.v1", 20.0, None),
+                enrichment_window(now, "shared-card.v1", "third.v1", 30.0, None),
+            ],
+        );
+
+        enrich_snapshot_with(
+            &mut snapshot,
+            now.timestamp(),
+            |active, observations, batch_now| {
+                assert_eq!(batch_now, now.timestamp());
+                assert_eq!(active.len(), 1);
+                assert_eq!(active[0].window_key, "first.v1");
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].used_percent, 10.0);
+                Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
+            },
+        );
+
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].card_id_for_test(), "shared-card.v1");
+        assert_eq!(
+            snapshot.windows[0].pace_status.duration_source,
+            Some(DurationSource::Observed)
+        );
+        assert!(serde_json::to_value(&snapshot).is_ok());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn enrichment_builds_active_keys_observations_and_coherent_results() {
+        let (scope, account_scope) = enrichment_scope("enrichment-batch-map");
+        let expected_scope = account_scope.as_str().to_string();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let reset = now + chrono::Duration::days(1);
+        let mut invalid_reset =
+            enrichment_window(now, "invalid-reset.v1", "invalid-reset.v1", 50.0, None);
+        invalid_reset.resets_at = Some("not-rfc3339".to_string());
+        invalid_reset.used_percent = f64::NAN;
+        invalid_reset.remaining_percent = f64::NAN;
+        let expired = UsageWindow::from_used_percent(
+            "Expired".to_string(),
+            60.0,
+            Some(now - chrono::Duration::seconds(1)),
+            now,
+        )
+        .with_identity("expired.v1", Some("expired.v1".to_string()));
+        let mut invalid_percent =
+            enrichment_window(now, "invalid-percent.v1", "invalid-percent.v1", 70.0, None);
+        invalid_percent.used_percent = f64::NAN;
+        invalid_percent.remaining_percent = f64::NAN;
+        let missing = UsageWindow::from_used_percent("Missing".to_string(), 30.0, None, now)
+            .with_identity("missing.v1", Some("missing.v1".to_string()));
+        let non_recurring =
+            UsageWindow::from_used_percent("Non-recurring".to_string(), 40.0, None, now)
+                .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
+                .with_unavailable_reason("nonRecurring");
+        let mut snapshot = enrichment_snapshot(
+            Ok(account_scope),
+            vec![
+                enrichment_window(
+                    now,
+                    "provider.v1",
+                    "provider.v1",
+                    10.0,
+                    Some(DurationSource::Provider),
+                ),
+                enrichment_window(
+                    now,
+                    "contract.v1",
+                    "contract.v1",
+                    20.0,
+                    Some(DurationSource::Contract),
+                ),
+                enrichment_window(now, "observed.v1", "observed.v1", 25.0, None),
+                missing,
+                non_recurring,
+                invalid_reset,
+                expired,
+                invalid_percent,
+            ],
+        );
+
+        enrich_snapshot_with(&mut snapshot, now.timestamp(), |active, observations, _| {
+            assert_eq!(
+                active,
+                &[
+                    SeriesKey::new("fixture", &expected_scope, "provider.v1"),
+                    SeriesKey::new("fixture", &expected_scope, "contract.v1"),
+                    SeriesKey::new("fixture", &expected_scope, "observed.v1"),
+                    SeriesKey::new("fixture", &expected_scope, "missing.v1"),
+                    SeriesKey::new("fixture", &expected_scope, "invalid-reset.v1"),
+                    SeriesKey::new("fixture", &expected_scope, "expired.v1"),
+                    SeriesKey::new("fixture", &expected_scope, "invalid-percent.v1"),
+                ]
+            );
+            assert_eq!(observations.len(), 3);
+            assert_eq!(observations[0].reset_at, Some(reset.timestamp()));
+            assert_eq!(
+                observations[0].provider,
+                Some(DurationEvidence::provider(reset.timestamp(), 86_400))
+            );
+            assert_eq!(observations[0].contract, None);
+            assert_eq!(observations[1].provider, None);
+            assert_eq!(
+                observations[1].contract,
+                Some(DurationEvidence::contract(86_400))
+            );
+            assert_eq!(observations[2].provider, None);
+            assert_eq!(observations[2].contract, None);
+            Ok(vec![
+                Ok((
+                    HistoryOutcome::Ready {
+                        duration_seconds: 86_400,
+                        source: DurationSource::Provider,
+                        sampled: true,
+                    },
+                    None,
+                    2,
+                )),
+                Ok((
+                    HistoryOutcome::Ready {
+                        duration_seconds: 86_400,
+                        source: DurationSource::Contract,
+                        sampled: true,
+                    },
+                    Some(HistoricalPace {
+                        expected_percent: 42.0,
+                        eta_seconds: Some(900.0),
+                        will_last_to_reset: false,
+                        run_out_probability: Some(0.25),
+                    }),
+                    4,
+                )),
+                Ok((HistoryOutcome::LearningDuration, None, 0)),
+            ])
+        });
+
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::LearningHistory
+        );
+        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 2);
+        assert_eq!(snapshot.windows[1].pace_status.state, PaceState::Available);
+        assert_eq!(snapshot.windows[1].pace_status.complete_cycles, 4);
+        let historical = snapshot.windows[1].historical_pace.as_ref().unwrap();
+        assert_eq!(historical.expected_used_percent, 42.0);
+        assert_eq!(historical.eta_seconds, Some(900.0));
+        assert!(!historical.will_last_to_reset);
+        assert_eq!(historical.run_out_probability, Some(0.25));
+        assert_eq!(
+            snapshot.windows[2].pace_status.state,
+            PaceState::LearningDuration
+        );
+        assert_eq!(
+            snapshot.windows[2].pace_status.duration_source,
+            Some(DurationSource::Observed)
+        );
+        assert_eq!(
+            snapshot.windows[3].pace_reason_for_test(),
+            Some("missingReset")
+        );
+        assert_eq!(
+            snapshot.windows[4].pace_reason_for_test(),
+            Some("nonRecurring")
+        );
+        for window in &snapshot.windows[5..] {
+            assert_eq!(window.pace_reason_for_test(), Some("invalidEvidence"));
+        }
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(wire["windows"][0]["windowMinutes"], 1_440);
+        assert_eq!(wire["windows"][1]["windowMinutes"], 1_440);
+        assert!(wire["windows"][2].get("windowMinutes").is_none());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn enrichment_maps_unavailable_and_rejects_contradictory_results() {
+        let (scope, account_scope) = enrichment_scope("enrichment-result-validation");
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let mut snapshot = enrichment_snapshot(
+            Ok(account_scope),
+            vec![
+                enrichment_window(now, "missing.v1", "missing.v1", 10.0, None),
+                enrichment_window(now, "invalid.v1", "invalid.v1", 20.0, None),
+                enrichment_window(
+                    now,
+                    "learning-conflict.v1",
+                    "learning-conflict.v1",
+                    30.0,
+                    Some(DurationSource::Contract),
+                ),
+                enrichment_window(
+                    now,
+                    "historical-conflict.v1",
+                    "historical-conflict.v1",
+                    40.0,
+                    Some(DurationSource::Contract),
+                ),
+                enrichment_window(
+                    now,
+                    "source-conflict.v1",
+                    "source-conflict.v1",
+                    50.0,
+                    Some(DurationSource::Contract),
+                ),
+                enrichment_window(
+                    now,
+                    "unavailable-conflict.v1",
+                    "unavailable-conflict.v1",
+                    60.0,
+                    None,
+                ),
+                enrichment_window(
+                    now,
+                    "nonfinite-history.v1",
+                    "nonfinite-history.v1",
+                    70.0,
+                    Some(DurationSource::Contract),
+                ),
+            ],
+        );
+        let historical = HistoricalPace {
+            expected_percent: 42.0,
+            eta_seconds: Some(900.0),
+            will_last_to_reset: false,
+            run_out_probability: Some(0.25),
+        };
+
+        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, observations, _| {
+            assert_eq!(observations.len(), 7);
+            Ok(vec![
+                Ok((
+                    HistoryOutcome::Unavailable(DurationUnavailableReason::MissingReset),
+                    None,
+                    0,
+                )),
+                Ok((
+                    HistoryOutcome::Unavailable(DurationUnavailableReason::InvalidEvidence),
+                    None,
+                    0,
+                )),
+                Ok((HistoryOutcome::LearningDuration, None, 0)),
+                Ok((
+                    HistoryOutcome::Ready {
+                        duration_seconds: 86_400,
+                        source: DurationSource::Contract,
+                        sampled: true,
+                    },
+                    Some(HistoricalPace {
+                        will_last_to_reset: true,
+                        ..historical.clone()
+                    }),
+                    3,
+                )),
+                Ok((
+                    HistoryOutcome::Ready {
+                        duration_seconds: 86_400,
+                        source: DurationSource::Provider,
+                        sampled: true,
+                    },
+                    None,
+                    2,
+                )),
+                Ok((
+                    HistoryOutcome::Unavailable(DurationUnavailableReason::InvalidEvidence),
+                    Some(historical.clone()),
+                    0,
+                )),
+                Ok((
+                    HistoryOutcome::Ready {
+                        duration_seconds: 86_400,
+                        source: DurationSource::Contract,
+                        sampled: true,
+                    },
+                    Some(HistoricalPace {
+                        expected_percent: f64::NAN,
+                        ..historical.clone()
+                    }),
+                    3,
+                )),
+            ])
+        });
+
+        assert_eq!(snapshot.windows[0].pace_reason_for_test(), Some("history"));
+        assert_eq!(
+            snapshot.windows[1].pace_reason_for_test(),
+            Some("invalidEvidence")
+        );
+        for window in &snapshot.windows[2..] {
+            assert_eq!(window.pace_reason_for_test(), Some("history"));
+        }
+        assert!(serde_json::to_value(&snapshot).is_ok());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn enrichment_maps_global_row_and_count_failures_only_to_observations() {
+        let (scope, account_scope) = enrichment_scope("enrichment-errors");
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+
+        let mut global_capacity =
+            enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
+        enrich_snapshot_with(
+            &mut global_capacity,
+            now.timestamp(),
+            |active, observations, _| {
+                assert_eq!(active.len(), 3);
+                assert_eq!(observations.len(), 2);
+                Err(HistoryError::StoreCapacity)
+            },
+        );
+        assert_eq!(
+            global_capacity.windows[0].pace_reason_for_test(),
+            Some("storeCapacity")
+        );
+        assert_eq!(
+            global_capacity.windows[1].pace_reason_for_test(),
+            Some("storeCapacity")
+        );
+        assert_eq!(
+            global_capacity.windows[2].pace_reason_for_test(),
+            Some("missingReset")
+        );
+        assert_eq!(
+            global_capacity.windows[3].pace_reason_for_test(),
+            Some("nonRecurring")
+        );
+
+        let mut global_history =
+            enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
+        enrich_snapshot_with(&mut global_history, now.timestamp(), |_, _, _| {
+            Err(HistoryError::Read)
+        });
+        assert_eq!(
+            global_history.windows[0].pace_reason_for_test(),
+            Some("history")
+        );
+        assert_eq!(
+            global_history.windows[1].pace_reason_for_test(),
+            Some("history")
+        );
+        assert_eq!(
+            global_history.windows[2].pace_reason_for_test(),
+            Some("missingReset")
+        );
+        assert_eq!(
+            global_history.windows[3].pace_reason_for_test(),
+            Some("nonRecurring")
+        );
+
+        let mut count_mismatch =
+            enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
+        enrich_snapshot_with(&mut count_mismatch, now.timestamp(), |_, _, _| {
+            Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
+        });
+        assert_eq!(
+            count_mismatch.windows[0].pace_reason_for_test(),
+            Some("history")
+        );
+        assert_eq!(
+            count_mismatch.windows[1].pace_reason_for_test(),
+            Some("history")
+        );
+        assert_eq!(
+            count_mismatch.windows[2].pace_reason_for_test(),
+            Some("missingReset")
+        );
+        assert_eq!(
+            count_mismatch.windows[3].pace_reason_for_test(),
+            Some("nonRecurring")
+        );
+
+        let mut row_errors =
+            enrichment_snapshot(Ok(account_scope), enrichment_failure_windows(now));
+        enrich_snapshot_with(&mut row_errors, now.timestamp(), |_, _, _| {
+            Ok(vec![
+                Err(HistoryError::StoreCapacity),
+                Err(HistoryError::Read),
+            ])
+        });
+        assert_eq!(
+            row_errors.windows[0].pace_reason_for_test(),
+            Some("storeCapacity")
+        );
+        assert_eq!(
+            row_errors.windows[1].pace_reason_for_test(),
+            Some("history")
+        );
+        assert_eq!(
+            row_errors.windows[2].pace_reason_for_test(),
+            Some("missingReset")
+        );
+        assert_eq!(
+            row_errors.windows[3].pace_reason_for_test(),
+            Some("nonRecurring")
+        );
+        for snapshot in [global_capacity, global_history, count_mismatch, row_errors] {
+            assert!(serde_json::to_value(snapshot).is_ok());
+        }
+        scope.cleanup();
     }
 
     #[test]
@@ -3879,8 +4658,7 @@ mod tests {
             five_hour: Some(ClaudeWindow {
                 utilization: Some(20.0),
                 resets_at: Some(
-                    (now + chrono::Duration::hours(1))
-                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                    (now + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
                 ),
             }),
             extra_usage: Some(ClaudeExtraUsage {
