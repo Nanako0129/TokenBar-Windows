@@ -160,8 +160,8 @@ public class DtoDecodeTests
         Assert.Equal(UsagePaceState.LegacyMissing, w.PaceStatus.State);
         Assert.Null(w.DurationSeconds);
         Assert.Null(w.HistoricalPace);
-        Assert.Null(w.HistoricalExpectedPercent);
-        Assert.Null(w.RunOutProbability);
+        Assert.Null(typeof(UsageWindow).GetProperty("HistoricalExpectedPercent"));
+        Assert.Null(typeof(UsageWindow).GetProperty("RunOutProbability"));
         Assert.Null(p.OpencodeSubscriptions);
     }
 
@@ -481,8 +481,6 @@ public class DtoDecodeTests
         Assert.Equal(55.5, window.HistoricalPace!.ExpectedUsedPercent);
         Assert.Equal(604800, window.DurationSeconds);
         Assert.Equal(UsagePaceState.Available, window.PaceStatus.State);
-        Assert.Null(window.HistoricalExpectedPercent);
-        Assert.Null(window.RunOutProbability);
     }
 
     [Fact]

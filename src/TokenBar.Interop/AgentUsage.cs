@@ -73,11 +73,6 @@ public sealed record UsageWindow
     /// <summary>Derived only from <see cref="PaceStatus.DurationSeconds"/>.</summary>
     public long? DurationSeconds { get; init; }
 
-    // Temporary Stage 4A2 compile bridge. These legacy values are retained for
-    // existing UsagePace callers only; the v3 decoder never reads them from wire.
-    public double? HistoricalExpectedPercent { get; init; }
-    public double? RunOutProbability { get; init; }
-
     // Nullable params carry = null defaults so existing C# callers keep their
     // pre-v3 construction shape while the decoder enforces the strict wire.
     public UsageWindow(
@@ -87,8 +82,6 @@ public sealed record UsageWindow
         string? ResetsAt = null,
         string? ResetText = null,
         long? WindowMinutes = null,
-        double? HistoricalExpectedPercent = null,
-        double? RunOutProbability = null,
         string? CardId = null,
         PaceStatus? PaceStatus = null,
         HistoricalPace? HistoricalPace = null,
@@ -119,8 +112,6 @@ public sealed record UsageWindow
         this.DurationSeconds = resolvedPaceStatus.State == UsagePaceState.LegacyMissing
             ? null
             : resolvedPaceStatus.DurationSeconds;
-        this.HistoricalExpectedPercent = HistoricalExpectedPercent;
-        this.RunOutProbability = RunOutProbability;
     }
 }
 
@@ -229,20 +220,12 @@ public sealed class UsageWindowJsonConverter : JsonConverter<UsageWindow>
 
         if (value.PaceStatus.State == UsagePaceState.LegacyMissing)
         {
-            // Preserve the old C# serialization surface without ever emitting
-            // the internal legacyMissing enum value onto the wire.
+            // Preserve legacy serialization without ever emitting the internal
+            // legacyMissing enum value onto the wire.
             if (value.HistoricalPace is not null)
             {
                 writer.WritePropertyName("historicalPace");
                 WriteHistoricalPace(writer, value.HistoricalPace);
-            }
-            if (value.HistoricalExpectedPercent is { } expected)
-            {
-                writer.WriteNumber("historicalExpectedPercent", expected);
-            }
-            if (value.RunOutProbability is { } probability)
-            {
-                writer.WriteNumber("runOutProbability", probability);
             }
         }
         else
