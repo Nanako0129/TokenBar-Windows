@@ -156,7 +156,13 @@ impl Backend for SystemBackend {
         Ok(bytes)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    fn random_bytes(&self, length: usize) -> Result<Vec<u8>, AccountScopeError> {
+        crate::agent_storage_windows::cng_random_bytes(length)
+            .map_err(|_| AccountScopeError::RandomUnavailable)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn random_bytes(&self, _length: usize) -> Result<Vec<u8>, AccountScopeError> {
         Err(AccountScopeError::UnsupportedPlatform)
     }
@@ -770,12 +776,38 @@ where
     L: FnMut(&Path, &Path) -> io::Result<()>,
     U: Fn(&Path) -> io::Result<()>,
 {
-    if backend.uses_windows_secure_storage() {
-        return Err(AccountScopeError::QuarantineFailed);
-    }
     backend
         .before_fs(FsOperation::QuarantineMetadata)
         .map_err(|_| AccountScopeError::QuarantineFailed)?;
+
+    #[cfg(target_os = "windows")]
+    if backend.uses_windows_secure_storage() {
+        let directory = path.parent().ok_or(AccountScopeError::QuarantineFailed)?;
+        let directory_handle =
+            crate::agent_storage_windows::ensure_secure_storage_directory(directory)
+                .map_err(|_| AccountScopeError::QuarantineFailed)?;
+        let now = backend.now_seconds();
+        for suffix in 0..=u32::MAX {
+            let name = if suffix == 0 {
+                format!("quota-account-scope-v1.{reason}-{now}.json")
+            } else {
+                format!("quota-account-scope-v1.{reason}-{now}.{suffix}.json")
+            };
+            let candidate = directory.join(name);
+            match crate::agent_storage_windows::quarantine_secure_file_candidate(
+                &directory_handle,
+                directory,
+                path,
+                &candidate,
+            ) {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(AccountScopeError::QuarantineFailed),
+            }
+        }
+        return Err(AccountScopeError::QuarantineFailed);
+    }
+
     let source = open_existing_owner_only(backend, path)
         .map_err(|_| AccountScopeError::QuarantineFailed)?
         .ok_or(AccountScopeError::QuarantineFailed)?;
@@ -818,12 +850,44 @@ fn save_atomic<B: Backend>(
     path: &Path,
     bytes: &[u8],
 ) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
     if backend.uses_windows_secure_storage() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows secure atomic writes are not wired",
+        let target_name = path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing target filename"))?
+            .to_string_lossy();
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = directory.join(format!(
+            ".{target_name}.tmp-{}-{counter}",
+            std::process::id()
         ));
+        let mut temp_created = false;
+        let staged = (|| -> io::Result<()> {
+            backend.before_fs(FsOperation::CreateTemp)?;
+            let directory_handle =
+                crate::agent_storage_windows::ensure_secure_storage_directory(directory)?;
+            let mut file = crate::agent_storage_windows::create_new_secure_file(&temp)?;
+            temp_created = true;
+            backend.before_fs(FsOperation::WriteTemp)?;
+            file.write_all(bytes)?;
+            file.flush()?;
+            backend.before_fs(FsOperation::SyncTemp)?;
+            file.sync_all()?;
+            drop(file);
+            backend.before_fs(FsOperation::ReplaceFile)?;
+            crate::agent_storage_windows::replace_secure_file(
+                &directory_handle,
+                directory,
+                &temp,
+                path,
+            )
+        })();
+        if staged.is_err() && temp_created {
+            cleanup_windows_secure_temp(&temp);
+        }
+        return staged;
     }
+
     let target_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing target filename"))?
@@ -857,6 +921,16 @@ fn save_atomic<B: Backend>(
         let _ = fs::remove_file(&temp);
     }
     staged
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_windows_secure_temp(path: &Path) {
+    let Ok(file) = crate::agent_storage_windows::open_existing_secure_file(path, false) else {
+        return;
+    };
+    if crate::agent_storage_windows::verify_secure_file_path(&file, path).is_ok() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn ensure_storage_dir<B: Backend>(backend: &B) -> Result<PathBuf, AccountScopeError> {
@@ -1703,6 +1777,8 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use std::collections::VecDeque;
     #[cfg(target_os = "windows")]
+    use std::mem::size_of;
+    #[cfg(target_os = "windows")]
     use std::os::windows::fs::{symlink_file, OpenOptionsExt as _};
     #[cfg(target_os = "windows")]
     use std::os::windows::io::AsRawHandle as _;
@@ -1720,7 +1796,9 @@ mod tests {
     };
     #[cfg(target_os = "windows")]
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        READ_CONTROL, WRITE_DAC,
     };
 
     fn resolve_test(
@@ -1778,6 +1856,59 @@ mod tests {
             )
         };
         assert_eq!(status, ERROR_SUCCESS);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn write_windows_secure_file(backend: &TestBackend, path: &Path, bytes: &[u8]) {
+        let mut file = open_owner_only(backend, path).unwrap();
+        file.set_len(0).unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)
+            .unwrap();
+        crate::agent_storage_windows::verify_secure_file_path(&file, path).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_secure_file_snapshot(path: &Path) -> (Vec<u8>, u64, [u8; 16]) {
+        let mut file =
+            crate::agent_storage_windows::open_existing_secure_file(path, false).unwrap();
+        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)
+            .unwrap();
+        crate::agent_storage_windows::verify_secure_file_path(&file, path).unwrap();
+        let mut identity = FILE_ID_INFO::default();
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle() as HANDLE,
+                    FileIdInfo,
+                    (&mut identity as *mut FILE_ID_INFO).cast(),
+                    size_of::<FILE_ID_INFO>() as u32,
+                )
+            },
+            0
+        );
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        crate::agent_storage_windows::verify_secure_file_path(&file, path).unwrap();
+        (
+            bytes,
+            identity.VolumeSerialNumber,
+            identity.FileId.Identifier,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_no_windows_secure_temp(directory: &Path, target_name: &str) {
+        let prefix = format!(".{target_name}.tmp-");
+        assert!(!fs::read_dir(directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        }));
     }
 
     #[test]
@@ -3524,85 +3655,358 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_secure_write_and_quarantine_guards_precede_all_mutation() {
-        let backend = TestBackend::new("windows-secure-guards").with_windows_secure_storage();
-        let directory = ensure_storage_dir(&backend).unwrap();
-        let path = directory.join(METADATA_FILE);
-        let mut file = open_owner_only(&backend, &path).unwrap();
-        file.write_all(b"last-good").unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        let entries_before = || {
-            let mut names = fs::read_dir(&directory)
+    fn windows_secure_concurrent_first_installation_key_create_has_one_exact_winner() {
+        let backend =
+            TestBackend::new("windows-secure-concurrent-key").with_windows_secure_storage();
+        let start = Arc::new(Barrier::new(3));
+        let one_backend = backend.clone();
+        let one_start = start.clone();
+        let one = thread::spawn(move || {
+            one_start.wait();
+            ensure_installation_key(&one_backend, &Mutex::new(()))
+        });
+        let two_backend = backend.clone();
+        let two_start = start.clone();
+        let two = thread::spawn(move || {
+            two_start.wait();
+            ensure_installation_key(&two_backend, &Mutex::new(()))
+        });
+        start.wait();
+
+        let one = one.join().unwrap().unwrap();
+        let two = two.join().unwrap().unwrap();
+        assert_eq!(one, two);
+        assert_eq!(one.len(), INSTALLATION_KEY_BYTES);
+        let key_path = installation_key_path(&backend);
+        assert_eq!(windows_secure_file_snapshot(&key_path).0, one.to_vec());
+        assert_no_windows_secure_temp(&backend.directory, INSTALLATION_KEY_FILE);
+        assert_eq!(
+            backend
+                .state
+                .lock()
                 .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<Vec<_>>();
-            names.sort();
-            names
-        };
-        let before = entries_before();
-
-        assert_eq!(
-            save_atomic(&backend, &directory, &path, b"replacement")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Unsupported
+                .events
+                .iter()
+                .filter(|event| **event == "replace-file")
+                .count(),
+            1
         );
-        assert_eq!(fs::read(&path).unwrap(), b"last-good");
-        assert_eq!(entries_before(), before);
-
-        let link_called = std::cell::Cell::new(false);
-        let unlink_called = std::cell::Cell::new(false);
-        assert_eq!(
-            quarantine_metadata_with(
-                &backend,
-                &path,
-                "corrupt",
-                |_, _| {
-                    link_called.set(true);
-                    Ok(())
-                },
-                |_| {
-                    unlink_called.set(true);
-                    Ok(())
-                },
-            ),
-            Err(AccountScopeError::QuarantineFailed)
-        );
-        assert!(!link_called.get());
-        assert!(!unlink_called.get());
-        assert_eq!(fs::read(&path).unwrap(), b"last-good");
-        assert_eq!(entries_before(), before);
-        let events = backend.state.lock().unwrap().events.clone();
-        assert!(!events.contains(&"create-temp"));
-        assert!(!events.contains(&"quarantine-metadata"));
         backend.cleanup();
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_system_backend_random_stop_guard_creates_no_profile_artifact() {
+    fn windows_secure_metadata_save_replace_round_trip_is_authenticated_and_stable() {
+        let backend =
+            TestBackend::new("windows-secure-metadata-round-trip").with_windows_secure_storage();
+        let lock = Mutex::new(());
+        let first = resolve_test(&backend, &lock, b"first-marker").unwrap();
+        let key = installation_key(&backend);
+        let metadata_path = backend.directory.join(METADATA_FILE);
+        let first_snapshot = windows_secure_file_snapshot(&metadata_path);
+        let first_payload = decode_metadata(&key, &first_snapshot.0).unwrap();
+        assert_eq!(first_payload.bindings.len(), 1);
+
+        let second = resolve_test(&backend, &lock, b"second-marker").unwrap();
+        let second_snapshot = windows_secure_file_snapshot(&metadata_path);
+        let second_payload = decode_metadata(&key, &second_snapshot.0).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first_snapshot.0, second_snapshot.0);
+        assert_ne!(
+            (first_snapshot.1, first_snapshot.2),
+            (second_snapshot.1, second_snapshot.2)
+        );
+        assert_eq!(second_payload.bindings.len(), 2);
+
+        let restarted = backend.clone();
         assert_eq!(
-            SystemBackend.random_bytes(INSTALLATION_KEY_BYTES),
-            Err(AccountScopeError::UnsupportedPlatform)
+            resolve_test(&restarted, &Mutex::new(()), b"second-marker").unwrap(),
+            second
+        );
+        decode_metadata(&key, &windows_secure_file_snapshot(&metadata_path).0).unwrap();
+        assert_no_windows_secure_temp(&backend.directory, INSTALLATION_KEY_FILE);
+        assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
+        backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_corrupt_metadata_quarantine_preserves_bytes_and_file_id() {
+        let backend = TestBackend::new("windows-secure-corrupt-quarantine")
+            .with_windows_secure_storage()
+            .with_installation_key(vec![0x31; INSTALLATION_KEY_BYTES]);
+        let metadata_path = backend.directory.join(METADATA_FILE);
+        let corrupt = b"corrupt-secure-metadata";
+        write_windows_secure_file(&backend, &metadata_path, corrupt);
+        let source_snapshot = windows_secure_file_snapshot(&metadata_path);
+
+        assert_eq!(
+            resolve_test(&backend, &Mutex::new(()), b"marker"),
+            Err(AccountScopeError::MetadataCorrupt)
+        );
+        let candidate = backend
+            .directory
+            .join("quota-account-scope-v1.corrupt-1752710400.json");
+        assert_eq!(windows_secure_file_snapshot(&candidate), source_snapshot);
+        assert!(matches!(
+            fs::symlink_metadata(&metadata_path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+
+        resolve_test(&backend, &Mutex::new(()), b"marker").unwrap();
+        decode_metadata(
+            &installation_key(&backend),
+            &windows_secure_file_snapshot(&metadata_path).0,
+        )
+        .unwrap();
+        assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
+        backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_orphan_recovery_preserves_v3_and_defers_the_current_poll() {
+        let backend = TestBackend::new("windows-secure-orphan-recovery")
+            .with_windows_secure_storage()
+            .with_installation_key(vec![0x31; INSTALLATION_KEY_BYTES]);
+        let old_scope = resolve_test(&backend, &Mutex::new(()), b"marker").unwrap();
+        let metadata_path = backend.directory.join(METADATA_FILE);
+        let metadata_snapshot = windows_secure_file_snapshot(&metadata_path);
+        let history_path = backend.directory.join(V3_HISTORY_FILE);
+        write_windows_secure_file(&backend, &history_path, b"v3-sentinel-bytes");
+        let history_snapshot = windows_secure_file_snapshot(&history_path);
+        let history_mtime = fs::metadata(&history_path).unwrap().modified().unwrap();
+        let key_path = installation_key_path(&backend);
+        let old_key = windows_secure_file_snapshot(&key_path).0;
+        let key_handle =
+            crate::agent_storage_windows::open_existing_secure_file(&key_path, false).unwrap();
+        crate::agent_storage_windows::verify_secure_file_path(&key_handle, &key_path).unwrap();
+        fs::remove_file(&key_path).unwrap();
+        drop(key_handle);
+
+        assert_eq!(
+            resolve_test(&backend, &Mutex::new(()), b"marker"),
+            Err(AccountScopeError::OrphanedArtifacts)
+        );
+        let candidate = backend
+            .directory
+            .join("quota-account-scope-v1.orphaned-1752710400.json");
+        assert_eq!(windows_secure_file_snapshot(&candidate), metadata_snapshot);
+        assert!(matches!(
+            fs::symlink_metadata(&metadata_path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        let replacement_key = windows_secure_file_snapshot(&key_path).0;
+        assert_eq!(replacement_key.len(), INSTALLATION_KEY_BYTES);
+        assert_ne!(replacement_key, old_key);
+        assert_eq!(
+            windows_secure_file_snapshot(&history_path),
+            history_snapshot
+        );
+        assert_eq!(
+            fs::metadata(&history_path).unwrap().modified().unwrap(),
+            history_mtime
         );
 
-        let directory = std::env::temp_dir().join(format!(
-            "tb-account-scope-system-stop-{}-{}",
-            std::process::id(),
-            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        ensure_real_directory(&SystemBackend, &directory).unwrap();
+        let replacement_scope = resolve_test(&backend, &Mutex::new(()), b"marker").unwrap();
+        assert_ne!(replacement_scope, old_scope);
         assert_eq!(
-            ensure_installation_key_locked(&SystemBackend, &directory),
-            Err(AccountScopeError::UnsupportedPlatform)
+            windows_secure_file_snapshot(&history_path),
+            history_snapshot
         );
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
-        assert!(!directory.join(INSTALLATION_KEY_FILE).exists());
-        assert!(!directory.join(METADATA_FILE).exists());
-        assert!(!directory.join(METADATA_LOCK_FILE).exists());
-        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            fs::metadata(&history_path).unwrap().modified().unwrap(),
+            history_mtime
+        );
+        assert_no_windows_secure_temp(&backend.directory, INSTALLATION_KEY_FILE);
+        assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
+        backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_quarantine_collision_uses_suffix_without_generic_closures() {
+        let backend =
+            TestBackend::new("windows-secure-quarantine-collision").with_windows_secure_storage();
+        let directory = ensure_storage_dir(&backend).unwrap();
+        let source = directory.join(METADATA_FILE);
+        let collision = directory.join("quota-account-scope-v1.corrupt-1752710400.json");
+        write_windows_secure_file(&backend, &source, b"source-evidence");
+        write_windows_secure_file(&backend, &collision, b"collision-evidence");
+        let source_snapshot = windows_secure_file_snapshot(&source);
+        let collision_snapshot = windows_secure_file_snapshot(&collision);
+
+        let candidate = quarantine_metadata_with(
+            &backend,
+            &source,
+            "corrupt",
+            |_, _| panic!("secure quarantine must not call generic link"),
+            |_| panic!("secure quarantine must not call generic unlink"),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate,
+            directory.join("quota-account-scope-v1.corrupt-1752710400.1.json")
+        );
+        assert_eq!(windows_secure_file_snapshot(&candidate), source_snapshot);
+        assert_eq!(windows_secure_file_snapshot(&collision), collision_snapshot);
+        assert!(matches!(
+            fs::symlink_metadata(&source),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_replace_failure_keeps_last_good_and_cleanup_fails_closed() {
+        let backend =
+            TestBackend::new("windows-secure-replace-failure").with_windows_secure_storage();
+        let lock = Mutex::new(());
+        resolve_test(&backend, &lock, b"old-marker").unwrap();
+        let key = installation_key(&backend);
+        let metadata_path = backend.directory.join(METADATA_FILE);
+        let last_good = windows_secure_file_snapshot(&metadata_path);
+        backend.state.lock().unwrap().events.clear();
+        backend.fail_fs(FsOperation::ReplaceFile);
+
+        assert_eq!(
+            resolve_test(&backend, &lock, b"new-marker"),
+            Err(AccountScopeError::MetadataWrite)
+        );
+        assert_eq!(windows_secure_file_snapshot(&metadata_path), last_good);
+        decode_metadata(&key, &last_good.0).unwrap();
+        let events = backend
+            .state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .copied()
+            .filter(|event| {
+                matches!(
+                    *event,
+                    "create-temp" | "write-temp" | "sync-temp" | "replace-file"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            ["create-temp", "write-temp", "sync-temp", "replace-file"]
+        );
+        assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
+
+        let residue = backend.directory.join(".blocked-secure-temp");
+        write_windows_secure_file(&backend, &residue, b"secure-residue");
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&residue)
+            .unwrap();
+        cleanup_windows_secure_temp(&residue);
+        assert_eq!(windows_secure_file_snapshot(&residue).0, b"secure-residue");
+        drop(blocker);
+        cleanup_windows_secure_temp(&residue);
+        assert!(matches!(
+            fs::symlink_metadata(&residue),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_persistence_quarantine_and_errors_do_not_disclose_raw_identity() {
+        let backend =
+            TestBackend::new("windows-secure-no-raw-identity").with_windows_secure_storage();
+        let lock = Mutex::new(());
+        let raw_email = "Sensitive.User@example.com";
+        let raw_opaque_id = "Provider-Account-ID-Sensitive";
+        let raw_marker = "sensitive-refresh-token-marker";
+        let raw_location = "/Users/sensitive/private/auth.json";
+        resolve_credential_with(
+            &backend,
+            &lock,
+            "claude",
+            "auth-json",
+            raw_location,
+            raw_marker.as_bytes(),
+        )
+        .unwrap();
+        resolve_authoritative_with(
+            &backend,
+            &lock,
+            "antigravity",
+            AuthoritativeIdKind::Email,
+            raw_email,
+        )
+        .unwrap();
+        resolve_authoritative_with(
+            &backend,
+            &lock,
+            "codex",
+            AuthoritativeIdKind::OpaqueId,
+            raw_opaque_id,
+        )
+        .unwrap();
+
+        let key_path = installation_key_path(&backend);
+        let metadata_path = backend.directory.join(METADATA_FILE);
+        let key_bytes = windows_secure_file_snapshot(&key_path).0;
+        let metadata_bytes = windows_secure_file_snapshot(&metadata_path).0;
+        let payload_bytes = serde_json::to_vec(
+            &decode_metadata(&installation_key(&backend), &metadata_bytes).unwrap(),
+        )
+        .unwrap();
+        for persisted in [&key_bytes, &metadata_bytes, &payload_bytes] {
+            for raw in [raw_email, raw_opaque_id, raw_marker, raw_location] {
+                assert!(!persisted
+                    .windows(raw.len())
+                    .any(|window| window == raw.as_bytes()));
+            }
+        }
+
+        write_windows_secure_file(&backend, &metadata_path, b"corrupt-envelope");
+        let error = resolve_authoritative_with(
+            &backend,
+            &lock,
+            "antigravity",
+            AuthoritativeIdKind::Email,
+            raw_email,
+        )
+        .unwrap_err();
+        assert_eq!(error, AccountScopeError::MetadataCorrupt);
+        let error_text = format!("{error:?} {error}").to_ascii_lowercase();
+        for raw in [raw_email, raw_opaque_id, raw_marker, raw_location] {
+            assert!(!error_text.contains(&raw.to_ascii_lowercase()));
+        }
+        assert!(!error_text.contains(&backend.directory.to_string_lossy().to_ascii_lowercase()));
+        let names = fs::read_dir(&backend.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for name in names {
+            let name = name.to_ascii_lowercase();
+            for raw in [raw_email, raw_opaque_id, raw_marker, raw_location] {
+                assert!(!name.contains(&raw.to_ascii_lowercase()));
+            }
+        }
+        windows_secure_file_snapshot(
+            &backend
+                .directory
+                .join("quota-account-scope-v1.corrupt-1752710400.json"),
+        );
+        backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_system_backend_cng_returns_requested_distinct_bytes_without_storage_access() {
+        let first = SystemBackend.random_bytes(INSTALLATION_KEY_BYTES).unwrap();
+        let second = SystemBackend.random_bytes(INSTALLATION_KEY_BYTES).unwrap();
+        assert_eq!(first.len(), INSTALLATION_KEY_BYTES);
+        assert_eq!(second.len(), INSTALLATION_KEY_BYTES);
+        assert_ne!(first, second);
     }
 
     #[test]
