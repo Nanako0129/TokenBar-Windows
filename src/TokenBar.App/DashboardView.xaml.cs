@@ -932,29 +932,7 @@ public sealed partial class DashboardView : UserControl
             {
                 var row = UsagePace.RowPresentation(
                     window, paceMode, asUsed, classic, now);
-                var details = string.Join(" · ",
-                    new[] { row.PaceText, row.ProjectionText }
-                        .Where(static text => !string.IsNullOrEmpty(text)));
-                var paceLabel = Ui.Text(details, 10,
-                    row.IsHistoricalDeficit ? 1.0 : 0.7);
-                if (row.IsHistoricalDeficit)
-                {
-                    paceLabel.Foreground = Ui.BrushFromHex(PaceOrange);
-                }
-
-                section.Children.Add(Ui.Row(
-                    Ui.Text($"{window.Label} · {row.AmountText}", 11),
-                    paceLabel));
-                section.Children.Add(GaugeBar(
-                    row.FillPercent,
-                    row.RemainingPercent,
-                    row.MarkerPercent,
-                    row.ExpectedUsedPercent,
-                    row.IsHistoricalDeficit));
-                if (window.ResetText is { } reset)
-                {
-                    section.Children.Add(Ui.Dim(reset, 10));
-                }
+                section.Children.Add(QuotaRow(window, row, classic));
             }
 
             panel.Children.Add(section);
@@ -1528,6 +1506,123 @@ public sealed partial class DashboardView : UserControl
     }
 
     internal const string PaceOrange = "#ff9500"; // macOS Color.orange
+
+    /// <summary>Render one complete quota window row from Core's precomputed
+    /// display values. The responsive footer is built once and only toggles
+    /// visibility when the actual row width crosses its measured threshold.</summary>
+    internal static FrameworkElement QuotaRow(
+        UsageWindow window, UsagePaceRowPresentation row, bool classic)
+    {
+        var root = new StackPanel { Spacing = 3 };
+        var headerTrailing = Ui.Text(
+            classic ? window.ResetText ?? row.AmountText : window.ResetText ?? "",
+            10, 0.6);
+        root.Children.Add(Ui.Row(
+            Ui.Text(window.Label, 11, bold: true), headerTrailing));
+        root.Children.Add(GaugeBar(
+            row.FillPercent,
+            row.RemainingPercent,
+            classic ? null : row.MarkerPercent,
+            classic ? null : row.ExpectedUsedPercent,
+            row.IsHistoricalDeficit));
+
+        TextBlock AmountLabel() => Ui.Text(row.AmountText, 10, 0.75);
+        TextBlock PaceLabel(string text)
+        {
+            var label = Ui.Text(text, 10, row.IsHistoricalDeficit ? 1.0 : 0.7);
+            label.HorizontalAlignment = HorizontalAlignment.Right;
+            label.TextAlignment = TextAlignment.Right;
+            if (row.IsHistoricalDeficit)
+            {
+                label.Foreground = Ui.BrushFromHex(PaceOrange);
+            }
+
+            return label;
+        }
+
+        if (classic)
+        {
+            if (window.ResetText is not null)
+            {
+                root.Children.Add(AmountLabel());
+            }
+
+            return root;
+        }
+
+        if (string.IsNullOrEmpty(row.ProjectionText))
+        {
+            if (string.IsNullOrEmpty(row.PaceText))
+            {
+                root.Children.Add(AmountLabel());
+            }
+            else
+            {
+                root.Children.Add(Ui.Row(AmountLabel(), PaceLabel(row.PaceText)));
+            }
+
+            return root;
+        }
+
+        var wideAmount = AmountLabel();
+        var wideDetails = PaceLabel(string.Join(" · ",
+            new[] { row.PaceText, row.ProjectionText }
+                .Where(static text => !string.IsNullOrEmpty(text))));
+        var wideFooter = Ui.Row(wideAmount, wideDetails);
+
+        var narrowFooter = new StackPanel { Spacing = 1 };
+        var narrowFirst = string.IsNullOrEmpty(row.PaceText)
+            ? (FrameworkElement)AmountLabel()
+            : Ui.Row(AmountLabel(), PaceLabel(row.PaceText));
+        narrowFooter.Children.Add(narrowFirst);
+
+        var narrowProjection = PaceLabel(row.ProjectionText);
+        narrowProjection.TextWrapping = TextWrapping.Wrap;
+        narrowProjection.TextTrimming = TextTrimming.None;
+        narrowProjection.HorizontalAlignment = HorizontalAlignment.Right;
+        narrowProjection.TextAlignment = TextAlignment.Right;
+        var projectionRow = new Grid();
+        projectionRow.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        projectionRow.Children.Add(narrowProjection);
+        narrowFooter.Children.Add(projectionRow);
+
+        narrowFooter.Visibility = Visibility.Collapsed;
+        root.Children.Add(wideFooter);
+        root.Children.Add(narrowFooter);
+
+        wideAmount.Measure(new Windows.Foundation.Size(
+            double.PositiveInfinity, double.PositiveInfinity));
+        wideDetails.Measure(new Windows.Foundation.Size(
+            double.PositiveInfinity, double.PositiveInfinity));
+        var requiredWidth = wideAmount.DesiredSize.Width
+            + wideDetails.DesiredSize.Width + 8;
+        var wideVisible = true;
+        root.SizeChanged += (_, _) =>
+        {
+            var width = root.ActualWidth;
+            if (!double.IsFinite(width) || width <= 0)
+            {
+                return;
+            }
+
+            var nextWide = wideVisible
+                ? width >= requiredWidth
+                : width > requiredWidth + 8;
+            if (nextWide == wideVisible)
+            {
+                return;
+            }
+
+            wideVisible = nextWide;
+            wideFooter.Visibility = nextWide ? Visibility.Visible : Visibility.Collapsed;
+            narrowFooter.Visibility = nextWide ? Visibility.Collapsed : Visibility.Visible;
+        };
+
+        return root;
+    }
 
     /// <summary>The quota bar: fills by used or remaining per the setting,
     /// colors by remaining either way (macOS gaugeColor), and carries the

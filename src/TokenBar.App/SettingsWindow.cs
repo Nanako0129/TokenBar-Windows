@@ -635,29 +635,7 @@ public sealed class SettingsWindow : Window
         {
             var row = UsagePace.RowPresentation(
                 window, paceMode, asUsed, classic, now);
-            var details = string.Join(" · ",
-                new[] { row.PaceText, row.ProjectionText }
-                    .Where(static text => !string.IsNullOrEmpty(text)));
-            var paceLabel = Ui.Text(details, 10,
-                row.IsHistoricalDeficit ? 1.0 : 0.7);
-            if (row.IsHistoricalDeficit)
-            {
-                paceLabel.Foreground = Ui.BrushFromHex(DashboardView.PaceOrange);
-            }
-
-            card.Children.Add(Ui.Row(
-                Ui.Text($"{window.Label} · {row.AmountText}", 11),
-                paceLabel));
-            card.Children.Add(DashboardView.GaugeBar(
-                row.FillPercent,
-                row.RemainingPercent,
-                row.MarkerPercent,
-                row.ExpectedUsedPercent,
-                row.IsHistoricalDeficit));
-            if (window.ResetText is { } reset)
-            {
-                card.Children.Add(Ui.Dim(reset, 10));
-            }
+            card.Children.Add(DashboardView.QuotaRow(window, row, classic));
         }
 
         _preview.Children.Add(card);
