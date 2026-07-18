@@ -15,7 +15,10 @@
 //!
 //! Both yield per-model "remaining fraction + reset" which map to `UsageWindow`s.
 
-use crate::agent_account_scope::{self, AccountScope, AccountScopeError, AuthoritativeIdKind};
+use crate::agent_account_scope::{
+    self, AccountScope, AccountScopeError, AuthoritativeIdKind, RefreshCheckpoint,
+    RefreshScopeTransaction,
+};
 use crate::agent_usage::{clean_plan, parse_datetime, percent_encode, AgentIdentity, UsageWindow};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -389,30 +392,17 @@ fn local_plan_name(info: LocalPlanInfo) -> Option<String> {
 
 async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
     let creds_path = gemini_home()
-        .map(|h| h.join("oauth_creds.json"))
+        .map(|home| home.join("oauth_creds.json"))
         .ok_or_else(|| "Could not resolve ~/.gemini".to_string())?;
-    let raw = std::fs::read_to_string(&creds_path)
-        .map_err(|_| "Antigravity not logged in (no ~/.gemini/oauth_creds.json)".to_string())?;
-    let mut creds: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("decode oauth_creds.json: {e}"))?;
+    let mut creds = load_remote_credentials(&creds_path)?;
+    let mut access_token = remote_access_token(&creds)?;
+    let mut refreshed_scope = None;
 
-    let mut access_token = creds
-        .get("access_token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "Antigravity creds have no access token".to_string())?;
-
-    let expiry_ms = creds.get("expiry_date").and_then(Value::as_f64);
-    let now_ms = now.timestamp_millis() as f64;
-    if expiry_ms.is_none_or(|exp| exp <= now_ms + (REFRESH_SAFETY_SECS * 1000) as f64) {
-        let refresh_token = creds
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "Antigravity access token expired and no refresh token".to_string())?
-            .to_string();
-        access_token = refresh_access_token(&refresh_token, &mut creds, now, &creds_path).await?;
+    if remote_credentials_need_refresh(&creds, now) {
+        let refreshed = refresh_access_token(&creds_path, now).await?;
+        creds = refreshed.0;
+        access_token = refreshed.1;
+        refreshed_scope = Some(refreshed.2);
     }
 
     let client = reqwest::Client::builder()
@@ -431,24 +421,88 @@ async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
     .await?;
     let project = project_id(&code_assist);
     let plan = resolve_remote_plan(&code_assist);
-
     let windows = fetch_model_quotas(&client, &access_token, project.as_deref(), now).await?;
-    let email = gemini_active_email();
+    let account_scope =
+        refreshed_scope.unwrap_or_else(|| resolve_remote_account_scope(&creds_path, &creds));
 
     Ok(Fetched {
         source: "oauth".to_string(),
-        identity: Some(AgentIdentity { email, plan }),
-        account_scope: Err(AccountScopeError::NoTrustedEvidence),
+        identity: Some(remote_identity(plan)),
+        account_scope,
         windows,
     })
 }
 
+fn remote_identity(plan: Option<String>) -> AgentIdentity {
+    AgentIdentity { email: None, plan }
+}
+
+fn load_remote_credentials(path: &Path) -> Result<Value, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|_| "Antigravity not logged in (no ~/.gemini/oauth_creds.json)".to_string())?;
+    serde_json::from_str(&raw).map_err(|e| format!("decode oauth_creds.json: {e}"))
+}
+
+fn remote_access_token(creds: &Value) -> Result<String, String> {
+    creds
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Antigravity creds have no access token".to_string())
+}
+
+fn remote_refresh_marker(creds: &Value) -> Option<&[u8]> {
+    creds
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::as_bytes)
+}
+
+fn remote_credentials_need_refresh(creds: &Value, now: DateTime<Utc>) -> bool {
+    let expiry_ms = creds.get("expiry_date").and_then(Value::as_f64);
+    let now_ms = now.timestamp_millis() as f64;
+    expiry_ms.is_none_or(|expiry| expiry <= now_ms + (REFRESH_SAFETY_SECS * 1000) as f64)
+}
+
+fn remote_scope_location(path: &Path) -> Result<String, AccountScopeError> {
+    agent_account_scope::canonical_file_location(path, Some("refresh_token"))
+}
+
+fn resolve_remote_account_scope(
+    path: &Path,
+    creds: &Value,
+) -> Result<AccountScope, AccountScopeError> {
+    let marker = remote_refresh_marker(creds).ok_or(AccountScopeError::NoTrustedEvidence)?;
+    agent_account_scope::resolve_credential(
+        "antigravity",
+        "google-oauth-creds",
+        &remote_scope_location(path)?,
+        marker,
+    )
+}
+
 async fn refresh_access_token(
-    refresh_token: &str,
-    creds: &mut Value,
-    now: DateTime<Utc>,
     creds_path: &Path,
-) -> Result<String, String> {
+    now: DateTime<Utc>,
+) -> Result<(Value, String, Result<AccountScope, AccountScopeError>), String> {
+    let refresh = agent_account_scope::begin_refresh("antigravity")
+        .map_err(|_| "Antigravity credential refresh lock is unavailable.".to_string())?;
+    refresh_access_token_with(
+        creds_path,
+        now,
+        &refresh,
+        request_access_token,
+        |creds| write_creds_atomic(creds_path, creds),
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn request_access_token(refresh_token: String) -> Result<Value, String> {
     let client = resolve_oauth_client()
         .ok_or_else(|| "Antigravity OAuth client not found. Install Antigravity.app or set ANTIGRAVITY_OAUTH_CLIENT_ID/SECRET.".to_string())?;
     let http = reqwest::Client::builder()
@@ -459,7 +513,7 @@ async fn refresh_access_token(
         "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
         percent_encode(&client.0),
         percent_encode(&client.1),
-        percent_encode(refresh_token),
+        percent_encode(&refresh_token),
     );
     let response = http
         .post(GOOGLE_TOKEN_URL)
@@ -474,19 +528,54 @@ async fn refresh_access_token(
     if !response.status().is_success() {
         return Err("Antigravity token refresh rejected. Re-login in Antigravity.".to_string());
     }
-    let json: Value = response
+    response
         .json()
         .await
-        .map_err(|e| format!("decode refresh response: {e}"))?;
+        .map_err(|e| format!("decode refresh response: {e}"))
+}
+
+async fn refresh_access_token_with<R, Request, RequestFuture, Save, Checkpoint>(
+    creds_path: &Path,
+    now: DateTime<Utc>,
+    refresh: &R,
+    request: Request,
+    save: Save,
+    mut checkpoint: Checkpoint,
+) -> Result<(Value, String, Result<AccountScope, AccountScopeError>), String>
+where
+    R: RefreshScopeTransaction + ?Sized,
+    Request: FnOnce(String) -> RequestFuture,
+    RequestFuture: std::future::Future<Output = Result<Value, String>>,
+    Save: FnOnce(&Value) -> std::io::Result<()>,
+    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), String>,
+{
+    let mut creds = load_remote_credentials(creds_path)?;
+    checkpoint(RefreshCheckpoint::Reloaded)?;
+    let location = remote_scope_location(creds_path)
+        .map_err(|_| "Antigravity auth location cannot be scoped safely.".to_string())?;
+    if !remote_credentials_need_refresh(&creds, Utc::now()) {
+        let access_token = remote_access_token(&creds)?;
+        let scope = match remote_refresh_marker(&creds) {
+            Some(marker) => refresh.resolve_current("google-oauth-creds", &location, marker),
+            None => Err(AccountScopeError::NoTrustedEvidence),
+        };
+        return Ok((creds, access_token, scope));
+    }
+
+    let old_marker = remote_refresh_marker(&creds)
+        .ok_or_else(|| "Antigravity access token expired and no refresh token".to_string())?
+        .to_vec();
+    let refresh_token = std::str::from_utf8(&old_marker)
+        .map_err(|_| "Antigravity refresh credential is not valid text.".to_string())?
+        .to_string();
+    let json = request(refresh_token).await?;
+    checkpoint(RefreshCheckpoint::NetworkReturned)?;
     let access_token = json
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| "refresh response missing access_token".to_string())?
         .to_string();
 
-    // Persist back to ~/.gemini/oauth_creds.json so we share a single source of
-    // truth with Antigravity. Preserve every original field; only touch the ones
-    // the refresh changed. A write failure is non-fatal (use the token in-memory).
     if let Some(obj) = creds.as_object_mut() {
         obj.insert("access_token".into(), Value::String(access_token.clone()));
         if let Some(expires_in) = json.get("expires_in").and_then(Value::as_f64) {
@@ -496,21 +585,75 @@ async fn refresh_access_token(
         if let Some(id_token) = json.get("id_token").and_then(Value::as_str) {
             obj.insert("id_token".into(), Value::String(id_token.to_string()));
         }
+        if let Some(replacement) = json
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            obj.insert(
+                "refresh_token".into(),
+                Value::String(replacement.to_string()),
+            );
+        }
     }
-    let _ = write_creds_atomic(creds_path, creds);
-    Ok(access_token)
+    let new_marker = remote_refresh_marker(&creds);
+    let marker_rotated = new_marker.is_some_and(|marker| marker != old_marker.as_slice());
+    let scope = match new_marker {
+        Some(new_marker) => {
+            refresh.transfer("google-oauth-creds", &location, &old_marker, new_marker)
+        }
+        None => Err(AccountScopeError::NoTrustedEvidence),
+    };
+    checkpoint(RefreshCheckpoint::MetadataHandled)?;
+    if marker_rotated && scope.is_err() {
+        return Ok((creds, access_token, scope));
+    }
+    let _ = save(&creds);
+    checkpoint(RefreshCheckpoint::CredentialsPersisted)?;
+    Ok((creds, access_token, scope))
 }
 
 fn write_creds_atomic(path: &Path, creds: &Value) -> std::io::Result<()> {
-    let data = serde_json::to_vec_pretty(creds).unwrap_or_default();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let data = serde_json::to_vec_pretty(creds).map_err(std::io::Error::other)?;
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "credential path has no parent",
+        )
+    })?;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = directory.join(format!(
+        ".oauth_creds.json.tokenbar.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&data)?;
+        file.sync_all()
+    })();
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    std::fs::rename(&tmp, path)
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
 }
 
 async fn code_assist_post(
@@ -822,20 +965,10 @@ fn gemini_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".gemini"))
 }
 
-fn gemini_active_email() -> Option<String> {
-    let path = gemini_home()?.join("google_accounts.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&raw).ok()?;
-    json.get("active")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_account_scope::test_support::TestRefreshScope;
 
     #[test]
     fn extracts_flags_both_forms() {
@@ -1010,8 +1143,244 @@ mod tests {
     }
 
     #[test]
+    fn remote_scope_and_presentation_ignore_unbound_active_email() {
+        let stale_active_email = "stale-other-account@example.com";
+        let credentials = json!({
+            "access_token": "short-lived-access",
+            "refresh_token": "bound-google-refresh"
+        });
+        assert_eq!(
+            remote_refresh_marker(&credentials),
+            Some(b"bound-google-refresh".as_slice())
+        );
+        assert_ne!(
+            remote_refresh_marker(&credentials),
+            Some(stale_active_email.as_bytes())
+        );
+        let identity = remote_identity(Some("Paid".to_string()));
+        assert_eq!(identity.email, None);
+        assert_eq!(identity.plan.as_deref(), Some("Paid"));
+
+        let access_only = json!({ "access_token": "access-is-not-the-frozen-marker" });
+        assert_eq!(remote_refresh_marker(&access_only), None);
+    }
+
+    #[test]
+    fn atomic_credential_write_replaces_existing_without_orphan_temp() {
+        let scope = TestRefreshScope::new("antigravity", "antigravity-credential-write");
+        let path = scope.root().join("antigravity/oauth_creds.json");
+        let directory = path.parent().unwrap();
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(&path, b"old credentials").unwrap();
+
+        let credentials = json!({
+            "access_token": "replacement-access",
+            "refresh_token": "replacement-refresh"
+        });
+        let expected = serde_json::to_vec_pretty(&credentials).unwrap();
+        write_creds_atomic(&path, &credentials).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert!(!std::fs::read_dir(directory).unwrap().any(|entry| {
+            entry
+                .ok()
+                .is_some_and(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".oauth_creds.json.tokenbar.")
+                })
+        }));
+        scope.cleanup();
+    }
+
+    #[test]
     fn resolves_remote_plan_from_tier() {
         assert_eq!(resolve_remote_plan(&json!({"currentTier":{"id":"free-tier"}})).as_deref(), Some("Free"));
         assert_eq!(resolve_remote_plan(&json!({"planInfo":{"planType":"standard"}})).as_deref(), Some("Standard"));
+    }
+
+    fn checkpoint_at(
+        target: Option<RefreshCheckpoint>,
+    ) -> impl FnMut(RefreshCheckpoint) -> Result<(), String> {
+        move |checkpoint| {
+            if Some(checkpoint) == target {
+                Err("injected crash".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    async fn test_refresh_response(refresh_token: String) -> Result<Value, String> {
+        assert_eq!(refresh_token, "antigravity-old-refresh");
+        Ok(json!({
+            "access_token": "antigravity-new-access",
+            "refresh_token": "antigravity-new-refresh",
+            "expires_in": 3600
+        }))
+    }
+
+    fn setup_refresh(tag: &str) -> (TestRefreshScope, PathBuf, AccountScope, Vec<u8>, String) {
+        let scope = TestRefreshScope::new("antigravity", tag);
+        let path = scope.root().join("antigravity/oauth_creds.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "access_token": "antigravity-old-access",
+                "refresh_token": "antigravity-old-refresh",
+                "expiry_date": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let location = remote_scope_location(&path).unwrap();
+        let old_scope = scope
+            .resolve_current("google-oauth-creds", &location, b"antigravity-old-refresh")
+            .unwrap();
+        let metadata = scope.metadata_bytes();
+        (scope, path, old_scope, metadata, location)
+    }
+
+    async fn run_refresh(
+        scope: &TestRefreshScope,
+        path: &Path,
+        crash: Option<RefreshCheckpoint>,
+    ) -> Result<(Value, String, Result<AccountScope, AccountScopeError>), String> {
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        refresh_access_token_with(
+            path,
+            now,
+            scope,
+            test_refresh_response,
+            |creds| write_creds_atomic(path, creds),
+            checkpoint_at(crash),
+        )
+        .await
+    }
+
+    fn stored_refresh_token(path: &Path) -> String {
+        let credentials = load_remote_credentials(path).unwrap();
+        std::str::from_utf8(remote_refresh_marker(&credentials).unwrap())
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn refresh_crash_boundaries_and_scope_gate_use_production_sequence() {
+        for boundary in [
+            RefreshCheckpoint::Reloaded,
+            RefreshCheckpoint::NetworkReturned,
+            RefreshCheckpoint::MetadataHandled,
+            RefreshCheckpoint::CredentialsPersisted,
+        ] {
+            let (scope, path, old_scope, before, location) = setup_refresh("antigravity-crash");
+            assert_eq!(
+                run_refresh(&scope, &path, Some(boundary))
+                    .await
+                    .unwrap_err(),
+                "injected crash"
+            );
+            assert_eq!(
+                stored_refresh_token(&path),
+                if boundary == RefreshCheckpoint::CredentialsPersisted {
+                    "antigravity-new-refresh"
+                } else {
+                    "antigravity-old-refresh"
+                }
+            );
+            if matches!(
+                boundary,
+                RefreshCheckpoint::Reloaded | RefreshCheckpoint::NetworkReturned
+            ) {
+                assert_eq!(scope.metadata_bytes(), before);
+            } else {
+                assert_ne!(scope.metadata_bytes(), before);
+                assert_eq!(
+                    scope
+                        .resolve_current(
+                            "google-oauth-creds",
+                            &location,
+                            b"antigravity-old-refresh",
+                        )
+                        .unwrap(),
+                    old_scope
+                );
+                assert_eq!(
+                    scope
+                        .resolve_current(
+                            "google-oauth-creds",
+                            &location,
+                            b"antigravity-new-refresh",
+                        )
+                        .unwrap(),
+                    old_scope
+                );
+            }
+            scope.cleanup();
+        }
+
+        let (scope, path, old_scope, before, location) = setup_refresh("antigravity-metadata-fail");
+        scope.fail_metadata_save();
+        let (refreshed, access_token, scope_outcome) =
+            run_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(access_token, "antigravity-new-access");
+        assert_eq!(remote_access_token(&refreshed).unwrap(), access_token);
+        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(stored_refresh_token(&path), "antigravity-old-refresh");
+        assert_eq!(
+            scope
+                .resolve_current("google-oauth-creds", &location, b"antigravity-old-refresh")
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+
+        let (scope, path, _old_scope, before, _) =
+            setup_refresh("antigravity-metadata-fail-unchanged");
+        scope.fail_metadata_save();
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let save_path = path.clone();
+        let (refreshed, access_token, scope_outcome) = refresh_access_token_with(
+            &path,
+            now,
+            &scope,
+            |refresh_token| async move {
+                assert_eq!(refresh_token, "antigravity-old-refresh");
+                Ok(json!({
+                    "access_token": "antigravity-new-access",
+                    "expires_in": 3600
+                }))
+            },
+            move |credentials| write_creds_atomic(&save_path, credentials),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(access_token, "antigravity-new-access");
+        assert_eq!(remote_access_token(&refreshed).unwrap(), access_token);
+        let persisted = load_remote_credentials(&path).unwrap();
+        assert_eq!(remote_access_token(&persisted).unwrap(), access_token);
+        assert_eq!(stored_refresh_token(&path), "antigravity-old-refresh");
+        scope.cleanup();
+
+        let (scope, path, old_scope, _, location) = setup_refresh("antigravity-success");
+        let (_, _, scope_outcome) = run_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(scope_outcome.unwrap(), old_scope);
+        assert_eq!(
+            scope
+                .resolve_current("google-oauth-creds", &location, b"antigravity-new-refresh")
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
     }
 }
