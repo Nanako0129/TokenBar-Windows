@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 using TokenBar.Interop;
 
 namespace TokenBar.Core;
@@ -37,17 +38,29 @@ public static class PaceStageExtensions
         stage is PaceStage.SlightlyAhead or PaceStage.Ahead or PaceStage.FarAhead;
 }
 
+/// <summary>The source of the expected-usage projection.</summary>
+public enum UsagePaceBasis
+{
+    Linear,
+    Historical,
+}
+
 public sealed record UsagePace(
     PaceStage Stage,
+    UsagePaceBasis Basis,
     // actual − expected, in percentage points (>0 = ahead/deficit).
     double DeltaPercent,
     double ExpectedUsedPercent,
     double ActualUsedPercent,
-    // Seconds until the window empties at the current rate, if before reset.
+    // Seconds until the window empties, if before reset.
     double? EtaSeconds,
     // True if the current rate lasts past the reset (won't run out).
     bool WillLastToReset)
 {
+    /// <summary>Yellow historical deficit is valid only for a backend
+    /// historical result.</summary>
+    public bool IsHistoricalDeficit => Basis == UsagePaceBasis.Historical && Stage.IsDeficit();
+
     /// <summary>Short left-hand label: "On pace" / "12% in deficit" /
     /// "8% in reserve".</summary>
     public string Label
@@ -98,73 +111,96 @@ public sealed record UsagePace(
         return hr > 0 ? $"{days}d {hr}h" : $"{days}d";
     }
 
-    /// <summary>Compute *linear* pace for a window, or null if it can't be
-    /// derived yet.</summary>
+    /// <summary>Compute linear pace for a duration-ready v3 window, or null
+    /// if it can't be derived yet.</summary>
     public static UsagePace? Compute(UsageWindow window, DateTimeOffset now) =>
-        ComputeCore(window, now, expectedOverride: null);
+        IsDurationReady(window.PaceStatus.State) ? ComputeCore(window, now) : null;
 
     /// <summary>Compute pace under the user's chosen mode:
-    /// Off → null (no pace marker). Historical → use the backend's historical
-    /// expected-percent if present, otherwise transparently fall back to
-    /// linear. Linear → naive elapsed/duration pace.</summary>
+    /// Off → null; Historical → backend projection for Available and local
+    /// Linear while LearningHistory; Linear → exact-duration Linear for
+    /// duration-ready states.</summary>
     public static UsagePace? Compute(UsageWindow window, PaceMode mode, DateTimeOffset now)
     {
-        if (mode == PaceMode.Off)
+        return mode switch
         {
-            return null;
-        }
-
-        double? expectedOverride = mode == PaceMode.Historical && window.HistoricalExpectedPercent is { } h
-            ? Clamp(h, 0, 100)
-            : null;
-        var pace = ComputeCore(window, now, expectedOverride);
-        if (pace is null)
-        {
-            return null;
-        }
-
-        // In historical mode the run-out *probability* (share of past weeks
-        // that hit the cap) is a better lasts/empty signal than the naive
-        // linear burn rate — otherwise the card could read "in reserve ·
-        // Projected empty" at once. If most past weeks lasted, project "Lasts
-        // until reset"; codexbar does the same.
-        if (expectedOverride is not null && window.RunOutProbability is { } probability)
-        {
-            var lasts = probability < 0.5;
-            return pace with
+            PaceMode.Off => null,
+            PaceMode.Historical => window.PaceStatus.State switch
             {
-                EtaSeconds = lasts ? null : pace.EtaSeconds,
-                WillLastToReset = lasts,
-            };
-        }
-
-        return pace;
+                UsagePaceState.Available when window.HistoricalPace is { } historical =>
+                    ComputeHistorical(window, historical, now),
+                UsagePaceState.LearningHistory => ComputeCore(window, now),
+                _ => null,
+            },
+            PaceMode.Linear when IsDurationReady(window.PaceStatus.State) =>
+                ComputeCore(window, now),
+            _ => null,
+        };
     }
 
-    private static UsagePace? ComputeCore(
-        UsageWindow window, DateTimeOffset now, double? expectedOverride)
+    /// <summary>Assemble display-only projection strings. A visible historical
+    /// risk takes precedence over the generic lasts text.</summary>
+    public static UsagePacePresentation Presentation(
+        UsageWindow window, PaceMode mode, UsagePace pace)
     {
-        if (window.ResetsAt is not { } resetsAtRaw ||
-            window.WindowMinutes is not { } windowMinutes || windowMinutes <= 0 ||
-            ParseRfc3339(resetsAtRaw) is not { } resetsAt)
+        var risk = mode == PaceMode.Historical ? RunOutRiskLabel(window, pace) : null;
+        var eta = pace.WillLastToReset && risk is not null ? null : pace.EtaText;
+        return new UsagePacePresentation(eta, risk);
+    }
+
+    /// <summary>codexbar-style historical run-out risk, e.g.
+    /// "≈ 30% run-out risk", or null. A supplied pace suppresses risk for a
+    /// Linear result.</summary>
+    public static string? RunOutRiskLabel(UsageWindow window, UsagePace? pace = null)
+    {
+        if (window.PaceStatus.State != UsagePaceState.Available ||
+            pace?.Basis == UsagePaceBasis.Linear ||
+            window.HistoricalPace?.RunOutProbability is not { } probability)
         {
             return null;
         }
 
-        var duration = windowMinutes * 60.0;
-        var timeUntilReset = (resetsAt - now).TotalSeconds;
-        if (timeUntilReset <= 0 || timeUntilReset > duration)
+        var pct = (int)Math.Round(Clamp(probability, 0, 1) * 100,
+            MidpointRounding.AwayFromZero);
+        return pct <= 0 ? null : $"≈ {pct}% run-out risk";
+    }
+
+    private static bool IsDurationReady(UsagePaceState state) =>
+        state is UsagePaceState.LearningHistory or UsagePaceState.Available;
+
+    private static UsagePace? ComputeHistorical(
+        UsageWindow window, HistoricalPace historical, DateTimeOffset now)
+    {
+        // Historical data supplies the projection values, but a quota card
+        // still needs a current reset boundary before showing a pace marker.
+        if (Timing(window, now) is not { } timing)
         {
             return null;
         }
 
-        var elapsed = Clamp(duration - timeUntilReset, 0, duration);
-        // Expected used-percent: historical override when available, else the
-        // naive linear elapsed/duration. The rest (delta/stage/ETA) is
-        // identical either way.
-        var expected = expectedOverride ?? Clamp(elapsed / duration * 100, 0, 100);
         var actual = Clamp(window.UsedPercent, 0, 100);
-        if (elapsed == 0 && actual > 0)
+        if (timing.Elapsed == 0 && actual > 0)
+        {
+            return null;
+        }
+
+        var expected = Clamp(historical.ExpectedUsedPercent, 0, 100);
+        var delta = actual - expected;
+        return new UsagePace(
+            StageFor(delta), UsagePaceBasis.Historical, delta, expected, actual,
+            historical.EtaSeconds, historical.WillLastToReset);
+    }
+
+    private static UsagePace? ComputeCore(UsageWindow window, DateTimeOffset now)
+    {
+        if (Timing(window, now) is not { } timing)
+        {
+            return null;
+        }
+
+        var expected = Clamp(timing.Elapsed / timing.Duration * 100, 0, 100);
+        var actual = Clamp(window.UsedPercent, 0, 100);
+        if (timing.Elapsed == 0 && actual > 0)
         {
             return null;
         }
@@ -173,14 +209,14 @@ public sealed record UsagePace(
 
         double? etaSeconds = null;
         var willLastToReset = false;
-        if (elapsed > 0 && actual > 0)
+        if (timing.Elapsed > 0 && actual > 0)
         {
-            var rate = actual / elapsed; // percentage points per second
+            var rate = actual / timing.Elapsed; // percentage points per second
             if (rate > 0)
             {
                 var remaining = Math.Max(0, 100 - actual);
                 var candidate = remaining / rate;
-                if (candidate >= timeUntilReset)
+                if (candidate >= timing.TimeUntilReset)
                 {
                     willLastToReset = true;
                 }
@@ -190,13 +226,42 @@ public sealed record UsagePace(
                 }
             }
         }
-        else if (elapsed > 0 && actual == 0)
+        else if (timing.Elapsed > 0 && actual == 0)
         {
             willLastToReset = true;
         }
 
         return new UsagePace(
-            StageFor(delta), delta, expected, actual, etaSeconds, willLastToReset);
+            StageFor(delta), UsagePaceBasis.Linear, delta, expected, actual,
+            etaSeconds, willLastToReset);
+    }
+
+    private readonly record struct WindowTiming(
+        double Duration,
+        double TimeUntilReset,
+        double Elapsed);
+
+    private static WindowTiming? Timing(UsageWindow window, DateTimeOffset now)
+    {
+        if (window.ResetsAt is not { } resetsAtRaw ||
+            window.PaceStatus.DurationSeconds is not { } durationSeconds ||
+            durationSeconds <= 0 ||
+            ParseRfc3339(resetsAtRaw) is not { } resetsAt)
+        {
+            return null;
+        }
+
+        var duration = durationSeconds;
+        var timeUntilReset = (resetsAt - now).TotalSeconds;
+        if (timeUntilReset <= 0 || timeUntilReset > duration)
+        {
+            return null;
+        }
+
+        return new WindowTiming(
+            duration,
+            timeUntilReset,
+            Clamp(duration - timeUntilReset, 0, duration));
     }
 
     private static PaceStage StageFor(double delta)
@@ -208,35 +273,52 @@ public sealed record UsagePace(
         return delta >= 0 ? PaceStage.FarAhead : PaceStage.FarBehind;
     }
 
-    private static readonly string[] Rfc3339Formats =
-    [
-        "yyyy-MM-dd'T'HH:mm:ssK",
-        "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK",
-    ];
+    private static readonly Regex Rfc3339Pattern = new(
+        @"^(?<date>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(?<fraction>\d+))?(?<zone>[Zz]|[+-]\d{2}:\d{2})$",
+        RegexOptions.CultureInvariant);
 
-    /// <summary>RFC3339 parser tolerating fractional seconds (the backend
-    /// emits both). TryParseExact keeps Swift ISO8601DateFormatter's
-    /// strictness — a lenient TryParse would accept non-RFC3339 strings and
-    /// show a pace the macOS app would suppress.</summary>
-    internal static DateTimeOffset? ParseRfc3339(string s) =>
-        DateTimeOffset.TryParseExact(
-            s, Rfc3339Formats, CultureInfo.InvariantCulture,
-            DateTimeStyles.AdjustToUniversal, out var parsed)
-            ? parsed
-            : null;
-
-    private static double Clamp(double v, double lo, double hi) => Math.Min(hi, Math.Max(lo, v));
-
-    /// <summary>codexbar-style historical run-out risk, e.g.
-    /// "≈ 30% run-out risk", or null.</summary>
-    public static string? RunOutRiskLabel(UsageWindow window)
+    /// <summary>Strict RFC3339 parser requiring an explicit zone while
+    /// tolerating arbitrary fractional precision and lowercase z, matching
+    /// the canonical Swift formatter's valid timestamp variants.</summary>
+    internal static DateTimeOffset? ParseRfc3339(string s)
     {
-        if (window.RunOutProbability is not { } probability)
+        var match = Rfc3339Pattern.Match(s);
+        if (!match.Success)
         {
             return null;
         }
 
-        var pct = (int)Math.Round(Clamp(probability, 0, 1) * 100, MidpointRounding.AwayFromZero);
-        return pct <= 0 ? null : $"≈ {pct}% run-out risk";
+        var fraction = match.Groups["fraction"].Value;
+        if (fraction.Length > 7)
+        {
+            // DateTimeOffset stores 100ns ticks; sub-tick digits cannot affect
+            // the displayed pace, so preserve canonical acceptance by truncating.
+            fraction = fraction[..7];
+        }
+
+        var zone = match.Groups["zone"].Value;
+        if (zone is "Z" or "z")
+        {
+            zone = "+00:00";
+        }
+
+        var normalized = match.Groups["date"].Value
+            + (fraction.Length == 0 ? "" : $".{fraction}")
+            + zone;
+        var format = fraction.Length == 0
+            ? "yyyy-MM-dd'T'HH:mm:sszzz"
+            : "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFzzz";
+        return DateTimeOffset.TryParseExact(
+            normalized, format, CultureInfo.InvariantCulture,
+            DateTimeStyles.AdjustToUniversal, out var parsed)
+            ? parsed
+            : null;
     }
+
+    private static double Clamp(double v, double lo, double hi) =>
+        Math.Min(hi, Math.Max(lo, v));
 }
+
+/// <summary>Display-only presentation assembled from one pace result and its
+/// optional historical risk.</summary>
+public sealed record UsagePacePresentation(string? EtaText, string? RiskText);
