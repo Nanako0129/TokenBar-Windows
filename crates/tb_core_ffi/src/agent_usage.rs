@@ -116,6 +116,8 @@ pub struct UsageWindow {
     used_percent: f64,
     remaining_percent: f64,
     resets_at: Option<String>,
+    /// Exact provider reset retained independently from millisecond wire formatting.
+    reset_at_evidence: Option<DateTime<Utc>>,
     reset_text: Option<String>,
     /// Resolved provider/contract evidence retained only to validate the nested wire state.
     duration_evidence: Option<(DurationEvidence, DurationSource)>,
@@ -199,6 +201,7 @@ impl UsageWindow {
             used_percent: used,
             remaining_percent: remaining,
             resets_at: resets_at.map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            reset_at_evidence: resets_at,
             reset_text: resets_at.map(|d| reset_text(d, now)),
             duration_evidence: None,
             pace_status: PaceStatusPayload {
@@ -262,14 +265,21 @@ impl UsageWindow {
         if self.pace_status.window_key.is_none() {
             return self;
         }
-        let reset_at = self
-            .resets_at
-            .as_deref()
-            .and_then(parse_datetime)
-            .map(|reset| reset.timestamp());
-        if reset_was_supplied != reset_at.is_some() {
+        let parsed_reset = self.resets_at.as_deref().and_then(parse_datetime);
+        let exact_reset = match (parsed_reset, self.reset_at_evidence) {
+            (Some(_), Some(reset)) => Some(reset),
+            _ => None,
+        };
+        if reset_was_supplied != exact_reset.is_some() {
             return self.with_unavailable_reason("invalidEvidence");
         }
+        let reset_at = match exact_reset {
+            Some(reset) if reset > now => {
+                Some(reset.timestamp().max(now.timestamp().saturating_add(1)))
+            }
+            Some(_) => return self.with_unavailable_reason("invalidEvidence"),
+            None => None,
+        };
         match resolve_duration(now.timestamp(), reset_at, provider, contract, None) {
             DurationResolution::Ready {
                 duration_seconds,
@@ -298,6 +308,18 @@ impl UsageWindow {
                 DurationUnavailableReason::InvalidEvidence => "invalidEvidence",
             }),
         }
+    }
+
+    pub(crate) fn with_observed_duration_evidence(
+        self,
+        now: DateTime<Utc>,
+        reset_was_supplied: bool,
+    ) -> Self {
+        let mut window = self.with_duration_evidence(now, reset_was_supplied, None, None);
+        if window.pace_status.state == PaceState::LearningDuration {
+            window.pace_status.duration_source = Some(DurationSource::Observed);
+        }
+        window
     }
 
     fn with_unavailable_reason(mut self, reason: &str) -> Self {
@@ -805,6 +827,7 @@ where
         window.remaining_percent = 100.0 - window.used_percent;
         if window.resets_at.is_some() && reset_at.is_none() {
             window.resets_at = None;
+            window.reset_at_evidence = None;
             window.reset_text = None;
         }
         if !valid_reset || !valid_percent {
@@ -3332,6 +3355,80 @@ mod tests {
             assert!(value.get("historicalExpectedPercent").is_none());
             assert!(value.get("runOutProbability").is_none());
         }
+    }
+
+    #[test]
+    fn observed_duration_evidence_preserves_reset_presence() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let future_reset = now + chrono::Duration::hours(1);
+        let past_reset = now - chrono::Duration::hours(1);
+
+        let absent = UsageWindow::from_used_percent("Absent".to_string(), 20.0, None, now)
+            .with_identity("absent.v1", Some("absent.v1".to_string()))
+            .with_observed_duration_evidence(now, false);
+        assert_eq!(absent.pace_reason_for_test(), Some("missingReset"));
+
+        let mut malformed = UsageWindow::from_used_percent(
+            "Malformed".to_string(),
+            20.0,
+            Some(future_reset),
+            now,
+        )
+        .with_identity("malformed.v1", Some("malformed.v1".to_string()));
+        malformed.resets_at = Some("bogus".to_string());
+        malformed = malformed.with_observed_duration_evidence(now, true);
+        assert_eq!(malformed.pace_reason_for_test(), Some("invalidEvidence"));
+
+        let past = UsageWindow::from_used_percent("Past".to_string(), 20.0, Some(past_reset), now)
+            .with_identity("past.v1", Some("past.v1".to_string()))
+            .with_observed_duration_evidence(now, true);
+        assert_eq!(past.pace_reason_for_test(), Some("invalidEvidence"));
+
+        let future = UsageWindow::from_used_percent(
+            "Future".to_string(),
+            20.0,
+            Some(future_reset),
+            now,
+        )
+        .with_identity("future.v1", Some("future.v1".to_string()))
+        .with_observed_duration_evidence(now, true);
+        assert_eq!(future.pace_reason_for_test(), None);
+        assert_eq!(future.pace_status.state, PaceState::LearningDuration);
+        assert_eq!(
+            future.pace_status.duration_source,
+            Some(DurationSource::Observed)
+        );
+
+        let subsecond_now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let subsecond_reset = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let subsecond = UsageWindow::from_used_percent(
+            "Subsecond".to_string(),
+            20.0,
+            Some(subsecond_reset),
+            subsecond_now,
+        )
+        .with_identity("subsecond.v1", Some("subsecond.v1".to_string()))
+        .with_observed_duration_evidence(subsecond_now, true);
+        assert_eq!(subsecond.pace_status.state, PaceState::LearningDuration);
+        assert_eq!(
+            subsecond.pace_status.duration_source,
+            Some(DurationSource::Observed)
+        );
+
+        let mut missing_identity = UsageWindow::from_used_percent(
+            "Missing identity".to_string(),
+            20.0,
+            Some(future_reset),
+            now,
+        )
+        .with_identity("row.missing.v1", None);
+        missing_identity.resets_at = Some("bogus".to_string());
+        missing_identity = missing_identity.with_observed_duration_evidence(now, true);
+        assert_eq!(missing_identity.pace_reason_for_test(), Some("windowIdentity"));
     }
 
     #[test]
