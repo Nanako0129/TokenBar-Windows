@@ -742,7 +742,12 @@ fn retain_unique_windows(windows: &mut Vec<UsageWindow>) {
     });
 }
 
-#[allow(dead_code)] // Stage 3B2b seam; the production caller is a later scope.
+fn enrich_snapshot(snapshot: &mut AgentUsageSnapshot, now: i64) {
+    enrich_snapshot_with(snapshot, now, |active_keys, observations, now| {
+        crate::agent_quota_history::record_observations_and_evaluate(active_keys, observations, now)
+    });
+}
+
 fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: i64, mut record: F)
 where
     F: FnMut(
@@ -1179,13 +1184,16 @@ async fn fetch_claude() -> AgentUsageSnapshot {
         return claude_gate_fallback(blocked_until, now);
     }
     match fetch_claude_inner().await {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
+            enrich_snapshot(&mut snapshot, now.timestamp());
+            // Cache the display-ready snapshot. A later 429 fallback returns it
+            // without another enrichment pass or history write.
             claude_gate_record_success(&snapshot);
             snapshot
         }
         Err(error) => {
             // A 429 inside fetch_claude_inner arms the gate; fall back to the
-            // cached snapshot rather than blanking the card.
+            // cached, already-enriched snapshot rather than blanking the card.
             let now = Utc::now();
             if let Some(blocked_until) = claude_gate_blocked_until(now) {
                 return claude_gate_fallback(blocked_until, now);
@@ -1309,7 +1317,17 @@ async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
         return Err("Codex usage API returned no rate-limit windows.".to_string());
     }
 
-    Ok(AgentUsageSnapshot {
+    // Only the non-empty account ID actually attached to this successful request
+    // may authorize legacy migration. Migration remains best-effort so the live
+    // v3 observation still records if import fails.
+    maybe_migrate_codex_v2_with(
+        request_account_id,
+        &account_scope,
+        now.timestamp(),
+        crate::agent_quota_history::migrate_codex_v2,
+    );
+
+    let mut snapshot = AgentUsageSnapshot {
         client_id: "codex".to_string(),
         source: "oauth".to_string(),
         updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -1321,7 +1339,9 @@ async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
             unlimited: credits.unlimited,
         }),
         error: None,
-    })
+    };
+    enrich_snapshot(&mut snapshot, now.timestamp());
+    Ok(snapshot)
 }
 
 fn resolve_codex_account_scope<ResolveAuthoritative, ResolveCredential>(
@@ -1341,6 +1361,26 @@ where
         return resolve_authoritative(account_id);
     }
     refreshed_scope.unwrap_or_else(resolve_credential)
+}
+
+fn maybe_migrate_codex_v2_with<F, T>(
+    request_account_id: Option<&str>,
+    account_scope: &Result<AccountScope, AccountScopeError>,
+    now: i64,
+    migrate: F,
+) where
+    F: FnOnce(&str, &str, i64) -> Result<T, HistoryError>,
+{
+    let Some(request_account_id) = request_account_id
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+    else {
+        return;
+    };
+    let Ok(account_scope) = account_scope else {
+        return;
+    };
+    let _ = migrate(request_account_id, account_scope.as_str(), now);
 }
 
 async fn fetch_claude_inner() -> Result<AgentUsageSnapshot, String> {
@@ -4187,6 +4227,112 @@ mod tests {
         scope_store.cleanup();
     }
 
+    #[test]
+    fn codex_v2_migration_requires_request_id_and_scope_and_is_best_effort() {
+        let scope_store = TestRefreshScope::new("codex", "codex-v2-migration-gate");
+        let account_scope = scope_store
+            .resolve_current("fixture", "codex-v2", b"codex-v2-marker")
+            .unwrap();
+        let opaque_scope = account_scope.as_str().to_string();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        maybe_migrate_codex_v2_with(
+            Some("request-account"),
+            &Ok(account_scope.clone()),
+            now.timestamp(),
+            |request_account_id, scope, call_now| {
+                calls.borrow_mut().push((
+                    request_account_id.to_string(),
+                    scope.to_string(),
+                    call_now,
+                ));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls.borrow().as_slice(),
+            &[(
+                "request-account".to_string(),
+                opaque_scope.clone(),
+                now.timestamp(),
+            )]
+        );
+
+        let skipped_calls = std::cell::Cell::new(0);
+        maybe_migrate_codex_v2_with(
+            None,
+            &Ok(account_scope.clone()),
+            now.timestamp(),
+            |_, _, _| {
+                skipped_calls.set(skipped_calls.get() + 1);
+                Ok(())
+            },
+        );
+        maybe_migrate_codex_v2_with(
+            Some(" \t"),
+            &Ok(account_scope.clone()),
+            now.timestamp(),
+            |_, _, _| {
+                skipped_calls.set(skipped_calls.get() + 1);
+                Ok(())
+            },
+        );
+        maybe_migrate_codex_v2_with(
+            Some("request-account"),
+            &Err(AccountScopeError::MetadataRead),
+            now.timestamp(),
+            |_, _, _| {
+                skipped_calls.set(skipped_calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(skipped_calls.get(), 0);
+
+        let migration_error_calls = std::cell::Cell::new(0);
+        maybe_migrate_codex_v2_with(
+            Some("request-account"),
+            &Ok(account_scope.clone()),
+            now.timestamp(),
+            |_, _, _| {
+                migration_error_calls.set(migration_error_calls.get() + 1);
+                Err::<(), _>(HistoryError::AtomicSave)
+            },
+        );
+
+        let mut snapshot = enrichment_snapshot(
+            Ok(account_scope),
+            vec![enrichment_window(
+                now,
+                "weekly.v1",
+                "weekly.v1",
+                20.0,
+                Some(DurationSource::Contract),
+            )],
+        );
+        let record_calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, observations, _| {
+            record_calls.set(record_calls.get() + 1);
+            assert_eq!(observations.len(), 1);
+            Ok(vec![Ok((
+                HistoryOutcome::Ready {
+                    duration_seconds: 86_400,
+                    source: DurationSource::Contract,
+                    sampled: true,
+                },
+                None,
+                1,
+            ))])
+        });
+        assert_eq!(migration_error_calls.get(), 1);
+        assert_eq!(record_calls.get(), 1);
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::LearningHistory
+        );
+        scope_store.cleanup();
+    }
+
     // Single test for the whole gate lifecycle — the gate is a process-wide
     // static, so split tests would race under the parallel test runner.
     #[test]
@@ -4208,34 +4354,86 @@ mod tests {
         let later = now + chrono::Duration::seconds(301);
         assert!(claude_gate_blocked_until(later).is_none());
 
-        // Success caches the snapshot; a later 429 serves its display data but
-        // drops stale account evidence from the earlier authenticated poll.
+        // Success caches the display-ready snapshot; a later 429 returns those
+        // rows unchanged, without another enrichment/history pass, while dropping
+        // stale account evidence from the earlier authenticated poll.
         let scope_store = TestRefreshScope::new("claude", "cached-429");
         let account_scope = scope_store
             .resolve_current("fixture", "cached-429", b"cached-429-marker")
             .unwrap();
-        let snapshot = AgentUsageSnapshot {
+        let reset = now + chrono::Duration::days(1);
+        let mut snapshot = AgentUsageSnapshot {
             client_id: "claude".to_string(),
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: None,
             account_scope: Ok(account_scope),
-            windows: vec![
-                UsageWindow::from_used_percent("Session".to_string(), 20.0, None, now)
-                    .with_identity("session.v1", Some("session.v1".to_string())),
-            ],
+            windows: vec![UsageWindow::from_used_percent(
+                "Session".to_string(),
+                20.0,
+                Some(reset),
+                now,
+            )
+            .with_identity("session.v1", Some("session.v1".to_string()))
+            .with_duration_evidence(
+                now,
+                true,
+                None,
+                Some(DurationEvidence::contract(86_400)),
+            )],
             credits: None,
             error: None,
         };
+        let record_calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(
+            &mut snapshot,
+            now.timestamp(),
+            |active, observations, batch_now| {
+                record_calls.set(record_calls.get() + 1);
+                assert_eq!(batch_now, now.timestamp());
+                assert_eq!(active.len(), 1);
+                assert_eq!(observations.len(), 1);
+                Ok(vec![Ok((
+                    HistoryOutcome::Ready {
+                        duration_seconds: 86_400,
+                        source: DurationSource::Contract,
+                        sampled: true,
+                    },
+                    Some(HistoricalPace {
+                        expected_percent: 35.0,
+                        eta_seconds: Some(1_800.0),
+                        will_last_to_reset: false,
+                        run_out_probability: Some(0.42),
+                    }),
+                    6,
+                ))])
+            },
+        );
+        assert_eq!(record_calls.get(), 1);
+        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Available);
         claude_gate_record_success(&snapshot);
         assert!(claude_gate_blocked_until(later).is_none());
         claude_gate_record_rate_limit(Some(later + chrono::Duration::seconds(60)), later);
         let until = claude_gate_blocked_until(later).unwrap();
         let fallback = claude_gate_fallback(until, later);
+        assert_eq!(record_calls.get(), 1);
         assert!(fallback.error.is_none());
         assert_eq!(fallback.windows.len(), 1);
+        assert_eq!(fallback.windows[0].label, "Session");
+        assert_eq!(fallback.windows[0].card_id, "session.v1");
+        assert_eq!(fallback.windows[0].used_percent, 20.0);
+        assert_eq!(fallback.windows[0].remaining_percent, 80.0);
+        assert_eq!(fallback.windows[0].pace_status.state, PaceState::Available);
+        assert_eq!(fallback.windows[0].pace_status.complete_cycles, 6);
+        assert_eq!(
+            fallback.windows[0]
+                .historical_pace
+                .as_ref()
+                .map(|pace| pace.expected_used_percent),
+            Some(35.0)
+        );
         assert!(matches!(
-            fallback.account_scope,
+            &fallback.account_scope,
             Err(AccountScopeError::NoTrustedEvidence)
         ));
 
