@@ -14,10 +14,11 @@
 use crate::agent_account_scope::{
     self, AccountScope, AccountScopeError, RefreshCheckpoint, RefreshScopeTransaction,
 };
+use crate::agent_quota_duration::DurationEvidence;
 use crate::agent_usage::{AgentIdentity, UsageWindow};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -82,24 +83,24 @@ struct BillingResponse {
 struct BillingConfig {
     #[serde(default)]
     current_period: Option<UsagePeriod>,
-    #[serde(default)]
-    credit_usage_percent: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    credit_usage_percent: Option<Box<RawValue>>,
     #[serde(default)]
     product_usage: Option<Vec<ProductUsage>>,
-    #[serde(default)]
-    billing_period_start: Option<String>,
-    #[serde(default)]
-    billing_period_end: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    billing_period_start: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    billing_period_end: Option<Box<RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsagePeriod {
     #[serde(default, rename = "type")]
     period_type: Option<String>,
-    #[serde(default)]
-    start: Option<String>,
-    #[serde(default)]
-    end: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    start: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    end: Option<Box<RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,8 +108,8 @@ struct UsagePeriod {
 struct ProductUsage {
     #[serde(default)]
     product: Option<String>,
-    #[serde(default)]
-    usage_percent: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    usage_percent: Option<Box<RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,9 +237,41 @@ fn map_billing(
         "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string()
     })?;
 
-    let (label, card_id, window_key, resets_at) = period_meta(&config);
-    let window = UsageWindow::from_used_percent(label, used_percent, resets_at, now)
-        .with_identity(card_id, window_key);
+    let period = period_details(&config);
+    let window = match period.kind {
+        Some((label, window_key)) => {
+            let mut window = UsageWindow::from_used_percent(
+                label.to_string(),
+                used_percent,
+                period.end,
+                now,
+            )
+            .with_identity(window_key, Some(window_key.to_string()));
+
+            if period.invalid_evidence {
+                let invalid_provider = period.end.map(|end| {
+                    DurationEvidence::provider(provider_reset_at(end, now), 0)
+                });
+                window =
+                    window.with_provider_duration_evidence(now, true, invalid_provider);
+            } else if let (Some(end), Some(duration_seconds)) = (period.end, period.duration_seconds)
+            {
+                window = window.with_provider_duration_evidence(
+                    now,
+                    true,
+                    Some(DurationEvidence::provider(
+                        provider_reset_at(end, now),
+                        duration_seconds,
+                    )),
+                );
+            } else if period.end_was_supplied {
+                window = window.with_observed_duration_evidence(now, true);
+            }
+            window
+        }
+        None => UsageWindow::from_used_percent("Unknown".to_string(), used_percent, period.end, now)
+            .with_identity("row.billing.unknown.v1", None),
+    };
 
     Ok(GrokData {
         identity: Some(AgentIdentity {
@@ -256,37 +289,146 @@ fn map_billing(
 fn used_percent_from_config(config: &BillingConfig) -> Option<f64> {
     if let Some(products) = config.product_usage.as_ref() {
         for product in products {
-            let name = product.product.as_deref().unwrap_or("");
-            if name.eq_ignore_ascii_case("GrokBuild") {
-                if let Some(pct) = product.usage_percent {
-                    return Some(pct);
-                }
+            if !product
+                .product
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("GrokBuild"))
+            {
+                continue;
+            }
+            if let Some(raw) = product.usage_percent.as_deref() {
+                return valid_percentage(raw);
             }
         }
     }
-    config.credit_usage_percent
+    config
+        .credit_usage_percent
+        .as_deref()
+        .and_then(valid_percentage)
 }
 
-fn period_meta(config: &BillingConfig) -> (String, String, Option<String>, Option<DateTime<Utc>>) {
-    let period_type = config
-        .current_period
-        .as_ref()
-        .and_then(|period| period.period_type.as_deref())
-        .unwrap_or("");
-    let (label, card_id, window_key) = if period_type.contains("WEEKLY") {
-        ("Weekly", "billing.weekly.v1", Some("billing.weekly.v1".to_string()))
-    } else if period_type.contains("MONTHLY") {
-        ("Monthly", "billing.monthly.v1", Some("billing.monthly.v1".to_string()))
-    } else {
-        ("Unknown", "row.billing.unknown.v1", None)
+fn deserialize_optional_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+fn valid_percentage(raw: &RawValue) -> Option<f64> {
+    let value = raw.get();
+    serde_json::from_str::<f64>(value)
+        .ok()
+        .filter(|pct| pct.is_finite() && decimal_percentage_in_range(value))
+}
+
+fn decimal_percentage_in_range(value: &str) -> bool {
+    let (negative, unsigned) = match value.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, value),
     };
-    let end = config
-        .current_period
-        .as_ref()
+    let exponent_index = unsigned.find(|character| matches!(character, 'e' | 'E'));
+    let (mantissa, exponent_text) = match exponent_index {
+        Some(index) => (&unsigned[..index], Some(&unsigned[index + 1..])),
+        None => (unsigned, None),
+    };
+    let fractional_digits = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let digits = mantissa
+        .bytes()
+        .filter(|byte| byte.is_ascii_digit())
+        .collect::<Vec<_>>();
+    let Some(first_nonzero) = digits.iter().position(|digit| *digit != b'0') else {
+        return true;
+    };
+    if negative {
+        return false;
+    }
+    let exponent = match exponent_text {
+        Some(text) => match text.parse::<i128>() {
+            Ok(exponent) => exponent,
+            Err(_) => return text.starts_with('-'),
+        },
+        None => 0,
+    };
+
+    let significant = &digits[first_nonzero..];
+    let integer_digits = exponent
+        .saturating_add(significant.len() as i128)
+        .saturating_sub(fractional_digits as i128);
+    match integer_digits.cmp(&3) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => {
+            significant[0] == b'1' && significant[1..].iter().all(|digit| *digit == b'0')
+        }
+    }
+}
+
+struct PeriodDetails {
+    kind: Option<(&'static str, &'static str)>,
+    end: Option<DateTime<Utc>>,
+    end_was_supplied: bool,
+    duration_seconds: Option<i64>,
+    invalid_evidence: bool,
+}
+
+fn period_details(config: &BillingConfig) -> PeriodDetails {
+    let period = config.current_period.as_ref();
+    let period_type = period
+        .and_then(|period| period.period_type.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    let kind = match period_type.as_str() {
+        "WEEKLY" | "USAGE_PERIOD_TYPE_WEEKLY" => Some(("Weekly", "billing.weekly.v1")),
+        "MONTHLY" | "USAGE_PERIOD_TYPE_MONTHLY" => Some(("Monthly", "billing.monthly.v1")),
+        _ => None,
+    };
+
+    // Select each primary field independently. A present but malformed primary
+    // value must not be hidden by a valid billing-level fallback.
+    let start_raw = period
+        .and_then(|period| period.start.as_deref())
+        .or(config.billing_period_start.as_deref());
+    let end_raw = period
         .and_then(|period| period.end.as_deref())
-        .or(config.billing_period_end.as_deref())
-        .and_then(parse_timestamp);
-    (label.to_string(), card_id.to_string(), window_key, end)
+        .or(config.billing_period_end.as_deref());
+    let start = start_raw.and_then(parse_timestamp_raw);
+    let end = end_raw.and_then(parse_timestamp_raw);
+    let (duration_seconds, invalid_evidence) = match (start_raw, end_raw, start, end) {
+        (Some(_), Some(_), Some(start), Some(end)) if end > start => {
+            (Some((end - start).num_seconds()), false)
+        }
+        (Some(_), Some(_), Some(_), Some(_)) => (None, true),
+        (Some(_), Some(_), _, _) => (None, true),
+        (Some(_), None, Some(_), _) => (None, false),
+        (Some(_), None, None, _) => (None, true),
+        (None, Some(_), _, Some(_)) => (None, false),
+        (None, Some(_), _, None) => (None, true),
+        _ => (None, false),
+    };
+    PeriodDetails {
+        kind,
+        end,
+        end_was_supplied: end_raw.is_some(),
+        duration_seconds,
+        invalid_evidence,
+    }
+}
+
+fn provider_reset_at(reset: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    if reset > now {
+        reset.timestamp().max(now.timestamp().saturating_add(1))
+    } else {
+        reset.timestamp()
+    }
+}
+
+fn parse_timestamp_raw(value: &RawValue) -> Option<DateTime<Utc>> {
+    serde_json::from_str::<String>(value.get())
+        .ok()
+        .and_then(|value| parse_timestamp(&value))
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -699,6 +841,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_percentages_without_falling_back() {
+        for invalid in [
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": 150.0 }] }"#,
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": -1.0 }] }"#,
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": -1e-400 }] }"#,
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": -1e-9999999999999999999999999999999999999999 }] }"#,
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": 100.0000000000000000001 }] }"#,
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": 1e400 }] }"#,
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": "NaN" }] }"#,
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": null }] }"#,
+        ] {
+            let config: BillingConfig = serde_json::from_str(invalid).unwrap();
+            assert!(
+                used_percent_from_config(&config).is_none(),
+                "invalid GrokBuild usage must not fall back to overall credit usage"
+            );
+        }
+
+        for valid in [
+            "-0.0",
+            "99.9999999999999999999",
+            "1e2",
+            "0.100e3",
+            "1e-9999999999999999999999999999999999999999",
+            "0.01e-170141183460469231731687303715884105728",
+        ] {
+            let config: BillingConfig = serde_json::from_str(&format!(
+                r#"{{ "creditUsagePercent": {valid} }}"#
+            ))
+            .unwrap();
+            assert!(
+                used_percent_from_config(&config).is_some(),
+                "valid percentage {valid} must survive exact range validation"
+            );
+        }
+
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokChat" }] }"#,
+        )
+        .unwrap();
+        assert_eq!(used_percent_from_config(&config), Some(12.5));
+    }
+
+    #[test]
     fn maps_weekly_window_from_period() {
         let body = r#"{
             "config": {
@@ -751,15 +937,219 @@ mod tests {
     }
 
     #[test]
+    fn stage4_period_evidence_routes_and_fails_closed() {
+        let credentials = GrokCredentials {
+            auth_path: PathBuf::from("/tmp/unused"),
+            entry_key: "k".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            client_id: "c".into(),
+            expires_at: None,
+            email: None,
+            raw_json: Value::Object(Default::default()),
+        };
+        let map = |config: Value, now: DateTime<Utc>| {
+            let body = serde_json::json!({ "config": config }).to_string();
+            map_billing(
+                &body,
+                &credentials,
+                now,
+                Err(AccountScopeError::NoTrustedEvidence),
+            )
+            .unwrap()
+            .windows
+            .into_iter()
+            .next()
+            .unwrap()
+        };
+
+        let exact_weekly = map(
+            serde_json::json!({
+                "currentPeriod": {
+                    "type": "usage_period_type_weekly",
+                    "start": "2026-07-03T00:00:00.900Z",
+                    "end": "2026-07-10T00:00:00.900Z"
+                },
+                "creditUsagePercent": 12.0
+            }),
+            parse_timestamp("2026-07-10T00:00:00.100Z").unwrap(),
+        );
+        let weekly_wire = serde_json::to_value(&exact_weekly).unwrap();
+        assert_eq!(weekly_wire["cardId"], "billing.weekly.v1");
+        assert_eq!(weekly_wire["paceStatus"]["windowKey"], "billing.weekly.v1");
+        assert_eq!(weekly_wire["paceStatus"]["state"], "learningHistory");
+        assert_eq!(weekly_wire["paceStatus"]["durationSeconds"], 604_800);
+        assert_eq!(weekly_wire["paceStatus"]["durationSource"], "provider");
+        assert_eq!(weekly_wire["resetsAt"], "2026-07-10T00:00:00.900Z");
+
+        for (start, end, days) in [
+            ("2023-02-01T00:00:00Z", "2023-03-01T00:00:00Z", 28),
+            ("2024-02-01T00:00:00Z", "2024-03-01T00:00:00Z", 29),
+            ("2024-04-01T00:00:00Z", "2024-05-01T00:00:00Z", 30),
+            ("2024-05-01T00:00:00Z", "2024-06-01T00:00:00Z", 31),
+        ] {
+            let window = map(
+                serde_json::json!({
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_MONTHLY",
+                        "start": start,
+                        "end": end
+                    },
+                    "creditUsagePercent": 12.0
+                }),
+                parse_timestamp(start).unwrap() + chrono::Duration::days(1),
+            );
+            let wire = serde_json::to_value(&window).unwrap();
+            assert_eq!(wire["cardId"], "billing.monthly.v1");
+            assert_eq!(wire["paceStatus"]["windowKey"], "billing.monthly.v1");
+            assert_eq!(wire["paceStatus"]["durationSeconds"], days * 86_400);
+            assert_eq!(wire["paceStatus"]["durationSource"], "provider");
+            assert_eq!(wire["paceStatus"]["state"], "learningHistory");
+        }
+
+        let billing_fallback = map(
+            serde_json::json!({
+                "currentPeriod": { "type": "WEEKLY" },
+                "billingPeriodStart": "2026-07-03T00:00:00Z",
+                "billingPeriodEnd": "2026-07-10T00:00:00Z",
+                "creditUsagePercent": 12.0
+            }),
+            parse_timestamp("2026-07-05T00:00:00Z").unwrap(),
+        );
+        let fallback_wire = serde_json::to_value(&billing_fallback).unwrap();
+        assert_eq!(fallback_wire["paceStatus"]["durationSeconds"], 604_800);
+        assert_eq!(fallback_wire["paceStatus"]["durationSource"], "provider");
+
+        let end_only = map(
+            serde_json::json!({
+                "currentPeriod": {
+                    "type": "weekly",
+                    "end": "2026-07-24T00:00:00Z"
+                },
+                "creditUsagePercent": 12.0
+            }),
+            parse_timestamp("2026-07-17T00:00:00Z").unwrap(),
+        );
+        let end_only_wire = serde_json::to_value(&end_only).unwrap();
+        assert_eq!(end_only_wire["paceStatus"]["state"], "learningDuration");
+        assert_eq!(end_only_wire["paceStatus"]["durationSource"], "observed");
+        assert!(end_only_wire["paceStatus"].get("durationSeconds").is_none());
+
+        let unknown = map(
+            serde_json::json!({
+                "currentPeriod": {
+                    "type": "DAILY",
+                    "start": "2026-07-17T00:00:00Z",
+                    "end": "2026-07-18T00:00:00Z"
+                },
+                "creditUsagePercent": 12.0
+            }),
+            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+        );
+        let unknown_wire = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(unknown_wire["cardId"], "row.billing.unknown.v1");
+        assert_eq!(unknown_wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(unknown_wire["paceStatus"]["reason"], "windowIdentity");
+        assert!(unknown_wire["paceStatus"].get("windowKey").is_none());
+        assert!(unknown_wire["paceStatus"].get("durationSeconds").is_none());
+        for unknown_type in ["NOT_WEEKLY", "BIWEEKLY", "MONTHLYISH"] {
+            let window = map(
+                serde_json::json!({
+                    "currentPeriod": {
+                        "type": unknown_type,
+                        "start": "2026-07-17T00:00:00Z",
+                        "end": "2026-07-18T00:00:00Z"
+                    },
+                    "creditUsagePercent": 12.0
+                }),
+                parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+            );
+            let wire = serde_json::to_value(&window).unwrap();
+            assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
+        }
+
+        for (start, end) in [
+            ("2026-07-18T00:00:00Z", "2026-07-17T00:00:00Z"),
+            ("not-a-date", "2026-07-24T00:00:00Z"),
+            ("2026-07-17T00:00:00Z", "not-a-date"),
+        ] {
+            let window = map(
+                serde_json::json!({
+                    "currentPeriod": {
+                        "type": "weekly",
+                        "start": start,
+                        "end": end
+                    },
+                    "billingPeriodStart": "2026-07-17T00:00:00Z",
+                    "billingPeriodEnd": "2026-07-24T00:00:00Z",
+                    "creditUsagePercent": 12.0
+                }),
+                parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+            );
+            let wire = serde_json::to_value(&window).unwrap();
+            assert_eq!(wire["paceStatus"]["windowKey"], "billing.weekly.v1");
+            assert_eq!(wire["paceStatus"]["state"], "unavailable");
+            assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence");
+            assert!(wire["paceStatus"].get("durationSeconds").is_none());
+        }
+
+        let null_primary = map(
+            serde_json::json!({
+                "currentPeriod": {
+                    "type": "weekly",
+                    "start": null,
+                    "end": "2026-07-24T00:00:00Z"
+                },
+                "billingPeriodStart": "2026-07-17T00:00:00Z",
+                "creditUsagePercent": 12.0
+            }),
+            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+        );
+        let null_wire = serde_json::to_value(&null_primary).unwrap();
+        assert_eq!(null_wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(null_wire["paceStatus"]["reason"], "invalidEvidence");
+
+        let malformed_start_only = map(
+            serde_json::json!({
+                "currentPeriod": {
+                    "type": "weekly",
+                    "start": "not-a-date"
+                },
+                "creditUsagePercent": 12.0
+            }),
+            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+        );
+        let malformed_start_wire = serde_json::to_value(&malformed_start_only).unwrap();
+        assert_eq!(malformed_start_wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(
+            malformed_start_wire["paceStatus"]["reason"],
+            "invalidEvidence"
+        );
+
+        let valid_start_only = map(
+            serde_json::json!({
+                "currentPeriod": {
+                    "type": "weekly",
+                    "start": "2026-07-17T00:00:00Z"
+                },
+                "creditUsagePercent": 12.0
+            }),
+            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+        );
+        let start_only_wire = serde_json::to_value(&valid_start_only).unwrap();
+        assert_eq!(start_only_wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(start_only_wire["paceStatus"]["reason"], "missingReset");
+    }
+
+    #[test]
     fn unknown_period_has_no_history_identity() {
         let config: BillingConfig = serde_json::from_str(
             r#"{ "currentPeriod": { "type": "USAGE_PERIOD_TYPE_OTHER" } }"#,
         )
         .unwrap();
-        let (label, card_id, window_key, _) = period_meta(&config);
-        assert_eq!(label, "Unknown");
-        assert_eq!(card_id, "row.billing.unknown.v1");
-        assert!(window_key.is_none());
+        let period = period_details(&config);
+        assert!(period.kind.is_none());
+        assert!(period.end.is_none());
     }
 
     #[test]
