@@ -23,4 +23,10 @@
     <ProjectReference Include="..\TokenBar.Interop\TokenBar.Interop.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="..\..\crosscheck\fixtures\provider-quota-pace-v3.json"
+          Link="Fixtures\provider-quota-pace-v3.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
