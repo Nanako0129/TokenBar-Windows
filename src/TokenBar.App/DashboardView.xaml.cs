@@ -928,27 +928,30 @@ public sealed partial class DashboardView : UserControl
                 continue;
             }
 
-            foreach (var window in agent.Windows)
+            foreach (var window in agent.UniqueCardWindows)
             {
-                var remaining = Math.Clamp(window.RemainingPercent, 0, 100);
-                var used = Math.Clamp(window.UsedPercent, 0, 100);
-                var fill = asUsed ? used : remaining;
-                var amount = asUsed ? $"{used:F0}% used" : $"{remaining:F0}% left";
-                var pace = classic ? null : UsagePace.Compute(window, paceMode, now);
-                var paceText = pace is null ? ""
-                    : pace.EtaText is { } eta ? $"{pace.Label} · {eta}" : pace.Label;
-                var paceLabel = Ui.Text(paceText, 10,
-                    pace?.Stage.IsDeficit() == true ? 1.0 : 0.7);
-                if (pace?.Stage.IsDeficit() == true)
+                var row = UsagePace.RowPresentation(
+                    window, paceMode, asUsed, classic, now);
+                var details = string.Join(" · ",
+                    new[] { row.PaceText, row.ProjectionText }
+                        .Where(static text => !string.IsNullOrEmpty(text)));
+                var paceLabel = Ui.Text(details, 10,
+                    row.IsHistoricalDeficit ? 1.0 : 0.7);
+                if (row.IsHistoricalDeficit)
                 {
                     paceLabel.Foreground = Ui.BrushFromHex(PaceOrange);
                 }
 
                 section.Children.Add(Ui.Row(
-                    Ui.Text($"{window.Label} · {amount}", 11),
+                    Ui.Text($"{window.Label} · {row.AmountText}", 11),
                     paceLabel));
-                section.Children.Add(GaugeBar(fill, remaining, pace, asUsed));
-                if (!classic && window.ResetText is { } reset)
+                section.Children.Add(GaugeBar(
+                    row.FillPercent,
+                    row.RemainingPercent,
+                    row.MarkerPercent,
+                    row.ExpectedUsedPercent,
+                    row.IsHistoricalDeficit));
+                if (window.ResetText is { } reset)
                 {
                     section.Children.Add(Ui.Dim(reset, 10));
                 }
@@ -1524,21 +1527,25 @@ public sealed partial class DashboardView : UserControl
         return bar;
     }
 
-    private const string PaceOrange = "#ff9500"; // macOS Color.orange
+    internal const string PaceOrange = "#ff9500"; // macOS Color.orange
 
     /// <summary>The quota bar: fills by used or remaining per the setting,
     /// colors by remaining either way (macOS gaugeColor), and carries the
-    /// pace marker on the same axis so it lines up with the fill. Internal:
-    /// the settings window's preview column renders through the same bar.</summary>
+    /// precomputed pace marker on the same axis. Internal: the settings
+    /// window's preview column renders through the same bar.</summary>
     internal static FrameworkElement GaugeBar(
-        double fillPercent, double remainingForColor, UsagePace? pace = null,
-        bool asUsed = false)
+        double fillPercent,
+        double remainingForColor,
+        double? markerPercent,
+        double? expectedUsedPercent,
+        bool historicalDeficit)
     {
-        var fill = Math.Clamp(fillPercent, 0, 100);
+        var fill = double.IsFinite(fillPercent)
+            ? Math.Clamp(fillPercent, 0, 100) : 0;
         var remaining = double.IsFinite(remainingForColor)
             ? Math.Clamp(remainingForColor, 0, 100) : 100;
-        var color = remaining < 10 ? "#ef4444"
-            : remaining < 25 ? "#f59e0b" : "#22c55e";
+        var color = remaining <= 10 ? "#ef4444"
+            : remaining <= 25 ? "#f59e0b" : "#22c55e";
         var track = new Grid
         {
             Height = 5,
@@ -1558,34 +1565,31 @@ public sealed partial class DashboardView : UserControl
             Background = Ui.BrushFromHex(color),
             CornerRadius = new CornerRadius(2.5),
         });
-        if (pace is null)
+        if (markerPercent is not { } markerValue || !double.IsFinite(markerValue))
         {
             return track;
         }
 
-        // macOS-parity pace marker: a slim tick at the expected position,
-        // taller than the bar; orange in deficit, dim otherwise. It rides
-        // whichever axis the fill uses.
-        var paceLeft = Math.Clamp(
-            asUsed ? pace.ExpectedUsedPercent : 100 - pace.ExpectedUsedPercent, 0, 100);
+        // The shared row owns the axis; this renderer only places the tick.
+        var markerPosition = Math.Clamp(markerValue, 0, 100);
         var holder = new Grid { Height = 9 };
         track.VerticalAlignment = VerticalAlignment.Center;
         holder.Children.Add(track);
         var lanes = new Grid();
         lanes.ColumnDefinitions.Add(new ColumnDefinition
         {
-            Width = new GridLength(paceLeft, GridUnitType.Star),
+            Width = new GridLength(markerPosition, GridUnitType.Star),
         });
         lanes.ColumnDefinitions.Add(new ColumnDefinition
         {
-            Width = new GridLength(100 - paceLeft, GridUnitType.Star),
+            Width = new GridLength(100 - markerPosition, GridUnitType.Star),
         });
         var marker = new Rectangle
         {
             Width = 1.5,
             RadiusX = 0.75,
             RadiusY = 0.75,
-            Fill = pace.Stage.IsDeficit() ? Ui.BrushFromHex(PaceOrange)
+            Fill = historicalDeficit ? Ui.BrushFromHex(PaceOrange)
                 : new SolidColorBrush(Color.FromArgb(150, 160, 160, 160)),
             HorizontalAlignment = HorizontalAlignment.Right,
             Margin = new Thickness(0, 0, -0.75, 0),
@@ -1593,8 +1597,12 @@ public sealed partial class DashboardView : UserControl
         Grid.SetColumn(marker, 0);
         lanes.Children.Add(marker);
         holder.Children.Add(lanes);
-        var expectedUsed = asUsed ? paceLeft : 100 - paceLeft;
-        HoverTip.Attach(marker, () => $"Expected {expectedUsed:F0}% used by now");
+        if (expectedUsedPercent is { } expected && double.IsFinite(expected))
+        {
+            var expectedUsed = Math.Clamp(expected, 0, 100);
+            HoverTip.Attach(marker, () => $"Expected {expectedUsed:F0}% used by now");
+        }
+
         return holder;
     }
 }

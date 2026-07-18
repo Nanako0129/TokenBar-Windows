@@ -633,20 +633,30 @@ public sealed class SettingsWindow : Window
         ];
         foreach (var window in mocks)
         {
-            var fill = asUsed ? window.UsedPercent : window.RemainingPercent;
-            var amount = asUsed
-                ? $"{window.UsedPercent:F0}% used" : $"{window.RemainingPercent:F0}% left";
-            var pace = classic ? null : UsagePace.Compute(window, paceMode, now);
-            var paceText = pace is null ? ""
-                : pace.EtaText is { } eta ? $"{pace.Label} · {eta}" : pace.Label;
-            card.Children.Add(Ui.Row(
-                Ui.Text($"{window.Label} · {amount}", 11),
-                Ui.Text(paceText, 10, 0.7)));
-            card.Children.Add(DashboardView.GaugeBar(
-                fill, window.RemainingPercent, pace, asUsed));
-            if (!classic)
+            var row = UsagePace.RowPresentation(
+                window, paceMode, asUsed, classic, now);
+            var details = string.Join(" · ",
+                new[] { row.PaceText, row.ProjectionText }
+                    .Where(static text => !string.IsNullOrEmpty(text)));
+            var paceLabel = Ui.Text(details, 10,
+                row.IsHistoricalDeficit ? 1.0 : 0.7);
+            if (row.IsHistoricalDeficit)
             {
-                card.Children.Add(Ui.Dim(window.ResetText!, 10));
+                paceLabel.Foreground = Ui.BrushFromHex(DashboardView.PaceOrange);
+            }
+
+            card.Children.Add(Ui.Row(
+                Ui.Text($"{window.Label} · {row.AmountText}", 11),
+                paceLabel));
+            card.Children.Add(DashboardView.GaugeBar(
+                row.FillPercent,
+                row.RemainingPercent,
+                row.MarkerPercent,
+                row.ExpectedUsedPercent,
+                row.IsHistoricalDeficit));
+            if (window.ResetText is { } reset)
+            {
+                card.Children.Add(Ui.Dim(reset, 10));
             }
         }
 
