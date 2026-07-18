@@ -323,4 +323,48 @@ public class UsagePaceTests
             Assert.NotNull(UsagePace.Compute(Window(used: 50, resetsAt: resetsAt), Now));
         }
     }
+
+    [Fact]
+    public void LinearTimingMatchesFoundationUnixDoublePrecision()
+    {
+        var now = DateTimeOffset.Parse(
+            "2026-07-10T12:00:00.123Z",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.RoundtripKind);
+        var pace = UsagePace.Compute(
+            Window(
+                used: 40,
+                durationSeconds: 18_000,
+                resetsAt: "2026-07-10T15:00:00Z",
+                windowMinutes: 300),
+            PaceMode.Historical,
+            now);
+
+        Assert.NotNull(pace);
+        Assert.Equal(40.00068333281411, pace.ExpectedUsedPercent);
+        Assert.Equal(-0.0006833328141127026, pace.DeltaPercent);
+    }
+
+    [Fact]
+    public void ResetFractionUsesFoundationMillisecondPrecision()
+    {
+        var now = DateTimeOffset.Parse(
+            "2026-07-10T12:00:00Z",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.RoundtripKind);
+        UsagePace Compute(string resetsAt) => UsagePace.Compute(
+            Window(
+                used: 40,
+                durationSeconds: 18_000,
+                resetsAt: resetsAt,
+                windowMinutes: 300),
+            PaceMode.Linear,
+            now)!;
+
+        var milliseconds = Compute("2026-07-10T15:00:00.123Z");
+        var higherPrecision = Compute("2026-07-10T15:00:00.12345678Z");
+
+        Assert.Equal(milliseconds.ExpectedUsedPercent, higherPrecision.ExpectedUsedPercent);
+        Assert.Equal(milliseconds.DeltaPercent, higherPrecision.DeltaPercent);
+    }
 }
