@@ -1018,20 +1018,22 @@ fn historical_pace_payload(pace: HistoricalPace) -> HistoricalPacePayload {
     }
 }
 
-async fn fetch_grok() -> Option<AgentUsageSnapshot> {
-    let now = Utc::now();
-    match agent_grok::fetch(now).await? {
-        Ok(data) => Some(AgentUsageSnapshot {
+fn finalize_grok_snapshot(
+    fetched: Result<agent_grok::GrokData, String>,
+    now: DateTime<Utc>,
+) -> AgentUsageSnapshot {
+    match fetched {
+        Ok(data) => AgentUsageSnapshot {
             client_id: "grok".to_string(),
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: data.identity,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
+            account_scope: data.account_scope,
             windows: data.windows,
             credits: None,
             error: None,
-        }),
-        Err(error) => Some(AgentUsageSnapshot {
+        },
+        Err(error) => AgentUsageSnapshot {
             client_id: "grok".to_string(),
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -1040,8 +1042,13 @@ async fn fetch_grok() -> Option<AgentUsageSnapshot> {
             windows: Vec::new(),
             credits: None,
             error: Some(error),
-        }),
+        },
     }
+}
+
+async fn fetch_grok() -> Option<AgentUsageSnapshot> {
+    let now = Utc::now();
+    Some(finalize_grok_snapshot(agent_grok::fetch(now).await?, now))
 }
 
 async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
@@ -3330,6 +3337,60 @@ mod tests {
                 .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
                 .with_unavailable_reason("nonRecurring"),
         ]
+    }
+
+    #[test]
+    fn finalizes_grok_scope_without_history_enrichment_and_errors_fail_closed() {
+        let scope_store = TestRefreshScope::new("grok", "grok-finalize");
+        let marker = b"grok-sensitive-refresh-marker";
+        let account_scope = scope_store
+            .resolve_current("grok-auth-json", "fixture-location", marker)
+            .unwrap();
+        let opaque_scope = account_scope.as_str().to_string();
+        let now = DateTime::parse_from_rfc3339("2026-07-18T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let success = finalize_grok_snapshot(
+            Ok(agent_grok::GrokData {
+                identity: None,
+                account_scope: Ok(account_scope.clone()),
+                windows: Vec::new(),
+            }),
+            now,
+        );
+        assert_eq!(success.account_scope, Ok(account_scope));
+        let wire = serde_json::to_string(&success).unwrap();
+        assert!(!wire.contains("accountScope"));
+        assert!(!wire.contains(String::from_utf8_lossy(marker).as_ref()));
+        assert!(!wire.contains(&opaque_scope));
+
+        let learning = UsageWindow::from_used_percent(
+            "Weekly".to_string(),
+            10.0,
+            Some(now + chrono::Duration::days(7)),
+            now,
+        )
+        .with_identity("billing.weekly.v1", Some("billing.weekly.v1".to_string()));
+        let unscoped = finalize_grok_snapshot(
+            Ok(agent_grok::GrokData {
+                identity: None,
+                account_scope: Err(AccountScopeError::NoTrustedEvidence),
+                windows: vec![learning],
+            }),
+            now,
+        );
+        assert_eq!(unscoped.windows[0].pace_status.state, PaceState::LearningDuration);
+        assert!(unscoped.windows[0].pace_status.reason.is_none());
+
+        let failed = finalize_grok_snapshot(Err("Grok billing failed".to_string()), now);
+        assert_eq!(
+            failed.account_scope,
+            Err(AccountScopeError::NoTrustedEvidence)
+        );
+        assert!(failed.windows.is_empty());
+        assert_eq!(failed.error.as_deref(), Some("Grok billing failed"));
+        scope_store.cleanup();
     }
 
     #[test]
