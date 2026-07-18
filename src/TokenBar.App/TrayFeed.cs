@@ -33,6 +33,7 @@ public sealed class TrayFeed : IDisposable
     public AgentUsagePayload? Quota { get; private set; }
 
     private bool _hasTrace;
+    private double? _cachedQuotaRemaining;
 
     /// <summary>Resolved remaining % for the selected quota window. Boots
     /// from the persisted last reading (macOS lastRemaining: the gauge never
@@ -45,7 +46,8 @@ public sealed class TrayFeed : IDisposable
     {
         _dispatcher = dispatcher;
         var persisted = AppSettings.Store.GetDouble("tokenbar.quota.lastRemaining", double.NaN);
-        QuotaRemaining = double.IsNaN(persisted) ? null : persisted;
+        _cachedQuotaRemaining = double.IsNaN(persisted) ? null : persisted;
+        QuotaRemaining = _cachedQuotaRemaining;
 
         _fast = dispatcher.CreateTimer();
         _fast.Interval = TimeSpan.FromSeconds(30);
@@ -68,11 +70,12 @@ public sealed class TrayFeed : IDisposable
                     Changed?.Invoke();
                 });
             }
-            else if (key == ClientRegistry.TabHiddenKey)
+            else if (key is ClientRegistry.TabHiddenKey or ClientRegistry.LimitsHiddenKey)
             {
                 _ = _dispatcher.TryEnqueue(() =>
                 {
                     RecomputeVisibleUsage();
+                    ResolveRemaining();
                     Changed?.Invoke();
                 });
             }
@@ -168,6 +171,17 @@ public sealed class TrayFeed : IDisposable
 
                     Graph = graph ?? Graph;
                     Quota = quota ?? Quota;
+                    if (quota is not null)
+                    {
+                        var persistedSelection = AppSettings.Store.GetString(
+                            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
+                        if (QuotaSelectionPolicy.MigrationToPersist(quota, persistedSelection)
+                            is { } migrated)
+                        {
+                            AppSettings.Store.SetString("tokenbar.quota.source", migrated);
+                        }
+                    }
+
                     RecomputeVisibleUsage();
                     ResolveRemaining();
                     Changed?.Invoke();
@@ -189,28 +203,35 @@ public sealed class TrayFeed : IDisposable
 
     private void ResolveRemaining()
     {
-        var selection = AppSettings.Store.GetString("tokenbar.quota.source", "auto")
-            ?? QuotaResolver.Auto;
-        if (QuotaResolver.Resolve(Quota, selection) is { } pick)
+        var persistedSelection = AppSettings.Store.GetString(
+            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
+        var selection = QuotaSelectionPolicy.EffectiveSelection(Quota, persistedSelection);
+        var hidden = ClientRegistry.QuotaExcludedClients(AppSettings.Store);
+        if (QuotaResolver.Resolve(Quota, selection, hidden) is { } pick)
         {
             var resolved = Math.Clamp(pick.Window.RemainingPercent, 0, 100);
             if (resolved != QuotaRemaining)
             {
-                DevLog.Write($"tray quota pick: {pick.ClientId}|{pick.Window.Label} {resolved:F1}%");
+                DevLog.Write($"tray quota pick: {pick.ClientId}|{pick.Window.CardId} {resolved:F1}%");
             }
 
             QuotaRemaining = resolved;
+            _cachedQuotaRemaining = resolved;
             // Write-through cache so the next launch boots with a reading
             // (the store no-ops when the value hasn't changed).
             AppSettings.Store.SetDouble("tokenbar.quota.lastRemaining", resolved);
         }
-        else if (Quota is not null)
+        else if (QuotaResolver.ExcludedAllCandidates(Quota, selection, hidden))
         {
-            // A payload arrived but the selected window is gone (auth failed,
-            // no windows): drop the reading so the tray doesn't keep showing
-            // a stale percentage. lastRemaining stays only as a cold-boot
-            // seed, used before the first payload — not now.
+            // All healthy AUTO candidates are hidden. Suppress only the
+            // displayed reading; keep the selected-source last-good cache.
             QuotaRemaining = null;
+        }
+        else
+        {
+            // Fetch/provider/explicit-selection failures keep the last-good
+            // selected-source reading visible.
+            QuotaRemaining = _cachedQuotaRemaining;
         }
     }
 
