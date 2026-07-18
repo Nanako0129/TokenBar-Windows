@@ -86,10 +86,22 @@ pub(crate) async fn fetch(now: DateTime<Utc>) -> Result<CopilotData, String> {
     let snapshots = usage.quota_snapshots;
     let mut windows = Vec::new();
     if let Some(snapshots) = snapshots {
-        if let Some(window) = snapshot_window("Premium", snapshots.premium_interactions, resets_at, now) {
+        if let Some(window) = snapshot_window_with_identity(
+            "Premium",
+            "premium_interactions.v1",
+            snapshots.premium_interactions,
+            resets_at,
+            now,
+        ) {
             windows.push(window);
         }
-        if let Some(window) = snapshot_window("Chat", snapshots.chat, resets_at, now) {
+        if let Some(window) = snapshot_window_with_identity(
+            "Chat",
+            "chat.v1",
+            snapshots.chat,
+            resets_at,
+            now,
+        ) {
             windows.push(window);
         }
     }
@@ -103,8 +115,9 @@ pub(crate) async fn fetch(now: DateTime<Utc>) -> Result<CopilotData, String> {
     })
 }
 
-fn snapshot_window(
+fn snapshot_window_with_identity(
     label: &str,
+    window_key: &str,
     snapshot: Option<QuotaSnapshot>,
     resets_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -117,12 +130,35 @@ fn snapshot_window(
     let percent_remaining = snapshot.percent_remaining.or_else(|| {
         (snapshot.entitlement > 0.0).then(|| (snapshot.remaining / snapshot.entitlement) * 100.0)
     })?;
-    Some(UsageWindow::from_fraction(
-        label.to_string(),
-        percent_remaining / 100.0,
-        resets_at,
-        now,
-    ))
+    (percent_remaining.is_finite() && (0.0..=100.0).contains(&percent_remaining)).then(|| {
+        UsageWindow::from_fraction(label.to_string(), percent_remaining / 100.0, resets_at, now)
+            .with_identity(window_key, Some(window_key.to_string()))
+    })
+}
+
+#[cfg(test)]
+fn snapshot_window(
+    label: &str,
+    snapshot: Option<QuotaSnapshot>,
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<UsageWindow> {
+    let (card_id, window_key) = match label {
+        "Premium" => ("premium_interactions.v1", Some("premium_interactions.v1".to_string())),
+        "Chat" => ("chat.v1", Some("chat.v1".to_string())),
+        _ => ("row.copilot.unknown.v1", None),
+    };
+    let snapshot = snapshot?;
+    if snapshot.entitlement == 0.0 && snapshot.remaining == 0.0 && snapshot.percent_remaining.is_none() {
+        return None;
+    }
+    let percent_remaining = snapshot.percent_remaining.or_else(|| {
+        (snapshot.entitlement > 0.0).then(|| (snapshot.remaining / snapshot.entitlement) * 100.0)
+    })?;
+    (percent_remaining.is_finite() && (0.0..=100.0).contains(&percent_remaining)).then(|| {
+        UsageWindow::from_fraction(label.to_string(), percent_remaining / 100.0, resets_at, now)
+            .with_identity(card_id, window_key)
+    })
 }
 
 /// Copilot reports `quota_reset_date` as a bare `YYYY-MM-DD`; treat it as UTC midnight.
@@ -149,9 +185,29 @@ mod tests {
         let usage: CopilotUser = serde_json::from_str(body).unwrap();
         let snaps = usage.quota_snapshots.unwrap();
         let premium = snapshot_window("Premium", snaps.premium_interactions, None, now).unwrap();
+        assert_eq!(premium.card_id_for_test(), "premium_interactions.v1");
+        assert_eq!(premium.pace_window_key_for_test(), Some("premium_interactions.v1"));
         assert!((premium.remaining_for_test() - 30.0).abs() < 0.01);
         // chat is a zero-entitlement placeholder → skipped
         assert!(snapshot_window("Chat", snaps.chat, None, now).is_none());
+    }
+
+    #[test]
+    fn unknown_test_window_has_no_history_identity() {
+        let window = snapshot_window(
+            "Other",
+            Some(QuotaSnapshot {
+                entitlement: 10.0,
+                remaining: 5.0,
+                percent_remaining: None,
+            }),
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(window.card_id_for_test(), "row.copilot.unknown.v1");
+        assert!(window.pace_window_key_for_test().is_none());
+        assert_eq!(window.pace_reason_for_test(), Some("windowIdentity"));
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
+use crate::agent_quota_duration::DurationSource;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,22 +63,92 @@ pub struct AgentIdentity {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HistoricalPacePayload {
+    pub(crate) expected_used_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) eta_seconds: Option<f64>,
+    pub(crate) will_last_to_reset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_out_probability: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PaceState {
+    LearningDuration,
+    LearningHistory,
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaceStatusPayload {
+    state: PaceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_source: Option<DurationSource>,
+    complete_cycles: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct UsageWindow {
+    card_id: String,
     label: String,
     used_percent: f64,
     remaining_percent: f64,
     resets_at: Option<String>,
     reset_text: Option<String>,
-    /// Total length of this rate-limit window in minutes. Lets the frontend
-    /// derive a usage *pace* (expected vs actual at this point in the window).
+    pace_status: PaceStatusPayload,
+    historical_pace: Option<HistoricalPacePayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageWindowWire<'a> {
+    card_id: &'a str,
+    label: &'a str,
+    used_percent: f64,
+    remaining_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resets_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset_text: Option<&'a str>,
+    /// Compatibility mirror; it is never an independent source of duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
     window_minutes: Option<i64>,
-    /// Legacy pace placeholder retained until the v3 wire cutover. Production
-    /// mappings no longer populate it, so serde omits it while it remains `None`.
+    pace_status: &'a PaceStatusPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
-    historical_expected_percent: Option<f64>,
-    /// Legacy companion to `historical_expected_percent`; likewise never populated.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    run_out_probability: Option<f64>,
+    historical_pace: Option<&'a HistoricalPacePayload>,
+}
+
+impl Serialize for UsageWindow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate_wire().map_err(serde::ser::Error::custom)?;
+        UsageWindowWire {
+            card_id: &self.card_id,
+            label: &self.label,
+            used_percent: self.used_percent,
+            remaining_percent: self.remaining_percent,
+            resets_at: self.resets_at.as_deref(),
+            reset_text: self.reset_text.as_deref(),
+            window_minutes: self
+                .pace_status
+                .duration_seconds
+                .map(|seconds| seconds / 60),
+            pace_status: &self.pace_status,
+            historical_pace: self.historical_pace.as_ref(),
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,44 +159,146 @@ pub struct CreditsSnapshot {
 }
 
 impl UsageWindow {
-    /// Build a window from a "remaining fraction" (0..1) — the shape Antigravity
-    /// reports per model. Used-percent is derived; pace/window fields stay empty.
+    /// Builds a display window before its provider assigns stable presentation
+    /// identity. Stage 3A deliberately does not infer duration from a label.
     pub(crate) fn from_fraction(
         label: String,
         remaining_fraction: f64,
         resets_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Self {
-        Self::from_used_percent(
-            label,
-            (1.0 - remaining_fraction) * 100.0,
-            resets_at,
-            now,
-            None,
-        )
+        Self::from_used_percent(label, (1.0 - remaining_fraction) * 100.0, resets_at, now)
     }
 
-    /// Build a window from an absolute used-percent (0..100), with optional
-    /// window length for pace. Clamps used into range and derives remaining.
     pub(crate) fn from_used_percent(
         label: String,
         used_percent: f64,
         resets_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
-        window_minutes: Option<i64>,
     ) -> Self {
         let used = used_percent.clamp(0.0, 100.0);
         let remaining = (100.0 - used).clamp(0.0, 100.0);
-        UsageWindow {
+        Self {
+            card_id: "row.unassigned.v1".to_string(),
             label,
             used_percent: used,
             remaining_percent: remaining,
             resets_at: resets_at.map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true)),
             reset_text: resets_at.map(|d| reset_text(d, now)),
-            window_minutes,
-            historical_expected_percent: None,
-            run_out_probability: None,
+            pace_status: PaceStatusPayload {
+                state: PaceState::Unavailable,
+                window_key: None,
+                duration_seconds: None,
+                duration_source: None,
+                complete_cycles: 0,
+                reason: Some("windowIdentity".to_string()),
+            },
+            historical_pace: None,
         }
+    }
+
+    pub(crate) fn with_identity(
+        mut self,
+        card_id: impl Into<String>,
+        window_key: Option<String>,
+    ) -> Self {
+        self.card_id = card_id.into();
+        self.pace_status = match (window_key, self.resets_at.is_some()) {
+            (None, _) => PaceStatusPayload {
+                state: PaceState::Unavailable,
+                window_key: None,
+                duration_seconds: None,
+                duration_source: None,
+                complete_cycles: 0,
+                reason: Some("windowIdentity".to_string()),
+            },
+            (Some(window_key), false) => PaceStatusPayload {
+                state: PaceState::Unavailable,
+                window_key: Some(window_key),
+                duration_seconds: None,
+                duration_source: None,
+                complete_cycles: 0,
+                reason: Some("missingReset".to_string()),
+            },
+            (Some(window_key), true) => PaceStatusPayload {
+                state: PaceState::LearningDuration,
+                window_key: Some(window_key),
+                duration_seconds: None,
+                duration_source: None,
+                complete_cycles: 0,
+                reason: None,
+            },
+        };
+        self.historical_pace = None;
+        self
+    }
+
+    fn validate_wire(&self) -> Result<(), String> {
+        if self.card_id.trim().is_empty() {
+            return Err("pace cardId must be non-empty".to_string());
+        }
+        if !self.used_percent.is_finite()
+            || !self.remaining_percent.is_finite()
+            || !(0.0..=100.0).contains(&self.used_percent)
+            || !(0.0..=100.0).contains(&self.remaining_percent)
+            || ((self.used_percent + self.remaining_percent) - 100.0).abs() > 1e-6
+        {
+            return Err("usage percentages must be finite, bounded, and complementary".to_string());
+        }
+        let has_window_key = self
+            .pace_status
+            .window_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        if self.pace_status.window_key.is_some() && !has_window_key {
+            return Err("pace windowKey must be non-empty".to_string());
+        }
+        let identity_unavailable = self.pace_status.state == PaceState::Unavailable
+            && self.pace_status.reason.as_deref() == Some("windowIdentity");
+        if has_window_key == identity_unavailable {
+            return Err("pace window identity invariant failed".to_string());
+        }
+        let has_duration = self.pace_status.duration_seconds.is_some();
+        let observed_learning_source = self.pace_status.state == PaceState::LearningDuration
+            && self.pace_status.duration_source == Some(DurationSource::Observed);
+        if self.pace_status.duration_seconds.is_some_and(|duration| duration <= 0)
+            || (has_duration != self.pace_status.duration_source.is_some() && !observed_learning_source)
+        {
+            return Err("pace duration invariant failed".to_string());
+        }
+        match self.pace_status.state {
+            PaceState::LearningDuration => {
+                if has_duration || self.historical_pace.is_some() || self.pace_status.reason.is_some() {
+                    return Err("learningDuration pace invariant failed".to_string());
+                }
+            }
+            PaceState::LearningHistory => {
+                if !has_duration || self.historical_pace.is_some() || self.pace_status.reason.is_some() {
+                    return Err("learningHistory pace invariant failed".to_string());
+                }
+            }
+            PaceState::Available => {
+                if !has_duration || self.historical_pace.is_none() || self.pace_status.reason.is_some() {
+                    return Err("available pace invariant failed".to_string());
+                }
+            }
+            PaceState::Unavailable => {
+                if self.historical_pace.is_some() || self.pace_status.reason.is_none() {
+                    return Err("unavailable pace invariant failed".to_string());
+                }
+            }
+        }
+        if let Some(historical) = &self.historical_pace {
+            if !historical.expected_used_percent.is_finite()
+                || !(0.0..=100.0).contains(&historical.expected_used_percent)
+                || historical.eta_seconds.is_some_and(|eta| !eta.is_finite() || eta < 0.0)
+                || historical.run_out_probability.is_some_and(|risk| !risk.is_finite() || !(0.0..=1.0).contains(&risk))
+                || (historical.eta_seconds.is_none() != historical.will_last_to_reset)
+            {
+                return Err("historicalPace contains contradictory values".to_string());
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -135,6 +309,21 @@ impl UsageWindow {
     #[cfg(test)]
     pub(crate) fn remaining_for_test(&self) -> f64 {
         self.remaining_percent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_id_for_test(&self) -> &str {
+        &self.card_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pace_window_key_for_test(&self) -> Option<&str> {
+        self.pace_status.window_key.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pace_reason_for_test(&self) -> Option<&str> {
+        self.pace_status.reason.as_deref()
     }
 }
 
@@ -327,11 +516,30 @@ pub async fn run() -> AgentUsagePayload {
     if let Some(grok) = grok {
         agents.push(grok);
     }
+    for snapshot in &mut agents {
+        retain_unique_windows(&mut snapshot.windows);
+    }
     AgentUsagePayload {
         generated_at,
         agents,
         opencode_subscriptions: crate::opencode_integrations::detect_subscriptions(),
     }
+}
+
+fn retain_unique_windows(windows: &mut Vec<UsageWindow>) {
+    let mut card_ids = HashSet::new();
+    let mut window_keys = HashSet::new();
+    windows.retain(|window| {
+        let key = window.pace_status.window_key.as_ref();
+        if card_ids.contains(&window.card_id) || key.is_some_and(|key| window_keys.contains(key)) {
+            return false;
+        }
+        card_ids.insert(window.card_id.clone());
+        if let Some(key) = key {
+            window_keys.insert(key.clone());
+        }
+        true
+    });
 }
 
 async fn fetch_grok() -> Option<AgentUsageSnapshot> {
@@ -1597,38 +1805,49 @@ fn codex_windows(
 ) -> Vec<UsageWindow> {
     let mut windows = Vec::new();
     if let Some(rate_limit) = rate_limit {
-        let mut primary = rate_limit.primary_window.clone();
-        let mut secondary = rate_limit.secondary_window.clone();
-        if role(primary.as_ref()) == Some("weekly") && role(secondary.as_ref()) != Some("weekly") {
-            std::mem::swap(&mut primary, &mut secondary);
-        }
-
-        if let Some(window) = primary {
-            windows.push(map_window("Session", window, now));
-        }
-        if let Some(window) = secondary {
-            windows.push(map_window("Weekly", window, now));
+        let mut main = [
+            ("primary", rate_limit.primary_window.clone()),
+            ("secondary", rate_limit.secondary_window.clone()),
+        ];
+        main.sort_by_key(|(_, window)| match window.as_ref().map(|window| window.limit_window_seconds) {
+            Some(18_000) => 0,
+            Some(604_800) => 1,
+            _ => 2,
+        });
+        for (slot, window) in main
+            .into_iter()
+            .filter_map(|(slot, window)| window.map(|window| (slot, window)))
+        {
+            let (label, card_id, window_key) = match window.limit_window_seconds {
+                18_000 => ("Session", "main.session.v1".to_string(), Some("main.session.v1".to_string())),
+                604_800 => ("Weekly", "main.weekly.v1".to_string(), Some("main.weekly.v1".to_string())),
+                _ => ("Unknown", format!("row.main.{slot}.v1"), None),
+            };
+            if let Some(window) = map_window_with_identity(label, window, now, card_id, window_key) {
+                windows.push(window);
+            }
         }
     }
 
-    let mut seen = windows
-        .iter()
-        .map(|w| w.label.clone())
-        .collect::<HashSet<_>>();
     for extra in additional_rate_limits.unwrap_or(&[]) {
         let Some(rate_limit) = extra.rate_limit.as_ref() else {
             continue;
         };
-        let Some(window) = rate_limit
-            .primary_window
-            .clone()
-            .or_else(|| rate_limit.secondary_window.clone())
-        else {
-            continue;
+        let (slot, window) = match (rate_limit.primary_window.clone(), rate_limit.secondary_window.clone()) {
+            (Some(window), _) => ("primary", window),
+            (None, Some(window)) => ("secondary", window),
+            (None, None) => continue,
         };
-        let label = additional_limit_label(extra);
-        if seen.insert(label.clone()) {
-            windows.push(map_window(&label, window, now));
+        let source = additional_limit_source(extra);
+        let (label, card_id, window_key) = match source {
+            Some(source) => {
+                let key = format!("additional.{}.{slot}.v1", sha256_hex(&source));
+                (additional_limit_label(extra), key.clone(), Some(key))
+            }
+            None => ("Unknown".to_string(), format!("row.additional.unknown.{slot}.v1"), None),
+        };
+        if let Some(window) = map_window_with_identity(&label, window, now, card_id, window_key) {
+            windows.push(window);
         }
     }
     windows
@@ -1636,19 +1855,26 @@ fn codex_windows(
 
 fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageWindow> {
     let mut windows = Vec::new();
-    push_claude_window(&mut windows, "Session", usage.five_hour.as_ref(), now);
-    push_claude_window(&mut windows, "Weekly", usage.seven_day.as_ref(), now);
+    push_claude_window(&mut windows, "Session", "session.v1", usage.five_hour.as_ref(), now);
+    push_claude_window(&mut windows, "Weekly", "weekly.v1", usage.seven_day.as_ref(), now);
     push_claude_window(
         &mut windows,
         "OAuth Apps",
+        "oauth_apps.weekly.v1",
         usage.seven_day_oauth_apps.as_ref(),
         now,
     );
-    push_claude_window(&mut windows, "Sonnet", usage.seven_day_sonnet.as_ref(), now);
-    push_claude_window(&mut windows, "Opus", usage.seven_day_opus.as_ref(), now);
-    push_claude_window(&mut windows, "Designs", usage.design_window(), now);
-    push_claude_window(&mut windows, "Daily Routines", usage.routines_window(), now);
-    if let Some(extra) = claude_extra_usage_window(usage.extra_usage.as_ref()) {
+    push_claude_window(&mut windows, "Sonnet", "sonnet.weekly.v1", usage.seven_day_sonnet.as_ref(), now);
+    push_claude_window(&mut windows, "Opus", "opus.weekly.v1", usage.seven_day_opus.as_ref(), now);
+    push_claude_window(&mut windows, "Designs", "design.weekly.v1", usage.design_window(), now);
+    push_claude_window(
+        &mut windows,
+        "Daily Routines",
+        "routines.weekly.v1",
+        usage.routines_window(),
+        now,
+    );
+    if let Some(extra) = claude_extra_usage_window(usage.extra_usage.as_ref(), now) {
         windows.push(extra);
     }
     windows
@@ -1689,31 +1915,27 @@ impl ClaudeUsageResponse {
 fn push_claude_window(
     windows: &mut Vec<UsageWindow>,
     label: &str,
+    window_key: &str,
     window: Option<&ClaudeWindow>,
     now: DateTime<Utc>,
 ) {
-    if let Some(mapped) = window.and_then(|window| map_claude_window(label, window, now)) {
+    if let Some(mapped) = window.and_then(|window| map_claude_window(label, window_key, window, now)) {
         windows.push(mapped);
     }
 }
 
 fn map_claude_window(
     label: &str,
+    window_key: &str,
     window: &ClaudeWindow,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let used = window.utilization?.clamp(0.0, 100.0);
+    let used = window.utilization?;
     let resets_at = window.resets_at.as_deref().and_then(parse_datetime);
-    Some(UsageWindow {
-        label: label.to_string(),
-        used_percent: used,
-        remaining_percent: (100.0 - used).max(0.0),
-        resets_at: resets_at.map(|date| date.to_rfc3339_opts(SecondsFormat::Millis, true)),
-        reset_text: resets_at.map(|date| reset_text(date, now)),
-        window_minutes: claude_window_minutes(label),
-        historical_expected_percent: None,
-        run_out_probability: None,
-    })
+    Some(
+        UsageWindow::from_used_percent(label.to_string(), used, resets_at, now)
+            .with_identity(window_key, Some(window_key.to_string())),
+    )
 }
 
 /// Parse the `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}` response
@@ -1733,16 +1955,18 @@ fn parse_unified_ratelimit_windows(
         headers.get(name)?.to_str().ok()?.trim().parse::<i64>().ok()
     };
     let mut windows = Vec::new();
-    if let Some(window) = unified_ratelimit_window(
+    if let Some(window) = unified_ratelimit_window_with_identity(
         "Session",
+        "session.v1",
         read_f64("anthropic-ratelimit-unified-5h-utilization"),
         read_i64("anthropic-ratelimit-unified-5h-reset"),
         now,
     ) {
         windows.push(window);
     }
-    if let Some(window) = unified_ratelimit_window(
+    if let Some(window) = unified_ratelimit_window_with_identity(
         "Weekly",
+        "weekly.v1",
         read_f64("anthropic-ratelimit-unified-7d-utilization"),
         read_i64("anthropic-ratelimit-unified-7d-reset"),
         now,
@@ -1756,29 +1980,45 @@ fn parse_unified_ratelimit_windows(
 /// (mirrors `map_claude_window`); reset is optional. `utilization_fraction` is
 /// 0..1 (scaled ×100); `reset_epoch_seconds` is Unix seconds (like the Codex
 /// `map_window` epoch handling).
+fn unified_ratelimit_window_with_identity(
+    label: &str,
+    window_key: &str,
+    utilization_fraction: Option<f64>,
+    reset_epoch_seconds: Option<i64>,
+    now: DateTime<Utc>,
+) -> Option<UsageWindow> {
+    let used = utilization_fraction? * 100.0;
+    let resets_at = reset_epoch_seconds
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single());
+    Some(
+        UsageWindow::from_used_percent(label.to_string(), used, resets_at, now)
+            .with_identity(window_key, Some(window_key.to_string())),
+    )
+}
+
+#[cfg(test)]
 fn unified_ratelimit_window(
     label: &str,
     utilization_fraction: Option<f64>,
     reset_epoch_seconds: Option<i64>,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let used = (utilization_fraction? * 100.0).clamp(0.0, 100.0);
-    let resets_at = reset_epoch_seconds
-        .filter(|seconds| *seconds > 0)
-        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single());
-    Some(UsageWindow {
-        label: label.to_string(),
-        used_percent: used,
-        remaining_percent: (100.0 - used).max(0.0),
-        resets_at: resets_at.map(|date| date.to_rfc3339_opts(SecondsFormat::Millis, true)),
-        reset_text: resets_at.map(|date| reset_text(date, now)),
-        window_minutes: claude_window_minutes(label),
-        historical_expected_percent: None,
-        run_out_probability: None,
-    })
+    let key = if label.eq_ignore_ascii_case("Session") {
+        "session.v1"
+    } else {
+        "weekly.v1"
+    };
+    unified_ratelimit_window_with_identity(
+        label,
+        key,
+        utilization_fraction,
+        reset_epoch_seconds,
+        now,
+    )
 }
 
-fn claude_extra_usage_window(extra: Option<&ClaudeExtraUsage>) -> Option<UsageWindow> {
+fn claude_extra_usage_window(extra: Option<&ClaudeExtraUsage>, now: DateTime<Utc>) -> Option<UsageWindow> {
     let extra = extra?;
     if !extra.is_enabled {
         return None;
@@ -1800,16 +2040,10 @@ fn claude_extra_usage_window(extra: Option<&ClaudeExtraUsage>) -> Option<UsageWi
         )),
         _ => None,
     };
-    Some(UsageWindow {
-        label: "Extra usage".to_string(),
-        used_percent: used.clamp(0.0, 100.0),
-        remaining_percent: (100.0 - used).max(0.0),
-        resets_at: None,
-        reset_text,
-        window_minutes: None,
-        historical_expected_percent: None,
-        run_out_probability: None,
-    })
+    let mut window = UsageWindow::from_used_percent("Extra usage".to_string(), used, None, now)
+        .with_identity("extra_usage.v1", Some("extra_usage.v1".to_string()));
+    window.reset_text = reset_text;
+    Some(window)
 }
 
 fn claude_credits(extra: Option<&ClaudeExtraUsage>) -> Option<CreditsSnapshot> {
@@ -1878,37 +2112,31 @@ fn clean_limit_label(value: &str) -> String {
         .join(" ")
 }
 
-fn map_window(label: &str, window: CodexWindow, now: DateTime<Utc>) -> UsageWindow {
-    let resets_at = if window.reset_at > 0 {
-        Utc.timestamp_opt(window.reset_at, 0).single()
-    } else {
-        None
-    };
-    let used = window.used_percent.clamp(0.0, 100.0);
-    UsageWindow {
-        label: label.to_string(),
-        used_percent: used,
-        remaining_percent: (100.0 - used).max(0.0),
-        resets_at: resets_at.map(|date| date.to_rfc3339_opts(SecondsFormat::Millis, true)),
-        reset_text: resets_at.map(|date| reset_text(date, now)),
-        window_minutes: (window.limit_window_seconds > 0).then_some(window.limit_window_seconds / 60),
-        historical_expected_percent: None,
-        run_out_probability: None,
-    }
+fn map_window_with_identity(
+    label: &str,
+    window: CodexWindow,
+    now: DateTime<Utc>,
+    card_id: impl Into<String>,
+    window_key: Option<String>,
+) -> Option<UsageWindow> {
+    let resets_at = (window.reset_at > 0)
+        .then(|| Utc.timestamp_opt(window.reset_at, 0).single())
+        .flatten();
+    (window.used_percent.is_finite() && (0.0..=100.0).contains(&window.used_percent)).then(|| {
+        UsageWindow::from_used_percent(label.to_string(), window.used_percent, resets_at, now)
+            .with_identity(card_id, window_key)
+    })
 }
 
-/// Standard Claude window lengths by label, since the API doesn't report them:
-/// the session bucket is 5h, everything else is the 7-day weekly family.
-fn claude_window_minutes(label: &str) -> Option<i64> {
-    Some(if label.eq_ignore_ascii_case("Session") { 300 } else { 10_080 })
+fn additional_limit_source(limit: &CodexAdditionalRateLimit) -> Option<String> {
+    first_non_empty([limit.metered_feature.as_deref(), limit.limit_name.as_deref()]).map(str::to_string)
 }
 
-fn role(window: Option<&CodexWindow>) -> Option<&'static str> {
-    match window?.limit_window_seconds {
-        18_000 => Some("session"),
-        604_800 => Some("weekly"),
-        _ => None,
-    }
+fn sha256_hex(value: &str) -> String {
+    Sha256::digest(value.trim().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn reset_text(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -2106,6 +2334,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serializes_stage3a_pace_states_without_legacy_scalars() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let ready = UsageWindow::from_used_percent(
+            "Known".to_string(),
+            20.0,
+            Some(now + chrono::Duration::hours(1)),
+            now,
+        )
+        .with_identity("known.v1", Some("known.v1".to_string()));
+        let missing_reset = UsageWindow::from_used_percent("No reset".to_string(), 20.0, None, now)
+            .with_identity("no_reset.v1", Some("no_reset.v1".to_string()));
+        let unknown = UsageWindow::from_used_percent(
+            "Unknown".to_string(),
+            20.0,
+            Some(now + chrono::Duration::hours(1)),
+            now,
+        )
+        .with_identity("row.unknown.v1", None);
+
+        let values = [ready, missing_reset, unknown]
+            .into_iter()
+            .map(|window| serde_json::to_value(window).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values[0]["cardId"], "known.v1");
+        assert_eq!(values[0]["paceStatus"]["state"], "learningDuration");
+        assert_eq!(values[1]["paceStatus"]["state"], "unavailable");
+        assert_eq!(values[1]["paceStatus"]["reason"], "missingReset");
+        assert_eq!(values[2]["paceStatus"]["state"], "unavailable");
+        assert_eq!(values[2]["paceStatus"]["reason"], "windowIdentity");
+        for value in values {
+            assert!(value.get("paceStatus").is_some());
+            assert!(value.get("historicalPace").is_none());
+            assert!(value.get("windowMinutes").is_none());
+            assert!(value.get("historicalExpectedPercent").is_none());
+            assert!(value.get("runOutProbability").is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_usage_window_wire() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let mut window = UsageWindow::from_used_percent(
+            "Known".to_string(),
+            20.0,
+            Some(now + chrono::Duration::hours(1)),
+            now,
+        )
+        .with_identity("known.v1", Some("known.v1".to_string()));
+        window.card_id.clear();
+        assert!(serde_json::to_value(&window).is_err());
+        window.card_id = "known.v1".to_string();
+        window.used_percent = f64::NAN;
+        assert!(serde_json::to_value(&window).is_err());
+    }
+
+    #[test]
+    fn retain_unique_windows_drops_later_card_or_window_identity() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let first = UsageWindow::from_used_percent(
+            "First".to_string(),
+            20.0,
+            Some(now + chrono::Duration::hours(1)),
+            now,
+        )
+        .with_identity("card.a.v1", Some("window.a.v1".to_string()));
+        let duplicate_card = UsageWindow::from_used_percent(
+            "Later card".to_string(),
+            30.0,
+            Some(now + chrono::Duration::hours(1)),
+            now,
+        )
+        .with_identity("card.a.v1", Some("window.b.v1".to_string()));
+        let duplicate_key = UsageWindow::from_used_percent(
+            "Later key".to_string(),
+            40.0,
+            Some(now + chrono::Duration::hours(1)),
+            now,
+        )
+        .with_identity("card.c.v1", Some("window.a.v1".to_string()));
+        let mut windows = vec![first, duplicate_card, duplicate_key];
+        retain_unique_windows(&mut windows);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label_for_test(), "First");
+    }
+
+    #[test]
     fn parses_retry_after_seconds_and_http_date() {
         let header = reqwest::header::HeaderValue::from_static("120");
         let parsed = parse_retry_after(Some(&header)).unwrap();
@@ -2148,16 +2462,10 @@ mod tests {
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: None,
-            windows: vec![UsageWindow {
-                label: "Session".to_string(),
-                used_percent: 20.0,
-                remaining_percent: 80.0,
-                resets_at: None,
-                reset_text: None,
-                window_minutes: Some(300),
-                historical_expected_percent: None,
-                run_out_probability: None,
-            }],
+            windows: vec![
+                UsageWindow::from_used_percent("Session".to_string(), 20.0, None, now)
+                    .with_identity("session.v1", Some("session.v1".to_string())),
+            ],
             credits: None,
             error: None,
         };
@@ -2191,8 +2499,12 @@ mod tests {
         let windows = codex_windows(Some(&rate_limit), None, now);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].card_id_for_test(), "main.session.v1");
+        assert_eq!(windows[0].pace_window_key_for_test(), Some("main.session.v1"));
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
+        assert_eq!(windows[1].card_id_for_test(), "main.weekly.v1");
+        assert_eq!(windows[1].pace_window_key_for_test(), Some("main.weekly.v1"));
         assert_eq!(windows[1].remaining_percent, 65.0);
     }
 
@@ -2228,11 +2540,15 @@ mod tests {
             .find(|window| window["label"] == "Weekly")
             .expect("normal Codex Weekly mapping");
         let object = weekly.as_object().unwrap();
+        assert_eq!(object["cardId"], "main.weekly.v1");
         assert_eq!(object["usedPercent"], 35.0);
         assert_eq!(object["remainingPercent"], 65.0);
-        assert_eq!(object["windowMinutes"], 10_080);
+        assert_eq!(object["paceStatus"]["state"], "learningDuration");
+        assert_eq!(object["paceStatus"]["windowKey"], "main.weekly.v1");
+        assert!(!object.contains_key("windowMinutes"));
         assert!(!object.contains_key("historicalExpectedPercent"));
         assert!(!object.contains_key("runOutProbability"));
+        assert!(!object.contains_key("historicalPace"));
     }
 
     #[test]
@@ -2253,6 +2569,10 @@ mod tests {
         let windows = codex_windows(None, Some(&[extra]), now);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label, "Codex Spark");
+        assert_eq!(
+            windows[0].card_id_for_test(),
+            format!("additional.{}.primary.v1", sha256_hex("gpt-5.2-codex-spark"))
+        );
         assert_eq!(windows[0].remaining_percent, 59.0);
     }
 
@@ -2356,12 +2676,19 @@ mod tests {
         let windows = claude_windows(&usage, now);
         assert_eq!(windows.len(), 4);
         assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].card_id_for_test(), "session.v1");
+        assert_eq!(windows[0].pace_window_key_for_test(), Some("session.v1"));
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
+        assert_eq!(windows[1].card_id_for_test(), "weekly.v1");
+        assert_eq!(windows[1].pace_window_key_for_test(), Some("weekly.v1"));
         assert_eq!(windows[1].remaining_percent, 77.0);
         assert_eq!(windows[2].label, "Sonnet");
+        assert_eq!(windows[2].card_id_for_test(), "sonnet.weekly.v1");
+        assert_eq!(windows[2].pace_reason_for_test(), Some("missingReset"));
         assert_eq!(windows[2].remaining_percent, 97.0);
         assert_eq!(windows[3].label, "Designs");
+        assert_eq!(windows[3].card_id_for_test(), "design.weekly.v1");
         assert_eq!(windows[3].remaining_percent, 100.0);
     }
 
@@ -2407,15 +2734,17 @@ mod tests {
         let windows = parse_unified_ratelimit_windows(&headers, now);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].card_id_for_test(), "session.v1");
+        assert_eq!(windows[0].pace_window_key_for_test(), Some("session.v1"));
         assert!((windows[0].used_percent - 11.0).abs() < 1e-9);
         assert!((windows[0].remaining_percent - 89.0).abs() < 1e-9);
-        assert_eq!(windows[0].window_minutes, Some(300));
         assert!(windows[0].resets_at.is_some());
         assert!(windows[0].reset_text.is_some());
         assert_eq!(windows[1].label, "Weekly");
+        assert_eq!(windows[1].card_id_for_test(), "weekly.v1");
+        assert_eq!(windows[1].pace_window_key_for_test(), Some("weekly.v1"));
         assert!((windows[1].used_percent - 60.0).abs() < 1e-9);
         assert!((windows[1].remaining_percent - 40.0).abs() < 1e-9);
-        assert_eq!(windows[1].window_minutes, Some(10_080));
     }
 
     #[test]

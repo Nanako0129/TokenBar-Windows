@@ -39,7 +39,9 @@ char *tb_usage_trace(int64_t window_secs);
 // Live rate: {"tokensPerMin": <number>} (10-minute-window average).
 char *tb_tokens_per_min(void);
 
-// OAuth quota cards (AgentUsagePayload) for codex/claude/antigravity/copilot.
+// OAuth quota cards (AgentUsagePayload) for codex/claude/grok/antigravity/copilot.
+// Each quota window has a stable cardId and typed paceStatus; historicalPace is
+// present only when the Rust core has a coherent historical projection.
 // Network-bound; per-provider failures are reported inside each snapshot.
 char *tb_agent_usage(void);
 
