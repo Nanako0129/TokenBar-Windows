@@ -1283,10 +1283,17 @@ fn open_refresh_lock_file<B: Backend>(
 fn sync_directory<B: Backend>(backend: &B, directory: &Path) -> io::Result<()> {
     backend.before_fs(FsOperation::SyncDirectory)?;
     #[cfg(target_os = "windows")]
-    if backend.uses_windows_secure_storage() {
-        let directory = crate::agent_storage_windows::ensure_secure_storage_directory(directory)?;
-        return crate::agent_storage_windows::flush_secure_storage_directory(&directory);
+    {
+        if backend.uses_windows_secure_storage() {
+            let directory =
+                crate::agent_storage_windows::ensure_secure_storage_directory(directory)?;
+            return crate::agent_storage_windows::flush_secure_storage_directory(&directory);
+        }
+        // Production SystemBackend is always secure on Windows. This fallback is only for
+        // injected/non-production backends because std File cannot open a flushable directory.
+        return Ok(());
     }
+    #[cfg(not(target_os = "windows"))]
     File::open(directory)?.sync_all()
 }
 
@@ -3727,6 +3734,130 @@ mod tests {
         assert_no_windows_secure_temp(&backend.directory, INSTALLATION_KEY_FILE);
         assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
         backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_conflicting_lineage_transfers_have_one_persistent_winner() {
+        let backend =
+            TestBackend::new("windows-secure-transfer-conflict").with_windows_secure_storage();
+        let setup_lock = Mutex::new(());
+        let scope_a =
+            resolve_credential_with(&backend, &setup_lock, "claude", "file", "slot-a", b"old-a")
+                .unwrap();
+        let scope_b =
+            resolve_credential_with(&backend, &setup_lock, "claude", "file", "slot-b", b"old-b")
+                .unwrap();
+        assert_ne!(scope_a, scope_b);
+        let key = installation_key(&backend);
+        let start = Arc::new(Barrier::new(3));
+
+        let one_backend = backend.clone();
+        let one_start = start.clone();
+        let one = thread::spawn(move || {
+            let process_lock = Mutex::new(());
+            one_start.wait();
+            transfer_credential_with(
+                &one_backend,
+                &process_lock,
+                &key,
+                "claude",
+                "file",
+                "slot-a",
+                b"old-a",
+                b"shared-new",
+            )
+        });
+        let two_backend = backend.clone();
+        let two_start = start.clone();
+        let two = thread::spawn(move || {
+            let process_lock = Mutex::new(());
+            two_start.wait();
+            transfer_credential_with(
+                &two_backend,
+                &process_lock,
+                &key,
+                "claude",
+                "file",
+                "slot-b",
+                b"old-b",
+                b"shared-new",
+            )
+        });
+        start.wait();
+
+        let winner = match [one.join().unwrap(), two.join().unwrap()] {
+            [Ok(winner), Err(AccountScopeError::MetadataConflict)] => {
+                assert_eq!(winner, scope_a);
+                winner
+            }
+            [Err(AccountScopeError::MetadataConflict), Ok(winner)] => {
+                assert_eq!(winner, scope_b);
+                winner
+            }
+            results => panic!("unexpected secure transfer results: {results:?}"),
+        };
+        let restarted = backend.clone();
+        assert_eq!(
+            resolve_credential_with(
+                &restarted,
+                &Mutex::new(()),
+                "claude",
+                "file",
+                "restart-slot",
+                b"shared-new",
+            )
+            .unwrap(),
+            winner
+        );
+
+        assert_eq!(
+            windows_secure_file_snapshot(&installation_key_path(&backend)).0,
+            key.to_vec()
+        );
+        let metadata = windows_secure_file_snapshot(&backend.directory.join(METADATA_FILE));
+        decode_metadata(&key, &metadata.0).unwrap();
+        windows_secure_file_snapshot(&backend.directory.join(METADATA_LOCK_FILE));
+        assert_no_windows_secure_temp(&backend.directory, INSTALLATION_KEY_FILE);
+        assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
+        backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_atomic_failpoints_preserve_authenticated_last_good_file() {
+        for operation in [
+            FsOperation::CreateTemp,
+            FsOperation::WriteTemp,
+            FsOperation::SyncTemp,
+            FsOperation::ReplaceFile,
+        ] {
+            let backend =
+                TestBackend::new("windows-secure-atomic-failpoint").with_windows_secure_storage();
+            let lock = Mutex::new(());
+            let old_scope = resolve_test(&backend, &lock, b"old-marker").unwrap();
+            let key = installation_key(&backend);
+            let metadata_path = backend.directory.join(METADATA_FILE);
+            let last_good = windows_secure_file_snapshot(&metadata_path);
+            backend.fail_fs(operation);
+
+            assert_eq!(
+                resolve_test(&backend, &lock, b"new-marker"),
+                Err(AccountScopeError::MetadataWrite),
+                "{operation:?}"
+            );
+            let after_failure = windows_secure_file_snapshot(&metadata_path);
+            assert_eq!(after_failure, last_good, "{operation:?}");
+            decode_metadata(&key, &after_failure.0).unwrap();
+            assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
+            assert_eq!(
+                resolve_test(&backend, &lock, b"old-marker").unwrap(),
+                old_scope,
+                "{operation:?}"
+            );
+            assert_no_windows_secure_temp(&backend.directory, METADATA_FILE);
+            backend.cleanup();
+        }
     }
 
     #[cfg(target_os = "windows")]
