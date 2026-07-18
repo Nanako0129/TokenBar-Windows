@@ -1107,16 +1107,42 @@ async fn fetch_grok() -> Option<AgentUsageSnapshot> {
 }
 
 async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
-    // No opencode Copilot auth → no card at all (rather than an error row).
-    crate::opencode_integrations::github_copilot_token()?;
-    let now = Utc::now();
-    Some(match agent_copilot::fetch(now).await {
+    fetch_copilot_with(
+        crate::opencode_integrations::github_copilot_credential(),
+        Utc::now(),
+        agent_copilot::fetch,
+    )
+    .await
+}
+
+async fn fetch_copilot_with<Fetch, FetchFuture>(
+    credential: Option<crate::opencode_integrations::GitHubCopilotCredential>,
+    now: DateTime<Utc>,
+    fetch: Fetch,
+) -> Option<AgentUsageSnapshot>
+where
+    Fetch: FnOnce(
+        DateTime<Utc>,
+        crate::opencode_integrations::GitHubCopilotCredential,
+    ) -> FetchFuture,
+    FetchFuture: std::future::Future<Output = Result<agent_copilot::CopilotData, String>>,
+{
+    // No exact opencode github-copilot OAuth credential means no card and no network.
+    let credential = credential?;
+    Some(finalize_copilot_snapshot(fetch(now, credential).await, now))
+}
+
+fn finalize_copilot_snapshot(
+    fetched: Result<agent_copilot::CopilotData, String>,
+    now: DateTime<Utc>,
+) -> AgentUsageSnapshot {
+    match fetched {
         Ok(data) => AgentUsageSnapshot {
             client_id: "copilot".to_string(),
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: data.identity,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
+            account_scope: data.account_scope,
             windows: data.windows,
             credits: None,
             error: None,
@@ -1131,7 +1157,7 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
             credits: None,
             error: Some(error),
         },
-    })
+    }
 }
 
 fn finalize_antigravity_snapshot_with<F>(
@@ -3329,6 +3355,27 @@ mod tests {
     use super::*;
     use crate::agent_account_scope::test_support::TestRefreshScope;
 
+    static COPILOT_TEMP_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn copilot_auth_path(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tb-usage-copilot-{tag}-{}-{}",
+            std::process::id(),
+            COPILOT_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root.join("auth.json")
+    }
+
+    fn copilot_credential(
+        path: &Path,
+        json: &serde_json::Value,
+    ) -> Option<crate::opencode_integrations::GitHubCopilotCredential> {
+        std::fs::write(path, serde_json::to_vec(json).unwrap()).unwrap();
+        crate::opencode_integrations::github_copilot_credential_from(path, json)
+    }
+
     fn enrichment_scope(tag: &str) -> (TestRefreshScope, AccountScope) {
         let scope = TestRefreshScope::new("fixture", tag);
         let account_scope = scope
@@ -3392,6 +3439,135 @@ mod tests {
                 .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
                 .with_unavailable_reason("nonRecurring"),
         ]
+    }
+
+    #[tokio::test]
+    async fn copilot_blank_or_missing_credential_skips_fetch() {
+        let path = copilot_auth_path("no-credential");
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let calls = std::cell::Cell::new(0);
+        for json in [
+            serde_json::json!({}),
+            serde_json::json!({"github-copilot": {
+                "type": "oauth", "refresh": "  ", "access": "\t\n"
+            }}),
+            serde_json::json!({
+                "github-copilot": {"type": "oauth"},
+                "copilot": {"type": "oauth", "refresh": "foreign-token"}
+            }),
+        ] {
+            let snapshot = fetch_copilot_with(copilot_credential(&path, &json), now, |_, _| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err::<agent_copilot::CopilotData, String>(
+                    "network must not run".to_string(),
+                ))
+            })
+            .await;
+            assert!(snapshot.is_none());
+        }
+        assert_eq!(calls.get(), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn copilot_snapshot_transmits_scope_without_enabling_history_or_wire_metadata() {
+        let path = copilot_auth_path("snapshot");
+        let credential = copilot_credential(
+            &path,
+            &serde_json::json!({"github-copilot": {
+                "type": "oauth",
+                "refresh": " fake-copilot-marker ",
+                "access": "unused-access-token"
+            }}),
+        );
+        let location = crate::agent_account_scope::canonical_file_location(
+            &path,
+            Some("github-copilot"),
+        )
+        .unwrap();
+        let scope_store = TestRefreshScope::new("copilot", "copilot-central-snapshot");
+        let now = Utc.timestamp_opt(1_751_328_000, 0).single().unwrap();
+        let reset = now + chrono::Duration::days(30);
+        let premium = UsageWindow::from_fraction("Premium".to_string(), 0.30, Some(reset), now)
+            .with_identity(
+                "premium_interactions.v1",
+                Some("premium_interactions.v1".to_string()),
+            );
+        let chat = UsageWindow::from_fraction("Chat".to_string(), 0.75, Some(reset), now)
+            .with_identity("chat.v1", Some("chat.v1".to_string()));
+        let snapshot = fetch_copilot_with(credential, now, |request_now, credential| {
+            assert_eq!(request_now, now);
+            assert_eq!(credential.request_token, "fake-copilot-marker");
+            assert_eq!(credential.marker, b"fake-copilot-marker");
+            assert_eq!(credential.semantic_source, "opencode-auth-json");
+            assert_eq!(credential.canonical_location, location);
+            let account_scope = scope_store.resolve_current(
+                credential.semantic_source,
+                &credential.canonical_location,
+                &credential.marker,
+            );
+            std::future::ready(Ok(agent_copilot::CopilotData {
+                identity: None,
+                account_scope,
+                windows: vec![premium, chat],
+            }))
+        })
+        .await
+        .unwrap();
+        let account_scope = snapshot.account_scope.as_ref().unwrap();
+        let opaque_scope = account_scope.as_str().to_string();
+        assert_eq!(snapshot.windows.len(), 2);
+        let premium_key = snapshot.windows[0].pace_window_key_for_test().unwrap();
+        let chat_key = snapshot.windows[1].pace_window_key_for_test().unwrap();
+        assert_eq!(premium_key, "premium_interactions.v1");
+        assert_eq!(chat_key, "chat.v1");
+        let premium_series = SeriesKey::new("copilot", account_scope.as_str(), premium_key);
+        let chat_series = SeriesKey::new("copilot", account_scope.as_str(), chat_key);
+        assert_eq!(premium_series.account_scope, chat_series.account_scope);
+        assert_ne!(premium_series.window_key, chat_series.window_key);
+        for window in &snapshot.windows {
+            assert_eq!(window.pace_status.state, PaceState::LearningDuration);
+            assert!(window.pace_status.duration_seconds.is_none());
+            assert!(window.pace_status.duration_source.is_none());
+            assert!(window.historical_pace.is_none());
+        }
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("accountScope"));
+        assert!(!wire.contains("fake-copilot-marker"));
+        assert!(!wire.contains("unused-access-token"));
+        assert!(!wire.contains(path.to_string_lossy().as_ref()));
+        assert!(!wire.contains(&location));
+        assert!(!wire.contains(&opaque_scope));
+
+        let mut failed_scope = finalize_copilot_snapshot(
+            Ok(agent_copilot::CopilotData {
+                identity: None,
+                account_scope: Err(AccountScopeError::MetadataWrite),
+                windows: snapshot.windows.clone(),
+            }),
+            now,
+        );
+        let history_calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut failed_scope, now, |_, _, _| {
+            history_calls.set(history_calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(history_calls.get(), 0);
+        assert_eq!(failed_scope.windows.len(), 2);
+        assert!(failed_scope
+            .windows
+            .iter()
+            .all(|window| window.pace_reason_for_test() == Some("accountScope")));
+
+        let api_error = finalize_copilot_snapshot(
+            Err("Copilot usage API returned 503.".to_string()),
+            now,
+        );
+        assert_eq!(api_error.account_scope, Err(AccountScopeError::NoTrustedEvidence));
+        assert!(api_error.windows.is_empty());
+        assert_eq!(api_error.error.as_deref(), Some("Copilot usage API returned 503."));
+        scope_store.cleanup();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
