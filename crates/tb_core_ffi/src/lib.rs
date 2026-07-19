@@ -53,6 +53,56 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
     )
 }
 
+/// Snapshot the local source roots used by every FFI report and parse path.
+/// Environment roots are process-startup configuration: changing them requires
+/// restarting the FFI process. Cache keys intentionally do not fingerprint roots.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalSourceContext {
+    home_dir: Option<PathBuf>,
+}
+
+impl LocalSourceContext {
+    pub(crate) fn current() -> Self {
+        Self {
+            home_dir: user_home_dir(),
+        }
+    }
+
+    pub(crate) fn report_options(
+        &self,
+        year: Option<String>,
+        clients: Option<Vec<String>>,
+    ) -> tokscale_core::ReportOptions {
+        tokscale_core::ReportOptions {
+            home_dir: self
+                .home_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            use_env_roots: true,
+            year,
+            clients,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn parse_options(
+        &self,
+        year: Option<String>,
+        clients: Option<Vec<String>>,
+    ) -> tokscale_core::LocalParseOptions {
+        tokscale_core::LocalParseOptions {
+            home_dir: self
+                .home_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            use_env_roots: true,
+            year,
+            clients,
+            ..Default::default()
+        }
+    }
+}
+
 /// Serve `tb_graph` from cache when the last computation is at most this old;
 /// `tb_refresh_graph` always recomputes. Mirrors the Tauri app's oneshot cache.
 const ONESHOT_MAX_AGE_SECS: u64 = 30;
@@ -208,7 +258,8 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     // briefly to re-stamp so the next calls inside the oneshot window skip the
     // probe entirely. A lost re-stamp (entry evicted/replaced meanwhile) just
     // degrades to the next call re-probing — benign.
-    let fresh = tokscale_core::latest_source_mtime_ms(&Default::default()).ok()?;
+    let context = LocalSourceContext::current();
+    let fresh = tokscale_core::latest_source_mtime_ms(&context.parse_options(None, None)).ok()?;
     if fresh == token {
         let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = cache.get_mut(year) {
@@ -222,9 +273,12 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
 fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
     // Probe before parsing: a write that lands mid-compute moves the mtime
     // past this token, so the next aged-out read recomputes rather than
-    // serving a graph that missed it.
-    let token = tokscale_core::latest_source_mtime_ms(&Default::default()).unwrap_or(0);
-    let data = usage_graph::run(year)?;
+    // serving a graph that missed it. Keep the same context for both paths so
+    // the mtime token and report scan observe identical source roots.
+    let context = LocalSourceContext::current();
+    let token = tokscale_core::latest_source_mtime_ms(&context.parse_options(None, None))
+        .unwrap_or(0);
+    let data = usage_graph::run(&context, year)?;
     GRAPH_CACHE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -285,8 +339,8 @@ fn tail_tick_if_stale() {
 #[no_mangle]
 pub extern "C" fn tb_probe() -> *mut c_char {
     guarded("tb_probe", || {
-        let opts = tokscale_core::LocalParseOptions::default();
-        let json = match tokscale_core::parse_local_clients(opts) {
+        let context = LocalSourceContext::current();
+        let json = match tokscale_core::parse_local_clients(context.parse_options(None, None)) {
             Ok(pm) => format!(r#"{{"ok":true,"messages":{}}}"#, pm.messages.len()),
             Err(e) => serde_json::json!({"ok": false, "err": e}).to_string(),
         };
@@ -330,7 +384,8 @@ pub unsafe extern "C" fn tb_refresh_graph(year: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_model_report(year: *const c_char) -> *mut c_char {
     guarded("tb_model_report", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| model_report::run(&year)))
+        let context = LocalSourceContext::current();
+        envelope(unsafe { year_from(year) }.and_then(|year| model_report::run(&context, &year)))
     })
 }
 
@@ -347,9 +402,10 @@ pub unsafe extern "C" fn tb_hourly_report(
     clients: *const c_char,
 ) -> *mut c_char {
     guarded("tb_hourly_report", || {
+        let context = LocalSourceContext::current();
         envelope(unsafe { year_from(year) }.and_then(|year| {
             let clients = unsafe { clients_from(clients) }?;
-            hourly_report::run(&year, clients)
+            hourly_report::run(&context, &year, clients)
         }))
     })
 }
@@ -368,9 +424,10 @@ pub unsafe extern "C" fn tb_agents_report(
     clients: *const c_char,
 ) -> *mut c_char {
     guarded("tb_agents_report", || {
+        let context = LocalSourceContext::current();
         envelope(unsafe { year_from(year) }.and_then(|year| {
             let clients = unsafe { clients_from(clients) }?;
-            agents_report::run(&year, clients)
+            agents_report::run(&context, &year, clients)
         }))
     })
 }
@@ -465,6 +522,29 @@ mod tests {
     #[test]
     fn select_user_home_returns_none_without_candidates() {
         assert_eq!(select_user_home(None, None), None);
+    }
+
+    #[test]
+    fn local_source_context_builders_preserve_home_filters_and_env_roots() {
+        let platform_home = PathBuf::from("platform-home");
+        let context = LocalSourceContext {
+            home_dir: select_user_home(None, Some(platform_home.clone())),
+        };
+        let year = Some("2026".to_string());
+        let clients = Some(vec!["claude".to_string(), "codex".to_string()]);
+
+        let report = context.report_options(year.clone(), clients.clone());
+        let parse = context.parse_options(year.clone(), clients.clone());
+        let expected_home = Some(platform_home.to_string_lossy().into_owned());
+
+        assert_eq!(report.home_dir, expected_home);
+        assert_eq!(parse.home_dir, expected_home);
+        assert!(report.use_env_roots);
+        assert!(parse.use_env_roots);
+        assert_eq!(report.year, year);
+        assert_eq!(parse.year, year);
+        assert_eq!(report.clients, clients);
+        assert_eq!(parse.clients, clients);
     }
 
     /// Read a heap JSON pointer into an owned String and free it — the test-side
