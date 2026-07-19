@@ -938,6 +938,13 @@ fn ensure_storage_dir<B: Backend>(backend: &B) -> Result<PathBuf, AccountScopeEr
     backend
         .before_fs(FsOperation::CreateDirectory)
         .map_err(|_| AccountScopeError::StorageUnavailable)?;
+    #[cfg(target_os = "windows")]
+    let directory = if backend.uses_windows_secure_storage() {
+        crate::agent_storage_windows::resolve_secure_storage_directory(&directory)
+            .map_err(|_| AccountScopeError::StorageUnavailable)?
+    } else {
+        directory
+    };
     ensure_real_directory(backend, &directory)
         .map_err(|_| AccountScopeError::StorageUnavailable)?;
     Ok(directory)
@@ -3563,6 +3570,54 @@ mod tests {
         let second = resolve_test(&restarted, &Mutex::new(()), b"marker").unwrap();
         assert_eq!(first, second);
         backend.cleanup();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_account_scope_routes_new_artifacts_to_secure_fallback() {
+        let backend =
+            TestBackend::new("windows-secure-fallback-root").with_windows_secure_storage();
+        fs::create_dir(&backend.directory).expect("create inherited legacy preferred root");
+        assert!(
+            crate::agent_storage_windows::ensure_secure_storage_directory(&backend.directory)
+                .is_err(),
+            "legacy preferred root is not exact secure"
+        );
+        let mut fallback_name = backend.directory.file_name().unwrap().to_os_string();
+        fallback_name.push(".secure");
+        let fallback = backend.directory.with_file_name(fallback_name);
+
+        let scope = resolve_test(&backend, &Mutex::new(()), b"fallback-marker")
+            .expect("account scope succeeds through fallback");
+        assert!(!scope.as_str().is_empty());
+        assert_eq!(ensure_storage_dir(&backend).unwrap(), fallback);
+        let directory =
+            crate::agent_storage_windows::ensure_secure_storage_directory(&fallback).unwrap();
+        crate::agent_storage_windows::verify_storage_handle(directory.as_raw_handle() as HANDLE)
+            .unwrap();
+        drop(directory);
+
+        let key_path = fallback.join(INSTALLATION_KEY_FILE);
+        let metadata_path = fallback.join(METADATA_FILE);
+        let lock_path = fallback.join(METADATA_LOCK_FILE);
+        let key_bytes = windows_secure_file_snapshot(&key_path).0;
+        let key: [u8; INSTALLATION_KEY_BYTES] = key_bytes.try_into().unwrap();
+        decode_metadata(&key, &windows_secure_file_snapshot(&metadata_path).0).unwrap();
+        assert!(windows_secure_file_snapshot(&lock_path).0.is_empty());
+        assert_no_windows_secure_temp(&fallback, INSTALLATION_KEY_FILE);
+        assert_no_windows_secure_temp(&fallback, METADATA_FILE);
+        assert!(
+            fs::read_dir(&backend.directory).unwrap().next().is_none(),
+            "legacy preferred root receives no key, metadata, lock, or temp artifacts"
+        );
+        assert!(
+            crate::agent_storage_windows::ensure_secure_storage_directory(&backend.directory)
+                .is_err(),
+            "legacy preferred ACL remains unchanged"
+        );
+
+        backend.cleanup();
+        fs::remove_dir_all(fallback).unwrap();
     }
 
     #[cfg(target_os = "windows")]
