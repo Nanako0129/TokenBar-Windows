@@ -44,6 +44,7 @@ public class DtoDecodeTests
           "label":"Weekly",
           "usedPercent":25.0,
           "remainingPercent":75.0,
+          "resetsAt":"2026-07-09T00:00:00Z",
           "windowMinutes":1440,
           "paceStatus":{
             "state":"learningHistory",
@@ -61,6 +62,7 @@ public class DtoDecodeTests
           "label":"Session",
           "usedPercent":10.0,
           "remainingPercent":90.0,
+          "resetsAt":"2026-07-09T00:00:00Z",
           "paceStatus":{
             "state":"learningDuration",
             "windowKey":"antigravity.session.v1",
@@ -76,6 +78,7 @@ public class DtoDecodeTests
           "label":"Session",
           "usedPercent":10.0,
           "remainingPercent":90.0,
+          "resetsAt":"2026-07-09T00:00:00Z",
           "paceStatus":{
             "state":"learningDuration",
             "windowKey":"grok.session.v1",
@@ -428,6 +431,38 @@ public class DtoDecodeTests
              "historicalPace":{"expectedUsedPercent":10,"willLastToReset":true}}
             """;
         AssertRejects(withHistory);
+    }
+
+    [Fact]
+    public void UnavailableCannotCarryDuration()
+    {
+        var json = Replace(
+            UnavailableJson,
+            "\"remainingPercent\":50.0,",
+            "\"remainingPercent\":50.0,\"windowMinutes\":1,");
+        json = Replace(
+            json,
+            "\"completeCycles\":0,",
+            "\"durationSeconds\":60,\"durationSource\":\"provider\",\"completeCycles\":0,");
+        AssertRejects(json);
+    }
+
+    [Fact]
+    public void V3ResetPresenceAndFormatMustMatchPaceState()
+    {
+        const string reset = "\"resetsAt\":\"2026-07-09T00:00:00Z\",";
+        AssertRejects(Replace(AvailableJson, reset, ""));
+        AssertRejects(Replace(LearningHistoryJson, reset, ""));
+        AssertRejects(Replace(LearningDurationJson, reset, ""));
+        AssertRejects(Replace(AvailableJson, reset, "\"resetsAt\":\"tomorrow\","));
+
+        var missingResetWithReset = """
+            {"cardId":"x","label":"Unknown","usedPercent":50,"remainingPercent":50,
+             "resetsAt":"2026-07-09T00:00:00Z",
+             "paceStatus":{"state":"unavailable","windowKey":"x",
+               "completeCycles":0,"reason":"missingReset"}}
+            """;
+        AssertRejects(missingResetWithReset);
     }
 
     [Fact]

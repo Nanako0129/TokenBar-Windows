@@ -152,7 +152,10 @@ public sealed class UsageWindowJsonConverter : JsonConverter<UsageWindow>
 
             // Required rather than decode-if-present: present null must fail.
             var paceStatus = ParsePaceStatus(paceStatusElement);
-            ValidateV3Window(windowMinutes, paceStatus, historicalPace);
+            var resetIsValid = resetsAt is not null &&
+                root.GetProperty("resetsAt").TryGetDateTimeOffset(out _);
+            ValidateV3Window(
+                windowMinutes, paceStatus, historicalPace, resetsAt, resetIsValid);
             return new UsageWindow(
                 Label: label,
                 UsedPercent: usedPercent,
@@ -367,9 +370,9 @@ public sealed class UsageWindowJsonConverter : JsonConverter<UsageWindow>
                 }
                 break;
             case UsagePaceState.Unavailable:
-                if (reason is null)
+                if (reason is null || durationSeconds is not null || durationSource is not null)
                 {
-                    throw Invalid("unavailable pace requires a reason");
+                    throw Invalid("unavailable pace invariant failed");
                 }
                 break;
             case UsagePaceState.LegacyMissing:
@@ -387,8 +390,15 @@ public sealed class UsageWindowJsonConverter : JsonConverter<UsageWindow>
     private static void ValidateV3Window(
         long? windowMinutes,
         PaceStatus paceStatus,
-        HistoricalPace? historicalPace)
+        HistoricalPace? historicalPace,
+        string? resetsAt,
+        bool resetIsValid)
     {
+        if (resetsAt is not null && !resetIsValid)
+        {
+            throw Invalid("pace resetsAt must be a valid timestamp");
+        }
+
         if (paceStatus.DurationSeconds is { } durationSeconds)
         {
             if (windowMinutes != durationSeconds / 60)
@@ -403,12 +413,18 @@ public sealed class UsageWindowJsonConverter : JsonConverter<UsageWindow>
 
         switch (paceStatus.State)
         {
-            case UsagePaceState.Available when historicalPace is null:
-                throw Invalid("available pace requires historicalPace");
-            case UsagePaceState.LearningHistory when historicalPace is not null:
-            case UsagePaceState.LearningDuration when historicalPace is not null:
+            case UsagePaceState.Available when !resetIsValid || historicalPace is null:
+                throw Invalid("available pace requires reset and historicalPace");
+            case UsagePaceState.LearningHistory when !resetIsValid || historicalPace is not null:
+                throw Invalid("learningHistory pace invariant failed");
+            case UsagePaceState.LearningDuration when !resetIsValid || historicalPace is not null:
+                throw Invalid("learningDuration pace invariant failed");
             case UsagePaceState.Unavailable when historicalPace is not null:
-                throw Invalid("pace state and historicalPace contradict");
+                throw Invalid("unavailable pace cannot carry historicalPace");
+            case UsagePaceState.Unavailable
+                when paceStatus.Reason == UsagePaceUnavailableReason.MissingReset &&
+                     resetsAt is not null:
+                throw Invalid("missingReset pace cannot carry resetsAt");
             case UsagePaceState.LegacyMissing:
                 throw Invalid("legacy pace status cannot appear in v3 wire");
         }
