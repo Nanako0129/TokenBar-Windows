@@ -33,11 +33,12 @@ public sealed class TrayFeed : IDisposable
     public AgentUsagePayload? Quota { get; private set; }
 
     private bool _hasTrace;
+    private string? _cachedQuotaSelection;
     private double? _cachedQuotaRemaining;
 
     /// <summary>Resolved remaining % for the selected quota window. Boots
-    /// from the persisted last reading (macOS lastRemaining: the gauge never
-    /// blanks across restarts) until a fresh fetch lands.</summary>
+    /// from the persisted last reading only when its selection identity matches
+    /// the current effective selection.</summary>
     public double? QuotaRemaining { get; private set; }
 
     public event Action? Changed;
@@ -45,8 +46,16 @@ public sealed class TrayFeed : IDisposable
     public TrayFeed(DispatcherQueue dispatcher)
     {
         _dispatcher = dispatcher;
+        var persistedSelection = AppSettings.Store.GetString(
+            "tokenbar.quota.lastSelection");
+        var currentSelection = AppSettings.Store.GetString(
+            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
         var persisted = AppSettings.Store.GetDouble("tokenbar.quota.lastRemaining", double.NaN);
-        _cachedQuotaRemaining = double.IsNaN(persisted) ? null : persisted;
+        _cachedQuotaRemaining = QuotaSelectionPolicy.MatchingLastGoodRemaining(
+            QuotaSelectionPolicy.EffectiveSelection(null, currentSelection),
+            persistedSelection,
+            double.IsNaN(persisted) ? null : persisted);
+        _cachedQuotaSelection = _cachedQuotaRemaining is null ? null : persistedSelection;
         QuotaRemaining = _cachedQuotaRemaining;
 
         _fast = dispatcher.CreateTimer();
@@ -216,22 +225,25 @@ public sealed class TrayFeed : IDisposable
             }
 
             QuotaRemaining = resolved;
+            _cachedQuotaSelection = selection;
             _cachedQuotaRemaining = resolved;
-            // Write-through cache so the next launch boots with a reading
-            // (the store no-ops when the value hasn't changed).
+            // Write-through pair so the next launch boots only for this
+            // selection (the store no-ops when values have not changed).
             AppSettings.Store.SetDouble("tokenbar.quota.lastRemaining", resolved);
+            AppSettings.Store.SetString("tokenbar.quota.lastSelection", selection);
         }
         else if (QuotaResolver.ExcludedAllCandidates(Quota, selection, hidden))
         {
             // All healthy AUTO candidates are hidden. Suppress only the
-            // displayed reading; keep the selected-source last-good cache.
+            // displayed reading; keep the selected-source last-good pair.
             QuotaRemaining = null;
         }
         else
         {
-            // Fetch/provider/explicit-selection failures keep the last-good
-            // selected-source reading visible.
-            QuotaRemaining = _cachedQuotaRemaining;
+            // Fetch/provider/explicit-selection failures keep only this
+            // selection's last-good reading visible.
+            QuotaRemaining = QuotaSelectionPolicy.MatchingLastGoodRemaining(
+                selection, _cachedQuotaSelection, _cachedQuotaRemaining);
         }
     }
 

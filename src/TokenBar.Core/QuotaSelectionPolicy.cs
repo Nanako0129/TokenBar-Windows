@@ -27,4 +27,13 @@ public static class QuotaSelectionPolicy
         var selection = EffectiveSelection(payload, persistedSelection);
         return QuotaResolver.Resolve(payload, selection, excluding);
     }
+
+    /// <summary>Returns a last-good reading only when it belongs to the
+    /// current effective selection. The tray deliberately keeps one pair, not
+    /// a multi-selection cache.</summary>
+    public static double? MatchingLastGoodRemaining(
+        string effectiveSelection,
+        string? lastGoodSelection,
+        double? lastGoodRemaining) =>
+        lastGoodSelection == effectiveSelection ? lastGoodRemaining : null;
 }
