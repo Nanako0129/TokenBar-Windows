@@ -15,7 +15,14 @@ a native WinUI 3 shell.
 | C ABI contract | `include/ctb.h` | 10 entry points, `{"ok":true,"data":…}` / `{"ok":false,"err":…}` |
 | Interop | `src/TokenBar.Interop` | `net10.0`, platform-neutral — P/Invoke facade + envelope decode |
 | Logic | `src/TokenBar.Core` | `net10.0`, platform-neutral — C# port of the macOS `TokenBarCore` |
-| Shell | `src/TokenBar.App` | WinUI 3, unpackaged. Windows-only build (not in the slnx): `dotnet build src/TokenBar.App -c Release -p:Platform=x64` |
+| Shell | `src/TokenBar.App` | WinUI 3, unpackaged. Windows-only build (not in the slnx): `dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64` |
+| Windows native packaging | `src/Directory.Build.targets` | The sole `Platform`/`RuntimeIdentifier` → explicit Rust-target mapping. `BuildTbNative` produces the target-specific `tb_core_ffi.dll`; missing/conflicting tuples, wrong PE machines, and stale output/publish bytes fail fast. |
+
+Windows native packaging is opt-in for `TokenBar.App`, `TokenBar.Smoke`, and
+`TokenBar.Core.Tests`. The supported tuples are `x64`/`win-x64` →
+`x86_64-pc-windows-msvc` and `ARM64`/`win-arm64` →
+`aarch64-pc-windows-msvc`; Windows managed builds never select a default
+`target/release` DLL.
 
 ## Build
 
@@ -23,17 +30,51 @@ a native WinUI 3 shell.
 # macOS (inner loop — no Windows needed)
 scripts/check.sh
 
-# Windows
+# Windows x64: build the explicit native source, then run the x64 gates
 .\scripts\dev.ps1
+
+dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+dotnet build src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64
+dotnet test src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64 --no-build
+dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+dotnet build src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -p:Platform=x64
+dotnet run --project src/TokenBar.Smoke -c Release -p:Platform=x64 --no-build
+dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-x64 --self-contained -o out/smoke-win-x64
 ```
+
+ARM64 is cross-build/package validation only on an x64 runner:
+
+```bash
+dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64
+dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64
+dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-arm64 --self-contained -o out/smoke-win-arm64
+dotnet publish src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -r win-arm64 -o out/app-win-arm64
+```
+
+The cross-language CrossCheck stays platform-neutral and has no Platform/RID:
+
+```bash
+TZ=Asia/Taipei dotnet run \
+  --project src/TokenBar.CrossCheck \
+  -c Release -- \
+  crosscheck/fixtures \
+  crosscheck/csharp-out
+```
+
+CI publishes the ARM64 artifacts `smoke-win-arm64` and `app-win-arm64` without
+executing those binaries on the x64 runner. A real ARM64 runtime on the Windows
+VM remains the merge gate.
 
 Prereqs: Rust (stable), .NET 10 SDK; on Windows the MSVC toolchain.
 
-Windows CI now blocks on the full Rust workspace release tests, the WinUI App
-x64 Release build, solution build/tests, isolated P/Invoke and synthetic parse
-smokes (including strict relocated-`CODEX_HOME` coverage across every local
-usage surface and pre-aggregation client filters), a self-contained win-x64
-smoke bundle, and the ARM64 Rust release cross-build. The provider-pace branch
+Windows CI runs the x64 Rust workspace tests, Core.Tests, WinUI App, and Smoke
+from their project roots (the solution has no x64 configuration), then executes
+both the all-entry-point and strict relocated-`CODEX_HOME` Smoke checks with
+network and host-profile isolation. It runs the no-Platform/RID CrossCheck,
+publishes and executes the self-contained `smoke-win-x64` bundle, and uploads
+that artifact. The `arm64-cross` job only cross-builds and packages the native
+DLL, Smoke bundle, and App bundle, uploading `smoke-win-arm64` and
+`app-win-arm64`; it is not an ARM64 runtime test. The provider-pace branch
 passed local command-equivalent x64 and ARM64 gates plus fresh review on
 2026-07-19; GitHub PR #3 preserves its remote CI and review record. `cargo fmt`
 is not currently a repository CI gate; its existing workspace-wide formatting
@@ -72,7 +113,8 @@ unchanged; expected secure account-scope and v3 pace-history artifacts were
 created or updated as the provider checks progressed. Session-parser
 environment-root overrides now flow through one shared FFI source context and
 have strict relocated-`CODEX_HOME` coverage. RID-aware native-DLL selection and
-freshness remain a separate follow-up.
+freshness are complete through the shared `BuildTbNative`/`Directory.Build.targets`
+path.
 
 ## Credits
 
