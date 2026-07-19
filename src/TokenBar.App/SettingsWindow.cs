@@ -536,12 +536,16 @@ public sealed class SettingsWindow : Window
         var hidden = ClientRegistry.QuotaExcludedClients(store);
         var lastRemaining = store.GetDouble(
             "tokenbar.quota.lastRemaining", double.NaN);
+        var lastSelection = store.GetString("tokenbar.quota.lastSelection");
         double? remaining = QuotaSelectionPolicy.Resolve(payload, selection, hidden)
             is { } pick
             ? Math.Clamp(pick.Window.RemainingPercent, 0, 100)
             : QuotaResolver.ExcludedAllCandidates(payload, selection, hidden)
                 ? null
-                : double.IsFinite(lastRemaining) ? lastRemaining : null;
+                : QuotaSelectionPolicy.MatchingLastGoodRemaining(
+                    selection,
+                    lastSelection,
+                    double.IsFinite(lastRemaining) ? lastRemaining : null);
         var title = SampleTitle(mode, remaining);
 
         System.Drawing.Color? titleColor = mode == TrayMode.QuotaLeft
