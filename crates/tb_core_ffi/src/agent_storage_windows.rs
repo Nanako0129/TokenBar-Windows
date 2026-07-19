@@ -12,7 +12,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::{self, null, null_mut};
 use std::slice;
 
@@ -56,6 +56,7 @@ const SECURITY_DESCRIPTOR_REVISION_VALUE: u32 = 1;
 const STORAGE_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const VALIDATION_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const STORAGE_SECURITY_ACCESS: u32 = READ_CONTROL;
+const SECURE_STORAGE_FALLBACK_SUFFIX: &str = ".secure";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct StorageIdentity {
@@ -82,6 +83,59 @@ impl StorageObjectKind {
         };
         type_flag | FILE_FLAG_OPEN_REPARSE_POINT
     }
+}
+
+/// Resolve the sticky exact-secure root for new account and v3 history artifacts.
+/// An existing fallback wins even if the preferred root later disappears or becomes
+/// secure. A colliding fallback must itself pass the exact directory contract;
+/// otherwise resolution fails closed before consulting or creating the preferred root.
+///
+/// The caller must place `preferred` beneath the trusted per-user `dirs::data_dir`
+/// parent. The fallback is a sibling formed by appending `.secure` to its filename.
+pub(crate) fn resolve_secure_storage_directory(preferred: &Path) -> io::Result<PathBuf> {
+    let preferred_name = preferred.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secure storage root has no filename",
+        )
+    })?;
+    let mut fallback_name = preferred_name.to_os_string();
+    fallback_name.push(SECURE_STORAGE_FALLBACK_SUFFIX);
+    let fallback = preferred.with_file_name(fallback_name);
+
+    match open_existing_secure_storage_directory(&fallback) {
+        Ok(_) => return Ok(fallback),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    // Only a confirmed contract rejection activates fallback. Operational
+    // failures stay unavailable rather than permanently splitting an exact root.
+    match ensure_secure_storage_directory(preferred) {
+        Ok(directory) => drop(directory),
+        Err(error) if is_security_verification_failure(&error) => {
+            drop(ensure_secure_storage_directory(&fallback)?);
+            return Ok(fallback);
+        }
+        Err(error) => return Err(error),
+    }
+
+    // Recheck after preferred creation/verification so a concurrently installed
+    // fallback is never ignored. Exact fallback remains the sticky authority.
+    match open_existing_secure_storage_directory(&fallback) {
+        Ok(_) => Ok(fallback),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(preferred.to_path_buf()),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_existing_secure_storage_directory(path: &Path) -> io::Result<File> {
+    open_secure_storage_object(
+        path,
+        GENERIC_WRITE | FILE_READ_ATTRIBUTES | STORAGE_SECURITY_ACCESS,
+        OPEN_EXISTING,
+        StorageObjectKind::Directory,
+    )
 }
 
 /// Create only the final directory component securely when absent, then open and
@@ -1355,6 +1409,10 @@ fn security_verification_failed() -> io::Error {
     )
 }
 
+fn is_security_verification_failure(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1793,6 +1851,250 @@ mod tests {
             .is_err(),
             "incomplete access mask is rejected"
         );
+    }
+
+    #[test]
+    fn secure_root_resolver_preserves_legacy_preferred_and_uses_exact_fallback() {
+        let root = TempRoot::create().expect("create temporary root");
+        let preferred = root.join("com.nyanako.tokenbar");
+        let fallback = root.join("com.nyanako.tokenbar.secure");
+        fs::create_dir(&preferred).expect("create inherited legacy directory");
+        let preferred_handle = open_windows_path(
+            &preferred,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            StorageObjectKind::Directory.open_flags(),
+        )
+        .expect("open inherited legacy directory");
+        assert!(
+            verify_storage_handle(preferred_handle.as_raw_handle() as HANDLE).is_err(),
+            "legacy directory does not satisfy the exact DACL contract"
+        );
+        let preferred_identity = storage_identity(
+            preferred_handle.as_raw_handle() as HANDLE,
+            StorageObjectKind::Directory,
+        )
+        .expect("snapshot legacy directory identity");
+        let preferred_acl = read_acl_snapshot(preferred_handle.as_raw_handle() as HANDLE)
+            .expect("snapshot legacy directory DACL");
+
+        let v1_path = preferred.join("codex-weekly-history.json");
+        let v1_bytes = b"legacy-v1-sentinel";
+        fs::write(&v1_path, v1_bytes).expect("write legacy v1 sentinel");
+        let v1_handle = open_windows_path(
+            &v1_path,
+            GENERIC_READ | FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+        )
+        .expect("open legacy v1 sentinel");
+        let v1_identity = regular_file_identity(&v1_handle).expect("snapshot v1 identity");
+        let v1_mtime = fs::metadata(&v1_path)
+            .expect("read v1 metadata")
+            .modified()
+            .expect("read v1 mtime");
+
+        assert_eq!(
+            resolve_secure_storage_directory(&preferred).expect("resolve secure sibling"),
+            fallback
+        );
+        let fallback_handle = ensure_secure_storage_directory(&fallback)
+            .expect("fallback remains an exact secure directory");
+        verify_storage_handle(fallback_handle.as_raw_handle() as HANDLE)
+            .expect("fallback DACL is exact");
+
+        let preferred_after = open_windows_path(
+            &preferred,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            StorageObjectKind::Directory.open_flags(),
+        )
+        .expect("reopen legacy directory");
+        assert!(
+            storage_identity(
+                preferred_after.as_raw_handle() as HANDLE,
+                StorageObjectKind::Directory
+            )
+            .expect("reread legacy directory identity")
+                == preferred_identity
+        );
+        assert!(
+            read_acl_snapshot(preferred_after.as_raw_handle() as HANDLE)
+                .expect("reread legacy directory DACL")
+                == preferred_acl,
+            "resolver never secures the legacy root in place"
+        );
+        let v1_after = open_windows_path(
+            &v1_path,
+            GENERIC_READ | FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+        )
+        .expect("reopen legacy v1 sentinel");
+        assert!(
+            regular_file_identity(&v1_after).expect("reread v1 identity") == v1_identity
+        );
+        assert_eq!(fs::read(&v1_path).expect("reread v1 bytes"), v1_bytes);
+        assert_eq!(
+            fs::metadata(&v1_path)
+                .expect("reread v1 metadata")
+                .modified()
+                .expect("reread v1 mtime"),
+            v1_mtime
+        );
+        assert_eq!(
+            fs::read_dir(&preferred)
+                .expect("list legacy directory")
+                .map(|entry| entry.expect("read legacy entry").file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("codex-weekly-history.json")]
+        );
+
+        drop(v1_after);
+        drop(v1_handle);
+        drop(preferred_after);
+        drop(preferred_handle);
+        drop(fallback_handle);
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_root_resolver_keeps_existing_fallback_sticky() {
+        let root = TempRoot::create().expect("create temporary root");
+        let preferred = root.join("com.nyanako.tokenbar");
+        let fallback = root.join("com.nyanako.tokenbar.secure");
+        drop(
+            ensure_secure_storage_directory(&fallback)
+                .expect("create exact secure fallback before preferred"),
+        );
+
+        assert_eq!(
+            resolve_secure_storage_directory(&preferred)
+                .expect("existing fallback wins while preferred is absent"),
+            fallback
+        );
+        drop(
+            ensure_secure_storage_directory(&preferred)
+                .expect("create exact preferred after fallback"),
+        );
+        assert_eq!(
+            resolve_secure_storage_directory(&preferred)
+                .expect("existing fallback remains sticky after preferred is exact"),
+            fallback
+        );
+
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_root_resolver_uses_exact_preferred_when_fallback_is_absent() {
+        let root = TempRoot::create().expect("create temporary root");
+        let preferred = root.join("com.nyanako.tokenbar");
+        let fallback = root.join("com.nyanako.tokenbar.secure");
+        drop(ensure_secure_storage_directory(&preferred).expect("create exact secure preferred"));
+
+        assert_eq!(
+            resolve_secure_storage_directory(&preferred).expect("resolve exact preferred"),
+            preferred
+        );
+        assert!(
+            !fallback.exists(),
+            "resolver does not create an unused fallback"
+        );
+
+        root.cleanup().expect("remove temporary root");
+    }
+
+    #[test]
+    fn secure_root_resolver_fails_closed_on_fallback_collisions() {
+        {
+            let root = TempRoot::create().expect("create temporary root");
+            let preferred = root.join("com.nyanako.tokenbar");
+            let fallback = root.join("com.nyanako.tokenbar.secure");
+            let fallback_file =
+                create_test_file(&fallback, b"fallback-file").expect("create file collision");
+            let fallback_identity =
+                regular_file_identity(&fallback_file).expect("snapshot file collision identity");
+
+            resolve_secure_storage_directory(&preferred)
+                .expect_err("regular-file fallback collision fails closed");
+            assert!(
+                !preferred.exists(),
+                "preferred receives no secure artifacts"
+            );
+            assert_eq!(
+                fs::read(&fallback).expect("read file collision"),
+                b"fallback-file"
+            );
+            assert!(
+                regular_file_identity(&fallback_file).expect("reread file collision identity")
+                    == fallback_identity
+            );
+
+            drop(fallback_file);
+            root.cleanup().expect("remove temporary root");
+        }
+
+        {
+            let root = TempRoot::create().expect("create temporary root");
+            let preferred = root.join("com.nyanako.tokenbar");
+            let fallback = root.join("com.nyanako.tokenbar.secure");
+            let target = root.join("fallback-target");
+            let target_file =
+                create_test_file(&target, b"fallback-target").expect("create reparse target");
+            let target_identity =
+                regular_file_identity(&target_file).expect("snapshot reparse target identity");
+            symlink_file(&target, &fallback).expect("create fallback reparse collision");
+
+            resolve_secure_storage_directory(&preferred)
+                .expect_err("fallback reparse collision fails closed");
+            assert!(
+                !preferred.exists(),
+                "preferred receives no secure artifacts"
+            );
+            assert!(fs::symlink_metadata(&fallback)
+                .expect("fallback reparse remains")
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::read(&target).expect("read reparse target"),
+                b"fallback-target"
+            );
+            assert!(
+                regular_file_identity(&target_file).expect("reread reparse target identity")
+                    == target_identity
+            );
+
+            fs::remove_file(&fallback).expect("remove fallback reparse collision");
+            drop(target_file);
+            root.cleanup().expect("remove temporary root");
+        }
+
+        {
+            let root = TempRoot::create().expect("create temporary root");
+            let preferred = root.join("com.nyanako.tokenbar");
+            let fallback = root.join("com.nyanako.tokenbar.secure");
+            let fallback_directory = create_permissive_test_directory(&fallback)
+                .expect("create permissive fallback collision");
+            let fallback_acl = read_acl_snapshot(fallback_directory.as_raw_handle() as HANDLE)
+                .expect("snapshot permissive fallback DACL");
+
+            resolve_secure_storage_directory(&preferred)
+                .expect_err("permissive fallback collision fails closed");
+            assert!(
+                !preferred.exists(),
+                "preferred receives no secure artifacts"
+            );
+            assert!(
+                read_acl_snapshot(fallback_directory.as_raw_handle() as HANDLE)
+                    .expect("reread permissive fallback DACL")
+                    == fallback_acl,
+                "collision rejection never repairs fallback in place"
+            );
+
+            drop(fallback_directory);
+            root.cleanup().expect("remove temporary root");
+        }
     }
 
     #[test]

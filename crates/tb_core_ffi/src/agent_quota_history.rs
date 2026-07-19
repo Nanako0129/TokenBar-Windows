@@ -295,11 +295,13 @@ pub(crate) fn record_observation_and_evaluate(
 }
 
 pub(crate) fn production_history_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|directory| {
-        directory
-            .join("com.nyanako.tokenbar")
-            .join(HISTORY_FILE_NAME)
-    })
+    let preferred = dirs::data_dir()?.join("com.nyanako.tokenbar");
+    #[cfg(target_os = "windows")]
+    let directory =
+        crate::agent_storage_windows::resolve_secure_storage_directory(&preferred).ok()?;
+    #[cfg(not(target_os = "windows"))]
+    let directory = preferred;
+    Some(directory.join(HISTORY_FILE_NAME))
 }
 
 /// Import only the legacy Codex records bound to the account ID used by the
@@ -310,16 +312,21 @@ pub(crate) fn migrate_codex_v2(
     account_scope: &str,
     now: i64,
 ) -> Result<MigrationOutcome, HistoryError> {
-    let Some(directory) = dirs::data_dir().map(|directory| directory.join("com.nyanako.tokenbar"))
+    let Some(preferred) = dirs::data_dir().map(|directory| directory.join("com.nyanako.tokenbar"))
     else {
         return Err(HistoryError::StorageUnavailable);
     };
+    #[cfg(target_os = "windows")]
+    let destination = crate::agent_storage_windows::resolve_secure_storage_directory(&preferred)
+        .map_err(|_| HistoryError::StorageUnavailable)?;
+    #[cfg(not(target_os = "windows"))]
+    let destination = preferred.clone();
     migrate_codex_v2_at_paths_with_clock_and_mode(
         request_account_id,
         account_scope,
         now,
-        &directory.join(LEGACY_V2_FILE_NAME),
-        &directory.join(HISTORY_FILE_NAME),
+        &preferred.join(LEGACY_V2_FILE_NAME),
+        &destination.join(HISTORY_FILE_NAME),
         StorageMode::System,
         unix_now,
     )
@@ -2570,6 +2577,27 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
+    fn windows_file_identity(path: &Path) -> (u64, [u8; 16]) {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .expect("open Windows file identity fixture");
+        let mut identity = FILE_ID_INFO::default();
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle() as HANDLE,
+                    FileIdInfo,
+                    (&mut identity as *mut FILE_ID_INFO).cast(),
+                    size_of::<FILE_ID_INFO>() as u32,
+                )
+            },
+            0
+        );
+        (identity.VolumeSerialNumber, identity.FileId.Identifier)
+    }
+
+    #[cfg(target_os = "windows")]
     fn make_windows_path_permissive(path: &Path, is_directory: bool) {
         let mut options = OpenOptions::new();
         options.access_mode(READ_CONTROL | WRITE_DAC);
@@ -3880,6 +3908,115 @@ mod tests {
             assert_no_windows_corrupt_candidate(&directory);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_system_history_skips_insecure_legacy_v2_and_writes_live_v3_to_fallback() {
+        let (root, _) = temp_path("resolved-secure-root");
+        let preferred = root.join("com.nyanako.tokenbar");
+        let fallback = root.join("com.nyanako.tokenbar.secure");
+        fs::create_dir(&preferred).expect("create inherited legacy preferred root");
+        assert!(
+            crate::agent_storage_windows::ensure_secure_storage_directory(&preferred).is_err(),
+            "legacy preferred root is not exact secure"
+        );
+
+        let now = 6_100_000_000_i64;
+        let v2_path = preferred.join(LEGACY_V2_FILE_NAME);
+        fs::write(
+            &v2_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 2,
+                "samples": [{
+                    "accountKey": "acct",
+                    "resetsAt": now + 10_080 * 60,
+                    "windowMinutes": 10_080,
+                    "usedPercent": 25.0,
+                    "sampledAt": now
+                }]
+            }))
+            .unwrap(),
+        )
+        .expect("write legacy v2 through general filesystem API");
+        make_windows_path_permissive(&v2_path, false);
+        let v2_bytes = fs::read(&v2_path).unwrap();
+        let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
+        let v2_identity = windows_file_identity(&v2_path);
+
+        let resolved = crate::agent_storage_windows::resolve_secure_storage_directory(&preferred)
+            .expect("resolve exact secure fallback");
+        assert_eq!(resolved, fallback);
+        let v3_path = resolved.join(HISTORY_FILE_NAME);
+        assert_eq!(
+            migrate_codex_v2_at_paths_with_clock_and_mode(
+                "acct",
+                "opaque-scope",
+                now,
+                &v2_path,
+                &v3_path,
+                StorageMode::System,
+                || now,
+            ),
+            Ok(MigrationOutcome {
+                imported_samples: 0,
+                skipped_samples: 0,
+            })
+        );
+        assert!(!v3_path.exists());
+        assert!(!resolved.join(HISTORY_LOCK_FILE_NAME).exists());
+        assert_eq!(fs::read(&v2_path).unwrap(), v2_bytes);
+        assert_eq!(
+            fs::metadata(&v2_path).unwrap().modified().unwrap(),
+            v2_mtime
+        );
+        assert_eq!(windows_file_identity(&v2_path), v2_identity);
+        assert!(
+            crate::agent_storage_windows::open_existing_secure_file(&v2_path, false).is_err(),
+            "legacy v2 remains insecure and is never repaired in place"
+        );
+
+        let reset = now + DAY;
+        assert!(matches!(
+            record_observation_at_path_and_evaluate_with_clock_and_mode(
+                key("fallback-live-v3"),
+                Some(reset),
+                30.0,
+                now,
+                provider(reset, DAY),
+                None,
+                &v3_path,
+                StorageMode::System,
+                || now,
+            ),
+            Ok((HistoryOutcome::Ready { sampled: true, .. }, None))
+        ));
+        let v3 = windows_secure_file_snapshot(&v3_path);
+        let store = serde_json::from_slice::<Store>(&v3.0).unwrap();
+        assert_eq!(store.schema_version, HISTORY_SCHEMA_VERSION);
+        assert_eq!(store.series.len(), 1);
+        assert!(
+            windows_secure_file_snapshot(&resolved.join(HISTORY_LOCK_FILE_NAME))
+                .0
+                .is_empty()
+        );
+        assert_no_windows_secure_temp(&resolved);
+        assert_no_windows_corrupt_candidate(&resolved);
+
+        assert_eq!(fs::read(&v2_path).unwrap(), v2_bytes);
+        assert_eq!(
+            fs::metadata(&v2_path).unwrap().modified().unwrap(),
+            v2_mtime
+        );
+        assert_eq!(windows_file_identity(&v2_path), v2_identity);
+        assert!(!preferred.join(HISTORY_FILE_NAME).exists());
+        assert!(!preferred.join(HISTORY_LOCK_FILE_NAME).exists());
+        assert!(
+            crate::agent_storage_windows::ensure_secure_storage_directory(&preferred).is_err(),
+            "legacy preferred ACL remains unchanged"
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
