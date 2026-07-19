@@ -64,11 +64,12 @@ existing workspace-wide formatting debt is tracked separately.
 | Grok | Live credential smoke not run. |
 
 Fixture cross-checks, synthetic session smokes, and path-only checks are kept
-separate from credential-bound live coverage. Sanitized before/after manifests
-showed no credential or account-metadata changes during the live checks; the
-normal `quota-pace-history-v3.json` product write was the only profile change.
-Session-parser environment-root overrides and RID-aware native-DLL
-selection/freshness remain separate follow-ups, not completed by PR #3.
+separate from credential-bound live coverage. Across the staged sanitized
+manifests, the Claude and Codex credential files and legacy v1 history remained
+unchanged; expected secure account-scope and v3 pace-history artifacts were
+created or updated as the provider checks progressed. Session-parser
+environment-root overrides and RID-aware native-DLL selection/freshness remain
+separate follow-ups, not completed by PR #3.
 
 ## Credits
 
