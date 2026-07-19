@@ -11,10 +11,53 @@ on:
       - "**.md"
 
 jobs:
+  crosscheck-swift:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: Nanako0129/TokenBar
+          ref: 1e00e7b769a1b0d20b2de077b0a3aab52a24c088
+          path: tokenbar-mac
+      - uses: actions/checkout@v6
+        with:
+          path: tokenbar-windows
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tokenbar-mac -> target
+      - name: build Swift expected outputs (canonical SHA)
+        shell: bash
+        env:
+          TOKENBAR_WINDOWS: ${{ github.workspace }}/tokenbar-windows
+          TOKENBAR_MAC_CANONICAL: ${{ github.workspace }}/tokenbar-mac
+        run: |
+          (
+            cd "$TOKENBAR_MAC_CANONICAL"
+            cargo build --release
+          )
+          rm -rf "$TOKENBAR_WINDOWS/crosscheck/swift-out"
+          mkdir -p "$TOKENBAR_WINDOWS/crosscheck/swift-out"
+          (
+            cd "$TOKENBAR_MAC_CANONICAL"
+            TZ=Asia/Taipei swift run crosscheck-harness \
+              "$TOKENBAR_WINDOWS/crosscheck/fixtures" \
+              "$TOKENBAR_WINDOWS/crosscheck/swift-out"
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crosscheck-swift-out
+          path: tokenbar-windows/crosscheck/swift-out
+
   build:
+    needs: crosscheck-swift
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: crosscheck-swift-out
+          path: crosscheck/swift-out
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-dotnet@v5
@@ -46,12 +89,15 @@ jobs:
       - name: CrossCheck (no Platform or RID)
         shell: bash
         run: |
-          tzutil.exe /s "Taipei Standard Time"
+          MSYS_NO_PATHCONV=1 tzutil.exe /s "Taipei Standard Time"
           TZ=Asia/Taipei dotnet run \
             --project src/TokenBar.CrossCheck \
             -c Release -- \
             crosscheck/fixtures \
             crosscheck/csharp-out
+      - name: compare CrossCheck outputs
+        shell: bash
+        run: python3 crosscheck/diff.py crosscheck/swift-out crosscheck/csharp-out
       # Hermetic runtime check: point HOME at a synthetic Claude tree and put
       # one valid Codex session under a different CODEX_HOME root. The strict
       # client assertions make a pre-A1 binary fail instead of silently passing
@@ -182,6 +228,11 @@ jobs:
           $env:TB_SMOKE_MIN_MESSAGES = "3"
           $env:TB_SMOKE_EXPECT_CLIENT = "codex"
           $env:TB_SMOKE_SKIP_NETWORK = "1"
+          $now = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", [Globalization.CultureInfo]::InvariantCulture)
+          $codexSession = Join-Path $codex "sessions\ci\session.jsonl"
+          $codexJsonl = Get-Content -LiteralPath $codexSession -Raw
+          $codexJsonl = $codexJsonl -replace '"timestamp":"[^"]+"', ('"timestamp":"{0}"' -f $now)
+          Set-Content -LiteralPath $codexSession -Value $codexJsonl -Encoding utf8
           Push-Location (Join-Path $env:GITHUB_WORKSPACE "out\smoke-win-x64")
           try {
             & ".\TokenBar.Smoke.exe"
