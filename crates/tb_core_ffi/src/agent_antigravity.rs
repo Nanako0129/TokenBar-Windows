@@ -71,7 +71,7 @@ struct ProcInfo {
 }
 
 async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
-    let (proc, ports) = discover_local_ide()?;
+    let processes = discover_local_ide()?;
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true) // loopback language_server uses a self-signed cert
@@ -87,19 +87,8 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
         }
     });
 
-    // language-server ports use the language-server CSRF; the extension server
-    // (if advertised) carries its own token.
-    let mut candidates: Vec<(u16, String)> =
-        ports.iter().map(|p| (*p, proc.csrf_token.clone())).collect();
-    if let Some(port) = proc.extension_port {
-        if let Some(csrf) = proc.extension_csrf.as_ref() {
-            candidates.push((port, csrf.clone()));
-        }
-        candidates.push((port, proc.csrf_token.clone()));
-    }
-
     let mut last_err = "Antigravity local IDE API not reachable".to_string();
-    for (port, csrf) in candidates {
+    for (port, csrf) in local_api_candidates(processes) {
         let url = format!("https://127.0.0.1:{port}{LANG_SERVICE}");
         let resp = client
             .post(&url)
@@ -139,11 +128,31 @@ fn local_result_is_acceptable(fetched: &Fetched) -> bool {
     !fetched.windows.is_empty()
 }
 
+fn local_api_candidates(processes: Vec<(ProcInfo, Vec<u16>)>) -> Vec<(u16, String)> {
+    let mut candidates = Vec::new();
+    for (proc, ports) in processes {
+        // language-server ports use the language-server CSRF; the extension
+        // server (if advertised) carries its own token.
+        candidates.extend(
+            ports
+                .into_iter()
+                .map(|port| (port, proc.csrf_token.clone())),
+        );
+        if let Some(port) = proc.extension_port {
+            if let Some(csrf) = proc.extension_csrf.as_ref() {
+                candidates.push((port, csrf.clone()));
+            }
+            candidates.push((port, proc.csrf_token.clone()));
+        }
+    }
+    candidates
+}
+
 #[cfg(not(windows))]
-fn discover_local_ide() -> Result<(ProcInfo, Vec<u16>), String> {
+fn discover_local_ide() -> Result<Vec<(ProcInfo, Vec<u16>)>, String> {
     let proc = detect_process()?;
     let ports = listening_ports(proc.pid)?;
-    Ok((proc, ports))
+    Ok(vec![(proc, ports)])
 }
 
 #[cfg(not(windows))]
@@ -291,7 +300,7 @@ impl WindowsDiscoveryError {
 }
 
 #[cfg(windows)]
-fn discover_local_ide() -> Result<(ProcInfo, Vec<u16>), String> {
+fn discover_local_ide() -> Result<Vec<(ProcInfo, Vec<u16>)>, String> {
     let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
         WindowsDiscoveryError::PowerShellFailed
             .message()
@@ -327,7 +336,10 @@ fn discover_local_ide() -> Result<(ProcInfo, Vec<u16>), String> {
 }
 
 #[cfg(any(windows, test))]
-fn parse_windows_discovery(stdout: &str) -> Result<(ProcInfo, Vec<u16>), WindowsDiscoveryError> {
+fn parse_windows_discovery(
+    stdout: &str,
+) -> Result<Vec<(ProcInfo, Vec<u16>)>, WindowsDiscoveryError> {
+    let mut processes = Vec::new();
     let mut saw_valid_record = false;
     let mut saw_antigravity = false;
     let mut saw_csrf = false;
@@ -369,7 +381,7 @@ fn parse_windows_discovery(stdout: &str) -> Result<(ProcInfo, Vec<u16>), Windows
                 if ports.is_empty() {
                     continue;
                 }
-                return Ok((
+                processes.push((
                     ProcInfo {
                         pid,
                         csrf_token: csrf,
@@ -384,7 +396,9 @@ fn parse_windows_discovery(stdout: &str) -> Result<(ProcInfo, Vec<u16>), Windows
         }
     }
 
-    if saw_csrf {
+    if !processes.is_empty() {
+        Ok(processes)
+    } else if saw_csrf {
         Err(WindowsDiscoveryError::PortsMissing)
     } else if saw_antigravity {
         Err(WindowsDiscoveryError::TokenMissing)
@@ -1388,9 +1402,9 @@ mod tests {
         assert_eq!(parse_listen_port("... (ESTABLISHED)"), None);
     }
 
-    fn windows_process_fixture(command: &str, ports: &str) -> String {
+    fn windows_process_fixture(pid: i32, command: &str, ports: &str) -> String {
         let encoded = base64::engine::general_purpose::STANDARD.encode(command);
-        format!("{WINDOWS_DISCOVERY_PREFIX}\tP\t4242\t{encoded}\t{ports}")
+        format!("{WINDOWS_DISCOVERY_PREFIX}\tP\t{pid}\t{encoded}\t{ports}")
     }
 
     #[test]
@@ -1400,20 +1414,62 @@ mod tests {
         let command = format!(
             r#""C:\Program Files\Antigravity\language_server.exe" --app_data_dir antigravity --csrf_token={csrf} --extension_server_port 4567 --extension_server_csrf_token={extension_csrf}"#
         );
-        let valid = windows_process_fixture(&command, "61234,54321,61234");
+        let valid = windows_process_fixture(4242, &command, "61234,54321,61234");
         let fixture = format!(
             "garbage\n{WINDOWS_DISCOVERY_PREFIX}\tP\tnot-a-pid\tbad-base64\t80\n{valid}\r\n"
         );
 
-        let (proc, ports) = match parse_windows_discovery(&fixture) {
-            Ok(parsed) => parsed,
+        let processes = match parse_windows_discovery(&fixture) {
+            Ok(processes) => processes,
             Err(_) => panic!("valid Windows discovery fixture was rejected"),
         };
+        assert_eq!(processes.len(), 1);
+        let (proc, ports) = &processes[0];
         assert_eq!(proc.pid, 4242);
         assert!(proc.csrf_token == csrf);
         assert_eq!(proc.extension_port, Some(4567));
         assert!(proc.extension_csrf.as_deref() == Some(extension_csrf));
-        assert_eq!(ports, vec![54321, 61234]);
+        assert_eq!(ports.as_slice(), &[54321, 61234]);
+    }
+
+    #[test]
+    fn retains_all_windows_processes_in_probe_order() {
+        let first_csrf = "first-fixture-secret";
+        let first_extension_csrf = "first-extension-fixture-secret";
+        let second_csrf = "second-fixture-secret";
+        let first = windows_process_fixture(
+            1001,
+            &format!(
+                r#"C:\Antigravity\language_server.exe --app_data_dir antigravity --csrf_token={first_csrf} --extension_server_port=41999 --extension_server_csrf_token={first_extension_csrf}"#
+            ),
+            "41002,41001",
+        );
+        let second = windows_process_fixture(
+            1002,
+            &format!(
+                r#"C:\Antigravity\language_server.exe --app_data_dir antigravity --csrf_token={second_csrf}"#
+            ),
+            "42000",
+        );
+        let fixture = format!("{first}\n{second}\n");
+
+        let processes = match parse_windows_discovery(&fixture) {
+            Ok(processes) => processes,
+            Err(_) => panic!("multi-process Windows discovery fixture was rejected"),
+        };
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].0.pid, 1001);
+        assert_eq!(processes[0].1.as_slice(), &[41001, 41002]);
+        assert_eq!(processes[1].0.pid, 1002);
+        assert_eq!(processes[1].1.as_slice(), &[42000]);
+
+        let candidates = local_api_candidates(processes);
+        let candidate_ports: Vec<u16> = candidates.iter().map(|candidate| candidate.0).collect();
+        assert_eq!(candidate_ports, vec![41001, 41002, 41999, 41999, 42000]);
+        assert!(candidates[0].1.as_str() == first_csrf);
+        assert!(candidates[2].1.as_str() == first_extension_csrf);
+        assert!(candidates[3].1.as_str() == first_csrf);
+        assert!(candidates[4].1.as_str() == second_csrf);
     }
 
     #[test]
@@ -1424,6 +1480,7 @@ mod tests {
         ));
 
         let no_token = windows_process_fixture(
+            4242,
             r#"C:\Antigravity\language_server.exe --app_data_dir antigravity"#,
             "54321",
         );
@@ -1434,6 +1491,7 @@ mod tests {
 
         let csrf = "fixture-secret-that-must-not-leak";
         let no_ports = windows_process_fixture(
+            4242,
             &format!(
                 r#"C:\Antigravity\language_server.exe --app_data_dir antigravity --csrf_token={csrf}"#
             ),
