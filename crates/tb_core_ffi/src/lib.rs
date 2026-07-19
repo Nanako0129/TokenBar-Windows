@@ -33,10 +33,25 @@ mod usage_tail;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use usage_tail::UsageTailer;
+
+fn select_user_home(home: Option<PathBuf>, platform_home: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|path| !path.as_os_str().is_empty())
+        .or(platform_home)
+}
+
+/// Resolve the user's home without requiring `HOME`, which is normally absent
+/// for Windows GUI and Task Scheduler launches.
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    select_user_home(
+        std::env::var_os("HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
 
 /// Serve `tb_graph` from cache when the last computation is at most this old;
 /// `tb_refresh_graph` always recomputes. Mirrors the Tauri app's oneshot cache.
@@ -423,6 +438,34 @@ pub unsafe extern "C" fn tb_free(p: *mut c_char) {
 mod tests {
     use super::*;
     use usage_tail::UsageTailer;
+
+    #[test]
+    fn select_user_home_prefers_non_empty_home() {
+        let home = PathBuf::from("env-home");
+        let platform_home = PathBuf::from("platform-home");
+        assert_eq!(
+            select_user_home(Some(home.clone()), Some(platform_home)),
+            Some(home)
+        );
+    }
+
+    #[test]
+    fn select_user_home_uses_platform_fallback_for_missing_or_empty_home() {
+        let platform_home = PathBuf::from("platform-home");
+        assert_eq!(
+            select_user_home(None, Some(platform_home.clone())),
+            Some(platform_home.clone())
+        );
+        assert_eq!(
+            select_user_home(Some(PathBuf::new()), Some(platform_home.clone())),
+            Some(platform_home)
+        );
+    }
+
+    #[test]
+    fn select_user_home_returns_none_without_candidates() {
+        assert_eq!(select_user_home(None, None), None);
+    }
 
     /// Read a heap JSON pointer into an owned String and free it — the test-side
     /// equivalent of Swift's `decode`/`tb_free`.
