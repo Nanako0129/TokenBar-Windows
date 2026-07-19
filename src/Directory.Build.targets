@@ -1,14 +1,9 @@
 <Project>
-  <!-- Copy the cargo-built native library next to every managed output so
-       default DllImport probing finds it (tb_core_ffi.dll / libtb_core_ffi.dylib).
-       Build the Rust side first with a cargo release build at the repo root. -->
-  <PropertyGroup>
+  <!-- Keep the existing non-Windows native declarations unchanged. -->
+  <PropertyGroup Condition="'$(OS)' != 'Windows_NT'">
     <TbNativeDir>$(MSBuildThisFileDirectory)..\target\release\</TbNativeDir>
   </PropertyGroup>
-  <ItemGroup>
-    <None Include="$(TbNativeDir)tb_core_ffi.dll"
-          Condition="Exists('$(TbNativeDir)tb_core_ffi.dll')"
-          CopyToOutputDirectory="PreserveNewest" Link="tb_core_ffi.dll" Visible="false" />
+  <ItemGroup Condition="'$(OS)' != 'Windows_NT'">
     <None Include="$(TbNativeDir)libtb_core_ffi.dylib"
           Condition="Exists('$(TbNativeDir)libtb_core_ffi.dylib')"
           CopyToOutputDirectory="PreserveNewest" Link="libtb_core_ffi.dylib" Visible="false" />
@@ -16,4 +11,82 @@
           Condition="Exists('$(TbNativeDir)libtb_core_ffi.so')"
           CopyToOutputDirectory="PreserveNewest" Link="libtb_core_ffi.so" Visible="false" />
   </ItemGroup>
+
+  <!-- This is the only Windows Platform/RID to Rust-target mapping. -->
+  <PropertyGroup Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'">
+    <TbNativeRepoDir>$(MSBuildThisFileDirectory)..</TbNativeRepoDir>
+    <TbNativeVerifier>$(MSBuildThisFileDirectory)..\scripts\verify-native-dll.ps1</TbNativeVerifier>
+
+    <TbNativeRustTarget Condition="'$(Platform)' == 'x64' and ('$(RuntimeIdentifier)' == '' or '$(RuntimeIdentifier)' == 'win-x64')">x86_64-pc-windows-msvc</TbNativeRustTarget>
+    <TbNativeExpectedMachine Condition="'$(Platform)' == 'x64' and ('$(RuntimeIdentifier)' == '' or '$(RuntimeIdentifier)' == 'win-x64')">0x8664</TbNativeExpectedMachine>
+    <TbNativeRustTarget Condition="'$(Platform)' == 'ARM64' and ('$(RuntimeIdentifier)' == '' or '$(RuntimeIdentifier)' == 'win-arm64')">aarch64-pc-windows-msvc</TbNativeRustTarget>
+    <TbNativeExpectedMachine Condition="'$(Platform)' == 'ARM64' and ('$(RuntimeIdentifier)' == '' or '$(RuntimeIdentifier)' == 'win-arm64')">0xAA64</TbNativeExpectedMachine>
+    <TbNativeRustTarget Condition="('$(Platform)' == '' or '$(Platform)' == 'AnyCPU') and '$(RuntimeIdentifier)' == 'win-x64'">x86_64-pc-windows-msvc</TbNativeRustTarget>
+    <TbNativeExpectedMachine Condition="('$(Platform)' == '' or '$(Platform)' == 'AnyCPU') and '$(RuntimeIdentifier)' == 'win-x64'">0x8664</TbNativeExpectedMachine>
+    <TbNativeRustTarget Condition="('$(Platform)' == '' or '$(Platform)' == 'AnyCPU') and '$(RuntimeIdentifier)' == 'win-arm64'">aarch64-pc-windows-msvc</TbNativeRustTarget>
+    <TbNativeExpectedMachine Condition="('$(Platform)' == '' or '$(Platform)' == 'AnyCPU') and '$(RuntimeIdentifier)' == 'win-arm64'">0xAA64</TbNativeExpectedMachine>
+
+    <TbNativeSource>$(TbNativeRepoDir)\target\$(TbNativeRustTarget)\release\tb_core_ffi.dll</TbNativeSource>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true' and '$(TbNativeRustTarget)' != ''">
+    <None Include="$(TbNativeSource)"
+          CopyToOutputDirectory="Always"
+          CopyToPublishDirectory="Always"
+          Link="tb_core_ffi.dll"
+          Visible="false" />
+  </ItemGroup>
+
+  <Target Name="ValidateTbNativeConfiguration"
+          Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'">
+    <Error Condition="'$(TbNativeRustTarget)' == ''"
+           Text="Unsupported Windows native tuple: Platform='$(Platform)', RuntimeIdentifier='$(RuntimeIdentifier)'." />
+    <Error Condition="'$(TbNativeExpectedMachine)' == ''"
+           Text="Windows native tuple did not resolve an expected PE machine: Platform='$(Platform)', RuntimeIdentifier='$(RuntimeIdentifier)'." />
+  </Target>
+
+  <Target Name="ValidateTbNativeSource"
+          DependsOnTargets="ValidateTbNativeConfiguration"
+          Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'">
+    <Error Condition="!Exists('$(TbNativeSource)')"
+           Text="Missing Rust native DLL for $(TbNativeRustTarget): $(TbNativeSource)" />
+    <Exec Command="powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(TbNativeVerifier)&quot; -Path &quot;$(TbNativeSource)&quot; -ExpectedMachine &quot;$(TbNativeExpectedMachine)&quot;" />
+  </Target>
+
+  <!-- Managed Build/Publish never invoke cargo; they validate and package the
+       DLL produced by the explicit BuildTbNative target. -->
+  <Target Name="ValidateTbNativePackaging"
+          BeforeTargets="GetCopyToOutputDirectoryItems;GetCopyToPublishDirectoryItems;Build;Publish"
+          DependsOnTargets="ValidateTbNativeSource"
+          Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'" />
+
+  <Target Name="BuildTbNative"
+          DependsOnTargets="ValidateTbNativeConfiguration"
+          Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'">
+    <Exec Command="cargo build --release --target &quot;$(TbNativeRustTarget)&quot;"
+          WorkingDirectory="$(TbNativeRepoDir)" />
+    <CallTarget Targets="ValidateTbNativeSource" />
+  </Target>
+
+  <Target Name="CopyTbNativeToBuildOutput"
+          AfterTargets="Build"
+          DependsOnTargets="ValidateTbNativeSource"
+          Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'">
+    <Copy SourceFiles="$(TbNativeSource)"
+          DestinationFiles="$(TargetDir)tb_core_ffi.dll"
+          SkipUnchangedFiles="false"
+          OverwriteReadOnlyFiles="true" />
+    <Exec Command="powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(TbNativeVerifier)&quot; -Path &quot;$(TargetDir)tb_core_ffi.dll&quot; -ExpectedMachine &quot;$(TbNativeExpectedMachine)&quot; -CompareTo &quot;$(TbNativeSource)&quot;" />
+  </Target>
+
+  <Target Name="CopyTbNativeToPublishOutput"
+          AfterTargets="Publish"
+          DependsOnTargets="ValidateTbNativeSource"
+          Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'">
+    <Copy SourceFiles="$(TbNativeSource)"
+          DestinationFiles="$(PublishDir)tb_core_ffi.dll"
+          SkipUnchangedFiles="false"
+          OverwriteReadOnlyFiles="true" />
+    <Exec Command="powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(TbNativeVerifier)&quot; -Path &quot;$(PublishDir)tb_core_ffi.dll&quot; -ExpectedMachine &quot;$(TbNativeExpectedMachine)&quot; -CompareTo &quot;$(TbNativeSource)&quot;" />
+  </Target>
 </Project>
