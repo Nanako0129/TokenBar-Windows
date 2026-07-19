@@ -43,4 +43,24 @@
     <Content Include="Assets\**\*.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <Target Name="CopyAppWinUiAssetsAfterPublish" AfterTargets="Publish">
+    <ItemGroup>
+      <AppXbf Include="$(TargetDir)**\*.xbf" />
+    </ItemGroup>
+    <Error Condition="!Exists('$(TargetDir)$(AssemblyName).pri')"
+           Text="Missing App PRI: $(TargetDir)$(AssemblyName).pri" />
+    <Error Condition="'@(AppXbf)' == ''"
+           Text="No WinUI XBF files found under $(TargetDir)" />
+    <MakeDir Directories="$(PublishDir)" />
+    <MakeDir Directories="@(AppXbf->'$(PublishDir)%(RecursiveDir)')" />
+    <Copy SourceFiles="$(TargetDir)$(AssemblyName).pri"
+          DestinationFiles="$(PublishDir)$(AssemblyName).pri"
+          SkipUnchangedFiles="false"
+          OverwriteReadOnlyFiles="true" />
+    <Copy SourceFiles="@(AppXbf)"
+          DestinationFiles="@(AppXbf->'$(PublishDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="false"
+          OverwriteReadOnlyFiles="true" />
+  </Target>
+
 </Project>
