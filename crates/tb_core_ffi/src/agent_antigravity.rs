@@ -36,6 +36,7 @@ use std::sync::OnceLock;
 const LANG_SERVICE: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
 const CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const REFRESH_SAFETY_SECS: i64 = 60;
 
 pub(crate) struct Fetched {
@@ -631,9 +632,11 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
 fn resolve_local_account_scope(
     identity: Option<&AgentIdentity>,
 ) -> Result<AccountScope, AccountScopeError> {
-    resolve_local_account_scope_with(identity, |email| {
-        agent_account_scope::resolve_authoritative("antigravity", AuthoritativeIdKind::Email, email)
-    })
+    resolve_local_account_scope_with(identity, resolve_email_account_scope)
+}
+
+fn resolve_email_account_scope(email: &str) -> Result<AccountScope, AccountScopeError> {
+    agent_account_scope::resolve_authoritative("antigravity", AuthoritativeIdKind::Email, email)
 }
 
 fn resolve_local_account_scope_with<T>(
@@ -662,25 +665,34 @@ fn local_plan_name(info: LocalPlanInfo) -> Option<String> {
 
 // ── OAuth remote (Google Code Assist) ─────────────────────────────────────────
 
+#[derive(Deserialize)]
+struct GoogleUserInfo {
+    email: Option<String>,
+    #[serde(default)]
+    verified_email: bool,
+}
+
+struct RemoteAuth<T> {
+    access_token: String,
+    account_scope: Result<T, AccountScopeError>,
+}
+
 async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
     let creds_path = gemini_home()
         .map(|home| home.join("oauth_creds.json"))
         .ok_or_else(|| "Could not resolve ~/.gemini".to_string())?;
-    let mut creds = load_remote_credentials(&creds_path)?;
-    let mut access_token = remote_access_token(&creds)?;
-    let mut refreshed_scope = None;
-
-    if remote_credentials_need_refresh(&creds, now) {
-        let refreshed = refresh_access_token(&creds_path, now).await?;
-        creds = refreshed.0;
-        access_token = refreshed.1;
-        refreshed_scope = Some(refreshed.2);
-    }
-
+    let creds = load_remote_credentials(&creds_path)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("build Antigravity client: {e}"))?;
+    let auth = prepare_remote_auth_with(
+        &creds,
+        now,
+        || refresh_access_token(&creds_path, now),
+        |access_token| fetch_remote_account_scope(&client, access_token),
+    )
+    .await?;
 
     let code_assist_body = code_assist_post(
         &client,
@@ -688,26 +700,106 @@ async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
         &json!({
             "metadata": { "ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI" }
         }),
-        &access_token,
+        &auth.access_token,
     )
     .await?;
     let code_assist: Value = serde_json::from_str(&code_assist_body)
         .map_err(|e| format!("decode Antigravity loadCodeAssist: {e}"))?;
     let project = project_id(&code_assist);
     let plan = resolve_remote_plan(&code_assist);
-    let windows = fetch_model_quotas(&client, &access_token, project.as_deref(), now).await?;
-    let account_scope =
-        refreshed_scope.unwrap_or_else(|| resolve_remote_account_scope(&creds_path, &creds));
+    let windows = fetch_model_quotas(&client, &auth.access_token, project.as_deref(), now).await?;
 
-    Ok(Fetched {
+    Ok(remote_fetched(plan, auth.account_scope, windows))
+}
+
+async fn prepare_remote_auth_with<T, Refresh, RefreshFuture, Resolve, ResolveFuture>(
+    creds: &Value,
+    now: DateTime<Utc>,
+    refresh: Refresh,
+    resolve_account_scope: Resolve,
+) -> Result<RemoteAuth<T>, String>
+where
+    Refresh: FnOnce() -> RefreshFuture,
+    RefreshFuture: std::future::Future<
+        Output = Result<(Value, String, Result<AccountScope, AccountScopeError>), String>,
+    >,
+    Resolve: FnOnce(String) -> ResolveFuture,
+    ResolveFuture: std::future::Future<Output = Result<T, AccountScopeError>>,
+{
+    let mut access_token = remote_access_token(creds)?;
+    if remote_credentials_need_refresh(creds, now) {
+        // Credential lineage protects refresh rotation only; it is never history identity.
+        let (_, final_access_token, _credential_lineage) = refresh().await?;
+        access_token = final_access_token;
+    }
+    let account_scope = resolve_account_scope(access_token.clone()).await;
+    Ok(RemoteAuth {
+        access_token,
+        account_scope,
+    })
+}
+
+async fn fetch_remote_account_scope(
+    client: &reqwest::Client,
+    access_token: String,
+) -> Result<AccountScope, AccountScopeError> {
+    let response = client
+        .get(GOOGLE_USERINFO_URL)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|_| AccountScopeError::NoTrustedEvidence)?;
+    let status = response.status();
+    require_google_user_info_success(status)?;
+    let body = response
+        .text()
+        .await
+        .map_err(|_| AccountScopeError::NoTrustedEvidence)?;
+    resolve_google_user_info_response_with(status, &body, resolve_email_account_scope)
+}
+
+fn require_google_user_info_success(
+    status: reqwest::StatusCode,
+) -> Result<(), AccountScopeError> {
+    status
+        .is_success()
+        .then_some(())
+        .ok_or(AccountScopeError::NoTrustedEvidence)
+}
+
+fn resolve_google_user_info_response_with<T>(
+    status: reqwest::StatusCode,
+    body: &str,
+    resolve: impl FnOnce(&str) -> Result<T, AccountScopeError>,
+) -> Result<T, AccountScopeError> {
+    require_google_user_info_success(status)?;
+    let user_info: GoogleUserInfo =
+        serde_json::from_str(body).map_err(|_| AccountScopeError::NoTrustedEvidence)?;
+    if !user_info.verified_email {
+        return Err(AccountScopeError::NoTrustedEvidence);
+    }
+    let email = user_info
+        .email
+        .filter(|email| !email.trim().is_empty())
+        .ok_or(AccountScopeError::NoTrustedEvidence)?;
+    resolve(&email)
+}
+
+fn remote_fetched(
+    plan: Option<String>,
+    account_scope: Result<AccountScope, AccountScopeError>,
+    windows: Vec<UsageWindow>,
+) -> Fetched {
+    Fetched {
         source: "oauth".to_string(),
         identity: Some(remote_identity(plan)),
         account_scope,
         windows,
-    })
+    }
 }
 
 fn remote_identity(plan: Option<String>) -> AgentIdentity {
+    // UserInfo email is scope evidence only and must not enter the wire identity.
     AgentIdentity { email: None, plan }
 }
 
@@ -744,19 +836,6 @@ fn remote_credentials_need_refresh(creds: &Value, now: DateTime<Utc>) -> bool {
 
 fn remote_scope_location(path: &Path) -> Result<String, AccountScopeError> {
     agent_account_scope::canonical_file_location(path, Some("refresh_token"))
-}
-
-fn resolve_remote_account_scope(
-    path: &Path,
-    creds: &Value,
-) -> Result<AccountScope, AccountScopeError> {
-    let marker = remote_refresh_marker(creds).ok_or(AccountScopeError::NoTrustedEvidence)?;
-    agent_account_scope::resolve_credential(
-        "antigravity",
-        "google-oauth-creds",
-        &remote_scope_location(path)?,
-        marker,
-    )
 }
 
 async fn refresh_access_token(
@@ -1385,6 +1464,14 @@ fn gemini_home() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::agent_account_scope::test_support::TestRefreshScope;
+    use sha2::{Digest as _, Sha256};
+
+    fn fixture_authoritative_scope(email: &str) -> Result<[u8; 32], AccountScopeError> {
+        let mut digest = Sha256::new();
+        digest.update(b"antigravity\0email\0");
+        digest.update(email.trim().to_ascii_lowercase().as_bytes());
+        Ok(digest.finalize().into())
+    }
 
     #[test]
     fn extracts_flags_both_forms() {
@@ -2076,26 +2163,211 @@ mod tests {
     }
 
     #[test]
-    fn remote_scope_and_presentation_ignore_unbound_active_email() {
-        let stale_active_email = "stale-other-account@example.com";
-        let credentials = json!({
-            "access_token": "short-lived-access",
-            "refresh_token": "bound-google-refresh"
-        });
-        assert_eq!(
-            remote_refresh_marker(&credentials),
-            Some(b"bound-google-refresh".as_slice())
-        );
-        assert_ne!(
-            remote_refresh_marker(&credentials),
-            Some(stale_active_email.as_bytes())
-        );
-        let identity = remote_identity(Some("Paid".to_string()));
-        assert_eq!(identity.email, None);
-        assert_eq!(identity.plan.as_deref(), Some("Paid"));
+    fn verified_remote_user_info_shares_authoritative_scope_with_local_email() {
+        let local_identity = AgentIdentity {
+            email: Some(" Same.User@Example.COM ".to_string()),
+            plan: None,
+        };
+        let local_scope =
+            resolve_local_account_scope_with(Some(&local_identity), fixture_authoritative_scope)
+                .unwrap();
+        let remote_scope = resolve_google_user_info_response_with(
+            reqwest::StatusCode::OK,
+            r#"{"email":"same.user@example.com","verified_email":true}"#,
+            fixture_authoritative_scope,
+        )
+        .unwrap();
+        let other_remote_scope = resolve_google_user_info_response_with(
+            reqwest::StatusCode::OK,
+            r#"{"email":"other.user@example.com","verified_email":true}"#,
+            fixture_authoritative_scope,
+        )
+        .unwrap();
 
-        let access_only = json!({ "access_token": "access-is-not-the-frozen-marker" });
-        assert_eq!(remote_refresh_marker(&access_only), None);
+        assert_eq!(remote_scope, local_scope);
+        assert_ne!(other_remote_scope, local_scope);
+    }
+
+    #[tokio::test]
+    async fn remote_user_info_uses_refreshed_final_token_and_ignores_cached_identity() {
+        let scope_store = TestRefreshScope::new("antigravity", "antigravity-userinfo-token");
+        let lineage_scope = scope_store
+            .resolve_current(
+                "google-oauth-creds",
+                "fixture-location",
+                b"fixture-refresh-marker",
+            )
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let credentials = json!({
+            "access_token": "fixture-stale-access",
+            "refresh_token": "fixture-refresh-marker",
+            "expiry_date": 0,
+            "id_token": "stale-id-token-must-not-authorize-scope",
+            "active_email": "stale-active-email@example.com"
+        });
+        let final_token_seen = std::cell::Cell::new(false);
+        let verified_email_seen = std::cell::Cell::new(false);
+        let auth = prepare_remote_auth_with(
+            &credentials,
+            now,
+            || {
+                std::future::ready(Ok((
+                    json!({"access_token": "fixture-final-access"}),
+                    "fixture-final-access".to_string(),
+                    Ok(lineage_scope),
+                )))
+            },
+            |access_token| {
+                final_token_seen.set(access_token == "fixture-final-access");
+                let scope = resolve_google_user_info_response_with(
+                    reqwest::StatusCode::OK,
+                    r#"{"email":"fresh.user@example.com","verified_email":true}"#,
+                    |email| {
+                        verified_email_seen.set(email == "fresh.user@example.com");
+                        fixture_authoritative_scope(email)
+                    },
+                );
+                std::future::ready(scope)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(final_token_seen.get());
+        assert!(verified_email_seen.get());
+        assert!(auth.access_token == "fixture-final-access");
+        assert!(auth.account_scope.is_ok());
+        scope_store.cleanup();
+    }
+
+    #[tokio::test]
+    async fn untrusted_user_info_keeps_quota_and_never_falls_back_to_lineage() {
+        let scope_store = TestRefreshScope::new("antigravity", "antigravity-userinfo-fail");
+        let lineage_scope = scope_store
+            .resolve_current(
+                "google-oauth-creds",
+                "fixture-location",
+                b"fixture-refresh-marker",
+            )
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let fixtures = [
+            (
+                reqwest::StatusCode::OK,
+                r#"{"verified_email":true,"raw":"raw-response-must-not-leak"}"#,
+            ),
+            (
+                reqwest::StatusCode::OK,
+                r#"{"email":" \t ","verified_email":true,"raw":"raw-response-must-not-leak"}"#,
+            ),
+            (
+                reqwest::StatusCode::OK,
+                r#"{"email":"raw-email-must-not-leak@example.com","verified_email":false}"#,
+            ),
+            (
+                reqwest::StatusCode::OK,
+                r#"{"email":"raw-email-must-not-leak@example.com"}"#,
+            ),
+            (
+                reqwest::StatusCode::OK,
+                r#"{"email":"raw-email-must-not-leak@example.com","verified_email":"true","raw":"raw-response-must-not-leak"}"#,
+            ),
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                r#"{"email":"raw-email-must-not-leak@example.com","verified_email":true}"#,
+            ),
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                r#"{"email":"raw-email-must-not-leak@example.com","verified_email":true}"#,
+            ),
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "raw-response-must-not-leak",
+            ),
+        ];
+
+        for (status, body) in fixtures {
+            let credentials = json!({
+                "access_token": "fixture-stale-access",
+                "refresh_token": "fixture-refresh-marker",
+                "expiry_date": 0,
+                "id_token": "stale-id-token-must-not-authorize-scope"
+            });
+            let resolver_calls = std::cell::Cell::new(0);
+            let auth: RemoteAuth<AccountScope> = prepare_remote_auth_with(
+                &credentials,
+                now,
+                || {
+                    std::future::ready(Ok((
+                        json!({"access_token": "fixture-final-access"}),
+                        "fixture-final-access".to_string(),
+                        Ok(lineage_scope.clone()),
+                    )))
+                },
+                |_| {
+                    let scope = resolve_google_user_info_response_with(status, body, |_| {
+                        resolver_calls.set(resolver_calls.get() + 1);
+                        Err(AccountScopeError::MetadataWrite)
+                    });
+                    std::future::ready(scope)
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(resolver_calls.get(), 0);
+            assert_eq!(
+                auth.account_scope,
+                Err(AccountScopeError::NoTrustedEvidence)
+            );
+            let error = auth.account_scope.as_ref().unwrap_err();
+            let rendered = format!("{error} {error:?}");
+            for sensitive in [
+                "fixture-final-access",
+                "fixture-refresh-marker",
+                "stale-id-token-must-not-authorize-scope",
+                "raw-email-must-not-leak@example.com",
+                "raw-response-must-not-leak",
+            ] {
+                assert!(!rendered.contains(sensitive));
+            }
+
+            let window = quota_window(
+                "Gemini fixture".to_string(),
+                0.5,
+                None,
+                false,
+                now,
+                "model.fixture.v1".to_string(),
+                Some("model.fixture.v1".to_string()),
+            )
+            .unwrap();
+            let fetched = remote_fetched(
+                Some("Paid".to_string()),
+                auth.account_scope,
+                vec![window],
+            );
+            assert_eq!(fetched.source, "oauth");
+            assert_eq!(fetched.windows.len(), 1);
+            assert!((fetched.windows[0].remaining_for_test() - 50.0).abs() < 0.01);
+            assert_eq!(
+                fetched.account_scope,
+                Err(AccountScopeError::NoTrustedEvidence)
+            );
+            assert_eq!(
+                fetched
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.email.as_deref()),
+                None
+            );
+        }
+        scope_store.cleanup();
     }
 
     #[test]
