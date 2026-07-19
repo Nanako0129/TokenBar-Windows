@@ -110,6 +110,8 @@ jobs:
             provider-quota-pace-v3
       - name: compare CrossCheck outputs
         shell: bash
+        env:
+          PYTHONUTF8: "1"
         run: python3 crosscheck/diff.py crosscheck/swift-out crosscheck/csharp-out
       # Hermetic runtime check: point HOME at a synthetic Claude tree and put
       # one valid Codex session under a different CODEX_HOME root. The strict
