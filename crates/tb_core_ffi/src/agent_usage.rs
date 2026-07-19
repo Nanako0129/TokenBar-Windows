@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
@@ -3229,22 +3229,35 @@ pub(crate) fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-fn claude_user_agent() -> String {
-    std::process::Command::new("claude")
-        .arg("--version")
+static CLAUDE_USER_AGENT: LazyLock<String> = LazyLock::new(detect_claude_user_agent);
+
+fn claude_user_agent() -> &'static str {
+    CLAUDE_USER_AGENT.as_str()
+}
+
+fn detect_claude_user_agent() -> String {
+    let mut command = std::process::Command::new("claude");
+    command.arg("--version");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    command
         .output()
         .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8(output.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .and_then(|stdout| stdout.split_whitespace().next().map(str::to_string))
-        .filter(|version| !version.is_empty())
-        .map(|version| format!("claude-code/{}", version))
+        .filter(|output| output.status.success())
+        .and_then(|output| claude_user_agent_from_stdout(&output.stdout))
         .unwrap_or_else(|| "claude-code/2.1.0".to_string())
+}
+
+fn claude_user_agent_from_stdout(stdout: &[u8]) -> Option<String> {
+    std::str::from_utf8(stdout)
+        .ok()?
+        .split_whitespace()
+        .next()
+        .filter(|version| !version.is_empty())
+        .map(|version| format!("claude-code/{version}"))
 }
 
 fn form_urlencoded(params: &[(&str, &str)]) -> String {
@@ -3396,6 +3409,16 @@ mod tests {
     ) -> Option<crate::opencode_integrations::GitHubCopilotCredential> {
         std::fs::write(path, serde_json::to_vec(json).unwrap()).unwrap();
         crate::opencode_integrations::github_copilot_credential_from(path, json)
+    }
+
+    #[test]
+    fn claude_user_agent_uses_first_version_token() {
+        assert_eq!(
+            claude_user_agent_from_stdout(b"2.1.5 (Claude Code)\r\n").as_deref(),
+            Some("claude-code/2.1.5")
+        );
+        assert_eq!(claude_user_agent_from_stdout(b" \r\n"), None);
+        assert_eq!(claude_user_agent_from_stdout(&[0xff]), None);
     }
 
     fn enrichment_scope(tag: &str) -> (TestRefreshScope, AccountScope) {
