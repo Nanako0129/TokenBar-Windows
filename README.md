@@ -31,11 +31,13 @@ Prereqs: Rust (stable), .NET 10 SDK; on Windows the MSVC toolchain.
 
 Windows CI now blocks on the full Rust workspace release tests, the WinUI App
 x64 Release build, solution build/tests, isolated P/Invoke and synthetic parse
-smokes, a self-contained win-x64 smoke bundle, and the ARM64 Rust release
-cross-build. The provider-pace branch passed local command-equivalent x64 and
-ARM64 gates plus fresh review on 2026-07-19; GitHub PR #3 preserves its remote
-CI and review record. `cargo fmt` is not currently a repository CI gate; its
-existing workspace-wide formatting debt is tracked separately.
+smokes (including strict relocated-`CODEX_HOME` coverage across every local
+usage surface and pre-aggregation client filters), a self-contained win-x64
+smoke bundle, and the ARM64 Rust release cross-build. The provider-pace branch
+passed local command-equivalent x64 and ARM64 gates plus fresh review on
+2026-07-19; GitHub PR #3 preserves its remote CI and review record. `cargo fmt`
+is not currently a repository CI gate; its existing workspace-wide formatting
+debt is tracked separately.
 
 ## Progress
 
@@ -68,8 +70,9 @@ separate from credential-bound live coverage. Across the staged sanitized
 manifests, the Claude and Codex credential files and legacy v1 history remained
 unchanged; expected secure account-scope and v3 pace-history artifacts were
 created or updated as the provider checks progressed. Session-parser
-environment-root overrides and RID-aware native-DLL selection/freshness remain
-separate follow-ups, not completed by PR #3.
+environment-root overrides now flow through one shared FFI source context and
+have strict relocated-`CODEX_HOME` coverage. RID-aware native-DLL selection and
+freshness remain a separate follow-up.
 
 ## Credits
 

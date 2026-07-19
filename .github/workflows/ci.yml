@@ -38,23 +38,88 @@ jobs:
           TB_SMOKE_SKIP_NETWORK: "1"
           TOKSCALE_CONFIG_DIR: ${{ runner.temp }}\tb-smoke-config
           TOKSCALE_PRICING_CACHE_ONLY: "1"
-      # Hermetic runtime check: point HOME at a synthetic ~/.claude/projects
-      # tree and assert the engine actually parses messages on Windows —
-      # "compiles + doesn't crash" alone can't tell a dead parser from an
-      # empty machine.
-      - name: hermetic parse smoke (synthetic Claude session)
+      # Hermetic runtime check: point HOME at a synthetic Claude tree and put
+      # one valid Codex session under a different CODEX_HOME root. The strict
+      # client assertions make a pre-A1 binary fail instead of silently passing
+      # with only the HOME-backed Claude messages.
+      - name: hermetic parse smoke (isolated Claude, relocated Codex)
         shell: pwsh
         run: |
           $fx = Join-Path $env:RUNNER_TEMP "tb-home"
-          New-Item -ItemType Directory -Force -Path "$fx\.claude\projects\ci" | Out-Null
-          @'
-          {"type":"assistant","timestamp":"2026-04-01T10:00:01.000Z","requestId":"req_ci1","message":{"id":"msg_ci1","model":"claude-sonnet-4","usage":{"input_tokens":123,"output_tokens":45}}}
-          {"type":"assistant","timestamp":"2026-04-01T10:00:02.000Z","requestId":"req_ci2","message":{"id":"msg_ci2","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":5}}}
-          '@ | Set-Content -Path "$fx\.claude\projects\ci\session.jsonl" -Encoding utf8
+          $codex = Join-Path $env:RUNNER_TEMP "tb-codex-root"
+          @($fx, $codex) | ForEach-Object {
+            Remove-Item -LiteralPath $_ -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $appData = Join-Path $fx "appdata"
+          $localAppData = Join-Path $fx "local-appdata"
+          $xdgData = Join-Path $fx "xdg-data"
+          $config = Join-Path $fx "config"
+          $emptyRoots = @(
+            (Join-Path $fx "grok"),
+            (Join-Path $fx "gemini"),
+            (Join-Path $fx "hermes"),
+            (Join-Path $fx "codebuff"),
+            (Join-Path $fx "jcode"),
+            (Join-Path $fx "gjc"),
+            (Join-Path $fx "goose"),
+            (Join-Path $fx "headless")
+          )
+          @(
+            "$fx\.claude\projects\ci",
+            "$codex\sessions\ci",
+            $appData,
+            $localAppData,
+            $xdgData,
+            $config
+          ) + $emptyRoots | ForEach-Object {
+            New-Item -ItemType Directory -Force -Path $_ | Out-Null
+          }
+          # dirs::data_local_dir uses the Windows Known Folder API rather than
+          # LOCALAPPDATA. A hosted runner must have no host Zed DB to ingest.
+          $hostZed = Join-Path `
+            ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) `
+            "Zed\threads\threads.db"
+          if (Test-Path -LiteralPath $hostZed) {
+            throw "host profile contains a Zed session DB: $hostZed"
+          }
+          $now = [DateTime]::UtcNow
+          # Only Codex is inside the live 10-minute window, so the aggregate
+          # token rate must equal the Codex trace rate. Claude remains visible
+          # to graph/model/hourly/agents and the strict filter-delta checks.
+          $t1 = $now.AddHours(-2).AddSeconds(-20).ToString("yyyy-MM-ddTHH:mm:ss.fffZ", [Globalization.CultureInfo]::InvariantCulture)
+          $t2 = $now.AddHours(-2).AddSeconds(-10).ToString("yyyy-MM-ddTHH:mm:ss.fffZ", [Globalization.CultureInfo]::InvariantCulture)
+          $t3 = $now.AddSeconds(-10).ToString("yyyy-MM-ddTHH:mm:ss.fffZ", [Globalization.CultureInfo]::InvariantCulture)
+          @"
+          {"type":"assistant","timestamp":"$t1","requestId":"req_ci1","message":{"id":"msg_ci1","model":"claude-sonnet-4","usage":{"input_tokens":123,"output_tokens":45}}}
+          "@ | Set-Content -Path "$fx\.claude\projects\ci\session-1.jsonl" -Encoding utf8
+          @"
+          {"type":"assistant","timestamp":"$t2","requestId":"req_ci2","message":{"id":"msg_ci2","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":5}}}
+          "@ | Set-Content -Path "$fx\.claude\projects\ci\session-2.jsonl" -Encoding utf8
+          @"
+          {"timestamp":"$t3","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","source":"interactive","model_provider":"openai","cwd":"C:/ci/codex"}}
+          {"timestamp":"$t3","type":"turn_context","payload":{"model":"gpt-5.4"}}
+          {"timestamp":"$t3","type":"event_msg","payload":{"type":"user_message","message":"ci smoke"}}
+          {"timestamp":"$t3","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10},"last_token_usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10}}}}
+          "@ | Set-Content -Path "$codex\sessions\ci\session.jsonl" -Encoding utf8
           $env:HOME = $fx
-          $env:TOKSCALE_CONFIG_DIR = Join-Path $fx ".config\tokscale"
+          $env:CODEX_HOME = $codex
+          $env:APPDATA = $appData
+          $env:LOCALAPPDATA = $localAppData
+          $env:XDG_DATA_HOME = $xdgData
+          $env:TOKSCALE_CONFIG_DIR = $config
+          $env:GROK_HOME = $emptyRoots[0]
+          $env:GEMINI_CLI_HOME = $emptyRoots[1]
+          $env:HERMES_HOME = $emptyRoots[2]
+          $env:CODEBUFF_DATA_DIR = $emptyRoots[3]
+          $env:JCODE_HOME = $emptyRoots[4]
+          $env:GJC_CODING_AGENT_DIR = $emptyRoots[5]
+          $env:GOOSE_PATH_ROOT = $emptyRoots[6]
+          $env:TOKSCALE_HEADLESS_DIR = $emptyRoots[7]
+          $env:TOKSCALE_EXTRA_DIRS = ""
+          $env:COPILOT_OTEL_FILE_EXPORTER_PATH = Join-Path $fx "missing-copilot.jsonl"
           $env:TOKSCALE_PRICING_CACHE_ONLY = "1"
-          $env:TB_SMOKE_MIN_MESSAGES = "2"
+          $env:TB_SMOKE_MIN_MESSAGES = "3"
+          $env:TB_SMOKE_EXPECT_CLIENT = "codex"
           $env:TB_SMOKE_SKIP_NETWORK = "1"
           dotnet run --project src/TokenBar.Smoke -c Release --no-build
       # Self-contained smoke bundle (runtime + native dll included): lets a
