@@ -141,4 +141,67 @@ public class QuotaSelectionPolicyTests
 
         Assert.Null(QuotaSelectionPolicy.Resolve(Payload, "codex|stale.v1"));
     }
+
+    [Fact]
+    public void AllHiddenAutoResolvesToNull()
+    {
+        Assert.Null(QuotaSelectionPolicy.Resolve(
+            Payload,
+            QuotaResolver.Auto,
+            new HashSet<string> { "claude", "codex" }));
+        Assert.True(QuotaResolver.ExcludedAllCandidates(
+            Payload,
+            QuotaResolver.Auto,
+            new HashSet<string> { "claude", "codex" }));
+    }
+
+    [Fact]
+    public void LastGoodRemainingRequiresTheSameEffectiveSelection()
+    {
+        Assert.Equal(
+            12,
+            QuotaSelectionPolicy.MatchingLastGoodRemaining(
+                QuotaResolver.Auto, QuotaResolver.Auto, 12));
+        Assert.Null(QuotaSelectionPolicy.MatchingLastGoodRemaining(
+            "codex|weekly.v1", QuotaResolver.Auto, 12));
+        Assert.Null(QuotaSelectionPolicy.MatchingLastGoodRemaining(
+            QuotaResolver.Auto, null, 12));
+    }
+
+    [Fact]
+    public void AutoThenMissingExplicitDoesNotReuseAutoValue()
+    {
+        var auto = QuotaSelectionPolicy.Resolve(Payload, QuotaResolver.Auto);
+        Assert.Equal("claude", auto!.ClientId);
+        Assert.Null(QuotaSelectionPolicy.Resolve(Payload, "codex|missing.v1"));
+        Assert.Null(QuotaSelectionPolicy.MatchingLastGoodRemaining(
+            "codex|missing.v1", QuotaResolver.Auto, auto.Window.RemainingPercent));
+    }
+
+    [Fact]
+    public void ExplicitSelectionSwitchDoesNotReuseAnotherSourceAndSameSelectionRetainsItsValue()
+    {
+        var selected = QuotaSelectionPolicy.Resolve(Payload, "codex|weekly.v1");
+        Assert.Equal(35, selected!.Window.RemainingPercent);
+        Assert.Null(QuotaSelectionPolicy.Resolve(Payload, "codex|missing.v1"));
+        Assert.Null(QuotaSelectionPolicy.MatchingLastGoodRemaining(
+            "codex|missing.v1", "codex|weekly.v1", selected.Window.RemainingPercent));
+        Assert.Equal(
+            35,
+            QuotaSelectionPolicy.MatchingLastGoodRemaining(
+                "codex|weekly.v1", "codex|weekly.v1", selected.Window.RemainingPercent));
+    }
+
+    [Fact]
+    public void PersistedRemainingNeedsMatchingSelectionKey()
+    {
+        Assert.Equal(
+            35,
+            QuotaSelectionPolicy.MatchingLastGoodRemaining(
+                "codex|weekly.v1", "codex|weekly.v1", 35));
+        Assert.Null(QuotaSelectionPolicy.MatchingLastGoodRemaining(
+            "codex|weekly.v1", null, 35)); // legacy unkeyed scalar
+        Assert.Null(QuotaSelectionPolicy.MatchingLastGoodRemaining(
+            "codex|weekly.v1", "codex|session.v1", 35));
+    }
 }
