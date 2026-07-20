@@ -406,13 +406,6 @@ fn included_percentage_evidence(config: &BillingConfig) -> PercentageEvidence {
 }
 
 fn extra_usage_window(config: &BillingConfig, now: DateTime<Utc>) -> (bool, Option<UsageWindow>) {
-    let Some(used) = config
-        .on_demand_used
-        .as_deref()
-        .and_then(raw_amount_value)
-    else {
-        return (false, None);
-    };
     let Some(cap) = config
         .on_demand_cap
         .as_deref()
@@ -420,11 +413,22 @@ fn extra_usage_window(config: &BillingConfig, now: DateTime<Utc>) -> (bool, Opti
     else {
         return (false, None);
     };
-    if used < 0.0 || cap < 0.0 {
+    if cap < 0.0 {
         return (false, None);
     }
     if cap == 0.0 {
         return (true, None);
+    }
+
+    let Some(used) = config
+        .on_demand_used
+        .as_deref()
+        .and_then(raw_amount_value)
+    else {
+        return (false, None);
+    };
+    if used < 0.0 {
+        return (false, None);
     }
 
     let used_percent = ((used / cap) * 100.0).min(100.0);
@@ -1615,6 +1619,29 @@ mod tests {
             );
             let data = map_test_config(&config).unwrap();
             assert!(data.windows.is_empty(), "cap={cap}");
+        }
+    }
+
+    #[test]
+    fn zero_on_demand_cap_does_not_require_used() {
+        for (label, config) in [
+            ("missing used", r#"{ "onDemandCap": 0.0 }"#),
+            (
+                "null used",
+                r#"{ "onDemandUsed": null, "onDemandCap": { "val": 0.0 } }"#,
+            ),
+            (
+                "fully disabled",
+                r#"{
+                    "creditUsagePercent": 0.0,
+                    "used": 0.0,
+                    "monthlyLimit": 0.0,
+                    "onDemandCap": 0.0
+                }"#,
+            ),
+        ] {
+            let data = map_test_config(config).unwrap();
+            assert!(data.windows.is_empty(), "{label}");
         }
     }
 
