@@ -92,6 +92,10 @@ struct BillingConfig {
     #[serde(default, deserialize_with = "deserialize_optional_raw")]
     billing_period_end: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    used: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    monthly_limit: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     on_demand_used: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "deserialize_optional_raw")]
     on_demand_cap: Option<Box<RawValue>>,
@@ -114,6 +118,12 @@ struct ProductUsage {
     product: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_raw")]
     usage_percent: Option<Box<RawValue>>,
+}
+
+enum PercentageEvidence {
+    Absent,
+    Invalid,
+    Valid(f64),
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,8 +247,22 @@ fn map_billing(
         .config
         .ok_or_else(|| "Grok billing response missing config.".to_string())?;
 
-    let used_percent = used_percent_from_config(&config);
+    let (used_percent, included_monthly_fallback, included_invalid) =
+        match legacy_percentage_evidence(&config) {
+            PercentageEvidence::Valid(percent) => (Some(percent), false, false),
+            PercentageEvidence::Invalid => (None, false, false),
+            PercentageEvidence::Absent => match included_percentage_evidence(&config) {
+                PercentageEvidence::Valid(percent) => (Some(percent), true, false),
+                PercentageEvidence::Absent => (None, false, false),
+                PercentageEvidence::Invalid => (None, false, true),
+            },
+        };
     let (on_demand_recognized, extra_window) = extra_usage_window(&config, now);
+    if included_invalid && extra_window.is_none() {
+        return Err(
+            "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string(),
+        );
+    }
     if used_percent.is_none() && !on_demand_recognized {
         return Err(
             "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string(),
@@ -248,7 +272,10 @@ fn map_billing(
     let mut windows = Vec::with_capacity(2);
     if let Some(used_percent) = used_percent {
         let period = period_details(&config);
-        let window = match period.kind {
+        let kind = period.kind.or(
+            included_monthly_fallback.then_some(("Monthly", "billing.monthly.v1")),
+        );
+        let window = match kind {
             Some((label, window_key)) => {
                 let mut window = UsageWindow::from_used_percent(
                     label.to_string(),
@@ -303,7 +330,7 @@ fn map_billing(
     })
 }
 
-fn used_percent_from_config(config: &BillingConfig) -> Option<f64> {
+fn legacy_percentage_evidence(config: &BillingConfig) -> PercentageEvidence {
     if let Some(products) = config.product_usage.as_ref() {
         for product in products {
             if !product
@@ -314,28 +341,47 @@ fn used_percent_from_config(config: &BillingConfig) -> Option<f64> {
                 continue;
             }
             if let Some(raw) = product.usage_percent.as_deref() {
-                return valid_percentage(raw);
+                return valid_percentage(raw)
+                    .map_or(PercentageEvidence::Invalid, PercentageEvidence::Valid);
             }
         }
     }
-    config
-        .credit_usage_percent
-        .as_deref()
-        .and_then(valid_percentage)
+    match config.credit_usage_percent.as_deref() {
+        Some(raw) => valid_percentage(raw)
+            .map_or(PercentageEvidence::Invalid, PercentageEvidence::Valid),
+        None => PercentageEvidence::Absent,
+    }
+}
+
+fn included_percentage_evidence(config: &BillingConfig) -> PercentageEvidence {
+    let (used, monthly_limit) = match (config.used.as_deref(), config.monthly_limit.as_deref()) {
+        (None, None) => return PercentageEvidence::Absent,
+        (Some(used), Some(monthly_limit)) => (used, monthly_limit),
+        _ => return PercentageEvidence::Invalid,
+    };
+    let (Some(used), Some(monthly_limit)) =
+        (raw_amount_value(used), raw_amount_value(monthly_limit))
+    else {
+        return PercentageEvidence::Invalid;
+    };
+    if used < 0.0 || monthly_limit <= 0.0 {
+        return PercentageEvidence::Invalid;
+    }
+    PercentageEvidence::Valid(((used / monthly_limit) * 100.0).min(100.0))
 }
 
 fn extra_usage_window(config: &BillingConfig, now: DateTime<Utc>) -> (bool, Option<UsageWindow>) {
     let Some(used) = config
         .on_demand_used
         .as_deref()
-        .and_then(on_demand_value)
+        .and_then(raw_amount_value)
     else {
         return (false, None);
     };
     let Some(cap) = config
         .on_demand_cap
         .as_deref()
-        .and_then(on_demand_value)
+        .and_then(raw_amount_value)
     else {
         return (false, None);
     };
@@ -358,7 +404,7 @@ fn extra_usage_window(config: &BillingConfig, now: DateTime<Utc>) -> (bool, Opti
     (true, Some(window))
 }
 
-fn on_demand_value(raw: &RawValue) -> Option<f64> {
+fn raw_amount_value(raw: &RawValue) -> Option<f64> {
     let fields: std::collections::BTreeMap<String, Box<RawValue>> =
         serde_json::from_str(raw.get()).ok()?;
     let raw_value = fields.get("val")?.get();
@@ -892,7 +938,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!((used_percent_from_config(&config).unwrap() - 4.0).abs() < 0.01);
+        assert!(matches!(
+            legacy_percentage_evidence(&config),
+            PercentageEvidence::Valid(percent) if (percent - 4.0).abs() < 0.01
+        ));
     }
 
     #[test]
@@ -907,7 +956,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!((used_percent_from_config(&config).unwrap() - 12.5).abs() < 0.01);
+        assert!(matches!(
+            legacy_percentage_evidence(&config),
+            PercentageEvidence::Valid(percent) if (percent - 12.5).abs() < 0.01
+        ));
     }
 
     #[test]
@@ -924,7 +976,10 @@ mod tests {
         ] {
             let config: BillingConfig = serde_json::from_str(invalid).unwrap();
             assert!(
-                used_percent_from_config(&config).is_none(),
+                matches!(
+                    legacy_percentage_evidence(&config),
+                    PercentageEvidence::Invalid
+                ),
                 "invalid GrokBuild usage must not fall back to overall credit usage"
             );
         }
@@ -942,7 +997,10 @@ mod tests {
             ))
             .unwrap();
             assert!(
-                used_percent_from_config(&config).is_some(),
+                matches!(
+                    legacy_percentage_evidence(&config),
+                    PercentageEvidence::Valid(_)
+                ),
                 "valid percentage {valid} must survive exact range validation"
             );
         }
@@ -951,7 +1009,10 @@ mod tests {
             r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokChat" }] }"#,
         )
         .unwrap();
-        assert_eq!(used_percent_from_config(&config), Some(12.5));
+        assert!(matches!(
+            legacy_percentage_evidence(&config),
+            PercentageEvidence::Valid(percent) if percent == 12.5
+        ));
     }
 
     fn map_test_config(config: &str) -> Result<GrokData, String> {
@@ -973,6 +1034,213 @@ mod tests {
             now,
             Err(AccountScopeError::NoTrustedEvidence),
         )
+    }
+
+    #[test]
+    fn maps_unified_included_usage_with_period_semantics_before_disabled_extra() {
+        let data = map_test_config(
+            r#"{
+                "currentPeriod": { "type": "DAILY" },
+                "billingPeriodStart": "2026-07-01T00:00:00Z",
+                "billingPeriodEnd": "2026-08-01T00:00:00Z",
+                "used": { "val": 25.0 },
+                "monthlyLimit": { "val": 100.0 },
+                "onDemandUsed": { "val": 0.0 },
+                "onDemandCap": { "val": 0.0 }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 1);
+        let monthly = &data.windows[0];
+        assert_eq!(monthly.label_for_test(), "Monthly");
+        assert_eq!(monthly.card_id_for_test(), "billing.monthly.v1");
+        assert_eq!(monthly.pace_window_key_for_test(), Some("billing.monthly.v1"));
+        assert_eq!(monthly.pace_reason_for_test(), None);
+        let wire = serde_json::to_value(monthly).unwrap();
+        assert_eq!(wire["usedPercent"], 25.0);
+        assert_eq!(wire["paceStatus"]["durationSeconds"], 2_678_400);
+
+        let weekly = map_test_config(
+            r#"{
+                "currentPeriod": {
+                    "type": "WEEKLY",
+                    "start": "2026-07-07T00:00:00Z",
+                    "end": "2026-07-14T00:00:00Z"
+                },
+                "used": { "val": 25.0 },
+                "monthlyLimit": { "val": 100.0 }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(weekly.windows[0].card_id_for_test(), "billing.weekly.v1");
+    }
+
+    #[test]
+    fn maps_unified_included_ratio_boundaries_and_clamps_over_limit() {
+        for (used, monthly_limit, expected) in [
+            (0.0, 80.0, 0.0),
+            (80.0, 80.0, 100.0),
+            (160.0, 80.0, 100.0),
+        ] {
+            let config = format!(
+                r#"{{
+                    "used": {{ "val": {used} }},
+                    "monthlyLimit": {{ "val": {monthly_limit} }}
+                }}"#
+            );
+            let data = map_test_config(&config).unwrap();
+            assert_eq!(data.windows.len(), 1);
+            assert_eq!(data.windows[0].card_id_for_test(), "billing.monthly.v1");
+            let wire = serde_json::to_value(&data.windows[0]).unwrap();
+            assert_eq!(
+                wire["usedPercent"], expected,
+                "used={used}, monthlyLimit={monthly_limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_percentage_evidence_precedes_unified_included_usage() {
+        for (label, config, expected_remaining) in [
+            (
+                "GrokBuild",
+                r#"{
+                    "creditUsagePercent": 50.0,
+                    "productUsage": [{ "product": "GrokBuild", "usagePercent": 4.0 }],
+                    "used": { "val": 25.0 },
+                    "monthlyLimit": { "val": 100.0 }
+                }"#,
+                96.0,
+            ),
+            (
+                "creditUsagePercent",
+                r#"{
+                    "creditUsagePercent": 12.5,
+                    "used": { "val": 25.0 },
+                    "monthlyLimit": { "val": 100.0 }
+                }"#,
+                87.5,
+            ),
+        ] {
+            let data = map_test_config(config).unwrap();
+            assert_eq!(data.windows.len(), 1, "{label}");
+            assert_eq!(data.windows[0].card_id_for_test(), "row.billing.unknown.v1");
+            assert!(
+                (data.windows[0].remaining_for_test() - expected_remaining).abs() < 0.01,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_explicit_legacy_percentage_does_not_fall_through_to_unified() {
+        for config in [
+            r#"{
+                "creditUsagePercent": 12.5,
+                "productUsage": [{ "product": "GrokBuild", "usagePercent": "bad" }],
+                "used": { "val": 25.0 },
+                "monthlyLimit": { "val": 100.0 }
+            }"#,
+            r#"{
+                "creditUsagePercent": "bad",
+                "used": { "val": 25.0 },
+                "monthlyLimit": { "val": 100.0 }
+            }"#,
+        ] {
+            assert_eq!(
+                map_test_config(config)
+                    .err()
+                    .expect("invalid legacy percentage must fail without extra usage"),
+                "Grok billing response has no creditUsagePercent or GrokBuild usage."
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_unified_included_evidence_is_ignored_with_valid_legacy() {
+        let data = map_test_config(
+            r#"{
+                "creditUsagePercent": 12.5,
+                "used": { "val": "bad", "futureField": { "large": 1e400 } },
+                "monthlyLimit": "bad",
+                "onDemandUsed": { "val": 0.0 },
+                "onDemandCap": { "val": 0.0 }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 1);
+        assert!((data.windows[0].remaining_for_test() - 87.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn invalid_unified_included_evidence_is_not_masked_by_disabled_extra() {
+        for (label, included) in [
+            ("used only", r#""used": { "val": 1.0 }"#),
+            (
+                "monthly limit only",
+                r#""monthlyLimit": { "val": 10.0 }"#,
+            ),
+            (
+                "wrong type",
+                r#""used": { "val": "1" }, "monthlyLimit": { "val": 10.0 }"#,
+            ),
+            (
+                "negative used",
+                r#""used": { "val": -1.0 }, "monthlyLimit": { "val": 10.0 }"#,
+            ),
+            (
+                "zero limit",
+                r#""used": { "val": 1.0 }, "monthlyLimit": { "val": 0.0 }"#,
+            ),
+            (
+                "overflow",
+                r#""used": { "val": 1e400 }, "monthlyLimit": { "val": 10.0 }"#,
+            ),
+            (
+                "used underflow",
+                r#""used": { "val": 1e-400 }, "monthlyLimit": { "val": 10.0 }"#,
+            ),
+            (
+                "limit underflow",
+                r#""used": { "val": 1.0 }, "monthlyLimit": { "val": 1e-400 }"#,
+            ),
+        ] {
+            let config = format!(
+                r#"{{
+                    {included},
+                    "onDemandUsed": {{ "val": 0.0 }},
+                    "onDemandCap": {{ "val": 0.0 }}
+                }}"#
+            );
+            assert_eq!(
+                map_test_config(&config)
+                    .err()
+                    .expect("invalid included evidence must beat disabled extra"),
+                "Grok billing response has no creditUsagePercent or GrokBuild usage.",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_unified_included_evidence_allows_valid_positive_extra() {
+        let data = map_test_config(
+            r#"{
+                "used": { "val": 1.0 },
+                "onDemandUsed": { "val": 25.0 },
+                "onDemandCap": { "val": 100.0 }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 1);
+        let extra = &data.windows[0];
+        assert_eq!(extra.card_id_for_test(), "extra_usage.v1");
+        assert_eq!(extra.pace_window_key_for_test(), Some("extra_usage.v1"));
+        assert_eq!(extra.pace_reason_for_test(), Some("nonRecurring"));
+        assert!((extra.remaining_for_test() - 75.0).abs() < 0.01);
     }
 
     #[test]
