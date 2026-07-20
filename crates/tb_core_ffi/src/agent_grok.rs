@@ -353,6 +353,7 @@ fn map_billing(
 
 fn legacy_percentage_evidence(config: &BillingConfig) -> LegacyPercentageEvidence {
     if let Some(products) = config.product_usage.as_ref() {
+        let mut grok_build_percent = None;
         for product in products {
             if !product
                 .product
@@ -362,11 +363,14 @@ fn legacy_percentage_evidence(config: &BillingConfig) -> LegacyPercentageEvidenc
                 continue;
             }
             if let Some(raw) = product.usage_percent.as_deref() {
-                return valid_percentage(raw).map_or(
-                    LegacyPercentageEvidence::Invalid,
-                    LegacyPercentageEvidence::GrokBuild,
-                );
+                let Some(percent) = valid_percentage(raw) else {
+                    return LegacyPercentageEvidence::Invalid;
+                };
+                grok_build_percent.get_or_insert(percent);
             }
+        }
+        if let Some(percent) = grok_build_percent {
+            return LegacyPercentageEvidence::GrokBuild(percent);
         }
     }
     match config.credit_usage_percent.as_deref() {
@@ -1424,6 +1428,35 @@ mod tests {
                 map_test_config(config)
                     .err()
                     .expect("disabled on-demand must not mask malformed legacy evidence"),
+                "Grok billing response has no creditUsagePercent or GrokBuild usage."
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_duplicate_grok_build_evidence_fails_in_any_order() {
+        for config in [
+            r#"{
+                "productUsage": [
+                    { "product": "GrokBuild", "usagePercent": 4.0 },
+                    { "product": "GrokBuild", "usagePercent": "bad" }
+                ],
+                "onDemandUsed": 0.0,
+                "onDemandCap": 0.0
+            }"#,
+            r#"{
+                "productUsage": [
+                    { "product": "GrokBuild", "usagePercent": "bad" },
+                    { "product": "GrokBuild", "usagePercent": 4.0 }
+                ],
+                "onDemandUsed": 0.0,
+                "onDemandCap": 0.0
+            }"#,
+        ] {
+            assert_eq!(
+                map_test_config(config)
+                    .err()
+                    .expect("any malformed matching GrokBuild evidence must fail closed"),
                 "Grok billing response has no creditUsagePercent or GrokBuild usage."
             );
         }
