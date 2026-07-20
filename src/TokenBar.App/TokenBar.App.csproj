@@ -45,7 +45,8 @@
 
   <Target Name="CopyAppWinUiAssetsAfterPublish" AfterTargets="Publish">
     <ItemGroup>
-      <AppXbf Include="$(TargetDir)**\*.xbf" />
+      <AppXbf Include="$(TargetDir)**\*.xbf"
+              Exclude="$(PublishDir)**\*.xbf" />
     </ItemGroup>
     <Error Condition="!Exists('$(TargetDir)$(AssemblyName).pri')"
            Text="Missing App PRI: $(TargetDir)$(AssemblyName).pri" />
