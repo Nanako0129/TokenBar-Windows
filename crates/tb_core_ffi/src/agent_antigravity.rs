@@ -1359,6 +1359,7 @@ fn discover_client_from_app() -> Option<(String, String)> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn client_artifact_candidates() -> Vec<PathBuf> {
     let relative = [
         "Contents/Resources/bin/language_server",
@@ -1376,6 +1377,39 @@ fn client_artifact_candidates() -> Vec<PathBuf> {
         .iter()
         .flat_map(|root| relative.iter().map(move |r| root.join(r)))
         .collect()
+}
+
+#[cfg(any(windows, test))]
+fn windows_client_artifact_candidates(
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    const RELATIVE: &str = "Programs/antigravity/resources/bin/language_server.exe";
+
+    let mut candidates = Vec::new();
+    if let Some(root) = local_app_data.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(root.join(RELATIVE));
+    }
+    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
+        let fallback = home.join("AppData/Local").join(RELATIVE);
+        if candidates.last() != Some(&fallback) {
+            candidates.push(fallback);
+        }
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn client_artifact_candidates() -> Vec<PathBuf> {
+    windows_client_artifact_candidates(
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        crate::user_home_dir(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn client_artifact_candidates() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn is_token_byte(b: u8) -> bool {
@@ -1600,6 +1634,31 @@ mod tests {
         assert!(!WindowsDiscoveryError::PowerShellFailed
             .message()
             .contains(csrf));
+    }
+
+    #[test]
+    fn maps_windows_oauth_client_artifact_roots_in_order_without_duplicates() {
+        const RELATIVE: &str = "Programs/antigravity/resources/bin/language_server.exe";
+        let home = PathBuf::from("/Users/example");
+        let fallback = home.join("AppData/Local").join(RELATIVE);
+        let local_app_data = PathBuf::from("/redirected/local");
+
+        assert_eq!(
+            windows_client_artifact_candidates(Some(local_app_data.clone()), Some(home.clone())),
+            vec![local_app_data.join(RELATIVE), fallback.clone()]
+        );
+        assert_eq!(
+            windows_client_artifact_candidates(
+                Some(home.join("AppData/Local")),
+                Some(home.clone()),
+            ),
+            vec![fallback.clone()]
+        );
+        assert_eq!(
+            windows_client_artifact_candidates(None, Some(home)),
+            vec![fallback]
+        );
+        assert!(windows_client_artifact_candidates(None, None).is_empty());
     }
 
     #[test]
