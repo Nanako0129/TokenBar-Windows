@@ -120,6 +120,14 @@ struct ProductUsage {
     usage_percent: Option<Box<RawValue>>,
 }
 
+enum LegacyPercentageEvidence {
+    Absent,
+    Invalid,
+    GrokBuild(f64),
+    Credit(f64),
+    CreditZero(f64),
+}
+
 enum PercentageEvidence {
     Absent,
     Invalid,
@@ -249,9 +257,18 @@ fn map_billing(
 
     let (used_percent, included_monthly_fallback, included_invalid) =
         match legacy_percentage_evidence(&config) {
-            PercentageEvidence::Valid(percent) => (Some(percent), false, false),
-            PercentageEvidence::Invalid => (None, false, false),
-            PercentageEvidence::Absent => match included_percentage_evidence(&config) {
+            LegacyPercentageEvidence::GrokBuild(percent)
+            | LegacyPercentageEvidence::Credit(percent) => (Some(percent), false, false),
+            LegacyPercentageEvidence::CreditZero(percent) => {
+                match included_percentage_evidence(&config) {
+                    PercentageEvidence::Valid(included) => (Some(included), true, false),
+                    PercentageEvidence::Absent | PercentageEvidence::Invalid => {
+                        (Some(percent), false, false)
+                    }
+                }
+            }
+            LegacyPercentageEvidence::Invalid => (None, false, false),
+            LegacyPercentageEvidence::Absent => match included_percentage_evidence(&config) {
                 PercentageEvidence::Valid(percent) => (Some(percent), true, false),
                 PercentageEvidence::Absent => (None, false, false),
                 PercentageEvidence::Invalid => (None, false, true),
@@ -330,7 +347,7 @@ fn map_billing(
     })
 }
 
-fn legacy_percentage_evidence(config: &BillingConfig) -> PercentageEvidence {
+fn legacy_percentage_evidence(config: &BillingConfig) -> LegacyPercentageEvidence {
     if let Some(products) = config.product_usage.as_ref() {
         for product in products {
             if !product
@@ -341,15 +358,22 @@ fn legacy_percentage_evidence(config: &BillingConfig) -> PercentageEvidence {
                 continue;
             }
             if let Some(raw) = product.usage_percent.as_deref() {
-                return valid_percentage(raw)
-                    .map_or(PercentageEvidence::Invalid, PercentageEvidence::Valid);
+                return valid_percentage(raw).map_or(
+                    LegacyPercentageEvidence::Invalid,
+                    LegacyPercentageEvidence::GrokBuild,
+                );
             }
         }
     }
     match config.credit_usage_percent.as_deref() {
-        Some(raw) => valid_percentage(raw)
-            .map_or(PercentageEvidence::Invalid, PercentageEvidence::Valid),
-        None => PercentageEvidence::Absent,
+        Some(raw) => match valid_percentage(raw) {
+            Some(percent) if decimal_mantissa_is_zero(raw.get()) => {
+                LegacyPercentageEvidence::CreditZero(percent)
+            }
+            Some(percent) => LegacyPercentageEvidence::Credit(percent),
+            None => LegacyPercentageEvidence::Invalid,
+        },
+        None => LegacyPercentageEvidence::Absent,
     }
 }
 
@@ -405,22 +429,30 @@ fn extra_usage_window(config: &BillingConfig, now: DateTime<Utc>) -> (bool, Opti
 }
 
 fn raw_amount_value(raw: &RawValue) -> Option<f64> {
-    let fields: std::collections::BTreeMap<String, Box<RawValue>> =
-        serde_json::from_str(raw.get()).ok()?;
-    let raw_value = fields.get("val")?.get();
+    let raw_value = raw.get();
+    strict_json_number(raw_value).or_else(|| {
+        let fields: std::collections::BTreeMap<String, Box<RawValue>> =
+            serde_json::from_str(raw_value).ok()?;
+        strict_json_number(fields.get("val")?.get())
+    })
+}
+
+fn strict_json_number(raw_value: &str) -> Option<f64> {
     let value = serde_json::from_str::<f64>(raw_value).ok()?;
     // Reject any syntactically nonzero number that underflows to signed zero.
-    if value == 0.0 {
-        let unsigned = raw_value.strip_prefix('-').unwrap_or(raw_value);
-        let mantissa = unsigned.split(['e', 'E']).next().unwrap_or(unsigned);
-        if mantissa
-            .bytes()
-            .any(|digit| digit.is_ascii_digit() && digit != b'0')
-        {
-            return None;
-        }
+    if value == 0.0 && !decimal_mantissa_is_zero(raw_value) {
+        return None;
     }
     value.is_finite().then_some(value)
+}
+
+fn decimal_mantissa_is_zero(value: &str) -> bool {
+    let value = value.trim();
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let mantissa = unsigned.split(['e', 'E']).next().unwrap_or(unsigned);
+    !mantissa
+        .bytes()
+        .any(|digit| digit.is_ascii_digit() && digit != b'0')
 }
 
 fn deserialize_optional_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
@@ -940,7 +972,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             legacy_percentage_evidence(&config),
-            PercentageEvidence::Valid(percent) if (percent - 4.0).abs() < 0.01
+            LegacyPercentageEvidence::GrokBuild(percent) if (percent - 4.0).abs() < 0.01
         ));
     }
 
@@ -958,7 +990,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             legacy_percentage_evidence(&config),
-            PercentageEvidence::Valid(percent) if (percent - 12.5).abs() < 0.01
+            LegacyPercentageEvidence::Credit(percent) if (percent - 12.5).abs() < 0.01
         ));
     }
 
@@ -978,7 +1010,7 @@ mod tests {
             assert!(
                 matches!(
                     legacy_percentage_evidence(&config),
-                    PercentageEvidence::Invalid
+                    LegacyPercentageEvidence::Invalid
                 ),
                 "invalid GrokBuild usage must not fall back to overall credit usage"
             );
@@ -999,7 +1031,8 @@ mod tests {
             assert!(
                 matches!(
                     legacy_percentage_evidence(&config),
-                    PercentageEvidence::Valid(_)
+                    LegacyPercentageEvidence::Credit(_)
+                        | LegacyPercentageEvidence::CreditZero(_)
                 ),
                 "valid percentage {valid} must survive exact range validation"
             );
@@ -1011,7 +1044,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             legacy_percentage_evidence(&config),
-            PercentageEvidence::Valid(percent) if percent == 12.5
+            LegacyPercentageEvidence::Credit(percent) if percent == 12.5
         ));
     }
 
@@ -1034,6 +1067,149 @@ mod tests {
             now,
             Err(AccountScopeError::NoTrustedEvidence),
         )
+    }
+
+    #[test]
+    fn accepts_bare_and_wrapped_numeric_amounts_for_included_and_extra_usage() {
+        for (label, config, card_id) in [
+            (
+                "bare included",
+                r#"{ "used": 25.0, "monthlyLimit": 100.0 }"#,
+                "billing.monthly.v1",
+            ),
+            (
+                "wrapped included",
+                r#"{ "used": { "val": 25.0 }, "monthlyLimit": { "val": 100.0 } }"#,
+                "billing.monthly.v1",
+            ),
+            (
+                "bare extra",
+                r#"{ "onDemandUsed": 25.0, "onDemandCap": 100.0 }"#,
+                "extra_usage.v1",
+            ),
+            (
+                "wrapped extra",
+                r#"{ "onDemandUsed": { "val": 25.0 }, "onDemandCap": { "val": 100.0 } }"#,
+                "extra_usage.v1",
+            ),
+        ] {
+            let data = map_test_config(config).unwrap();
+            assert_eq!(data.windows.len(), 1, "{label}");
+            assert_eq!(data.windows[0].card_id_for_test(), card_id, "{label}");
+            assert!(
+                (data.windows[0].remaining_for_test() - 75.0).abs() < 0.01,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bare_numeric_strings_for_included_and_extra_usage() {
+        for (label, config) in [
+            (
+                "included used string",
+                r#"{
+                    "used": "25",
+                    "monthlyLimit": 100.0,
+                    "onDemandUsed": 0.0,
+                    "onDemandCap": 0.0
+                }"#,
+            ),
+            (
+                "included limit string",
+                r#"{
+                    "used": 25.0,
+                    "monthlyLimit": "100",
+                    "onDemandUsed": 0.0,
+                    "onDemandCap": 0.0
+                }"#,
+            ),
+            (
+                "extra string",
+                r#"{ "onDemandUsed": "25", "onDemandCap": 100.0 }"#,
+            ),
+        ] {
+            assert_eq!(
+                map_test_config(config)
+                    .err()
+                    .expect("numeric strings must not become amount evidence"),
+                "Grok billing response has no creditUsagePercent or GrokBuild usage.",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_zero_credit_uses_valid_unified_included_ratio() {
+        let data = map_test_config(
+            r#"{
+                "creditUsagePercent": 0.0,
+                "used": 25.0,
+                "monthlyLimit": 100.0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 1);
+        assert_eq!(data.windows[0].card_id_for_test(), "billing.monthly.v1");
+        assert!((data.windows[0].remaining_for_test() - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn default_zero_credit_keeps_legacy_when_included_is_absent_or_invalid() {
+        for (label, config) in [
+            ("absent", r#"{ "creditUsagePercent": 0.0 }"#),
+            (
+                "invalid",
+                r#"{
+                    "creditUsagePercent": 0.0,
+                    "used": "bad",
+                    "monthlyLimit": 100.0
+                }"#,
+            ),
+        ] {
+            let data = map_test_config(config).unwrap();
+            assert_eq!(data.windows.len(), 1, "{label}");
+            assert_eq!(
+                data.windows[0].card_id_for_test(),
+                "row.billing.unknown.v1",
+                "{label}"
+            );
+            assert!((data.windows[0].remaining_for_test() - 100.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn syntactically_nonzero_credit_still_beats_unified_when_float_underflows() {
+        let data = map_test_config(
+            r#"{
+                "creditUsagePercent": 1e-400,
+                "used": 25.0,
+                "monthlyLimit": 100.0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 1);
+        assert_eq!(data.windows[0].card_id_for_test(), "row.billing.unknown.v1");
+        assert!((data.windows[0].remaining_for_test() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn grok_build_zero_remains_higher_confidence_than_unified_included() {
+        let data = map_test_config(
+            r#"{
+                "creditUsagePercent": 50.0,
+                "productUsage": [{ "product": "GrokBuild", "usagePercent": 0.0 }],
+                "used": 25.0,
+                "monthlyLimit": 100.0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 1);
+        assert_eq!(data.windows[0].card_id_for_test(), "row.billing.unknown.v1");
+        assert!((data.windows[0].remaining_for_test() - 100.0).abs() < 0.01);
     }
 
     #[test]
@@ -1340,7 +1516,7 @@ mod tests {
             ("missing cap", r#"{ "onDemandUsed": { "val": 1.0 } }"#),
             (
                 "wrong outer type",
-                r#"{ "onDemandUsed": 1.0, "onDemandCap": { "val": 10.0 } }"#,
+                r#"{ "onDemandUsed": [1.0], "onDemandCap": { "val": 10.0 } }"#,
             ),
             (
                 "wrong val type",
