@@ -91,6 +91,10 @@ struct BillingConfig {
     billing_period_start: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "deserialize_optional_raw")]
     billing_period_end: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    on_demand_used: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    on_demand_cap: Option<Box<RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,45 +237,58 @@ fn map_billing(
         .config
         .ok_or_else(|| "Grok billing response missing config.".to_string())?;
 
-    let used_percent = used_percent_from_config(&config).ok_or_else(|| {
-        "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string()
-    })?;
+    let used_percent = used_percent_from_config(&config);
+    let (on_demand_recognized, extra_window) = extra_usage_window(&config, now);
+    if used_percent.is_none() && !on_demand_recognized {
+        return Err(
+            "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string(),
+        );
+    }
 
-    let period = period_details(&config);
-    let window = match period.kind {
-        Some((label, window_key)) => {
-            let mut window = UsageWindow::from_used_percent(
-                label.to_string(),
-                used_percent,
-                period.end,
-                now,
-            )
-            .with_identity(window_key, Some(window_key.to_string()));
-
-            if period.invalid_evidence {
-                let invalid_provider = period.end.map(|end| {
-                    DurationEvidence::provider(provider_reset_at(end, now), 0)
-                });
-                window =
-                    window.with_provider_duration_evidence(now, true, invalid_provider);
-            } else if let (Some(end), Some(duration_seconds)) = (period.end, period.duration_seconds)
-            {
-                window = window.with_provider_duration_evidence(
+    let mut windows = Vec::with_capacity(2);
+    if let Some(used_percent) = used_percent {
+        let period = period_details(&config);
+        let window = match period.kind {
+            Some((label, window_key)) => {
+                let mut window = UsageWindow::from_used_percent(
+                    label.to_string(),
+                    used_percent,
+                    period.end,
                     now,
-                    true,
-                    Some(DurationEvidence::provider(
-                        provider_reset_at(end, now),
-                        duration_seconds,
-                    )),
-                );
-            } else if period.end_was_supplied {
-                window = window.with_observed_duration_evidence(now, true);
+                )
+                .with_identity(window_key, Some(window_key.to_string()));
+
+                if period.invalid_evidence {
+                    let invalid_provider = period
+                        .end
+                        .map(|end| DurationEvidence::provider(provider_reset_at(end, now), 0));
+                    window = window.with_provider_duration_evidence(now, true, invalid_provider);
+                } else if let (Some(end), Some(duration_seconds)) =
+                    (period.end, period.duration_seconds)
+                {
+                    window = window.with_provider_duration_evidence(
+                        now,
+                        true,
+                        Some(DurationEvidence::provider(
+                            provider_reset_at(end, now),
+                            duration_seconds,
+                        )),
+                    );
+                } else if period.end_was_supplied {
+                    window = window.with_observed_duration_evidence(now, true);
+                }
+                window
             }
-            window
-        }
-        None => UsageWindow::from_used_percent("Unknown".to_string(), used_percent, period.end, now)
-            .with_identity("row.billing.unknown.v1", None),
-    };
+            None => {
+                UsageWindow::from_used_percent("Unknown".to_string(), used_percent, period.end, now)
+                    .with_identity("row.billing.unknown.v1", None)
+            }
+        };
+        windows.push(window);
+    }
+    if let Some(window) = extra_window {
+        windows.push(window);
+    }
 
     Ok(GrokData {
         identity: Some(AgentIdentity {
@@ -282,7 +299,7 @@ fn map_billing(
                 .map(|s| s.trim().to_string()),
         }),
         account_scope,
-        windows: vec![window],
+        windows,
     })
 }
 
@@ -305,6 +322,59 @@ fn used_percent_from_config(config: &BillingConfig) -> Option<f64> {
         .credit_usage_percent
         .as_deref()
         .and_then(valid_percentage)
+}
+
+fn extra_usage_window(config: &BillingConfig, now: DateTime<Utc>) -> (bool, Option<UsageWindow>) {
+    let Some(used) = config
+        .on_demand_used
+        .as_deref()
+        .and_then(on_demand_value)
+    else {
+        return (false, None);
+    };
+    let Some(cap) = config
+        .on_demand_cap
+        .as_deref()
+        .and_then(on_demand_value)
+    else {
+        return (false, None);
+    };
+    if used < 0.0 || cap < 0.0 {
+        return (false, None);
+    }
+    if cap == 0.0 {
+        return (true, None);
+    }
+
+    let used_percent = ((used / cap) * 100.0).min(100.0);
+    let reset = config
+        .billing_period_end
+        .as_deref()
+        .and_then(parse_timestamp_raw);
+    let window =
+        UsageWindow::from_used_percent("Extra usage".to_string(), used_percent, reset, now)
+            .with_identity("extra_usage.v1", Some("extra_usage.v1".to_string()))
+            .with_non_recurring();
+    (true, Some(window))
+}
+
+fn on_demand_value(raw: &RawValue) -> Option<f64> {
+    let fields: std::collections::BTreeMap<String, Box<RawValue>> =
+        serde_json::from_str(raw.get()).ok()?;
+    let raw_value = fields.get("val")?.get();
+    let value = serde_json::from_str::<f64>(raw_value).ok()?;
+    // Reject any syntactically nonzero number that underflows to signed zero.
+    if value == 0.0 {
+        let unsigned = raw_value.strip_prefix('-').unwrap_or(raw_value);
+        let mantissa = unsigned.split(['e', 'E']).next().unwrap_or(unsigned);
+        if mantissa
+            .bytes()
+            .any(|digit| digit.is_ascii_digit() && digit != b'0')
+        {
+            return None;
+        }
+    }
+    value.is_finite().then_some(value)
 }
 
 fn deserialize_optional_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
@@ -882,6 +952,183 @@ mod tests {
         )
         .unwrap();
         assert_eq!(used_percent_from_config(&config), Some(12.5));
+    }
+
+    fn map_test_config(config: &str) -> Result<GrokData, String> {
+        let body = format!(r#"{{ "config": {config} }}"#);
+        let credentials = GrokCredentials {
+            auth_path: PathBuf::from("/tmp/unused"),
+            entry_key: "k".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            client_id: "c".into(),
+            expires_at: None,
+            email: None,
+            raw_json: Value::Object(Default::default()),
+        };
+        let now = parse_timestamp("2026-07-11T12:00:00Z").unwrap();
+        map_billing(
+            &body,
+            &credentials,
+            now,
+            Err(AccountScopeError::NoTrustedEvidence),
+        )
+    }
+
+    #[test]
+    fn maps_old_and_on_demand_windows_without_changing_precedence() {
+        let data = map_test_config(
+            r#"{
+                "currentPeriod": {
+                    "type": "WEEKLY",
+                    "start": "2026-07-07T00:00:00Z",
+                    "end": "2026-07-14T00:00:00Z"
+                },
+                "billingPeriodEnd": "2026-08-01T00:00:00Z",
+                "creditUsagePercent": 50.0,
+                "productUsage": [
+                    { "product": "GrokChat", "usagePercent": 10.0 },
+                    { "product": "GrokBuild", "usagePercent": 4.0 }
+                ],
+                "onDemandUsed": { "val": 25.0 },
+                "onDemandCap": { "val": 100.0 }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 2);
+        assert_eq!(data.windows[0].card_id_for_test(), "billing.weekly.v1");
+        assert!((data.windows[0].remaining_for_test() - 96.0).abs() < 0.01);
+
+        let extra = &data.windows[1];
+        assert_eq!(extra.label_for_test(), "Extra usage");
+        assert_eq!(extra.card_id_for_test(), "extra_usage.v1");
+        assert_eq!(extra.pace_window_key_for_test(), Some("extra_usage.v1"));
+        assert_eq!(extra.pace_reason_for_test(), Some("nonRecurring"));
+        let wire = serde_json::to_value(extra).unwrap();
+        assert_eq!(wire["usedPercent"], 25.0);
+        assert_eq!(wire["resetsAt"], "2026-08-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn maps_on_demand_ratio_boundaries_and_clamps_over_cap() {
+        for (used, cap, expected) in [
+            (0.0, 80.0, 0.0),
+            (80.0, 80.0, 100.0),
+            (160.0, 80.0, 100.0),
+        ] {
+            let config = format!(
+                r#"{{
+                    "onDemandUsed": {{ "val": {used} }},
+                    "onDemandCap": {{ "val": {cap} }}
+                }}"#
+            );
+            let data = map_test_config(&config).unwrap();
+            assert_eq!(data.windows.len(), 1);
+            let wire = serde_json::to_value(&data.windows[0]).unwrap();
+            assert_eq!(wire["usedPercent"], expected, "used={used}, cap={cap}");
+            assert_eq!(data.windows[0].pace_reason_for_test(), Some("nonRecurring"));
+        }
+    }
+
+    #[test]
+    fn zero_on_demand_cap_is_recognized_but_disabled() {
+        for cap in ["0", "0.0", "-0.0", "0e10", "-0.0e-10"] {
+            let config = format!(
+                r#"{{
+                    "onDemandUsed": {{ "val": 5.0 }},
+                    "onDemandCap": {{ "val": {cap} }}
+                }}"#
+            );
+            let data = map_test_config(&config).unwrap();
+            assert!(data.windows.is_empty(), "cap={cap}");
+        }
+    }
+
+    #[test]
+    fn invalid_on_demand_pairs_do_not_create_quota() {
+        for (label, config) in [
+            (
+                "negative used",
+                r#"{ "onDemandUsed": { "val": -1.0 }, "onDemandCap": { "val": 10.0 } }"#,
+            ),
+            (
+                "negative cap",
+                r#"{ "onDemandUsed": { "val": 1.0 }, "onDemandCap": { "val": -10.0 } }"#,
+            ),
+            (
+                "negative used underflow",
+                r#"{ "onDemandUsed": { "val": -1e-400 }, "onDemandCap": { "val": 10.0 } }"#,
+            ),
+            (
+                "positive used underflow",
+                r#"{ "onDemandUsed": { "val": 1e-400 }, "onDemandCap": { "val": 10.0 } }"#,
+            ),
+            (
+                "positive cap underflow",
+                r#"{ "onDemandUsed": { "val": 1.0 }, "onDemandCap": { "val": 1e-400 } }"#,
+            ),
+            ("missing used", r#"{ "onDemandCap": { "val": 10.0 } }"#),
+            ("missing cap", r#"{ "onDemandUsed": { "val": 1.0 } }"#),
+            (
+                "wrong outer type",
+                r#"{ "onDemandUsed": 1.0, "onDemandCap": { "val": 10.0 } }"#,
+            ),
+            (
+                "wrong val type",
+                r#"{ "onDemandUsed": { "val": "1" }, "onDemandCap": { "val": 10.0 } }"#,
+            ),
+            (
+                "overflow used",
+                r#"{ "onDemandUsed": { "val": 1e400 }, "onDemandCap": { "val": 10.0 } }"#,
+            ),
+            (
+                "overflow cap",
+                r#"{ "onDemandUsed": { "val": 1.0 }, "onDemandCap": { "val": 1e400 } }"#,
+            ),
+        ] {
+            assert_eq!(
+                map_test_config(config)
+                    .err()
+                    .expect("invalid on-demand pair must fail"),
+                "Grok billing response has no creditUsagePercent or GrokBuild usage.",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_on_demand_does_not_break_old_subscription() {
+        let data = map_test_config(
+            r#"{
+                "creditUsagePercent": 12.5,
+                "onDemandUsed": {
+                    "val": "not-a-number",
+                    "futureField": { "large": 1e400 }
+                },
+                "onDemandCap": { "val": 100.0, "futureField": true }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.windows.len(), 1);
+        assert!((data.windows[0].remaining_for_test() - 87.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn prepaid_balance_only_does_not_create_quota() {
+        assert_eq!(
+            map_test_config(
+                r#"{
+                    "prepaidBalance": { "val": 500.0 },
+                    "topUpMethod": "manual",
+                    "isUnifiedBillingUser": true
+                }"#,
+            )
+            .err()
+            .expect("prepaid balance alone must fail"),
+            "Grok billing response has no creditUsagePercent or GrokBuild usage."
+        );
     }
 
     #[test]
