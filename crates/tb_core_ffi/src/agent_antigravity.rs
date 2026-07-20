@@ -1428,17 +1428,26 @@ fn scan_client_ids(data: &[u8]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while let Some(pos) = find_sub(&data[i..], suffix) {
-        let end = i + pos + suffix.len();
-        let mut start = i + pos;
-        while start > 0 && is_token_byte(data[start - 1]) {
-            start -= 1;
+        let suffix_start = i + pos;
+        let end = suffix_start + suffix.len();
+        let mut span_start = suffix_start;
+        while span_start > 0 && is_token_byte(data[span_start - 1]) {
+            span_start -= 1;
         }
-        if let Ok(candidate) = std::str::from_utf8(&data[start..end]) {
-            if valid_client_id(candidate) && !out.contains(&candidate.to_string()) {
-                out.push(candidate.to_string());
+        for start in span_start..suffix_start {
+            if !data[start].is_ascii_digit() || (start > 0 && data[start - 1].is_ascii_digit()) {
+                continue;
+            }
+            if let Ok(candidate) = std::str::from_utf8(&data[start..end]) {
+                if valid_client_id(candidate) {
+                    if !out.contains(&candidate.to_string()) {
+                        out.push(candidate.to_string());
+                    }
+                    break;
+                }
             }
         }
-        i = i + pos + suffix.len();
+        i = end;
     }
     out
 }
@@ -1671,6 +1680,29 @@ mod tests {
         let client = preferred_client(&ids, &secrets).unwrap();
         assert_eq!(client.0, "123-abcDEF_g.apps.googleusercontent.com");
         assert!(client.1.starts_with("GOCSPX-"));
+    }
+
+    #[test]
+    fn scans_client_id_attached_to_alphanumeric_prefix() {
+        let blob = b"prefix7x123456789012-attached_ID.apps.googleusercontent.com\x00tail";
+
+        assert_eq!(
+            scan_client_ids(blob),
+            vec!["123456789012-attached_ID.apps.googleusercontent.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn scans_multiple_client_ids_in_order_without_duplicates() {
+        let blob = b"123456789012-first.apps.googleusercontent.com\x001234567890123-second.apps.googleusercontent.com\x00123456789012-first.apps.googleusercontent.com";
+
+        assert_eq!(
+            scan_client_ids(blob),
+            vec![
+                "123456789012-first.apps.googleusercontent.com".to_string(),
+                "1234567890123-second.apps.googleusercontent.com".to_string(),
+            ]
+        );
     }
 
     #[test]
