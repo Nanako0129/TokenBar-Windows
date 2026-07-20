@@ -366,6 +366,10 @@ impl UsageWindow {
         window
     }
 
+    pub(crate) fn with_non_recurring(self) -> Self {
+        self.with_unavailable_reason("nonRecurring")
+    }
+
     fn with_unavailable_reason(mut self, reason: &str) -> Self {
         self.unavailable(reason);
         self
