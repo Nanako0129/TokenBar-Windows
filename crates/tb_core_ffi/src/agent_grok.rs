@@ -130,6 +130,7 @@ enum LegacyPercentageEvidence {
 
 enum PercentageEvidence {
     Absent,
+    Disabled,
     Invalid,
     Valid(f64),
 }
@@ -255,27 +256,30 @@ fn map_billing(
         .config
         .ok_or_else(|| "Grok billing response missing config.".to_string())?;
 
-    let (used_percent, included_monthly_fallback, included_invalid) =
+    let (used_percent, included_monthly_fallback, included_invalid, legacy_invalid) =
         match legacy_percentage_evidence(&config) {
             LegacyPercentageEvidence::GrokBuild(percent)
-            | LegacyPercentageEvidence::Credit(percent) => (Some(percent), false, false),
+            | LegacyPercentageEvidence::Credit(percent) => (Some(percent), false, false, false),
             LegacyPercentageEvidence::CreditZero(percent) => {
                 match included_percentage_evidence(&config) {
-                    PercentageEvidence::Valid(included) => (Some(included), true, false),
+                    PercentageEvidence::Valid(included) => (Some(included), true, false, false),
+                    PercentageEvidence::Disabled => (None, false, false, false),
                     PercentageEvidence::Absent | PercentageEvidence::Invalid => {
-                        (Some(percent), false, false)
+                        (Some(percent), false, false, false)
                     }
                 }
             }
-            LegacyPercentageEvidence::Invalid => (None, false, false),
+            LegacyPercentageEvidence::Invalid => (None, false, false, true),
             LegacyPercentageEvidence::Absent => match included_percentage_evidence(&config) {
-                PercentageEvidence::Valid(percent) => (Some(percent), true, false),
-                PercentageEvidence::Absent => (None, false, false),
-                PercentageEvidence::Invalid => (None, false, true),
+                PercentageEvidence::Valid(percent) => (Some(percent), true, false, false),
+                PercentageEvidence::Disabled | PercentageEvidence::Absent => {
+                    (None, false, false, false)
+                }
+                PercentageEvidence::Invalid => (None, false, true, false),
             },
         };
     let (on_demand_recognized, extra_window) = extra_usage_window(&config, now);
-    if included_invalid && extra_window.is_none() {
+    if legacy_invalid || (included_invalid && extra_window.is_none()) {
         return Err(
             "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string(),
         );
@@ -388,6 +392,9 @@ fn included_percentage_evidence(config: &BillingConfig) -> PercentageEvidence {
     else {
         return PercentageEvidence::Invalid;
     };
+    if used == 0.0 && monthly_limit == 0.0 {
+        return PercentageEvidence::Disabled;
+    }
     if used < 0.0 || monthly_limit <= 0.0 {
         return PercentageEvidence::Invalid;
     }
@@ -535,13 +542,24 @@ fn period_details(config: &BillingConfig) -> PeriodDetails {
     };
 
     // Select each primary field independently. A present but malformed primary
-    // value must not be hidden by a valid billing-level fallback.
-    let start_raw = period
-        .and_then(|period| period.start.as_deref())
-        .or(config.billing_period_start.as_deref());
-    let end_raw = period
-        .and_then(|period| period.end.as_deref())
-        .or(config.billing_period_end.as_deref());
+    // value on a recognized period must not be hidden by a valid billing-level
+    // fallback. Unrecognized nested periods are unrelated to the synthesized
+    // monthly included card, so only billing-level dates apply to them.
+    let (start_raw, end_raw) = if kind.is_some() {
+        (
+            period
+                .and_then(|period| period.start.as_deref())
+                .or(config.billing_period_start.as_deref()),
+            period
+                .and_then(|period| period.end.as_deref())
+                .or(config.billing_period_end.as_deref()),
+        )
+    } else {
+        (
+            config.billing_period_start.as_deref(),
+            config.billing_period_end.as_deref(),
+        )
+    };
     let start = start_raw.and_then(parse_timestamp_raw);
     let end = end_raw.and_then(parse_timestamp_raw);
     let (duration_seconds, invalid_evidence) = match (start_raw, end_raw, start, end) {
@@ -1156,6 +1174,22 @@ mod tests {
     }
 
     #[test]
+    fn fully_disabled_unified_billing_has_no_windows() {
+        let data = map_test_config(
+            r#"{
+                "creditUsagePercent": 0.0,
+                "used": 0.0,
+                "monthlyLimit": 0.0,
+                "onDemandUsed": 0.0,
+                "onDemandCap": 0.0
+            }"#,
+        )
+        .unwrap();
+
+        assert!(data.windows.is_empty());
+    }
+
+    #[test]
     fn default_zero_credit_keeps_legacy_when_included_is_absent_or_invalid() {
         for (label, config) in [
             ("absent", r#"{ "creditUsagePercent": 0.0 }"#),
@@ -1253,6 +1287,44 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_nested_period_is_not_attached_to_synthesized_monthly_card() {
+        let without_billing_period = map_test_config(
+            r#"{
+                "currentPeriod": {
+                    "type": "DAILY",
+                    "start": "2026-07-11T00:00:00Z",
+                    "end": "2026-07-12T00:00:00Z"
+                },
+                "used": 25.0,
+                "monthlyLimit": 100.0
+            }"#,
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&without_billing_period.windows[0]).unwrap();
+        assert_eq!(wire["cardId"], "billing.monthly.v1");
+        assert!(wire.get("resetsAt").is_none());
+        assert!(wire["paceStatus"].get("durationSeconds").is_none());
+
+        let with_billing_period = map_test_config(
+            r#"{
+                "currentPeriod": {
+                    "type": "DAILY",
+                    "start": "2026-07-11T00:00:00Z",
+                    "end": "2026-07-12T00:00:00Z"
+                },
+                "billingPeriodStart": "2026-07-01T00:00:00Z",
+                "billingPeriodEnd": "2026-08-01T00:00:00Z",
+                "used": 25.0,
+                "monthlyLimit": 100.0
+            }"#,
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&with_billing_period.windows[0]).unwrap();
+        assert_eq!(wire["resetsAt"], "2026-08-01T00:00:00.000Z");
+        assert_eq!(wire["paceStatus"]["durationSeconds"], 2_678_400);
+    }
+
+    #[test]
     fn maps_unified_included_ratio_boundaries_and_clamps_over_limit() {
         for (used, monthly_limit, expected) in [
             (0.0, 80.0, 0.0),
@@ -1328,6 +1400,30 @@ mod tests {
                 map_test_config(config)
                     .err()
                     .expect("invalid legacy percentage must fail without extra usage"),
+                "Grok billing response has no creditUsagePercent or GrokBuild usage."
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_is_not_masked_by_disabled_on_demand() {
+        for config in [
+            r#"{
+                "creditUsagePercent": 12.5,
+                "productUsage": [{ "product": "GrokBuild", "usagePercent": "bad" }],
+                "onDemandUsed": 0.0,
+                "onDemandCap": 0.0
+            }"#,
+            r#"{
+                "creditUsagePercent": "bad",
+                "onDemandUsed": 0.0,
+                "onDemandCap": 0.0
+            }"#,
+        ] {
+            assert_eq!(
+                map_test_config(config)
+                    .err()
+                    .expect("disabled on-demand must not mask malformed legacy evidence"),
                 "Grok billing response has no creditUsagePercent or GrokBuild usage."
             );
         }
