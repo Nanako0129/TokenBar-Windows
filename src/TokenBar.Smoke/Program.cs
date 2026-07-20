@@ -174,7 +174,7 @@ else
     {
         var payload = TbCore.AgentUsage();
         var agents = string.Join(", ", payload.Agents.Select(a =>
-            $"{a.ClientId}:{(a.Error is null ? $"{a.Windows.Count}win" : "err")}"));
+            $"{a.ClientId}:{(a.Source is "cli" or "oauth" ? a.Source : "other")}:{(a.Error is null ? $"{a.Windows.Count}win" : "err")}"));
         return $"ok agents=[{agents}]";
     });
 }
