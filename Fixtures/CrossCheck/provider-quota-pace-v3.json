@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 3,
+  "payload": {
+    "generatedAt": "2026-07-10T12:00:00.000Z",
+    "agents": [
+      {
+        "clientId": "provider-fixture.invalid",
+        "source": "fixture.invalid",
+        "updatedAt": "2026-07-10T12:00:00.000Z",
+        "identity": null,
+        "windows": [
+          {
+            "cardId": "ahead.invalid",
+            "label": "Ahead quota",
+            "usedPercent": 72.0,
+            "remainingPercent": 28.0,
+            "resetsAt": "2026-07-10T15:00:00Z",
+            "windowMinutes": 300,
+            "paceStatus": {
+              "state": "available",
+              "windowKey": "quota.ahead.invalid",
+              "durationSeconds": 18000,
+              "durationSource": "provider",
+              "completeCycles": 5
+            },
+            "historicalPace": {
+              "expectedUsedPercent": 32.0,
+              "etaSeconds": 3600.0,
+              "willLastToReset": false,
+              "runOutProbability": 0.75
+            }
+          },
+          {
+            "cardId": "behind.invalid",
+            "label": "Behind quota",
+            "usedPercent": 28.0,
+            "remainingPercent": 72.0,
+            "resetsAt": "2026-07-15T12:00:00Z",
+            "windowMinutes": 10080,
+            "paceStatus": {
+              "state": "available",
+              "windowKey": "quota.behind.invalid",
+              "durationSeconds": 604800,
+              "durationSource": "contract",
+              "completeCycles": 7
+            },
+            "historicalPace": {
+              "expectedUsedPercent": 56.0,
+              "willLastToReset": true,
+              "runOutProbability": 0.2
+            }
+          },
+          {
+            "cardId": "learning-history.invalid",
+            "label": "Learning history",
+            "usedPercent": 40.0,
+            "remainingPercent": 60.0,
+            "resetsAt": "2026-07-10T15:00:00Z",
+            "windowMinutes": 300,
+            "paceStatus": {
+              "state": "learningHistory",
+              "windowKey": "quota.learning-history.invalid",
+              "durationSeconds": 18000,
+              "durationSource": "provider",
+              "completeCycles": 2
+            }
+          },
+          {
+            "cardId": "learning-duration.invalid",
+            "label": "Learning duration",
+            "usedPercent": 40.0,
+            "remainingPercent": 60.0,
+            "resetsAt": "2026-07-10T15:00:00Z",
+            "paceStatus": {
+              "state": "learningDuration",
+              "windowKey": "quota.learning-duration.invalid",
+              "durationSource": "observed",
+              "completeCycles": 0
+            }
+          },
+          {
+            "cardId": "missing-reset.invalid",
+            "label": "Missing reset",
+            "usedPercent": 50.0,
+            "remainingPercent": 50.0,
+            "paceStatus": {
+              "state": "unavailable",
+              "windowKey": "quota.missing-reset.invalid",
+              "completeCycles": 0,
+              "reason": "missingReset"
+            }
+          },
+          {
+            "cardId": "shared-first.invalid",
+            "label": "Shared label",
+            "usedPercent": 10.0,
+            "remainingPercent": 90.0,
+            "resetsAt": "2026-07-10T15:00:00Z",
+            "windowMinutes": 300,
+            "paceStatus": {
+              "state": "learningHistory",
+              "windowKey": "quota.shared-first.invalid",
+              "durationSeconds": 18000,
+              "durationSource": "provider",
+              "completeCycles": 2
+            }
+          },
+          {
+            "cardId": "shared-second.invalid",
+            "label": "Shared label",
+            "usedPercent": 20.0,
+            "remainingPercent": 80.0,
+            "resetsAt": "2026-07-10T15:00:00Z",
+            "windowMinutes": 300,
+            "paceStatus": {
+              "state": "learningHistory",
+              "windowKey": "quota.shared-second.invalid",
+              "durationSeconds": 18000,
+              "durationSource": "provider",
+              "completeCycles": 2
+            }
+          }
+        ],
+        "credits": null,
+        "error": null
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "available-ahead-historical",
+      "kind": "pace",
+      "clientId": "provider-fixture.invalid",
+      "cardId": "ahead.invalid",
+      "mode": "historical",
+      "now": "2026-07-10T12:00:00Z"
+    },
+    {
+      "name": "available-behind-historical",
+      "kind": "pace",
+      "clientId": "provider-fixture.invalid",
+      "cardId": "behind.invalid",
+      "mode": "historical",
+      "now": "2026-07-10T12:00:00Z"
+    },
+    {
+      "name": "learning-history-historical-uses-linear",
+      "kind": "pace",
+      "clientId": "provider-fixture.invalid",
+      "cardId": "learning-history.invalid",
+      "mode": "historical",
+      "now": "2026-07-10T12:00:00Z"
+    },
+    {
+      "name": "selection-exact-card-id",
+      "kind": "selection",
+      "selection": "provider-fixture.invalid|shared-second.invalid"
+    },
+    {
+      "name": "selection-unique-legacy-label",
+      "kind": "selection",
+      "selection": "provider-fixture.invalid|Ahead quota"
+    },
+    {
+      "name": "selection-ambiguous-legacy-label-preserved",
+      "kind": "selection",
+      "selection": "provider-fixture.invalid|Shared label"
+    },
+    {
+      "name": "legacy-missing-pace-status",
+      "kind": "legacy",
+      "now": "2026-07-10T12:00:00Z",
+      "rawWindow": "{\"cardId\":\"legacy.invalid\",\"label\":\"Legacy\",\"usedPercent\":20,\"remainingPercent\":80,\"resetsAt\":\"2026-07-10T15:00:00Z\",\"windowMinutes\":300}"
+    },
+    {
+      "name": "malformed-pace-status-null",
+      "kind": "malformed",
+      "rawWindow": "{\"cardId\":\"malformed-null.invalid\",\"label\":\"Malformed null\",\"usedPercent\":20,\"remainingPercent\":80,\"resetsAt\":\"2026-07-10T15:00:00Z\",\"windowMinutes\":300,\"paceStatus\":null}"
+    },
+    {
+      "name": "malformed-unknown-state",
+      "kind": "malformed",
+      "rawWindow": "{\"cardId\":\"malformed-state.invalid\",\"label\":\"Malformed state\",\"usedPercent\":20,\"remainingPercent\":80,\"resetsAt\":\"2026-07-10T15:00:00Z\",\"windowMinutes\":300,\"paceStatus\":{\"state\":\"unknownState\",\"windowKey\":\"quota.malformed-state.invalid\",\"durationSeconds\":18000,\"durationSource\":\"provider\",\"completeCycles\":0}}"
+    },
+    {
+      "name": "malformed-available-without-historical",
+      "kind": "malformed",
+      "rawWindow": "{\"cardId\":\"malformed-available.invalid\",\"label\":\"Malformed available\",\"usedPercent\":20,\"remainingPercent\":80,\"resetsAt\":\"2026-07-10T15:00:00Z\",\"windowMinutes\":300,\"paceStatus\":{\"state\":\"available\",\"windowKey\":\"quota.malformed-available.invalid\",\"durationSeconds\":18000,\"durationSource\":\"provider\",\"completeCycles\":5}}"
+    },
+    {
+      "name": "malformed-duration-window-minutes-mismatch",
+      "kind": "malformed",
+      "rawWindow": "{\"cardId\":\"malformed-duration.invalid\",\"label\":\"Malformed duration\",\"usedPercent\":20,\"remainingPercent\":80,\"resetsAt\":\"2026-07-10T15:00:00Z\",\"windowMinutes\":301,\"paceStatus\":{\"state\":\"learningHistory\",\"windowKey\":\"quota.malformed-duration.invalid\",\"durationSeconds\":18000,\"durationSource\":\"provider\",\"completeCycles\":0}}"
+    },
+    {
+      "name": "malformed-percentages-not-complementary",
+      "kind": "malformed",
+      "rawWindow": "{\"cardId\":\"malformed-percent.invalid\",\"label\":\"Malformed percentages\",\"usedPercent\":80,\"remainingPercent\":80,\"resetsAt\":\"2026-07-10T15:00:00Z\",\"windowMinutes\":300}"
+    }
+  ]
+}

@@ -5,10 +5,7 @@ use crate::agent_account_scope::{
 use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
-use crate::agent_quota_duration::{
-    resolve_duration, valid_duration, DurationEvidence, DurationResolution, DurationSource,
-    DurationUnavailableReason,
-};
+use crate::agent_quota_duration::{DurationEvidence, DurationSource, DurationUnavailableReason};
 use crate::agent_quota_history::{
     BatchObservationResult, HistoricalPace, HistoryError, HistoryOutcome, QuotaObservation,
     SeriesKey,
@@ -17,7 +14,7 @@ use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -45,6 +42,9 @@ const CLAUDE_RAW_TOKEN_KEYCHAIN_SERVICE: &str = "tokenbar-claude-oauth-token";
 #[serde(rename_all = "camelCase")]
 pub struct AgentUsagePayload {
     generated_at: String,
+    /// Monotonic order assigned by the Rust publication gate, not by wall time
+    /// or provider completion order.
+    publication_generation: u64,
     agents: Vec<AgentUsageSnapshot>,
     /// Subscription-type providers opencode is authenticated against (its
     /// `auth.json` `type: "oauth"` entries), e.g. ["Codex", "Copilot"]. Surfaced
@@ -65,7 +65,291 @@ pub struct AgentUsageSnapshot {
     windows: Vec<UsageWindow>,
     credits: Option<CreditsSnapshot>,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_diagnostic: Option<SafeTransportDiagnostic>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum TransportCategory {
+    Timeout,
+    Dns,
+    Tls,
+    ConnectionRefused,
+    ConnectionReset,
+    Connect,
+    Request,
+    ResponseBody,
+    RateLimited,
+    ServerError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SafeTransportDiagnostic {
+    category: TransportCategory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_code: Option<i32>,
+}
+
+impl SafeTransportDiagnostic {
+    pub(crate) fn from_facts(facts: TransportErrorFacts) -> Self {
+        let category = if facts.is_timeout {
+            TransportCategory::Timeout
+        } else {
+            match facts.raw_os_code {
+                Some(61 | 111 | 10061) => TransportCategory::ConnectionRefused,
+                Some(54 | 104 | 10054) => TransportCategory::ConnectionReset,
+                _ if facts.is_connect => TransportCategory::Connect,
+                _ if facts.phase == TransportPhase::ResponseBody => TransportCategory::ResponseBody,
+                _ => TransportCategory::Request,
+            }
+        };
+        Self {
+            category,
+            status: None,
+            os_code: facts.raw_os_code,
+        }
+    }
+
+    fn rate_limited(status: u16) -> Self {
+        Self {
+            category: TransportCategory::RateLimited,
+            status: (100..=599).contains(&status).then_some(status),
+            os_code: None,
+        }
+    }
+
+    fn server_error(status: u16) -> Self {
+        Self {
+            category: TransportCategory::ServerError,
+            status: (100..=599).contains(&status).then_some(status),
+            os_code: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportPhase {
+    Request,
+    ResponseBody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransportErrorFacts {
+    is_timeout: bool,
+    is_connect: bool,
+    phase: TransportPhase,
+    raw_os_code: Option<i32>,
+}
+
+impl TransportErrorFacts {
+    pub(crate) fn from_reqwest(error: &reqwest::Error, phase: TransportPhase) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        let mut raw_os_code = None;
+        while let Some(current) = source {
+            if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
+                raw_os_code = io_error.raw_os_error();
+                break;
+            }
+            source = current.source();
+        }
+        Self {
+            is_timeout: error.is_timeout(),
+            is_connect: error.is_connect(),
+            phase,
+            raw_os_code,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic(
+        is_timeout: bool,
+        is_connect: bool,
+        phase: TransportPhase,
+        raw_os_code: Option<i32>,
+    ) -> Self {
+        Self {
+            is_timeout,
+            is_connect,
+            phase,
+            raw_os_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderCacheBinding {
+    primary: AccountScope,
+    corroborating: Option<AccountScope>,
+}
+
+impl ProviderCacheBinding {
+    pub(crate) fn new(primary: AccountScope, corroborating: Option<AccountScope>) -> Self {
+        Self {
+            primary,
+            corroborating,
+        }
+    }
+
+    pub(crate) fn primary(primary: AccountScope) -> Self {
+        Self::new(primary, None)
+    }
+}
+
+pub(crate) async fn request_after_verified_binding<B, T, E, F, Future>(
+    binding: Result<B, E>,
+    request: F,
+) -> Result<T, E>
+where
+    F: FnOnce(B) -> Future,
+    Future: std::future::Future<Output = Result<T, E>>,
+{
+    request(binding?).await
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ProviderFetchFailure {
+    Transient {
+        display: String,
+        attempt_binding: Option<ProviderCacheBinding>,
+        transport_diagnostic: SafeTransportDiagnostic,
+    },
+    Terminal {
+        display: String,
+    },
+}
+
+impl ProviderFetchFailure {
+    pub(crate) fn transient(
+        display: impl Into<String>,
+        attempt_binding: Option<ProviderCacheBinding>,
+        transport_diagnostic: SafeTransportDiagnostic,
+    ) -> Self {
+        Self::Transient {
+            display: display.into(),
+            attempt_binding,
+            transport_diagnostic,
+        }
+    }
+
+    pub(crate) fn terminal(display: impl Into<String>) -> Self {
+        Self::Terminal {
+            display: display.into(),
+        }
+    }
+
+    pub(crate) fn from_send_error(
+        display: impl Into<String>,
+        attempt_binding: Option<ProviderCacheBinding>,
+        error: &reqwest::Error,
+    ) -> Self {
+        if error.is_builder() {
+            return Self::terminal(display);
+        }
+        Self::transient(
+            display,
+            attempt_binding,
+            SafeTransportDiagnostic::from_facts(TransportErrorFacts::from_reqwest(
+                error,
+                TransportPhase::Request,
+            )),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ProviderFetchOutcome {
+    Absent,
+    Success {
+        snapshot: AgentUsageSnapshot,
+        cache_binding: Option<ProviderCacheBinding>,
+    },
+    Failure(ProviderFetchFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseReadFailure {
+    Transient(SafeTransportDiagnostic),
+    Terminal(u16),
+}
+
+pub(crate) async fn read_response_body<F, Future>(
+    status: u16,
+    allow_forbidden_body: bool,
+    read: F,
+) -> Result<String, ResponseReadFailure>
+where
+    F: FnOnce() -> Future,
+    Future: std::future::Future<Output = Result<String, TransportErrorFacts>>,
+{
+    if status == 429 {
+        return Err(ResponseReadFailure::Transient(
+            SafeTransportDiagnostic::rate_limited(status),
+        ));
+    }
+    if (500..=599).contains(&status) {
+        return Err(ResponseReadFailure::Transient(
+            SafeTransportDiagnostic::server_error(status),
+        ));
+    }
+    let may_read = (200..=299).contains(&status) || (allow_forbidden_body && status == 403);
+    if !may_read {
+        return Err(ResponseReadFailure::Terminal(status));
+    }
+    match read().await {
+        Ok(body) => Ok(body),
+        Err(_) if status == 403 => Err(ResponseReadFailure::Terminal(status)),
+        Err(facts) => Err(ResponseReadFailure::Transient(
+            SafeTransportDiagnostic::from_facts(facts),
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LastGoodEntry {
+    binding: ProviderCacheBinding,
+    snapshot: AgentUsageSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct ProviderLastGoodCache {
+    entries: HashMap<String, LastGoodEntry>,
+}
+
+impl ProviderLastGoodCache {
+    fn clean_for(
+        &self,
+        client_id: &str,
+        binding: &ProviderCacheBinding,
+    ) -> Option<AgentUsageSnapshot> {
+        self.entries
+            .get(client_id)
+            .filter(|entry| &entry.binding == binding)
+            .map(|entry| entry.snapshot.clone())
+    }
+
+    fn replace(
+        &mut self,
+        client_id: &str,
+        binding: ProviderCacheBinding,
+        mut snapshot: AgentUsageSnapshot,
+    ) {
+        snapshot.error = None;
+        snapshot.transport_diagnostic = None;
+        self.entries
+            .insert(client_id.to_string(), LastGoodEntry { binding, snapshot });
+    }
+
+    fn clear(&mut self, client_id: &str) {
+        self.entries.remove(client_id);
+    }
+}
+
+static PROVIDER_LAST_GOOD: LazyLock<Mutex<ProviderLastGoodCache>> =
+    LazyLock::new(|| Mutex::new(ProviderLastGoodCache::default()));
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,15 +400,24 @@ pub struct UsageWindow {
     used_percent: f64,
     remaining_percent: f64,
     resets_at: Option<String>,
-    /// Exact provider reset retained independently from millisecond wire formatting.
-    reset_at_evidence: Option<DateTime<Utc>>,
     reset_text: Option<String>,
-    /// Resolved provider/contract evidence retained only to validate the nested wire state.
-    duration_evidence: Option<(DurationEvidence, DurationSource)>,
-    /// True only when a subsecond future reset was normalized into the next integer second.
-    provider_reset_normalized: bool,
+    /// Legacy compatibility only. Wire serialization derives this from
+    /// `duration_seconds`; provider adapters must never use this as identity.
+    window_minutes: Option<i64>,
+    window_key: Option<String>,
+    duration_seconds: Option<i64>,
+    duration_source: Option<DurationSource>,
+    provider_duration: Option<DurationEvidence>,
+    contract_duration: Option<DurationEvidence>,
     pace_status: PaceStatusPayload,
     historical_pace: Option<HistoricalPacePayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsSnapshot {
+    remaining: Option<f64>,
+    unlimited: bool,
 }
 
 #[derive(Serialize)]
@@ -138,7 +431,6 @@ struct UsageWindowWire<'a> {
     resets_at: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reset_text: Option<&'a str>,
-    /// Compatibility mirror; it is never an independent source of duration.
     #[serde(skip_serializing_if = "Option::is_none")]
     window_minutes: Option<i64>,
     pace_status: &'a PaceStatusPayload,
@@ -159,10 +451,7 @@ impl Serialize for UsageWindow {
             remaining_percent: self.remaining_percent,
             resets_at: self.resets_at.as_deref(),
             reset_text: self.reset_text.as_deref(),
-            window_minutes: self
-                .pace_status
-                .duration_seconds
-                .map(|seconds| seconds / 60),
+            window_minutes: self.duration_seconds.map(|seconds| seconds / 60),
             pace_status: &self.pace_status,
             historical_pace: self.historical_pace.as_ref(),
         }
@@ -170,62 +459,53 @@ impl Serialize for UsageWindow {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreditsSnapshot {
-    remaining: Option<f64>,
-    unlimited: bool,
-}
-
-fn normalized_reset_at(window: &mut UsageWindow, now: DateTime<Utc>) -> Option<i64> {
-    let Some(wire_reset) = window.resets_at.as_deref() else {
-        window.reset_at_evidence = None;
-        return None;
-    };
-    if parse_datetime(wire_reset).is_none() {
-        window.resets_at = None;
-        window.reset_at_evidence = None;
-        window.reset_text = None;
-        return None;
-    }
-    let exact_reset = window.reset_at_evidence?;
-    (exact_reset > now).then(|| {
-        exact_reset
-            .timestamp()
-            .max(now.timestamp().saturating_add(1))
-    })
-}
-
 impl UsageWindow {
-    /// Builds a display window before its provider assigns stable presentation
-    /// identity. Stage 3A deliberately does not infer duration from a label.
+    /// Build a window from a "remaining fraction" (0..1) — the shape Antigravity
+    /// reports per model. Used-percent is derived; identity and duration are
+    /// attached by the provider adapter before the snapshot is emitted.
     pub(crate) fn from_fraction(
         label: String,
         remaining_fraction: f64,
         resets_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Self {
-        Self::from_used_percent(label, (1.0 - remaining_fraction) * 100.0, resets_at, now)
+        Self::from_used_percent(
+            label,
+            (1.0 - remaining_fraction) * 100.0,
+            resets_at,
+            now,
+            None,
+        )
     }
 
+    /// Build a window from an absolute used-percent (0..100), with an optional
+    /// legacy duration hint. The hint is retained only for existing tests and
+    /// converted to exact seconds before any wire serialization.
     pub(crate) fn from_used_percent(
         label: String,
         used_percent: f64,
         resets_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
+        window_minutes: Option<i64>,
     ) -> Self {
         let used = used_percent.clamp(0.0, 100.0);
         let remaining = (100.0 - used).clamp(0.0, 100.0);
-        Self {
+        let duration_seconds = window_minutes
+            .filter(|minutes| *minutes > 0)
+            .and_then(|minutes| minutes.checked_mul(60));
+        let mut window = UsageWindow {
             card_id: "row.unassigned.v1".to_string(),
             label,
             used_percent: used,
             remaining_percent: remaining,
             resets_at: resets_at.map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true)),
-            reset_at_evidence: resets_at,
             reset_text: resets_at.map(|d| reset_text(d, now)),
-            duration_evidence: None,
-            provider_reset_normalized: false,
+            window_minutes,
+            window_key: None,
+            duration_seconds,
+            duration_source: duration_seconds.map(|_| DurationSource::Contract),
+            provider_duration: None,
+            contract_duration: duration_seconds.map(DurationEvidence::contract),
             pace_status: PaceStatusPayload {
                 state: PaceState::Unavailable,
                 window_key: None,
@@ -235,283 +515,220 @@ impl UsageWindow {
                 reason: Some("windowIdentity".to_string()),
             },
             historical_pace: None,
-        }
+        };
+        window.refresh_initial_pace_status();
+        window
     }
 
+    /// Preserve the raw provider reading until identity is attached so the
+    /// generic adapter can classify invalid evidence. `with_identity` then
+    /// restores finite display percentages before any wire serialization.
+    pub(crate) fn from_provider_used_percent(
+        label: String,
+        used_percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut window = Self::from_used_percent(label, used_percent, resets_at, now, None);
+        window.used_percent = used_percent;
+        window.remaining_percent = 100.0 - used_percent;
+        window
+    }
+
+    pub(crate) fn from_provider_fraction(
+        label: String,
+        remaining_fraction: f64,
+        resets_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self::from_provider_used_percent(label, (1.0 - remaining_fraction) * 100.0, resets_at, now)
+    }
+
+    pub(crate) fn try_from_provider_used_percent(
+        label: String,
+        used_percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        (used_percent.is_finite() && (0.0..=100.0).contains(&used_percent))
+            .then(|| Self::from_provider_used_percent(label, used_percent, resets_at, now))
+    }
+
+    pub(crate) fn try_from_provider_fraction(
+        label: String,
+        remaining_fraction: f64,
+        resets_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        (remaining_fraction.is_finite() && (0.0..=1.0).contains(&remaining_fraction))
+            .then(|| Self::from_provider_fraction(label, remaining_fraction, resets_at, now))
+    }
+
+    /// Attach provider-semantic presentation and history identity plus the
+    /// frozen provider/contract duration evidence.
     pub(crate) fn with_identity(
         mut self,
         card_id: impl Into<String>,
         window_key: Option<String>,
+        provider_duration: Option<DurationEvidence>,
+        contract_duration: Option<DurationEvidence>,
     ) -> Self {
+        let invalid_reading =
+            !self.used_percent.is_finite() || !(0.0..=100.0).contains(&self.used_percent);
+        if invalid_reading {
+            self.used_percent = if self.used_percent.is_finite() {
+                self.used_percent.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            self.remaining_percent = 100.0 - self.used_percent;
+        }
         self.card_id = card_id.into();
-        self.duration_evidence = None;
-        self.provider_reset_normalized = false;
-        self.pace_status = match (window_key, self.resets_at.is_some()) {
-            (None, _) => PaceStatusPayload {
+        self.window_key = window_key;
+        self.provider_duration = provider_duration;
+        self.contract_duration = contract_duration;
+        self.duration_seconds = self
+            .provider_duration
+            .or(self.contract_duration)
+            .map(|evidence| evidence.duration_seconds)
+            .filter(|duration| *duration > 0);
+        self.duration_source = if self.provider_duration.is_some() {
+            Some(DurationSource::Provider)
+        } else if self.contract_duration.is_some() {
+            Some(DurationSource::Contract)
+        } else {
+            None
+        };
+        self.window_minutes = self.duration_seconds.map(|seconds| seconds / 60);
+        self.refresh_initial_pace_status();
+        if invalid_reading && self.window_key.is_some() {
+            self.unavailable("invalidEvidence");
+        }
+        self
+    }
+
+    fn refresh_initial_pace_status(&mut self) {
+        if self.window_key.is_none() {
+            self.duration_seconds = None;
+            self.duration_source = None;
+            self.window_minutes = None;
+            self.pace_status = PaceStatusPayload {
                 state: PaceState::Unavailable,
                 window_key: None,
                 duration_seconds: None,
                 duration_source: None,
                 complete_cycles: 0,
                 reason: Some("windowIdentity".to_string()),
-            },
-            (Some(window_key), false) => PaceStatusPayload {
+            };
+            self.historical_pace = None;
+            return;
+        }
+        if self.resets_at.is_none() {
+            self.duration_seconds = None;
+            self.duration_source = None;
+            self.window_minutes = None;
+            self.pace_status = PaceStatusPayload {
                 state: PaceState::Unavailable,
-                window_key: Some(window_key),
+                window_key: self.window_key.clone(),
                 duration_seconds: None,
                 duration_source: None,
                 complete_cycles: 0,
                 reason: Some("missingReset".to_string()),
-            },
-            (Some(window_key), true) => PaceStatusPayload {
-                state: PaceState::LearningDuration,
-                window_key: Some(window_key),
-                duration_seconds: None,
-                duration_source: None,
-                complete_cycles: 0,
-                reason: None,
-            },
+            };
+            self.historical_pace = None;
+            return;
+        }
+        let state = if self.duration_seconds.is_some() {
+            PaceState::LearningHistory
+        } else {
+            PaceState::LearningDuration
+        };
+        self.pace_status = PaceStatusPayload {
+            state,
+            window_key: self.window_key.clone(),
+            duration_seconds: self.duration_seconds,
+            duration_source: self.duration_source,
+            complete_cycles: 0,
+            reason: None,
         };
         self.historical_pace = None;
-        self
     }
 
-    /// Resolve exact provider/contract duration only for adapters with explicit
-    /// duration semantics. Other providers keep using `with_identity`.
-    fn with_duration_evidence(
-        mut self,
-        now: DateTime<Utc>,
-        reset_was_supplied: bool,
-        provider: Option<DurationEvidence>,
-        contract: Option<DurationEvidence>,
-    ) -> Self {
-        if self.pace_status.window_key.is_none() {
-            return self;
-        }
-        self.provider_reset_normalized = false;
-        let had_wire_reset = self.resets_at.is_some();
-        let exact_reset = self.reset_at_evidence;
-        let reset_at = normalized_reset_at(&mut self, now);
-        if reset_was_supplied != reset_at.is_some() || had_wire_reset != reset_at.is_some() {
-            return self.with_unavailable_reason("invalidEvidence");
-        }
-        let provider_reset_normalized = provider.is_some_and(|evidence| {
-            let Some(exact_reset) = exact_reset else {
-                return false;
-            };
-            exact_reset > now
-                && exact_reset.timestamp() == now.timestamp()
-                && evidence.reset_at == reset_at
-                && evidence.reset_at == Some(exact_reset.timestamp().saturating_add(1))
-        });
-        match resolve_duration(now.timestamp(), reset_at, provider, contract, None) {
-            DurationResolution::Ready {
-                duration_seconds,
-                source,
-            } => {
-                let evidence = match source {
-                    DurationSource::Provider => provider,
-                    DurationSource::Contract => contract,
-                    DurationSource::Observed => None,
-                };
-                let Some(evidence) = evidence else {
-                    return self.with_unavailable_reason("invalidEvidence");
-                };
-                self.duration_evidence = Some((evidence, source));
-                self.provider_reset_normalized =
-                    source == DurationSource::Provider && provider_reset_normalized;
-                self.pace_status.state = PaceState::LearningHistory;
-                self.pace_status.duration_seconds = Some(duration_seconds);
-                self.pace_status.duration_source = Some(source);
-                self.pace_status.complete_cycles = 0;
-                self.pace_status.reason = None;
-                self.historical_pace = None;
-                self
-            }
-            DurationResolution::LearningDuration => self,
-            DurationResolution::Unavailable(reason) => self.with_unavailable_reason(match reason {
-                DurationUnavailableReason::MissingReset => "missingReset",
-                DurationUnavailableReason::InvalidEvidence => "invalidEvidence",
-            }),
-        }
-    }
-
-    pub(crate) fn with_provider_duration_evidence(
-        self,
-        now: DateTime<Utc>,
-        reset_was_supplied: bool,
-        provider: Option<DurationEvidence>,
-    ) -> Self {
-        self.with_duration_evidence(now, reset_was_supplied, provider, None)
-    }
-
-    pub(crate) fn with_contract_duration_evidence(
-        self,
-        now: DateTime<Utc>,
-        reset_was_supplied: bool,
-        contract: DurationEvidence,
-    ) -> Self {
-        self.with_duration_evidence(now, reset_was_supplied, None, Some(contract))
-    }
-
-    pub(crate) fn with_observed_duration_evidence(
-        self,
-        now: DateTime<Utc>,
-        reset_was_supplied: bool,
-    ) -> Self {
-        let mut window = self.with_duration_evidence(now, reset_was_supplied, None, None);
-        if window.pace_status.state == PaceState::LearningDuration {
-            window.pace_status.duration_source = Some(DurationSource::Observed);
-        }
-        window
-    }
-
-    pub(crate) fn with_non_recurring(self) -> Self {
-        self.with_unavailable_reason("nonRecurring")
-    }
-
-    fn with_unavailable_reason(mut self, reason: &str) -> Self {
-        self.unavailable(reason);
-        self
-    }
-
-    fn unavailable(&mut self, reason: &str) {
-        self.duration_evidence = None;
-        self.provider_reset_normalized = false;
+    pub(crate) fn unavailable(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.duration_seconds = None;
+        self.duration_source = None;
+        self.window_minutes = None;
+        self.historical_pace = None;
         self.pace_status = PaceStatusPayload {
             state: PaceState::Unavailable,
-            window_key: self.pace_status.window_key.clone(),
+            window_key: self.window_key.clone(),
             duration_seconds: None,
             duration_source: None,
             complete_cycles: 0,
-            reason: Some(reason.to_string()),
+            reason: Some(reason),
         };
-        self.historical_pace = None;
     }
 
     fn validate_wire(&self) -> Result<(), String> {
         if self.card_id.trim().is_empty() {
             return Err("pace cardId must be non-empty".to_string());
         }
-        if !self.used_percent.is_finite()
-            || !self.remaining_percent.is_finite()
-            || !(0.0..=100.0).contains(&self.used_percent)
-            || !(0.0..=100.0).contains(&self.remaining_percent)
-            || ((self.used_percent + self.remaining_percent) - 100.0).abs() > 1e-6
-        {
-            return Err("usage percentages must be finite, bounded, and complementary".to_string());
+        if self.window_key != self.pace_status.window_key {
+            return Err("pace windowKey internal and nested values differ".to_string());
         }
-        let has_window_key = self
-            .pace_status
-            .window_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty());
-        if self.pace_status.window_key.is_some() && !has_window_key {
-            return Err("pace windowKey must be non-empty".to_string());
+        if self.duration_seconds != self.pace_status.duration_seconds {
+            return Err("pace durationSeconds internal and nested values differ".to_string());
+        }
+        if self.duration_source != self.pace_status.duration_source {
+            return Err("pace durationSource internal and nested values differ".to_string());
+        }
+        if self.window_minutes != self.duration_seconds.map(|seconds| seconds / 60) {
+            return Err("pace windowMinutes must derive from durationSeconds".to_string());
+        }
+        if self.duration_seconds.is_none()
+            && self.duration_source.is_some()
+            && !(self.pace_status.state == PaceState::LearningDuration
+                && self.duration_source == Some(DurationSource::Observed))
+        {
+            return Err("pace durationSource requires a duration".to_string());
+        }
+        if let Some(window_key) = self.pace_status.window_key.as_deref() {
+            if window_key.trim().is_empty() {
+                return Err("pace windowKey must be non-empty".to_string());
+            }
         }
         let identity_unavailable = self.pace_status.state == PaceState::Unavailable
             && self.pace_status.reason.as_deref() == Some("windowIdentity");
-        if has_window_key == identity_unavailable {
-            return Err("pace window identity invariant failed".to_string());
+        if self.pace_status.window_key.is_none() != identity_unavailable {
+            return Err("pace windowKey identity invariant failed".to_string());
         }
-        let reset_at = self
-            .resets_at
-            .as_deref()
-            .and_then(parse_datetime)
-            .map(|reset| reset.timestamp());
-        let valid_reset = reset_at.is_some();
-        if self.resets_at.is_some() && !valid_reset {
-            return Err("pace resetsAt must be a valid timestamp".to_string());
-        }
-        let has_duration = self.pace_status.duration_seconds.is_some();
-        let observed_learning_source = self.pace_status.state == PaceState::LearningDuration
-            && self.pace_status.duration_source == Some(DurationSource::Observed);
-        if self
-            .pace_status
-            .duration_seconds
-            .is_some_and(|duration| !valid_duration(duration))
-            || (has_duration != self.pace_status.duration_source.is_some()
-                && !observed_learning_source)
-        {
-            return Err("pace duration invariant failed".to_string());
-        }
-        if self.provider_reset_normalized
-            && !matches!(
-                self.duration_evidence,
-                Some((_, DurationSource::Provider))
-            )
-        {
-            return Err("pace normalized provider reset lacks provider evidence".to_string());
-        }
-        match self.duration_evidence {
-            Some((evidence, source)) => {
-                let reset_is_coherent = match source {
-                    DurationSource::Provider => {
-                        let Some(evidence_reset) = evidence.reset_at else {
-                            return Err("pace provider evidence lacks reset".to_string());
-                        };
-                        let Some(wire_reset) = reset_at else {
-                            return Err("pace provider evidence lacks wire reset".to_string());
-                        };
-                        evidence_reset == wire_reset
-                            || (self.provider_reset_normalized
-                                && wire_reset.checked_add(1) == Some(evidence_reset))
-                    }
-                    DurationSource::Contract => evidence.reset_at.is_none(),
-                    DurationSource::Observed => false,
-                };
-                if !reset_is_coherent
-                    || self.pace_status.duration_seconds != Some(evidence.duration_seconds)
-                    || self.pace_status.duration_source != Some(source)
-                {
-                    return Err("pace duration evidence and state differ".to_string());
-                }
+        if let Some(duration) = self.pace_status.duration_seconds {
+            if duration <= 0 {
+                return Err("pace durationSeconds must be positive".to_string());
             }
-            None if matches!(
-                self.pace_status.duration_source,
-                Some(DurationSource::Provider | DurationSource::Contract)
-            ) =>
-            {
-                return Err("pace duration source lacks retained evidence".to_string());
+            if self.pace_status.duration_source.is_none() {
+                return Err("pace durationSource is required with durationSeconds".to_string());
             }
-            None => {}
         }
         match self.pace_status.state {
-            PaceState::LearningDuration => {
-                if !valid_reset
-                    || has_duration
-                    || self.historical_pace.is_some()
-                    || self.pace_status.reason.is_some()
-                {
-                    return Err("learningDuration pace invariant failed".to_string());
+            PaceState::Available => {
+                if self.pace_status.duration_seconds.is_none() || self.historical_pace.is_none() {
+                    return Err("available pace requires duration and historicalPace".to_string());
                 }
             }
             PaceState::LearningHistory => {
-                if !valid_reset
-                    || !has_duration
-                    || self.historical_pace.is_some()
-                    || self.pace_status.reason.is_some()
-                {
+                if self.pace_status.duration_seconds.is_none() || self.historical_pace.is_some() {
                     return Err("learningHistory pace invariant failed".to_string());
                 }
             }
-            PaceState::Available => {
-                if !valid_reset
-                    || !has_duration
-                    || self.historical_pace.is_none()
-                    || self.pace_status.reason.is_some()
-                {
-                    return Err("available pace invariant failed".to_string());
+            PaceState::LearningDuration => {
+                if self.pace_status.duration_seconds.is_some() || self.historical_pace.is_some() {
+                    return Err("learningDuration pace invariant failed".to_string());
                 }
             }
             PaceState::Unavailable => {
-                if has_duration
-                    || self.pace_status.duration_source.is_some()
-                    || self.historical_pace.is_some()
-                    || self.pace_status.reason.is_none()
-                    || (self.pace_status.reason.as_deref() == Some("missingReset")
-                        && self.resets_at.is_some())
-                {
+                if self.historical_pace.is_some() || self.pace_status.reason.as_deref().is_none() {
                     return Err("unavailable pace invariant failed".to_string());
                 }
             }
@@ -522,9 +739,9 @@ impl UsageWindow {
                 || historical
                     .eta_seconds
                     .is_some_and(|eta| !eta.is_finite() || eta < 0.0)
-                || historical
-                    .run_out_probability
-                    .is_some_and(|risk| !risk.is_finite() || !(0.0..=1.0).contains(&risk))
+                || historical.run_out_probability.is_some_and(|probability| {
+                    !probability.is_finite() || !(0.0..=1.0).contains(&probability)
+                })
                 || (historical.eta_seconds.is_none() != historical.will_last_to_reset)
             {
                 return Err("historicalPace contains contradictory values".to_string());
@@ -544,8 +761,13 @@ impl UsageWindow {
     }
 
     #[cfg(test)]
-    pub(crate) fn card_id_for_test(&self) -> &str {
-        &self.card_id
+    pub(crate) fn resets_at_for_test(&self) -> Option<&str> {
+        self.resets_at.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window_minutes_for_test(&self) -> Option<i64> {
+        self.duration_seconds.map(|seconds| seconds / 60)
     }
 
     #[cfg(test)]
@@ -583,6 +805,13 @@ struct CodexCredentials {
     scope_slot: CredentialSlot,
 }
 
+#[derive(Debug)]
+struct CodexCredentialWriteReceipt {
+    path: PathBuf,
+    previous_root: Value,
+    persisted_root: Value,
+}
+
 impl CodexCredentials {
     fn scope_marker(&self) -> &[u8] {
         self.refresh_token
@@ -605,9 +834,13 @@ struct ClaudeCredentials {
     /// Where the credentials were read from, so a rotated token can be written
     /// back to the same place (the Claude CLI shares this store).
     source: ClaudeCredentialSource,
-    /// Full credentials JSON as loaded, so a write-back preserves fields we
-    /// don't model (merge-update rather than overwrite).
+    /// Full credentials JSON captured at reload. The target object is the
+    /// optimistic write guard; top-level siblings are merged from the current
+    /// store at save time.
     raw_root: Option<Value>,
+    /// Exact Keychain account whose item was read at refresh reload. A later
+    /// write-back may validate this identity, but must never retarget it.
+    keychain_account: Option<String>,
     scope_slot: CredentialSlot,
 }
 
@@ -644,6 +877,14 @@ enum ClaudeCredentialSource {
     Environment,
 }
 
+#[derive(Debug)]
+enum ClaudeLoginResolution {
+    Absent,
+    ExplicitLogout,
+    Ready(ClaudeCredentials),
+    Terminal,
+}
+
 #[derive(Debug, Deserialize)]
 struct ClaudeCredentialsRoot {
     #[serde(default, rename = "claudeAiOauth")]
@@ -675,9 +916,9 @@ struct CodexUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct CodexRateLimit {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     primary_window: Option<CodexWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     secondary_window: Option<CodexWindow>,
 }
 
@@ -706,47 +947,53 @@ struct CodexCredits {
     balance: Option<f64>,
 }
 
+fn finite_codex_balance(credits: Option<&CodexCredits>) -> Option<f64> {
+    credits
+        .and_then(|credits| credits.balance)
+        .filter(|balance| balance.is_finite())
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct ClaudeUsageResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     five_hour: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_oauth_apps: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_opus: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_sonnet: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_claude_design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     claude_design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_omelette: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     omelette: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     omelette_promotional: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_claude_routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     claude_routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     routine: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_cowork: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     cowork: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     extra_usage: Option<ClaudeExtraUsage>,
 }
 
@@ -787,7 +1034,156 @@ struct ClaudeRefreshResponse {
     expires_in: i64,
 }
 
-pub async fn run() -> AgentUsagePayload {
+fn empty_error_snapshot(
+    client_id: &str,
+    source: &str,
+    now: DateTime<Utc>,
+    display: String,
+    transport_diagnostic: Option<SafeTransportDiagnostic>,
+) -> AgentUsageSnapshot {
+    AgentUsageSnapshot {
+        client_id: client_id.to_string(),
+        source: source.to_string(),
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: None,
+        account_scope: Err(AccountScopeError::NoTrustedEvidence),
+        windows: Vec::new(),
+        credits: None,
+        error: Some(display),
+        transport_diagnostic,
+    }
+}
+
+fn usable_success(snapshot: &AgentUsageSnapshot) -> bool {
+    match snapshot.client_id.as_str() {
+        "codex" => {
+            !snapshot.windows.is_empty()
+                || snapshot
+                    .credits
+                    .as_ref()
+                    .and_then(|credits| credits.remaining)
+                    .is_some_and(f64::is_finite)
+        }
+        "grok" => snapshot
+            .windows
+            .iter()
+            .any(|window| window.card_id == "billing.weekly.v1"),
+        "claude" | "copilot" | "antigravity" => !snapshot.windows.is_empty(),
+        _ => false,
+    }
+}
+
+fn lock_last_good(
+    cache: &Mutex<ProviderLastGoodCache>,
+) -> std::sync::MutexGuard<'_, ProviderLastGoodCache> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn apply_provider_outcome_with<F>(
+    cache: &Mutex<ProviderLastGoodCache>,
+    client_id: &str,
+    failure_source: &str,
+    now: DateTime<Utc>,
+    outcome: ProviderFetchOutcome,
+    mut enrich: F,
+) -> Option<AgentUsageSnapshot>
+where
+    F: FnMut(&mut AgentUsageSnapshot),
+{
+    match outcome {
+        ProviderFetchOutcome::Absent => {
+            lock_last_good(cache).clear(client_id);
+            None
+        }
+        ProviderFetchOutcome::Success {
+            mut snapshot,
+            cache_binding,
+        } => {
+            match snapshot.account_scope.as_ref() {
+                Ok(_) | Err(AccountScopeError::NoTrustedEvidence) => {}
+                Err(_) => {
+                    lock_last_good(cache).clear(client_id);
+                    let source = snapshot.source.clone();
+                    return Some(empty_error_snapshot(
+                        client_id,
+                        &source,
+                        now,
+                        format!(
+                            "{} account identity could not be verified.",
+                            clean_plan(client_id)
+                        ),
+                        None,
+                    ));
+                }
+            }
+
+            enrich(&mut snapshot);
+            let cacheable = snapshot.account_scope.is_ok()
+                && snapshot.error.is_none()
+                && snapshot.transport_diagnostic.is_none()
+                && usable_success(&snapshot);
+            let mut cache = lock_last_good(cache);
+            match (cacheable, cache_binding) {
+                (true, Some(binding)) => cache.replace(client_id, binding, snapshot.clone()),
+                _ => cache.clear(client_id),
+            }
+            Some(snapshot)
+        }
+        ProviderFetchOutcome::Failure(ProviderFetchFailure::Terminal { display }) => {
+            lock_last_good(cache).clear(client_id);
+            Some(empty_error_snapshot(
+                client_id,
+                failure_source,
+                now,
+                display,
+                None,
+            ))
+        }
+        ProviderFetchOutcome::Failure(ProviderFetchFailure::Transient {
+            display,
+            attempt_binding,
+            transport_diagnostic,
+        }) => {
+            let fallback = attempt_binding
+                .as_ref()
+                .and_then(|binding| lock_last_good(cache).clean_for(client_id, binding));
+            let Some(mut snapshot) = fallback else {
+                lock_last_good(cache).clear(client_id);
+                return Some(empty_error_snapshot(
+                    client_id,
+                    failure_source,
+                    now,
+                    display,
+                    Some(transport_diagnostic),
+                ));
+            };
+            snapshot.account_scope = Err(AccountScopeError::NoTrustedEvidence);
+            snapshot.error = Some(display);
+            snapshot.transport_diagnostic = Some(transport_diagnostic);
+            Some(snapshot)
+        }
+    }
+}
+
+fn apply_provider_outcome(
+    client_id: &str,
+    failure_source: &str,
+    now: DateTime<Utc>,
+    outcome: ProviderFetchOutcome,
+) -> Option<AgentUsageSnapshot> {
+    apply_provider_outcome_with(
+        &PROVIDER_LAST_GOOD,
+        client_id,
+        failure_source,
+        now,
+        outcome,
+        |snapshot| enrich_snapshot(snapshot, now.timestamp()),
+    )
+}
+
+pub async fn run(publication_generation: u64) -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let (codex, claude, antigravity, copilot, grok) = tokio::join!(
         fetch_codex(),
@@ -805,516 +1201,173 @@ pub async fn run() -> AgentUsagePayload {
     if let Some(grok) = grok {
         agents.push(grok);
     }
-    for snapshot in &mut agents {
-        retain_unique_windows(&mut snapshot.windows);
-    }
     AgentUsagePayload {
         generated_at,
+        publication_generation,
         agents,
         opencode_subscriptions: crate::opencode_integrations::detect_subscriptions(),
     }
 }
 
-fn retain_unique_windows(windows: &mut Vec<UsageWindow>) {
-    let mut card_ids = HashSet::new();
-    let mut window_keys = HashSet::new();
-    windows.retain(|window| {
-        let key = window.pace_status.window_key.as_ref();
-        if card_ids.contains(&window.card_id) || key.is_some_and(|key| window_keys.contains(key)) {
-            return false;
-        }
-        card_ids.insert(window.card_id.clone());
-        if let Some(key) = key {
-            window_keys.insert(key.clone());
-        }
-        true
-    });
-}
-
-fn enrich_snapshot(snapshot: &mut AgentUsageSnapshot, now: DateTime<Utc>) {
-    enrich_snapshot_with(snapshot, now, |active_keys, observations, now| {
-        crate::agent_quota_history::record_observations_and_evaluate(active_keys, observations, now)
-    });
-}
-
-fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: DateTime<Utc>, mut record: F)
-where
-    F: FnMut(
-        &[SeriesKey],
-        &[QuotaObservation],
-        i64,
-    ) -> Result<Vec<BatchObservationResult>, HistoryError>,
-{
-    retain_unique_windows(&mut snapshot.windows);
-
-    let Ok(account_scope) = snapshot.account_scope.as_ref() else {
-        for window in &mut snapshot.windows {
-            if window.pace_status.window_key.is_some()
-                && window.pace_status.reason.as_deref() != Some("nonRecurring")
-            {
-                window.unavailable("accountScope");
-            }
-        }
-        return;
-    };
-    let provider_id = snapshot.client_id.clone();
-    let account_scope = account_scope.as_str().to_string();
-    let mut active_keys = Vec::new();
-    let mut observations = Vec::new();
-    let mut mapped_indices = Vec::new();
-
-    for (index, window) in snapshot.windows.iter_mut().enumerate() {
-        if window.pace_status.reason.as_deref() == Some("nonRecurring") {
-            continue;
-        }
-        let Some(window_key) = window.pace_status.window_key.as_deref() else {
-            continue;
-        };
-        let key = SeriesKey::new(provider_id.clone(), account_scope.clone(), window_key);
-        active_keys.push(key.clone());
-        if window.pace_status.state == PaceState::Unavailable {
-            continue;
-        }
-
-        let reset_at = normalized_reset_at(window, now);
-        let valid_percent =
-            window.used_percent.is_finite() && (0.0..=100.0).contains(&window.used_percent);
-        if !valid_percent {
-            window.used_percent = if window.used_percent.is_finite() {
-                window.used_percent.clamp(0.0, 100.0)
-            } else {
-                0.0
-            };
-        }
-        window.remaining_percent = 100.0 - window.used_percent;
-        if !valid_percent {
-            window.unavailable("invalidEvidence");
-            continue;
-        }
-        let Some(reset_at) = reset_at else {
-            window.unavailable("invalidEvidence");
-            continue;
-        };
-        let (provider, contract) = match window.duration_evidence {
-            Some((evidence, DurationSource::Provider)) => (Some(evidence), None),
-            Some((evidence, DurationSource::Contract)) => (None, Some(evidence)),
-            Some((_, DurationSource::Observed)) => {
-                window.unavailable("invalidEvidence");
-                continue;
-            }
-            None => (None, None),
-        };
-        observations.push(QuotaObservation {
-            key,
-            reset_at: Some(reset_at),
-            used_percent: window.used_percent,
-            provider,
-            contract,
-        });
-        mapped_indices.push(index);
-    }
-
-    if active_keys.is_empty() {
-        return;
-    }
-
-    let results = match record(&active_keys, &observations, now.timestamp()) {
-        Ok(results) if results.len() == mapped_indices.len() => results,
-        Ok(_) => {
-            for index in mapped_indices {
-                snapshot.windows[index].unavailable("history");
-            }
-            return;
-        }
-        Err(error) => {
-            let reason = history_error_reason(error);
-            for index in mapped_indices {
-                snapshot.windows[index].unavailable(reason);
-            }
-            return;
-        }
-    };
-
-    for (index, result) in mapped_indices.into_iter().zip(results) {
-        let window = &mut snapshot.windows[index];
-        match result {
-            Err(error) => window.unavailable(history_error_reason(error)),
-            Ok((
-                HistoryOutcome::Ready {
-                    duration_seconds,
-                    source,
-                    ..
-                },
-                historical,
-                complete_cycles,
-            )) => {
-                let Some(reset_at) = normalized_reset_at(window, now) else {
-                    window.unavailable("history");
-                    continue;
-                };
-                if !history_duration_is_coherent(
-                    window,
-                    reset_at,
-                    now,
-                    duration_seconds,
-                    source,
-                ) {
-                    window.unavailable("history");
-                    continue;
-                }
-                match historical {
-                    Some(pace) if historical_pace_is_coherent(&pace) => {
-                        window.pace_status = PaceStatusPayload {
-                            state: PaceState::Available,
-                            window_key: window.pace_status.window_key.clone(),
-                            duration_seconds: Some(duration_seconds),
-                            duration_source: Some(source),
-                            complete_cycles,
-                            reason: None,
-                        };
-                        window.historical_pace = Some(historical_pace_payload(pace));
-                    }
-                    Some(_) => window.unavailable("history"),
-                    None => {
-                        window.pace_status = PaceStatusPayload {
-                            state: PaceState::LearningHistory,
-                            window_key: window.pace_status.window_key.clone(),
-                            duration_seconds: Some(duration_seconds),
-                            duration_source: Some(source),
-                            complete_cycles,
-                            reason: None,
-                        };
-                        window.historical_pace = None;
-                    }
-                }
-            }
-            Ok((HistoryOutcome::LearningDuration, None, 0))
-                if window.duration_evidence.is_none() =>
-            {
-                window.pace_status = PaceStatusPayload {
-                    state: PaceState::LearningDuration,
-                    window_key: window.pace_status.window_key.clone(),
-                    duration_seconds: None,
-                    duration_source: Some(DurationSource::Observed),
-                    complete_cycles: 0,
-                    reason: None,
-                };
-                window.historical_pace = None;
-            }
-            Ok((HistoryOutcome::Unavailable(reason), None, 0)) => {
-                if reason == DurationUnavailableReason::MissingReset && window.resets_at.is_some() {
-                    window.unavailable("history");
-                } else {
-                    window.unavailable(duration_unavailable_reason(reason));
-                }
-            }
-            Ok(_) => window.unavailable("history"),
-        }
-    }
-}
-
-fn history_duration_is_coherent(
-    window: &UsageWindow,
-    reset_at: i64,
-    now: DateTime<Utc>,
-    duration_seconds: i64,
-    source: DurationSource,
-) -> bool {
-    let (provider, contract) = match window.duration_evidence {
-        Some((evidence, DurationSource::Provider)) => (Some(evidence), None),
-        Some((evidence, DurationSource::Contract)) => (None, Some(evidence)),
-        Some((_, DurationSource::Observed)) => return false,
-        None => (None, None),
-    };
-    if source == DurationSource::Observed && window.duration_evidence.is_some() {
-        return false;
-    }
-    let observed = (source == DurationSource::Observed)
-        .then(|| DurationEvidence::observed(reset_at, duration_seconds));
-    matches!(
-        resolve_duration(now.timestamp(), Some(reset_at), provider, contract, observed),
-        DurationResolution::Ready {
-            duration_seconds: resolved,
-            source: resolved_source,
-        } if resolved == duration_seconds && resolved_source == source
-    )
-}
-
-fn history_error_reason(error: HistoryError) -> &'static str {
-    if error == HistoryError::StoreCapacity {
-        "storeCapacity"
-    } else {
-        "history"
-    }
-}
-
-fn duration_unavailable_reason(reason: DurationUnavailableReason) -> &'static str {
-    match reason {
-        DurationUnavailableReason::MissingReset => "missingReset",
-        DurationUnavailableReason::InvalidEvidence => "invalidEvidence",
-    }
-}
-
-fn historical_pace_is_coherent(pace: &HistoricalPace) -> bool {
-    pace.expected_percent.is_finite()
-        && (0.0..=100.0).contains(&pace.expected_percent)
-        && pace
-            .eta_seconds
-            .is_none_or(|eta| eta.is_finite() && eta >= 0.0)
-        && pace
-            .run_out_probability
-            .is_none_or(|probability| probability.is_finite() && (0.0..=1.0).contains(&probability))
-        && (pace.eta_seconds.is_none() == pace.will_last_to_reset)
-}
-
-fn historical_pace_payload(pace: HistoricalPace) -> HistoricalPacePayload {
-    HistoricalPacePayload {
-        expected_used_percent: pace.expected_percent,
-        eta_seconds: pace.eta_seconds,
-        will_last_to_reset: pace.will_last_to_reset,
-        run_out_probability: pace.run_out_probability,
-    }
-}
-
-fn finalize_grok_snapshot_with<F>(
-    fetched: Result<agent_grok::GrokData, String>,
-    now: DateTime<Utc>,
-    mut enrich: F,
-) -> AgentUsageSnapshot
-where
-    F: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
-{
-    let mut snapshot = match fetched {
-        Ok(data) => AgentUsageSnapshot {
-            client_id: "grok".to_string(),
-            source: "oauth".to_string(),
-            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: data.identity,
-            account_scope: data.account_scope,
-            windows: data.windows,
-            credits: None,
-            error: None,
-        },
-        Err(error) => AgentUsageSnapshot {
-            client_id: "grok".to_string(),
-            source: "oauth".to_string(),
-            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: None,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
-            windows: Vec::new(),
-            credits: None,
-            error: Some(error),
-        },
-    };
-    enrich(&mut snapshot, now);
-    snapshot
-}
-
 async fn fetch_grok() -> Option<AgentUsageSnapshot> {
     let now = Utc::now();
-    Some(finalize_grok_snapshot_with(
-        agent_grok::fetch(now).await?,
-        now,
-        enrich_snapshot,
-    ))
+    let outcome = match agent_grok::fetch(now).await {
+        Ok(Some(data)) => ProviderFetchOutcome::Success {
+            cache_binding: data.cache_binding,
+            snapshot: AgentUsageSnapshot {
+                client_id: "grok".to_string(),
+                source: "oauth".to_string(),
+                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                identity: data.identity,
+                account_scope: data.account_scope,
+                windows: data.windows,
+                credits: None,
+                error: None,
+                transport_diagnostic: None,
+            },
+        },
+        Ok(None) => ProviderFetchOutcome::Absent,
+        Err(failure) => ProviderFetchOutcome::Failure(failure),
+    };
+    apply_provider_outcome("grok", "oauth", now, outcome)
 }
 
 async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
-    fetch_copilot_with(
-        crate::opencode_integrations::github_copilot_credential(),
-        Utc::now(),
-        agent_copilot::fetch,
-        enrich_snapshot,
-    )
-    .await
-}
-
-async fn fetch_copilot_with<Fetch, FetchFuture, Enrich>(
-    credential: Option<crate::opencode_integrations::GitHubCopilotCredential>,
-    now: DateTime<Utc>,
-    fetch: Fetch,
-    enrich: Enrich,
-) -> Option<AgentUsageSnapshot>
-where
-    Fetch: FnOnce(
-        DateTime<Utc>,
-        crate::opencode_integrations::GitHubCopilotCredential,
-    ) -> FetchFuture,
-    FetchFuture: std::future::Future<Output = Result<agent_copilot::CopilotData, String>>,
-    Enrich: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
-{
-    // No exact opencode github-copilot OAuth credential means no card and no network.
-    let credential = credential?;
-    Some(finalize_copilot_snapshot_with(
-        fetch(now, credential).await,
-        now,
-        enrich,
-    ))
-}
-
-fn finalize_copilot_snapshot_with<F>(
-    fetched: Result<agent_copilot::CopilotData, String>,
-    now: DateTime<Utc>,
-    mut enrich: F,
-) -> AgentUsageSnapshot
-where
-    F: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
-{
-    let mut snapshot = match fetched {
-        Ok(data) => AgentUsageSnapshot {
-            client_id: "copilot".to_string(),
-            source: "oauth".to_string(),
-            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: data.identity,
-            account_scope: data.account_scope,
-            windows: data.windows,
-            credits: None,
-            error: None,
-        },
-        Err(error) => AgentUsageSnapshot {
-            client_id: "copilot".to_string(),
-            source: "oauth".to_string(),
-            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: None,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
-            windows: Vec::new(),
-            credits: None,
-            error: Some(error),
-        },
+    let now = Utc::now();
+    let outcome = match crate::opencode_integrations::github_copilot_credential() {
+        crate::opencode_integrations::GitHubCopilotCredentialLoad::Absent => {
+            ProviderFetchOutcome::Absent
+        }
+        crate::opencode_integrations::GitHubCopilotCredentialLoad::Terminal(display) => {
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display))
+        }
+        crate::opencode_integrations::GitHubCopilotCredentialLoad::Present(credential) => {
+            match agent_copilot::fetch(now, credential).await {
+                Ok(data) => ProviderFetchOutcome::Success {
+                    cache_binding: Some(data.cache_binding),
+                    snapshot: AgentUsageSnapshot {
+                        client_id: "copilot".to_string(),
+                        source: "oauth".to_string(),
+                        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                        identity: data.identity,
+                        account_scope: data.account_scope,
+                        windows: data.windows,
+                        credits: None,
+                        error: None,
+                        transport_diagnostic: None,
+                    },
+                },
+                Err(failure) => ProviderFetchOutcome::Failure(failure),
+            }
+        }
     };
-    enrich(&mut snapshot, now);
-    snapshot
-}
-
-fn finalize_antigravity_snapshot_with<F>(
-    fetched: Result<agent_antigravity::Fetched, String>,
-    now: DateTime<Utc>,
-    mut enrich: F,
-) -> AgentUsageSnapshot
-where
-    F: FnMut(&mut AgentUsageSnapshot, DateTime<Utc>),
-{
-    let mut snapshot = match fetched {
-        Ok(fetched) => AgentUsageSnapshot {
-            client_id: "antigravity".to_string(),
-            source: fetched.source,
-            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: fetched.identity,
-            account_scope: fetched.account_scope,
-            windows: fetched.windows,
-            credits: None,
-            error: None,
-        },
-        Err(error) => AgentUsageSnapshot {
-            client_id: "antigravity".to_string(),
-            source: "oauth".to_string(),
-            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: None,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
-            windows: Vec::new(),
-            credits: None,
-            error: Some(error),
-        },
-    };
-    enrich(&mut snapshot, now);
-    snapshot
+    apply_provider_outcome("copilot", "oauth", now, outcome)
 }
 
 async fn fetch_antigravity() -> AgentUsageSnapshot {
     let now = Utc::now();
-    finalize_antigravity_snapshot_with(agent_antigravity::fetch(now).await, now, enrich_snapshot)
+    let outcome = match agent_antigravity::fetch(now).await {
+        Ok(fetched) => ProviderFetchOutcome::Success {
+            cache_binding: fetched.cache_binding,
+            snapshot: AgentUsageSnapshot {
+                client_id: "antigravity".to_string(),
+                source: fetched.source,
+                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                identity: fetched.identity,
+                account_scope: fetched.account_scope,
+                windows: fetched.windows,
+                credits: None,
+                error: None,
+                transport_diagnostic: None,
+            },
+        },
+        Err(failure) => ProviderFetchOutcome::Failure(failure),
+    };
+    apply_provider_outcome("antigravity", "oauth", now, outcome)
+        .expect("Antigravity is a required provider card")
 }
 
 async fn fetch_codex() -> AgentUsageSnapshot {
-    match fetch_codex_inner().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => AgentUsageSnapshot {
-            client_id: "codex".to_string(),
-            source: "oauth".to_string(),
-            updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: None,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
-            windows: Vec::new(),
-            credits: None,
-            error: Some(error),
-        },
-    }
+    let now = Utc::now();
+    apply_provider_outcome("codex", "oauth", now, fetch_codex_inner().await)
+        .expect("Codex is a required provider card")
 }
 
-/// Claude's `/api/oauth/usage` rate-limits aggressively (and the budget is
-/// shared with any other monitor on the account, e.g. codexbar). Modeled on
-/// codexbar's ClaudeOAuthUsageRateLimitGate: after a 429, stop hitting the
-/// endpoint until Retry-After (default 5 min) and serve the last good
-/// snapshot so the card keeps its data instead of flashing an error.
+/// Claude's `/api/oauth/usage` rate-limits aggressively. The gate stores only
+/// the cooldown deadline and the exact opaque binding that triggered it; display
+/// snapshots live exclusively in the provider last-good cache.
+#[derive(Debug, Default)]
 struct ClaudeUsageGate {
     blocked_until: Option<DateTime<Utc>>,
-    last_good: Option<AgentUsageSnapshot>,
+    binding: Option<ProviderCacheBinding>,
+}
+
+impl ClaudeUsageGate {
+    fn blocked_until_for(
+        &mut self,
+        binding: &ProviderCacheBinding,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        if self.binding.as_ref() != Some(binding) {
+            self.blocked_until = None;
+            self.binding = None;
+            return None;
+        }
+        match self.blocked_until {
+            Some(until) if until > now => Some(until),
+            Some(_) => {
+                self.blocked_until = None;
+                self.binding = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn record_rate_limit(
+        &mut self,
+        binding: ProviderCacheBinding,
+        retry_after: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) {
+        self.blocked_until = Some(
+            retry_after
+                .filter(|until| *until > now)
+                .unwrap_or_else(|| now + chrono::Duration::minutes(5)),
+        );
+        self.binding = Some(binding);
+    }
+
+    fn clear(&mut self) {
+        self.blocked_until = None;
+        self.binding = None;
+    }
 }
 
 static CLAUDE_USAGE_GATE: Mutex<ClaudeUsageGate> = Mutex::new(ClaudeUsageGate {
     blocked_until: None,
-    last_good: None,
+    binding: None,
 });
 
-/// Lock the gate, recovering from a poisoned mutex instead of panicking. Under
-/// the release profile's unwind + FFI-boundary `catch_unwind` (see `guarded` in
-/// lib.rs), a panic caught mid-section poisons this static; `into_inner()` keeps
-/// the 429 gate working for the rest of the process instead of wedging every
-/// later `tb_agent_usage` call — same stance as the live-tail lock in lib.rs.
 fn lock_gate() -> std::sync::MutexGuard<'static, ClaudeUsageGate> {
     CLAUDE_USAGE_GATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn claude_gate_blocked_until(now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let mut gate = lock_gate();
-    match gate.blocked_until {
-        Some(until) if until > now => Some(until),
-        Some(_) => {
-            gate.blocked_until = None;
-            None
-        }
-        None => None,
-    }
-}
-
-fn claude_gate_record_rate_limit(retry_after: Option<DateTime<Utc>>, now: DateTime<Utc>) {
-    let blocked_until = retry_after
-        .filter(|until| *until > now)
-        .unwrap_or_else(|| now + chrono::Duration::minutes(5));
-    lock_gate().blocked_until = Some(blocked_until);
-}
-
-fn claude_gate_record_success(snapshot: &AgentUsageSnapshot) {
-    let mut gate = lock_gate();
-    gate.blocked_until = None;
-    gate.last_good = Some(snapshot.clone());
-}
-
-/// While the gate is closed, prefer the cached snapshot (its `updated_at`
-/// stays honest); with nothing cached yet, surface a countdown error.
-fn claude_gate_fallback(blocked_until: DateTime<Utc>, now: DateTime<Utc>) -> AgentUsageSnapshot {
-    if let Some(mut snapshot) = lock_gate().last_good.clone() {
-        // A cached 429 response is not current account-scope evidence. Keeping
-        // the stale scope would attribute a later poll to an unauthenticated account.
-        snapshot.account_scope = Err(AccountScopeError::NoTrustedEvidence);
-        return snapshot;
-    }
+fn claude_gate_failure(
+    binding: ProviderCacheBinding,
+    blocked_until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> ProviderFetchFailure {
     let wait_secs = (blocked_until - now).num_seconds().max(0);
-    AgentUsageSnapshot {
-        client_id: "claude".to_string(),
-        source: "oauth".to_string(),
-        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-        identity: None,
-        account_scope: Err(AccountScopeError::NoTrustedEvidence),
-        windows: Vec::new(),
-        credits: None,
-        error: Some(format!(
-            "Claude OAuth usage endpoint is rate limited. Retrying automatically in ~{}s.",
-            wait_secs
-        )),
-    }
+    ProviderFetchFailure::transient(
+        format!(
+            "Claude OAuth usage endpoint is rate limited. Retrying automatically in ~{wait_secs}s."
+        ),
+        Some(binding),
+        SafeTransportDiagnostic::rate_limited(429),
+    )
 }
 
 fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<DateTime<Utc>> {
@@ -1332,124 +1385,108 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Dat
 
 async fn fetch_claude() -> AgentUsageSnapshot {
     let now = Utc::now();
-    if let Some(blocked_until) = claude_gate_blocked_until(now) {
-        return claude_gate_fallback(blocked_until, now);
-    }
-    match fetch_claude_inner().await {
-        Ok(mut snapshot) => {
-            enrich_snapshot(&mut snapshot, now);
-            // Cache the display-ready snapshot. A later 429 fallback returns it
-            // without another enrichment pass or history write.
-            claude_gate_record_success(&snapshot);
-            snapshot
-        }
-        Err(error) => {
-            // A 429 inside fetch_claude_inner arms the gate; fall back to the
-            // cached, already-enriched snapshot rather than blanking the card.
-            let now = Utc::now();
-            if let Some(blocked_until) = claude_gate_blocked_until(now) {
-                return claude_gate_fallback(blocked_until, now);
-            }
-            // "unconfigured" == no credential at all, so the UI shows a setup
-            // prompt; every other error is a real failure of a present credential.
-            let source = if error.as_str() == CLAUDE_UNCONFIGURED_ERROR {
-                "unconfigured"
-            } else {
-                "oauth"
-            };
-            AgentUsageSnapshot {
-                client_id: "claude".to_string(),
-                source: source.to_string(),
-                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                identity: None,
-                account_scope: Err(AccountScopeError::NoTrustedEvidence),
-                windows: Vec::new(),
-                credits: None,
-                error: Some(error),
-            }
-        }
-    }
+    let (failure_source, outcome) = fetch_claude_inner().await;
+    apply_provider_outcome("claude", failure_source, now, outcome)
+        .expect("Claude is a required provider card")
 }
 
-async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
-    let mut credentials = load_codex_credentials()?;
-    let mut refreshed_scope = None;
-    if credentials_needs_refresh(credentials.last_refresh) {
-        if credentials
-            .refresh_token
-            .as_deref()
-            .unwrap_or("")
-            .is_empty()
-        {
-            return Err(
-                "Codex OAuth token needs refresh but auth.json has no refresh token.".to_string(),
-            );
+async fn fetch_codex_inner() -> ProviderFetchOutcome {
+    let loaded = match load_codex_credentials() {
+        Ok(credentials) => credentials,
+        Err(display) => {
+            return ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display));
         }
-        let refreshed = refresh_codex_credentials(&credentials.auth_path).await?;
-        credentials = refreshed.0;
-        refreshed_scope = Some(refreshed.1);
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("build Codex OAuth client: {}", e))?;
-
-    let mut request = client
-        .get(CODEX_USAGE_URL)
-        .bearer_auth(&credentials.access_token)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::USER_AGENT, "TokenBar");
+    };
+    let verified = if credentials_needs_refresh(loaded.last_refresh) {
+        refresh_codex_credentials(&loaded.auth_path).await
+    } else {
+        resolve_codex_cache_binding(&loaded)
+            .map(|binding| (loaded, binding))
+            .map_err(|_| {
+                ProviderFetchFailure::terminal("Codex account identity could not be verified.")
+            })
+    };
+    let (credentials, cache_binding, response) =
+        match request_after_verified_binding(verified, |(credentials, cache_binding)| async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|_| {
+                    ProviderFetchFailure::terminal("Codex usage client could not be created.")
+                })?;
+            let request_account_id = credentials
+                .account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let mut request = client
+                .get(CODEX_USAGE_URL)
+                .bearer_auth(&credentials.access_token)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::USER_AGENT, "TokenBar");
+            if let Some(account_id) = request_account_id {
+                request = request.header("ChatGPT-Account-Id", account_id);
+            }
+            let response = request.send().await.map_err(|error| {
+                ProviderFetchFailure::from_send_error(
+                    "Codex usage request failed. Retrying automatically.",
+                    Some(cache_binding.clone()),
+                    &error,
+                )
+            })?;
+            Ok((credentials, cache_binding, response))
+        })
+        .await
+        {
+            Ok(verified) => verified,
+            Err(failure) => return ProviderFetchOutcome::Failure(failure),
+        };
     let request_account_id = credentials
         .account_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(account_id) = request_account_id {
-        request = request.header("ChatGPT-Account-Id", account_id);
-    }
+    let status = response.status().as_u16();
+    let body = match read_response_body(status, false, || async {
+        response.text().await.map_err(|error| {
+            TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+        })
+    })
+    .await
+    {
+        Ok(body) => body,
+        Err(ResponseReadFailure::Transient(diagnostic)) => {
+            return ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
+                "Codex usage request failed. Retrying automatically.",
+                Some(cache_binding),
+                diagnostic,
+            ));
+        }
+        Err(ResponseReadFailure::Terminal(401 | 403)) => {
+            return ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                "Codex OAuth token expired or invalid. Run `codex` to log in again.",
+            ));
+        }
+        Err(ResponseReadFailure::Terminal(status)) => {
+            return ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(format!(
+                "Codex usage API rejected the request (status {status})."
+            )));
+        }
+    };
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Codex OAuth request failed: {}", e))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("read Codex OAuth response: {}", e))?;
-
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(
-            "Codex OAuth token expired or invalid. Run `codex` to log in again.".to_string(),
-        );
-    }
-    if !status.is_success() {
-        return Err(format!("Codex usage API returned {}.", status.as_u16()));
-    }
-
-    let usage: CodexUsageResponse =
-        serde_json::from_str(&body).map_err(|e| format!("decode Codex usage response: {}", e))?;
+    let mut usage: CodexUsageResponse = match serde_json::from_str(&body) {
+        Ok(usage) => usage,
+        Err(_) => {
+            return ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                "Codex usage response could not be decoded.",
+            ));
+        }
+    };
     let now = Utc::now();
-    let account_scope = resolve_codex_account_scope(
-        refreshed_scope,
-        request_account_id,
-        |account_id| {
-            agent_account_scope::resolve_authoritative(
-                "codex",
-                AuthoritativeIdKind::OpaqueId,
-                account_id,
-            )
-        },
-        || {
-            agent_account_scope::resolve_credential(
-                "codex",
-                credentials.scope_slot.semantic_source,
-                &credentials.scope_slot.canonical_location,
-                credentials.scope_marker(),
-            )
-        },
-    );
+    let account_scope = cache_binding
+        .corroborating
+        .clone()
+        .unwrap_or_else(|| cache_binding.primary.clone());
     let identity = Some(AgentIdentity {
         email: credentials.id_token.as_deref().and_then(jwt_email),
         plan: usage.plan_type.as_deref().map(clean_plan).or_else(|| {
@@ -1465,148 +1502,301 @@ async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
         usage.additional_rate_limits.as_deref(),
         now,
     );
-    if windows.is_empty() && usage.credits.as_ref().and_then(|c| c.balance).is_none() {
-        return Err("Codex usage API returned no rate-limit windows.".to_string());
+    let finite_balance = finite_codex_balance(usage.credits.as_ref());
+    if let Some(credits) = usage.credits.as_mut() {
+        credits.balance = finite_balance;
+    }
+    if windows.is_empty() && finite_balance.is_none() {
+        return ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+            "Codex usage API returned no usable quota data.",
+        ));
     }
 
-    // Only the non-empty account ID actually attached to this successful request
-    // may authorize legacy migration. Migration remains best-effort so the live
-    // v3 observation still records if import fails.
-    maybe_migrate_codex_v2_with(
-        request_account_id,
-        &account_scope,
-        now.timestamp(),
-        crate::agent_quota_history::migrate_codex_v2,
-    );
-
-    let mut snapshot = AgentUsageSnapshot {
-        client_id: "codex".to_string(),
-        source: "oauth".to_string(),
-        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-        identity,
-        account_scope,
-        windows,
-        credits: usage.credits.map(|credits| CreditsSnapshot {
-            remaining: credits.balance,
-            unlimited: credits.unlimited,
-        }),
-        error: None,
-    };
-    enrich_snapshot(&mut snapshot, now);
-    Ok(snapshot)
-}
-
-fn resolve_codex_account_scope<ResolveAuthoritative, ResolveCredential>(
-    refreshed_scope: Option<Result<AccountScope, AccountScopeError>>,
-    request_account_id: Option<&str>,
-    resolve_authoritative: ResolveAuthoritative,
-    resolve_credential: ResolveCredential,
-) -> Result<AccountScope, AccountScopeError>
-where
-    ResolveAuthoritative: FnOnce(&str) -> Result<AccountScope, AccountScopeError>,
-    ResolveCredential: FnOnce() -> Result<AccountScope, AccountScopeError>,
-{
-    if let Some(Err(error)) = refreshed_scope.as_ref() {
-        return Err(*error);
-    }
-    if let Some(account_id) = request_account_id {
-        return resolve_authoritative(account_id);
-    }
-    refreshed_scope.unwrap_or_else(resolve_credential)
-}
-
-fn maybe_migrate_codex_v2_with<F, T>(
-    request_account_id: Option<&str>,
-    account_scope: &Result<AccountScope, AccountScopeError>,
-    now: i64,
-    migrate: F,
-) where
-    F: FnOnce(&str, &str, i64) -> Result<T, HistoryError>,
-{
-    let Some(request_account_id) = request_account_id
-        .map(str::trim)
-        .filter(|account_id| !account_id.is_empty())
-    else {
-        return;
-    };
-    let Ok(account_scope) = account_scope else {
-        return;
-    };
-    let _ = migrate(request_account_id, account_scope.as_str(), now);
-}
-
-async fn fetch_claude_inner() -> Result<AgentUsageSnapshot, String> {
-    // Mirror Claude Code's auth precedence: CLAUDE_CODE_OAUTH_TOKEN (our env, or
-    // harvested from the user's ~/.zshrc) outranks a stored subscription /login,
-    // because Claude Code itself consumes that token first. So TokenBar reports
-    // the account Claude Code is actually spending against, read from the
-    // ratelimit headers. (This is why the harvest runs even for /login users.)
-    if let Some(token) = resolve_claude_code_oauth_token().await {
-        return claude_header_snapshot(
-            &claude_credentials_from_access_token(token),
-            Utc::now(),
-            None,
-        )
-        .await;
+    if let Some(request_account_id) = request_account_id {
+        let _ = crate::agent_quota_history::migrate_codex_v2(
+            request_account_id,
+            account_scope.as_str(),
+            now.timestamp(),
+        );
     }
 
-    // A stored full login (TokenBar env override / Keychain / file) uses the
-    // richer oauth/usage endpoint. Any failure -- a login that can't refresh, or
-    // a credentials file that exists but can't be read (permissions / I/O) -- is
-    // deferred: we still try the tokenbar Keychain setup-token below, and surface
-    // the error only if that misses too. So a stale login / read error never
-    // strands a working setup-token, yet a genuine failure isn't masked by the
-    // generic "unconfigured" setup prompt.
-    let deferred_error: Option<String> = match load_claude_login_credentials() {
-        Ok(Some(credentials)) => match fetch_claude_oauth_usage(credentials).await {
-            Ok(snapshot) => return Ok(snapshot),
-            Err(login_error) => Some(login_error),
+    ProviderFetchOutcome::Success {
+        snapshot: AgentUsageSnapshot {
+            client_id: "codex".to_string(),
+            source: "oauth".to_string(),
+            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            identity,
+            account_scope: Ok(account_scope),
+            windows,
+            credits: usage.credits.map(|credits| CreditsSnapshot {
+                remaining: credits.balance,
+                unlimited: credits.unlimited,
+            }),
+            error: None,
+            transport_diagnostic: None,
         },
-        Ok(None) => None,
-        Err(read_error) => Some(read_error),
-    };
+        cache_binding: Some(cache_binding),
+    }
+}
 
-    // Last resort: the tokenbar-claude-oauth-token Keychain item reads limits
-    // straight from the ratelimit headers (no oauth/usage GET, no 429 gate).
-    if let Some(token) = resolve_claude_keychain_token() {
-        return claude_header_snapshot(
-            &claude_credentials_from_access_token(token),
-            Utc::now(),
-            None,
-        )
-        .await;
+fn resolve_codex_cache_binding(
+    credentials: &CodexCredentials,
+) -> Result<ProviderCacheBinding, AccountScopeError> {
+    let primary = agent_account_scope::resolve_credential(
+        "codex",
+        credentials.scope_slot.semantic_source,
+        &credentials.scope_slot.canonical_location,
+        credentials.scope_marker(),
+    )?;
+    let corroborating = credentials
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|account_id| {
+            agent_account_scope::resolve_authoritative(
+                "codex",
+                AuthoritativeIdKind::OpaqueId,
+                account_id,
+            )
+        })
+        .transpose()?;
+    Ok(ProviderCacheBinding::new(primary, corroborating))
+}
+
+fn claude_cache_binding(
+    credentials: &ClaudeCredentials,
+) -> Result<ProviderCacheBinding, AccountScopeError> {
+    credentials
+        .resolve_account_scope()
+        .map(ProviderCacheBinding::primary)
+}
+
+fn clear_claude_gate_for_login_resolution(
+    login: &ClaudeLoginResolution,
+    gate: &mut ClaudeUsageGate,
+) {
+    if matches!(
+        login,
+        ClaudeLoginResolution::Absent | ClaudeLoginResolution::ExplicitLogout
+    ) {
+        gate.clear();
+    }
+}
+
+async fn fetch_claude_inner() -> (&'static str, ProviderFetchOutcome) {
+    if let Some(token) = resolve_claude_code_oauth_token().await {
+        return fetch_claude_setup_token(token).await;
     }
 
-    Err(deferred_error.unwrap_or_else(|| CLAUDE_UNCONFIGURED_ERROR.to_string()))
+    let login = load_claude_login_credentials();
+    clear_claude_gate_for_login_resolution(&login, &mut lock_gate());
+    fetch_claude_login_or_setup_with(
+        login,
+        |credentials| async move {
+            let verified = claude_cache_binding(&credentials).map_err(|_| {
+                ProviderFetchFailure::terminal("Claude account identity could not be verified.")
+            });
+            request_after_verified_binding(verified, |binding| async move {
+                Ok(fetch_claude_oauth_usage(credentials, binding).await)
+            })
+            .await
+            .unwrap_or_else(|failure| ("oauth", ProviderFetchOutcome::Failure(failure)))
+        },
+        resolve_claude_keychain_token,
+        fetch_claude_setup_token,
+    )
+    .await
+}
+
+async fn fetch_claude_setup_token(
+    token: ResolvedClaudeToken,
+) -> (&'static str, ProviderFetchOutcome) {
+    let credentials = claude_credentials_from_access_token(token);
+    let verified = claude_cache_binding(&credentials).map_err(|_| {
+        ProviderFetchFailure::terminal("Claude setup-token account identity could not be verified.")
+    });
+    let outcome = request_after_verified_binding(verified, |binding| async move {
+        Ok(claude_header_snapshot(
+            &credentials,
+            Utc::now(),
+            Ok(binding.primary.clone()),
+            Some(binding),
+        )
+        .await)
+    })
+    .await
+    .unwrap_or_else(ProviderFetchOutcome::Failure);
+    ("setup-token", outcome)
+}
+
+async fn fetch_claude_login_or_setup_with<Login, LoginFuture, LoadSetup, Setup, SetupFuture>(
+    login: ClaudeLoginResolution,
+    request_login: Login,
+    load_setup: LoadSetup,
+    request_setup: Setup,
+) -> (&'static str, ProviderFetchOutcome)
+where
+    Login: FnOnce(ClaudeCredentials) -> LoginFuture,
+    LoginFuture: std::future::Future<Output = (&'static str, ProviderFetchOutcome)>,
+    LoadSetup: FnOnce() -> Result<Option<ResolvedClaudeToken>, String>,
+    Setup: FnOnce(ResolvedClaudeToken) -> SetupFuture,
+    SetupFuture: std::future::Future<Output = (&'static str, ProviderFetchOutcome)>,
+{
+    match login {
+        ClaudeLoginResolution::Ready(credentials) => request_login(credentials).await,
+        ClaudeLoginResolution::Terminal => (
+            "oauth",
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                CLAUDE_CREDENTIALS_LOAD_ERROR,
+            )),
+        ),
+        ClaudeLoginResolution::Absent | ClaudeLoginResolution::ExplicitLogout => {
+            match load_setup() {
+                Ok(Some(token)) => request_setup(token).await,
+                Ok(None) => (
+                    "unconfigured",
+                    ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                        CLAUDE_UNCONFIGURED_ERROR,
+                    )),
+                ),
+                Err(_) => (
+                    "setup-token",
+                    ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                        CLAUDE_CREDENTIALS_LOAD_ERROR,
+                    )),
+                ),
+            }
+        }
+    }
 }
 
 async fn fetch_claude_oauth_usage(
-    mut credentials: ClaudeCredentials,
-) -> Result<AgentUsageSnapshot, String> {
-    let mut refreshed_scope = None;
-    if claude_credentials_expired(&credentials) {
-        let refreshed = refresh_claude_credentials(&credentials).await?;
-        credentials = refreshed.0;
-        refreshed_scope = Some(refreshed.1);
-    }
+    credentials: ClaudeCredentials,
+    pre_binding: ProviderCacheBinding,
+) -> (&'static str, ProviderFetchOutcome) {
+    fetch_claude_login_usage_with(
+        credentials,
+        pre_binding,
+        Utc::now(),
+        |binding, now| {
+            let mut gate = lock_gate();
+            gate.blocked_until_for(binding, now)
+        },
+        |credentials| async move { refresh_claude_credentials(&credentials).await },
+        |credentials, account_scope, cache_binding| async move {
+            claude_header_snapshot(&credentials, Utc::now(), Ok(account_scope), cache_binding).await
+        },
+        |credentials, account_scope, cache_binding, gate_binding| async move {
+            fetch_claude_oauth_usage_request(
+                &credentials,
+                account_scope,
+                cache_binding,
+                gate_binding,
+            )
+            .await
+        },
+    )
+    .await
+}
 
-    if !credentials.scopes.is_empty()
+async fn fetch_claude_login_usage_with<
+    Gate,
+    Refresh,
+    RefreshFuture,
+    Header,
+    HeaderFuture,
+    Oauth,
+    OauthFuture,
+>(
+    credentials: ClaudeCredentials,
+    pre_binding: ProviderCacheBinding,
+    now: DateTime<Utc>,
+    blocked_until_for: Gate,
+    refresh: Refresh,
+    header: Header,
+    oauth: Oauth,
+) -> (&'static str, ProviderFetchOutcome)
+where
+    Gate: FnOnce(&ProviderCacheBinding, DateTime<Utc>) -> Option<DateTime<Utc>>,
+    Refresh: FnOnce(ClaudeCredentials) -> RefreshFuture,
+    RefreshFuture: std::future::Future<
+        Output = Result<
+            (
+                ClaudeCredentials,
+                AccountScope,
+                Option<ProviderCacheBinding>,
+            ),
+            ProviderFetchFailure,
+        >,
+    >,
+    Header: FnOnce(ClaudeCredentials, AccountScope, Option<ProviderCacheBinding>) -> HeaderFuture,
+    HeaderFuture: std::future::Future<Output = ProviderFetchOutcome>,
+    Oauth: FnOnce(
+        ClaudeCredentials,
+        AccountScope,
+        Option<ProviderCacheBinding>,
+        ProviderCacheBinding,
+    ) -> OauthFuture,
+    OauthFuture: std::future::Future<Output = (&'static str, ProviderFetchOutcome)>,
+{
+    let header_route = !credentials.scopes.is_empty()
         && !credentials
             .scopes
             .iter()
-            .any(|scope| scope == "user:profile")
-    {
-        // Inference-only token declared explicit non-user:profile scopes — skip
-        // the (guaranteed-403) oauth/usage GET and read limits from headers.
-        return claude_header_snapshot(&credentials, Utc::now(), refreshed_scope).await;
+            .any(|scope| scope == "user:profile");
+    if !header_route {
+        if let Some(blocked_until) = blocked_until_for(&pre_binding, now) {
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(claude_gate_failure(pre_binding, blocked_until, now)),
+            );
+        }
     }
 
-    let client = reqwest::Client::builder()
+    let (credentials, account_scope, cache_binding) = if claude_credentials_expired(&credentials) {
+        match refresh(credentials).await {
+            Ok(refreshed) => refreshed,
+            Err(failure) => return ("oauth", ProviderFetchOutcome::Failure(failure)),
+        }
+    } else {
+        let account_scope = pre_binding.primary.clone();
+        (credentials, account_scope, Some(pre_binding))
+    };
+
+    if header_route {
+        return (
+            "setup-token",
+            header(credentials, account_scope, cache_binding).await,
+        );
+    }
+
+    let gate_binding = ProviderCacheBinding::primary(account_scope.clone());
+    oauth(credentials, account_scope, cache_binding, gate_binding).await
+}
+
+async fn fetch_claude_oauth_usage_request(
+    credentials: &ClaudeCredentials,
+    account_scope: AccountScope,
+    cache_binding: Option<ProviderCacheBinding>,
+    gate_binding: ProviderCacheBinding,
+) -> (&'static str, ProviderFetchOutcome) {
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("build Claude OAuth client: {}", e))?;
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                    "Claude usage client could not be created.",
+                )),
+            );
+        }
+    };
 
-    let response = client
+    let response = match client
         .get(CLAUDE_USAGE_URL)
         .bearer_auth(&credentials.access_token)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -1615,73 +1805,133 @@ async fn fetch_claude_oauth_usage(
         .header("anthropic-beta", "oauth-2025-04-20")
         .send()
         .await
-        .map_err(|e| format!("Claude OAuth request failed: {}", e))?;
-    let status = response.status();
-    let retry_after = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        parse_retry_after(response.headers().get(reqwest::header::RETRY_AFTER))
-    } else {
-        None
-    };
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("read Claude OAuth response: {}", e))?;
-
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(
-            "Claude OAuth token expired or invalid. Run `claude` to re-authenticate.".to_string(),
-        );
-    }
-    if status == reqwest::StatusCode::FORBIDDEN {
-        // oauth/usage requires user:profile. An inference-only token (e.g.
-        // `claude setup-token`) is denied *specifically* for that scope — fall
-        // back to the unified rate-limit headers, which it *is* allowed to read.
-        // Any other 403 keeps the actionable re-auth error (and skips the probe,
-        // so we don't spend an inference call on an unrelated denial).
-        if body.contains("user:profile") {
-            return claude_header_snapshot(&credentials, Utc::now(), refreshed_scope).await;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::from_send_error(
+                    "Claude usage request failed. Retrying automatically.",
+                    cache_binding,
+                    &error,
+                )),
+            );
         }
-        return Err(
-            "Claude OAuth usage was denied. Run `claude logout && claude login` to grant user:profile."
-                .to_string(),
+    };
+    let status = response.status().as_u16();
+    let retry_after = (status == 429)
+        .then(|| parse_retry_after(response.headers().get(reqwest::header::RETRY_AFTER)))
+        .flatten();
+    let body = match read_response_body(status, true, || async {
+        response.text().await.map_err(|error| {
+            TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+        })
+    })
+    .await
+    {
+        Ok(body) => body,
+        Err(ResponseReadFailure::Transient(diagnostic)) => {
+            if status == 429 {
+                lock_gate().record_rate_limit(gate_binding, retry_after, Utc::now());
+            }
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
+                    "Claude usage request failed. Retrying automatically.",
+                    cache_binding,
+                    diagnostic,
+                )),
+            );
+        }
+        Err(ResponseReadFailure::Terminal(401)) => {
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                    "Claude OAuth token expired or invalid. Run `claude` to re-authenticate.",
+                )),
+            );
+        }
+        Err(ResponseReadFailure::Terminal(403)) => {
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                    "Claude OAuth usage was denied. Run `claude logout && claude login` to grant user:profile.",
+                )),
+            );
+        }
+        Err(ResponseReadFailure::Terminal(status)) => {
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(format!(
+                    "Claude usage API rejected the request (status {status})."
+                ))),
+            );
+        }
+    };
+
+    if status == 403 {
+        if body.contains("user:profile") {
+            return (
+                "setup-token",
+                claude_header_snapshot(credentials, Utc::now(), Ok(account_scope), cache_binding)
+                    .await,
+            );
+        }
+        return (
+            "oauth",
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                "Claude OAuth usage was denied. Run `claude logout && claude login` to grant user:profile.",
+            )),
         );
-    }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        claude_gate_record_rate_limit(retry_after, Utc::now());
-        return Err(
-            "Claude OAuth usage endpoint is rate limited. Backing off automatically.".to_string(),
-        );
-    }
-    if !status.is_success() {
-        return Err(format!("Claude usage API returned {}.", status.as_u16()));
     }
 
-    let usage: ClaudeUsageResponse =
-        serde_json::from_str(&body).map_err(|e| format!("decode Claude usage response: {}", e))?;
+    let usage: ClaudeUsageResponse = match serde_json::from_str(&body) {
+        Ok(usage) => usage,
+        Err(_) => {
+            return (
+                "oauth",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                    "Claude usage response could not be decoded.",
+                )),
+            );
+        }
+    };
     let now = Utc::now();
     let windows = claude_windows(&usage, now);
     if windows.is_empty() {
-        return Err("Claude usage API returned no rate-limit windows.".to_string());
+        return (
+            "oauth",
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                "Claude usage API returned no usable quota windows.",
+            )),
+        );
     }
-    let account_scope = refreshed_scope.unwrap_or_else(|| credentials.resolve_account_scope());
+    lock_gate().clear();
 
-    Ok(AgentUsageSnapshot {
-        client_id: "claude".to_string(),
-        source: "oauth".to_string(),
-        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-        identity: Some(AgentIdentity {
-            email: None,
-            plan: first_non_empty([
-                credentials.subscription_type.as_deref(),
-                credentials.rate_limit_tier.as_deref(),
-            ])
-            .map(clean_plan),
-        }),
-        account_scope,
-        windows,
-        credits: claude_credits(usage.extra_usage.as_ref()),
-        error: None,
-    })
+    (
+        "oauth",
+        ProviderFetchOutcome::Success {
+            snapshot: AgentUsageSnapshot {
+                client_id: "claude".to_string(),
+                source: "oauth".to_string(),
+                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                identity: Some(AgentIdentity {
+                    email: None,
+                    plan: first_non_empty([
+                        credentials.subscription_type.as_deref(),
+                        credentials.rate_limit_tier.as_deref(),
+                    ])
+                    .map(clean_plan),
+                }),
+                account_scope: Ok(account_scope),
+                windows,
+                credits: claude_credits(usage.extra_usage.as_ref()),
+                error: None,
+                transport_diagnostic: None,
+            },
+            cache_binding,
+        },
+    )
 }
 
 /// Fallback for inference-only tokens (`claude setup-token`): the oauth/usage
@@ -1707,9 +1957,10 @@ fn refresh_cached_windows(windows: &[UsageWindow], now: DateTime<Utc>) -> Option
     let mut refreshed = Vec::with_capacity(windows.len());
     for window in windows {
         let mut window = window.clone();
-        if window.resets_at.is_some() {
-            normalized_reset_at(&mut window, now)?;
-            let reset = window.reset_at_evidence?;
+        if let Some(reset) = window.resets_at.as_deref().and_then(parse_datetime) {
+            if now >= reset {
+                return None;
+            }
             window.reset_text = Some(reset_text(reset, now));
         }
         refreshed.push(window);
@@ -1717,7 +1968,10 @@ fn refresh_cached_windows(windows: &[UsageWindow], now: DateTime<Utc>) -> Option
     Some(refreshed)
 }
 
-async fn fetch_claude_via_headers(access_token: &str) -> Result<Vec<UsageWindow>, String> {
+async fn fetch_claude_via_headers(
+    access_token: &str,
+    attempt_binding: Option<ProviderCacheBinding>,
+) -> Result<Vec<UsageWindow>, ProviderFetchFailure> {
     {
         let now = Utc::now();
         let guard = CLAUDE_HEADER_CACHE
@@ -1735,7 +1989,9 @@ async fn fetch_claude_via_headers(access_token: &str) -> Result<Vec<UsageWindow>
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("build Claude header-probe client: {}", e))?;
+        .map_err(|_| {
+            ProviderFetchFailure::terminal("Claude header-probe client could not be created.")
+        })?;
 
     let response = client
         .post(CLAUDE_MESSAGES_URL)
@@ -1752,63 +2008,83 @@ async fn fetch_claude_via_headers(access_token: &str) -> Result<Vec<UsageWindow>
         }))
         .send()
         .await
-        .map_err(|e| format!("Claude header probe failed: {}", e))?;
+        .map_err(|error| {
+            ProviderFetchFailure::from_send_error(
+                "Claude header probe failed. Retrying automatically.",
+                attempt_binding.clone(),
+                &error,
+            )
+        })?;
 
-    let status = response.status();
-    // Read headers before consuming the body — this returns an owned Vec, ending
-    // the borrow of `response`.
+    let status = response.status().as_u16();
     let windows = parse_unified_ratelimit_windows(response.headers(), Utc::now());
-
-    if status.is_success() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if (200..=299).contains(&status) || status == 429 {
         if windows.is_empty() {
-            return Err("Claude header probe returned no unified rate-limit headers.".to_string());
+            if status == 429 {
+                return Err(ProviderFetchFailure::transient(
+                    "Claude header probe is rate limited. Retrying automatically.",
+                    attempt_binding,
+                    SafeTransportDiagnostic::rate_limited(status),
+                ));
+            }
+            return Err(ProviderFetchFailure::terminal(
+                "Claude header probe returned no usable rate-limit headers.",
+            ));
         }
-        {
-            let mut guard = CLAUDE_HEADER_CACHE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = Some((Utc::now(), access_token.to_string(), windows.clone()));
-        }
+        let mut guard = CLAUDE_HEADER_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some((Utc::now(), access_token.to_string(), windows.clone()));
         return Ok(windows);
     }
-
-    let body = response.text().await.unwrap_or_default();
-    Err(format!(
-        "Claude header probe returned {} ({}).",
-        status.as_u16(),
-        body.chars().take(200).collect::<String>()
+    if (500..=599).contains(&status) {
+        return Err(ProviderFetchFailure::transient(
+            "Claude header probe failed. Retrying automatically.",
+            attempt_binding,
+            SafeTransportDiagnostic::server_error(status),
+        ));
+    }
+    Err(ProviderFetchFailure::terminal(
+        if matches!(status, 401 | 403) {
+            "Claude setup-token expired or lacks access.".to_string()
+        } else {
+            format!("Claude header probe rejected the request (status {status}).")
+        },
     ))
 }
 
-/// Build a Claude snapshot from the unified rate-limit headers. Shared by the
-/// scope-guard and HTTP-403 branches of `fetch_claude_inner`. `source` is
-/// `"setup-token"` — it doubles as the limits-card badge, so it names the auth
-/// method the user recognizes rather than the fetch mechanism, and still lets
-/// telemetry tell it apart from the richer oauth/usage path.
 async fn claude_header_snapshot(
     credentials: &ClaudeCredentials,
     now: DateTime<Utc>,
-    account_scope: Option<Result<AccountScope, AccountScopeError>>,
-) -> Result<AgentUsageSnapshot, String> {
-    let windows = fetch_claude_via_headers(&credentials.access_token).await?;
-    let account_scope = account_scope.unwrap_or_else(|| credentials.resolve_account_scope());
-    Ok(AgentUsageSnapshot {
-        client_id: "claude".to_string(),
-        source: "setup-token".to_string(),
-        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-        identity: Some(AgentIdentity {
-            email: None,
-            plan: first_non_empty([
-                credentials.subscription_type.as_deref(),
-                credentials.rate_limit_tier.as_deref(),
-            ])
-            .map(clean_plan),
-        }),
-        account_scope,
-        windows,
-        credits: None,
-        error: None,
-    })
+    account_scope: Result<AccountScope, AccountScopeError>,
+    cache_binding: Option<ProviderCacheBinding>,
+) -> ProviderFetchOutcome {
+    let windows =
+        match fetch_claude_via_headers(&credentials.access_token, cache_binding.clone()).await {
+            Ok(windows) => windows,
+            Err(failure) => return ProviderFetchOutcome::Failure(failure),
+        };
+    ProviderFetchOutcome::Success {
+        snapshot: AgentUsageSnapshot {
+            client_id: "claude".to_string(),
+            source: "setup-token".to_string(),
+            updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            identity: Some(AgentIdentity {
+                email: None,
+                plan: first_non_empty([
+                    credentials.subscription_type.as_deref(),
+                    credentials.rate_limit_tier.as_deref(),
+                ])
+                .map(clean_plan),
+            }),
+            account_scope,
+            windows,
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        },
+        cache_binding,
+    }
 }
 
 fn load_codex_credentials() -> Result<CodexCredentials, String> {
@@ -1869,45 +2145,72 @@ fn load_codex_credentials_from(auth_path: &Path) -> Result<CodexCredentials, Str
 /// with `source == "unconfigured"`, so the UI shows a setup prompt rather than a
 /// red error.
 const CLAUDE_UNCONFIGURED_ERROR: &str = "Claude OAuth credentials not found. Run `claude` to authenticate, or set CLAUDE_CODE_OAUTH_TOKEN / add a `tokenbar-claude-oauth-token` Keychain item to use a setup-token.";
+const CLAUDE_CREDENTIALS_LOAD_ERROR: &str = "Claude credentials could not be loaded.";
 
 /// Full-login credentials: structured `claudeAiOauth` blobs (Keychain
 /// `Claude Code-credentials`, then `~/.claude/.credentials.json`) plus the
-/// TokenBar env override. These carry refresh tokens / scopes / expiry and go
-/// through the richer oauth/usage endpoint. A present-but-logged-out entry (has
-/// `claudeAiOauth` but no `accessToken` — the #26 daily-logout state) or an
-/// unparseable blob is skipped, not treated as a hard error, so a configured
-/// setup-token can still take over.
-fn load_claude_login_credentials() -> Result<Option<ClaudeCredentials>, String> {
-    if let Some(credentials) = load_claude_credentials_from_environment()? {
-        return Ok(Some(credentials));
+/// TokenBar env override. Only a genuinely missing higher-priority store falls
+/// through; the explicit #26 logout shape stops full-login precedence.
+fn load_claude_login_credentials() -> ClaudeLoginResolution {
+    match load_claude_credentials_from_environment() {
+        Ok(Some(credentials)) => return ClaudeLoginResolution::Ready(credentials),
+        Ok(None) => {}
+        Err(_) => return ClaudeLoginResolution::Terminal,
     }
-    if let Some(raw) = load_claude_credentials_from_keychain()? {
-        if let Ok(credentials) =
-            parse_claude_credentials_data(&raw, ClaudeCredentialSource::Keychain)
-        {
-            return Ok(Some(credentials));
+    load_stored_claude_login_with(
+        load_claude_credentials_from_keychain,
+        || match fs::read_to_string(claude_credentials_path()) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err("Claude credentials file could not be read.".to_string()),
+        },
+    )
+}
+
+fn load_stored_claude_login_with<LoadKeychain, LoadFile>(
+    load_keychain: LoadKeychain,
+    load_file: LoadFile,
+) -> ClaudeLoginResolution
+where
+    LoadKeychain: FnOnce() -> Result<Option<String>, String>,
+    LoadFile: FnOnce() -> Result<Option<String>, String>,
+{
+    match load_keychain() {
+        Ok(Some(raw)) => {
+            return resolve_stored_claude_login(&raw, ClaudeCredentialSource::Keychain);
         }
+        Ok(None) => {}
+        Err(_) => return ClaudeLoginResolution::Terminal,
     }
-    match fs::read_to_string(claude_credentials_path()) {
-        Ok(raw) => {
-            if let Ok(credentials) =
-                parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)
-            {
-                return Ok(Some(credentials));
-            }
-            // Parsed but unusable (logged-out / no accessToken): fall through.
-            Ok(None)
-        }
-        // Absent is normal (no file login). A genuine read failure (permissions /
-        // I/O) is a real problem — return it so the caller can surface the
-        // actionable error after setup-token fallbacks miss, rather than the
-        // generic "unconfigured" setup prompt.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "read Claude credentials file {}: {}",
-            claude_credentials_path().display(),
-            error
-        )),
+    match load_file() {
+        Ok(Some(raw)) => resolve_stored_claude_login(&raw, ClaudeCredentialSource::File),
+        Ok(None) => ClaudeLoginResolution::Absent,
+        Err(_) => ClaudeLoginResolution::Terminal,
+    }
+}
+
+fn resolve_stored_claude_login(raw: &str, source: ClaudeCredentialSource) -> ClaudeLoginResolution {
+    let raw_root: Value = match serde_json::from_str(raw) {
+        Ok(root) => root,
+        Err(_) => return ClaudeLoginResolution::Terminal,
+    };
+    let explicitly_logged_out = raw_root
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .is_some_and(|oauth| {
+            oauth.contains_key("refreshToken")
+                && match oauth.get("accessToken") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::String(token)) => token.trim().is_empty(),
+                    _ => false,
+                }
+        });
+    if explicitly_logged_out {
+        return ClaudeLoginResolution::ExplicitLogout;
+    }
+    match parse_claude_credentials_data(raw, source) {
+        Ok(credentials) => ClaudeLoginResolution::Ready(credentials),
+        Err(_) => ClaudeLoginResolution::Terminal,
     }
 }
 
@@ -1939,17 +2242,16 @@ async fn resolve_claude_code_oauth_token() -> Option<ResolvedClaudeToken> {
 
 /// The `tokenbar-claude-oauth-token` Keychain item (a TokenBar-specific setup
 /// token). A last-resort fallback, below the stored `/login`.
-fn resolve_claude_keychain_token() -> Option<ResolvedClaudeToken> {
-    load_claude_raw_token_from_keychain()
-        .ok()
-        .flatten()
-        .map(|access_token| ResolvedClaudeToken {
+fn resolve_claude_keychain_token() -> Result<Option<ResolvedClaudeToken>, String> {
+    load_claude_raw_token_from_keychain().map(|token| {
+        token.map(|access_token| ResolvedClaudeToken {
             access_token,
             scope_slot: CredentialSlot {
                 semantic_source: "claude-setup-keychain",
                 canonical_location: CLAUDE_RAW_TOKEN_KEYCHAIN_SERVICE.to_string(),
             },
         })
+    })
 }
 
 fn load_claude_credentials_from_environment() -> Result<Option<ClaudeCredentials>, String> {
@@ -1987,6 +2289,7 @@ fn load_claude_credentials_from_environment() -> Result<Option<ClaudeCredentials
         subscription_type: None,
         source: ClaudeCredentialSource::Environment,
         raw_root: None,
+        keychain_account: None,
         scope_slot: CredentialSlot {
             semantic_source: "claude-environment",
             canonical_location: source_name.to_string(),
@@ -2025,6 +2328,7 @@ fn parse_claude_credentials_data(
         subscription_type: oauth.subscription_type,
         source,
         raw_root: Some(raw_root),
+        keychain_account: None,
         scope_slot: claude_login_scope_slot(source)?,
     })
 }
@@ -2050,32 +2354,52 @@ fn claude_login_scope_slot(source: ClaudeCredentialSource) -> Result<CredentialS
 }
 
 #[cfg(target_os = "macos")]
+fn keychain_item_not_found(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(44)
+}
+
 fn load_claude_credentials_from_keychain() -> Result<Option<String>, String> {
-    let output = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+    load_claude_credentials_from_keychain_item(None)
+}
+
+#[cfg(target_os = "macos")]
+fn load_claude_credentials_from_keychain_item(
+    account: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut command = std::process::Command::new("/usr/bin/security");
+    command.args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE]);
+    if let Some(account) = account {
+        command.args(["-a", account]);
+    }
+    let output = command
+        .arg("-w")
         .output()
         .map_err(|e| format!("read Claude Keychain credentials: {}", e))?;
     if !output.status.success() {
-        return Ok(None);
+        return if keychain_item_not_found(&output.status) {
+            Ok(None)
+        } else {
+            Err("Claude Keychain credentials could not be read.".to_string())
+        };
     }
     let raw = String::from_utf8(output.stdout)
         .map_err(|_| "Claude Keychain credentials are not UTF-8 JSON.".to_string())?;
     let raw = raw.trim_matches(['\r', '\n']).to_string();
     if raw.trim().is_empty() {
-        return Ok(None);
+        return Err("Claude Keychain credentials are empty.".to_string());
     }
     Ok(Some(raw))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn load_claude_credentials_from_keychain() -> Result<Option<String>, String> {
+fn load_claude_credentials_from_keychain_item(
+    _account: Option<&str>,
+) -> Result<Option<String>, String> {
     Ok(None)
 }
 
 /// Build credentials from a bare access token (no refresh/expiry/scope metadata).
-/// Used by the setup-token delivery paths (env var, shell harvest, raw keychain);
-/// empty scopes make `fetch_claude_inner` skip the scope guard and reach the
-/// header fallback on the resulting oauth/usage 403.
+/// Setup-token delivery paths use these credentials only for the header probe.
 fn claude_credentials_from_access_token(token: ResolvedClaudeToken) -> ClaudeCredentials {
     ClaudeCredentials {
         access_token: token.access_token,
@@ -2088,6 +2412,7 @@ fn claude_credentials_from_access_token(token: ResolvedClaudeToken) -> ClaudeCre
         // to, so treat it as read-only — save_claude_credentials skips it.
         source: ClaudeCredentialSource::Environment,
         raw_root: None,
+        keychain_account: None,
         scope_slot: token.scope_slot,
     }
 }
@@ -2247,13 +2572,17 @@ fn load_claude_raw_token_from_keychain() -> Result<Option<String>, String> {
         .output()
         .map_err(|e| format!("read TokenBar Claude token from Keychain: {}", e))?;
     if !output.status.success() {
-        return Ok(None);
+        return if keychain_item_not_found(&output.status) {
+            Ok(None)
+        } else {
+            Err("TokenBar Claude Keychain token could not be read.".to_string())
+        };
     }
     let raw = String::from_utf8(output.stdout)
         .map_err(|_| "TokenBar Claude Keychain token is not UTF-8.".to_string())?;
     let raw = raw.trim().to_string();
     if raw.is_empty() {
-        return Ok(None);
+        return Err("TokenBar Claude Keychain token is empty.".to_string());
     }
     Ok(Some(raw))
 }
@@ -2265,9 +2594,10 @@ fn load_claude_raw_token_from_keychain() -> Result<Option<String>, String> {
 
 async fn refresh_codex_credentials(
     auth_path: &Path,
-) -> Result<(CodexCredentials, Result<AccountScope, AccountScopeError>), String> {
-    let refresh = agent_account_scope::begin_refresh("codex")
-        .map_err(|_| "Codex credential refresh lock is unavailable.".to_string())?;
+) -> Result<(CodexCredentials, ProviderCacheBinding), ProviderFetchFailure> {
+    let refresh = agent_account_scope::begin_refresh("codex").map_err(|_| {
+        ProviderFetchFailure::terminal("Codex credential refresh lock is unavailable.")
+    })?;
     refresh_codex_credentials_with(
         auth_path,
         &refresh,
@@ -2278,11 +2608,16 @@ async fn refresh_codex_credentials(
     .await
 }
 
-async fn request_codex_refresh(refresh_token: String) -> Result<Value, String> {
+async fn request_codex_refresh(
+    refresh_token: String,
+    attempt_binding: ProviderCacheBinding,
+) -> Result<Value, ProviderFetchFailure> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("build Codex refresh client: {}", e))?;
+        .map_err(|_| {
+            ProviderFetchFailure::terminal("Codex refresh client could not be created.")
+        })?;
     let body = serde_json::json!({
         "client_id": CODEX_CLIENT_ID,
         "grant_type": "refresh_token",
@@ -2295,16 +2630,58 @@ async fn request_codex_refresh(refresh_token: String) -> Result<Value, String> {
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Codex token refresh failed: {}", e))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("read Codex refresh response: {}", e))?;
-    if !status.is_success() {
-        return Err("Codex OAuth refresh failed. Run `codex` to log in again.".to_string());
-    }
-    serde_json::from_str(&body).map_err(|e| format!("decode Codex refresh response: {}", e))
+        .map_err(|error| {
+            ProviderFetchFailure::from_send_error(
+                "Codex token refresh failed. Retrying automatically.",
+                Some(attempt_binding.clone()),
+                &error,
+            )
+        })?;
+    let status = response.status().as_u16();
+    let body = read_response_body(status, false, || async {
+        response.text().await.map_err(|error| {
+            TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+        })
+    })
+    .await
+    .map_err(|failure| match failure {
+        ResponseReadFailure::Transient(diagnostic) => ProviderFetchFailure::transient(
+            "Codex token refresh failed. Retrying automatically.",
+            Some(attempt_binding),
+            diagnostic,
+        ),
+        ResponseReadFailure::Terminal(_) => ProviderFetchFailure::terminal(
+            "Codex OAuth refresh failed. Run `codex` to log in again.",
+        ),
+    })?;
+    serde_json::from_str(&body).map_err(|_| {
+        ProviderFetchFailure::terminal("Codex OAuth refresh response could not be decoded.")
+    })
+}
+
+fn resolve_codex_cache_binding_with<R: RefreshScopeTransaction + ?Sized>(
+    credentials: &CodexCredentials,
+    refresh: &R,
+) -> Result<ProviderCacheBinding, AccountScopeError> {
+    let primary = refresh.resolve_current(
+        credentials.scope_slot.semantic_source,
+        &credentials.scope_slot.canonical_location,
+        credentials.scope_marker(),
+    )?;
+    let corroborating = credentials
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|account_id| {
+            agent_account_scope::resolve_authoritative(
+                "codex",
+                AuthoritativeIdKind::OpaqueId,
+                account_id,
+            )
+        })
+        .transpose()?;
+    Ok(ProviderCacheBinding::new(primary, corroborating))
 }
 
 async fn refresh_codex_credentials_with<R, Request, RequestFuture, Save, Checkpoint>(
@@ -2313,25 +2690,22 @@ async fn refresh_codex_credentials_with<R, Request, RequestFuture, Save, Checkpo
     request: Request,
     save: Save,
     mut checkpoint: Checkpoint,
-) -> Result<(CodexCredentials, Result<AccountScope, AccountScopeError>), String>
+) -> Result<(CodexCredentials, ProviderCacheBinding), ProviderFetchFailure>
 where
     R: RefreshScopeTransaction + ?Sized,
-    Request: FnOnce(String) -> RequestFuture,
-    RequestFuture: std::future::Future<Output = Result<Value, String>>,
-    Save: FnOnce(&CodexCredentials) -> Result<(), String>,
-    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), String>,
+    Request: FnOnce(String, ProviderCacheBinding) -> RequestFuture,
+    RequestFuture: std::future::Future<Output = Result<Value, ProviderFetchFailure>>,
+    Save: FnOnce(&CodexCredentials) -> Result<CodexCredentialWriteReceipt, String>,
+    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), ProviderFetchFailure>,
 {
-    // Another TokenBar process may have refreshed while this caller waited.
-    // Reload the request-bearing record only after the refresh lock is held.
-    let credentials = load_codex_credentials_from(auth_path)?;
+    let credentials =
+        load_codex_credentials_from(auth_path).map_err(ProviderFetchFailure::terminal)?;
     checkpoint(RefreshCheckpoint::Reloaded)?;
+    let pre_binding = resolve_codex_cache_binding_with(&credentials, refresh).map_err(|_| {
+        ProviderFetchFailure::terminal("Codex account identity could not be verified.")
+    })?;
     if !credentials_needs_refresh(credentials.last_refresh) {
-        let scope = refresh.resolve_current(
-            credentials.scope_slot.semantic_source,
-            &credentials.scope_slot.canonical_location,
-            credentials.scope_marker(),
-        );
-        return Ok((credentials, scope));
+        return Ok((credentials, pre_binding));
     }
 
     let refresh_token = credentials
@@ -2339,52 +2713,70 @@ where
         .as_deref()
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| "Codex auth.json has no refresh token.".to_string())?
+        .ok_or_else(|| ProviderFetchFailure::terminal("Codex auth.json has no refresh token."))?
         .to_string();
     let old_marker = credentials.scope_marker().to_vec();
-    let json = request(refresh_token).await?;
+    let json = request(refresh_token, pre_binding.clone()).await?;
     checkpoint(RefreshCheckpoint::NetworkReturned)?;
 
-    let response = json.as_object();
+    let response = json.as_object().ok_or_else(|| {
+        ProviderFetchFailure::terminal("Codex OAuth refresh response was not a JSON object.")
+    })?;
+    let access_token = string_key(response, "access_token", "accessToken").ok_or_else(|| {
+        ProviderFetchFailure::terminal(
+            "Codex OAuth refresh response contained no usable access token.",
+        )
+    })?;
     let refreshed = CodexCredentials {
-        access_token: response
-            .and_then(|tokens| string_key(tokens, "access_token", "accessToken"))
-            .unwrap_or(credentials.access_token),
-        refresh_token: response
-            .and_then(|tokens| string_key(tokens, "refresh_token", "refreshToken"))
+        access_token,
+        refresh_token: string_key(response, "refresh_token", "refreshToken")
             .or(credentials.refresh_token),
-        id_token: response
-            .and_then(|tokens| string_key(tokens, "id_token", "idToken"))
-            .or(credentials.id_token),
+        id_token: string_key(response, "id_token", "idToken").or(credentials.id_token),
         account_id: credentials.account_id,
         last_refresh: Some(Utc::now()),
         auth_path: credentials.auth_path,
         raw_json: credentials.raw_json,
         scope_slot: credentials.scope_slot,
     };
-    let marker_rotated = refreshed.scope_marker() != old_marker.as_slice();
-    let scope = refresh.transfer(
+    let write_receipt = save(&refreshed).map_err(|_| {
+        ProviderFetchFailure::terminal("Codex refreshed credentials could not be saved.")
+    })?;
+    checkpoint(RefreshCheckpoint::CredentialsPersisted)?;
+    let post_primary = match refresh.transfer(
         refreshed.scope_slot.semantic_source,
         &refreshed.scope_slot.canonical_location,
         &old_marker,
         refreshed.scope_marker(),
-    );
+    ) {
+        Ok(account_scope) => account_scope,
+        Err(_) => {
+            let _ = rollback_codex_credentials_if_unchanged(&write_receipt);
+            return Err(ProviderFetchFailure::terminal(
+                "Codex credential lineage could not be preserved.",
+            ));
+        }
+    };
     checkpoint(RefreshCheckpoint::MetadataHandled)?;
-    // A rotated marker may reach disk only after its lineage transfer is durable.
-    // The refreshed access token remains usable in memory for this poll.
-    if marker_rotated && scope.is_err() {
-        return Ok((refreshed, scope));
-    }
-    save(&refreshed)?;
-    checkpoint(RefreshCheckpoint::CredentialsPersisted)?;
-    Ok((refreshed, scope))
+    // The account ID is unchanged by refresh and was already verified in the
+    // pre-request binding. Reuse it instead of performing a second fallible
+    // metadata resolution after credentials and lineage are durable.
+    let post_binding = ProviderCacheBinding::new(post_primary, pre_binding.corroborating);
+    Ok((refreshed, post_binding))
 }
 
 async fn refresh_claude_credentials(
     original: &ClaudeCredentials,
-) -> Result<(ClaudeCredentials, Result<AccountScope, AccountScopeError>), String> {
-    let refresh = agent_account_scope::begin_refresh("claude")
-        .map_err(|_| "Claude credential refresh lock is unavailable.".to_string())?;
+) -> Result<
+    (
+        ClaudeCredentials,
+        AccountScope,
+        Option<ProviderCacheBinding>,
+    ),
+    ProviderFetchFailure,
+> {
+    let refresh = agent_account_scope::begin_refresh("claude").map_err(|_| {
+        ProviderFetchFailure::terminal("Claude credential refresh lock is unavailable.")
+    })?;
     refresh_claude_credentials_with(
         original,
         &refresh,
@@ -2396,11 +2788,16 @@ async fn refresh_claude_credentials(
     .await
 }
 
-async fn request_claude_refresh(refresh_token: String) -> Result<ClaudeRefreshResponse, String> {
+async fn request_claude_refresh(
+    refresh_token: String,
+    attempt_binding: ProviderCacheBinding,
+) -> Result<ClaudeRefreshResponse, ProviderFetchFailure> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("build Claude refresh client: {}", e))?;
+        .map_err(|_| {
+            ProviderFetchFailure::terminal("Claude refresh client could not be created.")
+        })?;
     let response = client
         .post(CLAUDE_REFRESH_URL)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -2415,16 +2812,33 @@ async fn request_claude_refresh(refresh_token: String) -> Result<ClaudeRefreshRe
         ]))
         .send()
         .await
-        .map_err(|e| format!("Claude OAuth refresh failed: {}", e))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("read Claude refresh response: {}", e))?;
-    if !status.is_success() {
-        return Err("Claude OAuth refresh failed. Run `claude` to re-authenticate.".to_string());
-    }
-    serde_json::from_str(&body).map_err(|e| format!("decode Claude refresh response: {}", e))
+        .map_err(|error| {
+            ProviderFetchFailure::from_send_error(
+                "Claude OAuth refresh failed. Retrying automatically.",
+                Some(attempt_binding.clone()),
+                &error,
+            )
+        })?;
+    let status = response.status().as_u16();
+    let body = read_response_body(status, false, || async {
+        response.text().await.map_err(|error| {
+            TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+        })
+    })
+    .await
+    .map_err(|failure| match failure {
+        ResponseReadFailure::Transient(diagnostic) => ProviderFetchFailure::transient(
+            "Claude OAuth refresh failed. Retrying automatically.",
+            Some(attempt_binding),
+            diagnostic,
+        ),
+        ResponseReadFailure::Terminal(_) => ProviderFetchFailure::terminal(
+            "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+        ),
+    })?;
+    serde_json::from_str(&body).map_err(|_| {
+        ProviderFetchFailure::terminal("Claude OAuth refresh response could not be decoded.")
+    })
 }
 
 async fn refresh_claude_credentials_with<R, Reload, Request, RequestFuture, Save, Checkpoint>(
@@ -2434,27 +2848,40 @@ async fn refresh_claude_credentials_with<R, Reload, Request, RequestFuture, Save
     request: Request,
     save: Save,
     mut checkpoint: Checkpoint,
-) -> Result<(ClaudeCredentials, Result<AccountScope, AccountScopeError>), String>
+) -> Result<
+    (
+        ClaudeCredentials,
+        AccountScope,
+        Option<ProviderCacheBinding>,
+    ),
+    ProviderFetchFailure,
+>
 where
     R: RefreshScopeTransaction + ?Sized,
     Reload: FnOnce(&ClaudeCredentials) -> Result<ClaudeCredentials, String>,
-    Request: FnOnce(String) -> RequestFuture,
-    RequestFuture: std::future::Future<Output = Result<ClaudeRefreshResponse, String>>,
+    Request: FnOnce(String, ProviderCacheBinding) -> RequestFuture,
+    RequestFuture:
+        std::future::Future<Output = Result<ClaudeRefreshResponse, ProviderFetchFailure>>,
     Save: FnOnce(&ClaudeCredentials) -> Result<(), String>,
-    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), String>,
+    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), ProviderFetchFailure>,
 {
-    let credentials = reload(original)?;
+    let credentials = reload(original).map_err(ProviderFetchFailure::terminal)?;
     checkpoint(RefreshCheckpoint::Reloaded)?;
+    let marker = credentials.scope_marker().ok_or_else(|| {
+        ProviderFetchFailure::terminal("Claude credential has no trusted account marker.")
+    })?;
+    let pre_scope = refresh
+        .resolve_current(
+            credentials.scope_slot.semantic_source,
+            &credentials.scope_slot.canonical_location,
+            marker,
+        )
+        .map_err(|_| {
+            ProviderFetchFailure::terminal("Claude account identity could not be verified.")
+        })?;
+    let pre_binding = ProviderCacheBinding::primary(pre_scope.clone());
     if !claude_credentials_expired(&credentials) {
-        let scope = match credentials.scope_marker() {
-            Some(marker) => refresh.resolve_current(
-                credentials.scope_slot.semantic_source,
-                &credentials.scope_slot.canonical_location,
-                marker,
-            ),
-            None => Err(AccountScopeError::NoTrustedEvidence),
-        };
-        return Ok((credentials, scope));
+        return Ok((credentials, pre_scope, Some(pre_binding)));
     }
 
     let refresh_token = credentials
@@ -2462,14 +2889,22 @@ where
         .as_deref()
         .filter(|token| !token.is_empty())
         .ok_or_else(|| {
-            "Claude OAuth token is expired and has no refresh token. Run `claude`.".to_string()
+            ProviderFetchFailure::terminal(
+                "Claude OAuth token is expired and has no refresh token. Run `claude`.",
+            )
         })?
         .to_string();
     let old_marker = refresh_token.as_bytes().to_vec();
-    let token_response = request(refresh_token).await?;
+    let token_response = request(refresh_token, pre_binding).await?;
     checkpoint(RefreshCheckpoint::NetworkReturned)?;
+    let access_token = token_response.access_token.trim();
+    if access_token.is_empty() {
+        return Err(ProviderFetchFailure::terminal(
+            "Claude OAuth refresh response has no access token.",
+        ));
+    }
     let refreshed = ClaudeCredentials {
-        access_token: token_response.access_token,
+        access_token: access_token.to_string(),
         refresh_token: token_response
             .refresh_token
             .as_deref()
@@ -2483,40 +2918,59 @@ where
         subscription_type: credentials.subscription_type.clone(),
         source: credentials.source,
         raw_root: credentials.raw_root.clone(),
+        keychain_account: credentials.keychain_account.clone(),
         scope_slot: credentials.scope_slot.clone(),
     };
-    let new_marker = refreshed.scope_marker();
-    let marker_rotated = new_marker.is_some_and(|marker| marker != old_marker.as_slice());
-    let scope = match new_marker {
-        Some(new_marker) => refresh.transfer(
+    let new_marker = refreshed.scope_marker().ok_or_else(|| {
+        ProviderFetchFailure::terminal("Claude refreshed credential has no trusted marker.")
+    })?;
+    let scope = refresh
+        .transfer(
             refreshed.scope_slot.semantic_source,
             &refreshed.scope_slot.canonical_location,
             &old_marker,
             new_marker,
-        ),
-        None => Err(AccountScopeError::NoTrustedEvidence),
-    };
+        )
+        .map_err(|_| {
+            ProviderFetchFailure::terminal("Claude credential lineage could not be preserved.")
+        })?;
     checkpoint(RefreshCheckpoint::MetadataHandled)?;
-    // A rotated marker may reach the shared provider store only after its
-    // lineage transfer is durable. The new access token remains usable in
-    // memory for this poll.
-    if marker_rotated && scope.is_err() {
-        return Ok((refreshed, scope));
-    }
-    if let Err(error) = save(&refreshed) {
-        eprintln!("tb_core_ffi: failed to persist refreshed Claude credentials: {error}");
-    }
+    let persisted = save(&refreshed).is_ok();
     checkpoint(RefreshCheckpoint::CredentialsPersisted)?;
-    Ok((refreshed, scope))
+    let cache_binding = if persisted {
+        Some(ProviderCacheBinding::primary(
+            refresh
+                .resolve_current(
+                    refreshed.scope_slot.semantic_source,
+                    &refreshed.scope_slot.canonical_location,
+                    new_marker,
+                )
+                .map_err(|_| {
+                    ProviderFetchFailure::terminal(
+                        "Claude account identity could not be verified after refresh.",
+                    )
+                })?,
+        ))
+    } else {
+        None
+    };
+    Ok((refreshed, scope, cache_binding))
 }
 
 fn reload_claude_credentials(original: &ClaudeCredentials) -> Result<ClaudeCredentials, String> {
     match original.source {
         ClaudeCredentialSource::Keychain => {
-            let raw = load_claude_credentials_from_keychain()?.ok_or_else(|| {
-                "Claude Keychain credentials disappeared during refresh.".to_string()
+            let account = claude_keychain_account().ok_or_else(|| {
+                "Claude Keychain account could not be captured during refresh.".to_string()
             })?;
-            parse_claude_credentials_data(&raw, ClaudeCredentialSource::Keychain)
+            let raw =
+                load_claude_credentials_from_keychain_item(Some(&account))?.ok_or_else(|| {
+                    "Claude Keychain credentials disappeared during refresh.".to_string()
+                })?;
+            let mut credentials =
+                parse_claude_credentials_data(&raw, ClaudeCredentialSource::Keychain)?;
+            credentials.keychain_account = Some(account);
+            Ok(credentials)
         }
         ClaudeCredentialSource::File => {
             let raw = fs::read_to_string(claude_credentials_path())
@@ -2533,9 +2987,7 @@ fn reload_claude_credentials(original: &ClaudeCredentials) -> Result<ClaudeCrede
 /// came from, preserving every other field the Claude CLI wrote.
 fn save_claude_credentials(credentials: &ClaudeCredentials) -> Result<(), String> {
     match credentials.source {
-        ClaudeCredentialSource::Keychain => {
-            save_claude_credentials_to_keychain(&merge_claude_credentials_json(credentials)?)
-        }
+        ClaudeCredentialSource::Keychain => save_claude_credentials_to_keychain(credentials),
         ClaudeCredentialSource::File => {
             save_claude_credentials_to_file(credentials, &claude_credentials_path())
         }
@@ -2547,7 +2999,10 @@ fn save_claude_credentials_to_file(
     credentials: &ClaudeCredentials,
     path: &Path,
 ) -> Result<(), String> {
-    atomic_write(path, &merge_claude_credentials_json(credentials)?)
+    let current_raw = fs::read_to_string(path)
+        .map_err(|e| format!("read current Claude credentials file: {e}"))?;
+    let data = merge_claude_credentials_json(credentials, &current_raw)?;
+    atomic_write(path, &data)
 }
 
 /// Replace `path` atomically: write a sibling temp file, then rename over the
@@ -2617,17 +3072,36 @@ fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Merge the rotated tokens into the loaded credentials JSON, preserving any
-/// other fields, and return it serialized. Pure so it's unit-testable.
-fn merge_claude_credentials_json(credentials: &ClaudeCredentials) -> Result<String, String> {
-    let mut root = credentials
+/// Merge rotated tokens into the current credentials JSON only when the
+/// `claudeAiOauth` object still matches the one captured at refresh reload.
+/// Top-level siblings come from `current_raw`, so unrelated concurrent writes
+/// survive. Pure so both file and Keychain decisions are fixture-testable.
+fn merge_claude_credentials_json(
+    credentials: &ClaudeCredentials,
+    current_raw: &str,
+) -> Result<String, String> {
+    let expected_oauth = credentials
         .raw_root
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({ "claudeAiOauth": {} }));
-    let oauth = root
+        .as_ref()
+        .and_then(|root| root.get("claudeAiOauth"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Reloaded Claude credentials have no claudeAiOauth object.".to_string())?;
+    let mut current_root: Value = serde_json::from_str(current_raw)
+        .map_err(|e| format!("decode current Claude credentials: {e}"))?;
+    let current_oauth = current_root
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Current Claude credentials have no claudeAiOauth object.".to_string())?;
+    if current_oauth != expected_oauth {
+        return Err(
+            "Claude credentials changed during refresh; refusing stale write-back.".to_string(),
+        );
+    }
+
+    let oauth = current_root
         .get_mut("claudeAiOauth")
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| "Claude credentials JSON has no claudeAiOauth object.".to_string())?;
+        .ok_or_else(|| "Current Claude credentials have no claudeAiOauth object.".to_string())?;
     oauth.insert(
         "accessToken".to_string(),
         Value::String(credentials.access_token.clone()),
@@ -2641,27 +3115,44 @@ fn merge_claude_credentials_json(credentials: &ClaudeCredentials) -> Result<Stri
             Value::Number(expires_at.timestamp_millis().into()),
         );
     }
-    serde_json::to_string(&root).map_err(|e| format!("encode Claude credentials: {}", e))
+    serde_json::to_string(&current_root).map_err(|e| format!("encode Claude credentials: {}", e))
+}
+
+fn prepare_claude_keychain_write<'a>(
+    credentials: &'a ClaudeCredentials,
+    current_account: Option<&str>,
+    current_raw: &str,
+) -> Result<(&'a str, String), String> {
+    let captured_account = credentials.keychain_account.as_deref().ok_or_else(|| {
+        "Claude Keychain refresh has no captured account; refusing write-back.".to_string()
+    })?;
+    if current_account != Some(captured_account) {
+        return Err(
+            "Claude Keychain account changed during refresh; refusing write-back.".to_string(),
+        );
+    }
+    let data = merge_claude_credentials_json(credentials, current_raw)?;
+    Ok((captured_account, data))
 }
 
 #[cfg(target_os = "macos")]
-fn save_claude_credentials_to_keychain(data: &str) -> Result<(), String> {
-    // Fail closed: only update the item once we can confirm the exact account
-    // the Claude CLI stored it under. `add-generic-password -U` matches on
-    // (service, account), so updating with the wrong or an empty account would
-    // create a SECOND "Claude Code-credentials" item and confuse the store the
-    // CLI shares — worse than not persisting. If the account can't be read,
-    // skip the write-back (the caller logs it); the next refresh retries.
-    let account = claude_keychain_account().ok_or_else(|| {
-        "could not resolve the Claude Keychain account; skipping write-back to avoid a duplicate item"
-            .to_string()
+fn save_claude_credentials_to_keychain(credentials: &ClaudeCredentials) -> Result<(), String> {
+    let captured_account = credentials.keychain_account.as_deref().ok_or_else(|| {
+        "Claude Keychain refresh has no captured account; refusing write-back.".to_string()
     })?;
-    // NOTE: `-w <data>` puts the credential JSON on the argv, briefly visible via
-    // `ps` to same-user processes. security(1) has no stdin form for
-    // add-generic-password (only an interactive `-w` prompt, unusable from a
-    // background app) and the item is already same-user-readable once the
-    // keychain is unlocked, so on a single-user Mac this narrow window is an
-    // accepted trade-off; move to the SecItem API if that assumption changes.
+    let current_raw = load_claude_credentials_from_keychain_item(Some(captured_account))?
+        .ok_or_else(|| "Claude Keychain credentials disappeared during refresh.".to_string())?;
+    let current_account = claude_keychain_account();
+    let (account, data) =
+        prepare_claude_keychain_write(credentials, current_account.as_deref(), &current_raw)?;
+
+    // NOTE: security(1) has no compare-and-swap operation. The exact-item read,
+    // account guard, and target comparison close the network-wait race and the
+    // write always stays pinned to the captured account. A same-item mutation
+    // between this check and `-U` remains the existing CLI platform limitation.
+    // `-w <data>` also puts the JSON on argv briefly; the item is already
+    // same-user-readable while the Keychain is unlocked. Move to SecItem only if
+    // either platform assumption changes.
     let status = std::process::Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
@@ -2669,9 +3160,9 @@ fn save_claude_credentials_to_keychain(data: &str) -> Result<(), String> {
             "-s",
             CLAUDE_KEYCHAIN_SERVICE,
             "-a",
-            &account,
+            account,
             "-w",
-            data,
+            &data,
         ])
         .status()
         .map_err(|e| format!("write Claude Keychain credentials: {}", e))?;
@@ -2682,7 +3173,7 @@ fn save_claude_credentials_to_keychain(data: &str) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn save_claude_credentials_to_keychain(_data: &str) -> Result<(), String> {
+fn save_claude_credentials_to_keychain(_credentials: &ClaudeCredentials) -> Result<(), String> {
     Err("Keychain writes are only supported on macOS.".to_string())
 }
 
@@ -2722,22 +3213,290 @@ fn claude_keychain_account() -> Option<String> {
     None
 }
 
-fn save_codex_credentials(credentials: &CodexCredentials) -> Result<(), String> {
-    let mut raw = credentials.raw_json.clone();
-    raw["tokens"]["access_token"] = Value::String(credentials.access_token.clone());
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_account() -> Option<String> {
+    None
+}
+
+fn save_codex_credentials(
+    credentials: &CodexCredentials,
+) -> Result<CodexCredentialWriteReceipt, String> {
+    let expected_tokens = credentials
+        .raw_json
+        .get("tokens")
+        .ok_or_else(|| "Codex tokens missing from the loaded credentials.".to_string())?;
+    let mut raw = load_codex_credentials_from(&credentials.auth_path)
+        .map_err(|e| format!("reload Codex auth.json before saving: {}", e))?
+        .raw_json;
+    let current_tokens = raw
+        .get("tokens")
+        .ok_or_else(|| "Codex tokens disappeared before saving.".to_string())?;
+    if current_tokens != expected_tokens {
+        return Err("Codex tokens changed during refresh.".to_string());
+    }
+    let previous_root = raw.clone();
+    let tokens = raw
+        .get_mut("tokens")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Codex tokens are not an object while saving.".to_string())?;
+
+    tokens.insert(
+        "access_token".to_string(),
+        Value::String(credentials.access_token.clone()),
+    );
     if let Some(refresh_token) = &credentials.refresh_token {
-        raw["tokens"]["refresh_token"] = Value::String(refresh_token.clone());
+        tokens.insert(
+            "refresh_token".to_string(),
+            Value::String(refresh_token.clone()),
+        );
     }
     if let Some(id_token) = &credentials.id_token {
-        raw["tokens"]["id_token"] = Value::String(id_token.clone());
+        tokens.insert("id_token".to_string(), Value::String(id_token.clone()));
     }
     if let Some(account_id) = &credentials.account_id {
-        raw["tokens"]["account_id"] = Value::String(account_id.clone());
+        tokens.insert("account_id".to_string(), Value::String(account_id.clone()));
     }
     raw["last_refresh"] = Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
     let data =
-        serde_json::to_vec_pretty(&raw).map_err(|e| format!("encode Codex auth.json: {}", e))?;
-    fs::write(&credentials.auth_path, data).map_err(|e| format!("save Codex auth.json: {}", e))
+        serde_json::to_string_pretty(&raw).map_err(|e| format!("encode Codex auth.json: {}", e))?;
+    atomic_write(&credentials.auth_path, &data)
+        .map_err(|e| format!("save Codex auth.json: {}", e))?;
+    Ok(CodexCredentialWriteReceipt {
+        path: credentials.auth_path.clone(),
+        previous_root,
+        persisted_root: raw,
+    })
+}
+
+/// Restore the pre-refresh Codex root only while this refresh still owns the
+/// exact root it persisted. External Codex writers do not share TokenBar's
+/// refresh lock, so the compare-to-rename interval remains a known residual
+/// window rather than a filesystem compare-and-swap.
+fn rollback_codex_credentials_if_unchanged(
+    receipt: &CodexCredentialWriteReceipt,
+) -> Result<bool, String> {
+    let current_raw = fs::read_to_string(&receipt.path)
+        .map_err(|e| format!("read Codex auth.json before rollback: {}", e))?;
+    let current_root: Value = serde_json::from_str(&current_raw)
+        .map_err(|e| format!("decode Codex auth.json before rollback: {}", e))?;
+    if current_root != receipt.persisted_root {
+        return Ok(false);
+    }
+    let previous_data = serde_json::to_string_pretty(&receipt.previous_root)
+        .map_err(|e| format!("encode Codex auth.json rollback: {}", e))?;
+    atomic_write(&receipt.path, &previous_data)
+        .map_err(|e| format!("rollback Codex auth.json: {}", e))?;
+    Ok(true)
+}
+
+fn enrich_snapshot(snapshot: &mut AgentUsageSnapshot, now: i64) {
+    enrich_snapshot_with(snapshot, now, |active_keys, observations, now| {
+        crate::agent_quota_history::record_observations_and_evaluate(active_keys, observations, now)
+    });
+}
+
+fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: i64, mut record: F)
+where
+    F: FnMut(
+        &[SeriesKey],
+        &[QuotaObservation],
+        i64,
+    ) -> Result<Vec<BatchObservationResult>, HistoryError>,
+{
+    let mut card_ids = HashSet::new();
+    let mut window_keys = HashSet::new();
+    snapshot.windows.retain(|window| {
+        let card_is_unique = !card_ids.contains(&window.card_id);
+        let key_is_unique = window
+            .window_key
+            .as_ref()
+            .is_none_or(|window_key| !window_keys.contains(window_key));
+        if !card_is_unique || !key_is_unique {
+            return false;
+        }
+        card_ids.insert(window.card_id.clone());
+        if let Some(window_key) = window.window_key.as_ref() {
+            window_keys.insert(window_key.clone());
+        }
+        true
+    });
+
+    let Ok(account_scope) = snapshot.account_scope.as_ref() else {
+        for window in &mut snapshot.windows {
+            if window.window_key.is_some() {
+                window.unavailable("accountScope");
+            }
+        }
+        return;
+    };
+    let account_scope = account_scope.as_str();
+    let mut active_keys = Vec::new();
+    let mut observations = Vec::new();
+    let mut mapped_indices = Vec::new();
+
+    for (index, window) in snapshot.windows.iter_mut().enumerate() {
+        let Some(window_key) = window.window_key.as_deref() else {
+            // The provider already classified this card as windowIdentity.
+            continue;
+        };
+        let key = SeriesKey::new(snapshot.client_id.clone(), account_scope, window_key);
+        active_keys.push(key.clone());
+        if matches!(window.pace_status.state, PaceState::Unavailable) {
+            // Emission protects existing history from capacity eviction, but
+            // missing reset and other typed early rejects never record a sample.
+            continue;
+        }
+        let Some(reset_at) = window
+            .resets_at
+            .as_deref()
+            .and_then(parse_datetime)
+            .map(|reset| reset.timestamp())
+        else {
+            window.unavailable("invalidEvidence");
+            continue;
+        };
+        if reset_at <= now
+            || !window.used_percent.is_finite()
+            || !(0.0..=100.0).contains(&window.used_percent)
+        {
+            window.unavailable("invalidEvidence");
+            continue;
+        }
+        observations.push(QuotaObservation {
+            key,
+            reset_at: Some(reset_at),
+            used_percent: window.used_percent,
+            provider: window.provider_duration,
+            contract: window.contract_duration,
+        });
+        mapped_indices.push(index);
+    }
+
+    if active_keys.is_empty() {
+        return;
+    }
+
+    let results = match record(&active_keys, &observations, now) {
+        Ok(results) if results.len() == mapped_indices.len() => results,
+        Ok(_) => {
+            for index in mapped_indices {
+                snapshot.windows[index].unavailable("history");
+            }
+            return;
+        }
+        Err(error) => {
+            let reason = if error == HistoryError::StoreCapacity {
+                "storeCapacity"
+            } else {
+                "history"
+            };
+            for index in mapped_indices {
+                snapshot.windows[index].unavailable(reason);
+            }
+            return;
+        }
+    };
+
+    for (index, result) in mapped_indices.into_iter().zip(results) {
+        let window = &mut snapshot.windows[index];
+        match result {
+            Ok((
+                HistoryOutcome::Ready {
+                    duration_seconds,
+                    source,
+                    ..
+                },
+                historical,
+                complete_cycles,
+            )) => {
+                window.duration_seconds = Some(duration_seconds);
+                window.duration_source = Some(source);
+                window.window_minutes = Some(duration_seconds / 60);
+                match historical {
+                    Some(pace) if historical_pace_is_coherent(&pace) => {
+                        window.pace_status = PaceStatusPayload {
+                            state: PaceState::Available,
+                            window_key: window.window_key.clone(),
+                            duration_seconds: Some(duration_seconds),
+                            duration_source: Some(source),
+                            complete_cycles,
+                            reason: None,
+                        };
+                        window.historical_pace = Some(historical_pace_payload(pace));
+                    }
+                    Some(_) => {
+                        window.unavailable("history");
+                    }
+                    None => {
+                        window.pace_status = PaceStatusPayload {
+                            state: PaceState::LearningHistory,
+                            window_key: window.window_key.clone(),
+                            duration_seconds: Some(duration_seconds),
+                            duration_source: Some(source),
+                            complete_cycles,
+                            reason: None,
+                        };
+                        window.historical_pace = None;
+                    }
+                }
+            }
+            Ok((HistoryOutcome::LearningDuration, None, _)) => {
+                window.duration_seconds = None;
+                window.duration_source = Some(DurationSource::Observed);
+                window.window_minutes = None;
+                window.pace_status = PaceStatusPayload {
+                    state: PaceState::LearningDuration,
+                    window_key: window.window_key.clone(),
+                    duration_seconds: None,
+                    duration_source: Some(DurationSource::Observed),
+                    complete_cycles: 0,
+                    reason: None,
+                };
+                window.historical_pace = None;
+            }
+            Ok((HistoryOutcome::Unavailable(reason), _, _)) => {
+                window.unavailable(duration_unavailable_reason(reason));
+            }
+            Err(error) => {
+                window.unavailable(if error == HistoryError::StoreCapacity {
+                    "storeCapacity"
+                } else {
+                    "history"
+                });
+            }
+            Ok((HistoryOutcome::LearningDuration, Some(_), _)) => {
+                window.unavailable("history");
+            }
+        }
+    }
+}
+
+fn duration_unavailable_reason(reason: DurationUnavailableReason) -> &'static str {
+    match reason {
+        DurationUnavailableReason::MissingReset => "missingReset",
+        DurationUnavailableReason::InvalidEvidence => "invalidEvidence",
+    }
+}
+
+fn historical_pace_is_coherent(pace: &HistoricalPace) -> bool {
+    pace.expected_percent.is_finite()
+        && (0.0..=100.0).contains(&pace.expected_percent)
+        && pace
+            .eta_seconds
+            .is_none_or(|eta| eta.is_finite() && eta >= 0.0)
+        && pace
+            .run_out_probability
+            .is_none_or(|probability| probability.is_finite() && (0.0..=1.0).contains(&probability))
+        && (pace.eta_seconds.is_none() == pace.will_last_to_reset)
+}
+
+fn historical_pace_payload(pace: HistoricalPace) -> HistoricalPacePayload {
+    HistoricalPacePayload {
+        expected_used_percent: pace.expected_percent,
+        eta_seconds: pace.eta_seconds,
+        will_last_to_reset: pace.will_last_to_reset,
+        run_out_probability: pace.run_out_probability,
+    }
 }
 
 fn codex_windows(
@@ -2746,68 +3505,96 @@ fn codex_windows(
     now: DateTime<Utc>,
 ) -> Vec<UsageWindow> {
     let mut windows = Vec::new();
+    let mut emitted_card_ids = HashSet::new();
     if let Some(rate_limit) = rate_limit {
         let mut main = [
             ("primary", rate_limit.primary_window.clone()),
             ("secondary", rate_limit.secondary_window.clone()),
         ];
         main.sort_by_key(|(_, window)| {
-            match window.as_ref().map(|window| window.limit_window_seconds) {
-                Some(18_000) => 0,
-                Some(604_800) => 1,
-                _ => 2,
-            }
+            window
+                .as_ref()
+                .map_or(2, |window| match window.limit_window_seconds {
+                    18_000 => 0,
+                    604_800 => 1,
+                    _ => 2,
+                })
         });
         for (slot, window) in main
             .into_iter()
             .filter_map(|(slot, window)| window.map(|window| (slot, window)))
         {
-            let (label, card_id, window_key) = match window.limit_window_seconds {
-                18_000 => (
-                    "Session",
-                    "main.session.v1".to_string(),
-                    Some("main.session.v1".to_string()),
-                ),
-                604_800 => (
-                    "Weekly",
-                    "main.weekly.v1".to_string(),
-                    Some("main.weekly.v1".to_string()),
-                ),
-                _ => ("Unknown", format!("row.main.{slot}.v1"), None),
+            let semantic = match window.limit_window_seconds {
+                18_000 => Some(("Session", "main.session.v1")),
+                604_800 => Some(("Weekly", "main.weekly.v1")),
+                _ => None,
             };
-            if let Some(window) = map_window_with_identity(label, window, now, card_id, window_key)
-            {
-                windows.push(window);
+            let (label, window_key) = semantic.unwrap_or(("Unknown", ""));
+            let card_id = if window_key.is_empty() {
+                format!("row.main.{slot}.v1")
+            } else {
+                window_key.to_string()
+            };
+            let Some(mapped) = map_window_with_identity(
+                label,
+                window,
+                now,
+                card_id.clone(),
+                (!window_key.is_empty()).then(|| window_key.to_string()),
+            ) else {
+                continue;
+            };
+            if !emitted_card_ids.insert(card_id) {
+                continue;
             }
+            windows.push(mapped);
         }
     }
 
+    let mut anonymous_slots = HashSet::new();
     for extra in additional_rate_limits.unwrap_or(&[]) {
+        let source = additional_limit_source(extra);
+        let digest = source.map(sha256_hex);
         let Some(rate_limit) = extra.rate_limit.as_ref() else {
             continue;
         };
-        let (slot, window) = match (
-            rate_limit.primary_window.clone(),
-            rate_limit.secondary_window.clone(),
-        ) {
-            (Some(window), _) => ("primary", window),
-            (None, Some(window)) => ("secondary", window),
-            (None, None) => continue,
-        };
-        let source = additional_limit_source(extra);
-        let (label, card_id, window_key) = match source {
-            Some(source) => {
-                let key = format!("additional.{}.{slot}.v1", sha256_hex(&source));
-                (additional_limit_label(extra), key.clone(), Some(key))
+        for (slot, window) in [
+            ("primary", rate_limit.primary_window.clone()),
+            ("secondary", rate_limit.secondary_window.clone()),
+        ]
+        .into_iter()
+        .filter_map(|(slot, window)| window.map(|window| (slot, window)))
+        {
+            let Some(digest) = digest.as_deref() else {
+                let Some(mapped) = map_window_with_identity(
+                    "Unknown",
+                    window,
+                    now,
+                    format!("row.additional.unknown.{slot}.v1"),
+                    None,
+                ) else {
+                    continue;
+                };
+                if anonymous_slots.insert(slot) {
+                    windows.push(mapped);
+                }
+                continue;
+            };
+            let label = additional_limit_label(extra);
+            let window_key = format!("additional.{digest}.{slot}.v1");
+            let Some(mapped) = map_window_with_identity(
+                &label,
+                window,
+                now,
+                window_key.clone(),
+                Some(window_key.clone()),
+            ) else {
+                continue;
+            };
+            if !emitted_card_ids.insert(window_key) {
+                continue;
             }
-            None => (
-                "Unknown".to_string(),
-                format!("row.additional.unknown.{slot}.v1"),
-                None,
-            ),
-        };
-        if let Some(window) = map_window_with_identity(&label, window, now, card_id, window_key) {
-            windows.push(window);
+            windows.push(mapped);
         }
     }
     windows
@@ -2819,7 +3606,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Session",
         "session.v1",
-        DurationEvidence::contract(18_000),
+        DurationEvidence::contract(300 * 60),
         usage.five_hour.as_ref(),
         now,
     );
@@ -2827,7 +3614,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Weekly",
         "weekly.v1",
-        DurationEvidence::contract(604_800),
+        DurationEvidence::contract(7 * 24 * 60 * 60),
         usage.seven_day.as_ref(),
         now,
     );
@@ -2835,7 +3622,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "OAuth Apps",
         "oauth_apps.weekly.v1",
-        DurationEvidence::contract(604_800),
+        DurationEvidence::contract(7 * 24 * 60 * 60),
         usage.seven_day_oauth_apps.as_ref(),
         now,
     );
@@ -2843,7 +3630,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Sonnet",
         "sonnet.weekly.v1",
-        DurationEvidence::contract(604_800),
+        DurationEvidence::contract(7 * 24 * 60 * 60),
         usage.seven_day_sonnet.as_ref(),
         now,
     );
@@ -2851,7 +3638,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Opus",
         "opus.weekly.v1",
-        DurationEvidence::contract(604_800),
+        DurationEvidence::contract(7 * 24 * 60 * 60),
         usage.seven_day_opus.as_ref(),
         now,
     );
@@ -2859,7 +3646,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Designs",
         "design.weekly.v1",
-        DurationEvidence::contract(604_800),
+        DurationEvidence::contract(7 * 24 * 60 * 60),
         usage.design_window(),
         now,
     );
@@ -2867,11 +3654,11 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         &mut windows,
         "Daily Routines",
         "routines.weekly.v1",
-        DurationEvidence::contract(604_800),
+        DurationEvidence::contract(7 * 24 * 60 * 60),
         usage.routines_window(),
         now,
     );
-    if let Some(extra) = claude_extra_usage_window(usage.extra_usage.as_ref(), now) {
+    if let Some(extra) = claude_extra_usage_window(usage.extra_usage.as_ref()) {
         windows.push(extra);
     }
     windows
@@ -2913,12 +3700,12 @@ fn push_claude_window(
     windows: &mut Vec<UsageWindow>,
     label: &str,
     window_key: &str,
-    contract: DurationEvidence,
+    contract_duration: DurationEvidence,
     window: Option<&ClaudeWindow>,
     now: DateTime<Utc>,
 ) {
-    if let Some(mapped) =
-        window.and_then(|window| map_claude_window(label, window_key, contract, window, now))
+    if let Some(mapped) = window
+        .and_then(|window| map_claude_window(label, window_key, contract_duration, window, now))
     {
         windows.push(mapped);
     }
@@ -2927,20 +3714,21 @@ fn push_claude_window(
 fn map_claude_window(
     label: &str,
     window_key: &str,
-    contract: DurationEvidence,
+    contract_duration: DurationEvidence,
     window: &ClaudeWindow,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    if !window.has_valid_utilization() {
-        return None;
-    }
     let used = window.utilization?;
-    let reset_was_supplied = window.resets_at.is_some();
     let resets_at = window.resets_at.as_deref().and_then(parse_datetime);
-    Some(
-        UsageWindow::from_used_percent(label.to_string(), used, resets_at, now)
-            .with_identity(window_key, Some(window_key.to_string()))
-            .with_duration_evidence(now, reset_was_supplied, None, Some(contract)),
+    UsageWindow::try_from_provider_used_percent(label.to_string(), used, resets_at, now).map(
+        |window| {
+            window.with_identity(
+                window_key,
+                Some(window_key.to_string()),
+                None,
+                Some(contract_duration),
+            )
+        },
     )
 }
 
@@ -2964,10 +3752,9 @@ fn parse_unified_ratelimit_windows(
     if let Some(window) = unified_ratelimit_window_with_identity(
         "Session",
         "session.v1",
-        DurationEvidence::contract(18_000),
+        DurationEvidence::contract(300 * 60),
         read_f64("anthropic-ratelimit-unified-5h-utilization"),
         read_i64("anthropic-ratelimit-unified-5h-reset"),
-        headers.contains_key("anthropic-ratelimit-unified-5h-reset"),
         now,
     ) {
         windows.push(window);
@@ -2975,10 +3762,9 @@ fn parse_unified_ratelimit_windows(
     if let Some(window) = unified_ratelimit_window_with_identity(
         "Weekly",
         "weekly.v1",
-        DurationEvidence::contract(604_800),
+        DurationEvidence::contract(7 * 24 * 60 * 60),
         read_f64("anthropic-ratelimit-unified-7d-utilization"),
         read_i64("anthropic-ratelimit-unified-7d-reset"),
-        headers.contains_key("anthropic-ratelimit-unified-7d-reset"),
         now,
     ) {
         windows.push(window);
@@ -2993,24 +3779,24 @@ fn parse_unified_ratelimit_windows(
 fn unified_ratelimit_window_with_identity(
     label: &str,
     window_key: &str,
-    contract: DurationEvidence,
+    contract_duration: DurationEvidence,
     utilization_fraction: Option<f64>,
     reset_epoch_seconds: Option<i64>,
-    reset_was_supplied: bool,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let fraction = utilization_fraction?;
-    if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
-        return None;
-    }
-    let used = fraction * 100.0;
+    let used = utilization_fraction? * 100.0;
     let resets_at = reset_epoch_seconds
         .filter(|seconds| *seconds > 0)
         .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single());
-    Some(
-        UsageWindow::from_used_percent(label.to_string(), used, resets_at, now)
-            .with_identity(window_key, Some(window_key.to_string()))
-            .with_duration_evidence(now, reset_was_supplied, None, Some(contract)),
+    UsageWindow::try_from_provider_used_percent(label.to_string(), used, resets_at, now).map(
+        |window| {
+            window.with_identity(
+                window_key,
+                Some(window_key.to_string()),
+                None,
+                Some(contract_duration),
+            )
+        },
     )
 }
 
@@ -3021,26 +3807,22 @@ fn unified_ratelimit_window(
     reset_epoch_seconds: Option<i64>,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let (key, contract) = if label.eq_ignore_ascii_case("Session") {
-        ("session.v1", DurationEvidence::contract(18_000))
+    let (window_key, duration) = if label.eq_ignore_ascii_case("Session") {
+        ("session.v1", DurationEvidence::contract(300 * 60))
     } else {
-        ("weekly.v1", DurationEvidence::contract(604_800))
+        ("weekly.v1", DurationEvidence::contract(7 * 24 * 60 * 60))
     };
     unified_ratelimit_window_with_identity(
         label,
-        key,
-        contract,
+        window_key,
+        duration,
         utilization_fraction,
         reset_epoch_seconds,
-        reset_epoch_seconds.is_some(),
         now,
     )
 }
 
-fn claude_extra_usage_window(
-    extra: Option<&ClaudeExtraUsage>,
-    now: DateTime<Utc>,
-) -> Option<UsageWindow> {
+fn claude_extra_usage_window(extra: Option<&ClaudeExtraUsage>) -> Option<UsageWindow> {
     let extra = extra?;
     if !extra.is_enabled {
         return None;
@@ -3054,9 +3836,6 @@ fn claude_extra_usage_window(
             None
         }
     })?;
-    if !used.is_finite() || !(0.0..=100.0).contains(&used) {
-        return None;
-    }
     let reset_text = match (extra.used_credits, extra.monthly_limit) {
         (Some(used), Some(limit)) => Some(format!(
             "Monthly cap: {} / {}",
@@ -3065,9 +3844,18 @@ fn claude_extra_usage_window(
         )),
         _ => None,
     };
-    let mut window = UsageWindow::from_used_percent("Extra usage".to_string(), used, None, now)
-        .with_identity("extra_usage.v1", Some("extra_usage.v1".to_string()))
-        .with_unavailable_reason("nonRecurring");
+    let mut window = UsageWindow::try_from_provider_used_percent(
+        "Extra usage".to_string(),
+        used,
+        None,
+        Utc::now(),
+    )?
+    .with_identity(
+        "extra_usage.v1",
+        Some("extra_usage.v1".to_string()),
+        None,
+        None,
+    );
     window.reset_text = reset_text;
     Some(window)
 }
@@ -3145,15 +3933,18 @@ fn map_window_with_identity(
     card_id: impl Into<String>,
     window_key: Option<String>,
 ) -> Option<UsageWindow> {
-    let resets_at = (window.reset_at > 0)
+    let resets_at = (window.reset_at != 0)
         .then(|| Utc.timestamp_opt(window.reset_at, 0).single())
         .flatten();
-    let provider = DurationEvidence::provider(window.reset_at, window.limit_window_seconds);
-    (window.used_percent.is_finite() && (0.0..=100.0).contains(&window.used_percent)).then(|| {
-        UsageWindow::from_used_percent(label.to_string(), window.used_percent, resets_at, now)
-            .with_identity(card_id, window_key)
-            .with_duration_evidence(now, true, Some(provider), None)
-    })
+    let provider_duration = (window.limit_window_seconds != 0)
+        .then(|| DurationEvidence::provider(window.reset_at, window.limit_window_seconds));
+    UsageWindow::try_from_provider_used_percent(
+        label.to_string(),
+        window.used_percent,
+        resets_at,
+        now,
+    )
+    .map(|window| window.with_identity(card_id, window_key, provider_duration, None))
 }
 
 fn additional_limit_source(limit: &CodexAdditionalRateLimit) -> Option<String> {
@@ -3164,11 +3955,9 @@ fn additional_limit_source(limit: &CodexAdditionalRateLimit) -> Option<String> {
     .map(str::to_string)
 }
 
-fn sha256_hex(value: &str) -> String {
-    Sha256::digest(value.trim().as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+fn sha256_hex(value: String) -> String {
+    let digest = Sha256::digest(value.trim().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub(crate) fn reset_text(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -3362,6 +4151,15 @@ pub(crate) fn clean_plan(value: impl AsRef<str>) -> String {
         .join(" ")
 }
 
+pub(crate) fn deserialize_optional_raw<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw = Option::<Box<serde_json::value::RawValue>>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| serde_json::from_str(raw.get()).ok()))
+}
+
 fn deserialize_optional_non_empty_string<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
@@ -3394,27 +4192,6 @@ mod tests {
     use super::*;
     use crate::agent_account_scope::test_support::TestRefreshScope;
 
-    static COPILOT_TEMP_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-
-    fn copilot_auth_path(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "tb-usage-copilot-{tag}-{}-{}",
-            std::process::id(),
-            COPILOT_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root.join("auth.json")
-    }
-
-    fn copilot_credential(
-        path: &Path,
-        json: &serde_json::Value,
-    ) -> Option<crate::opencode_integrations::GitHubCopilotCredential> {
-        std::fs::write(path, serde_json::to_vec(json).unwrap()).unwrap();
-        crate::opencode_integrations::github_copilot_credential_from(path, json)
-    }
-
     #[test]
     fn claude_user_agent_uses_first_version_token() {
         assert_eq!(
@@ -3423,1691 +4200,6 @@ mod tests {
         );
         assert_eq!(claude_user_agent_from_stdout(b" \r\n"), None);
         assert_eq!(claude_user_agent_from_stdout(&[0xff]), None);
-    }
-
-    fn enrichment_scope(tag: &str) -> (TestRefreshScope, AccountScope) {
-        let scope = TestRefreshScope::new("fixture", tag);
-        let account_scope = scope
-            .resolve_current("fixture", tag, tag.as_bytes())
-            .unwrap();
-        (scope, account_scope)
-    }
-
-    fn enrichment_snapshot(
-        account_scope: Result<AccountScope, AccountScopeError>,
-        windows: Vec<UsageWindow>,
-    ) -> AgentUsageSnapshot {
-        AgentUsageSnapshot {
-            client_id: "fixture".to_string(),
-            source: "fixture".to_string(),
-            updated_at: String::new(),
-            identity: None,
-            account_scope,
-            windows,
-            credits: None,
-            error: None,
-        }
-    }
-
-    fn enrichment_window(
-        now: DateTime<Utc>,
-        card_id: &str,
-        window_key: &str,
-        used_percent: f64,
-        duration_source: Option<DurationSource>,
-    ) -> UsageWindow {
-        let reset = now + chrono::Duration::days(1);
-        let window =
-            UsageWindow::from_used_percent(card_id.to_string(), used_percent, Some(reset), now)
-                .with_identity(card_id, Some(window_key.to_string()));
-        match duration_source {
-            Some(DurationSource::Provider) => window.with_duration_evidence(
-                now,
-                true,
-                Some(DurationEvidence::provider(reset.timestamp(), 86_400)),
-                None,
-            ),
-            Some(DurationSource::Contract) => window.with_duration_evidence(
-                now,
-                true,
-                None,
-                Some(DurationEvidence::contract(86_400)),
-            ),
-            Some(DurationSource::Observed) => panic!("observed duration is never retained"),
-            None => window,
-        }
-    }
-
-    fn enrichment_failure_windows(now: DateTime<Utc>) -> Vec<UsageWindow> {
-        vec![
-            enrichment_window(now, "first.v1", "first.v1", 10.0, None),
-            enrichment_window(now, "second.v1", "second.v1", 20.0, None),
-            UsageWindow::from_used_percent("Missing".to_string(), 30.0, None, now)
-                .with_identity("missing.v1", Some("missing.v1".to_string())),
-            UsageWindow::from_used_percent("Non-recurring".to_string(), 40.0, None, now)
-                .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
-                .with_unavailable_reason("nonRecurring"),
-        ]
-    }
-
-    #[tokio::test]
-    async fn copilot_blank_or_missing_credential_skips_fetch() {
-        let path = copilot_auth_path("no-credential");
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let fetch_calls = std::cell::Cell::new(0);
-        let enrich_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        for json in [
-            serde_json::json!({}),
-            serde_json::json!({"github-copilot": {
-                "type": "oauth", "refresh": "  ", "access": "\t\n"
-            }}),
-            serde_json::json!({
-                "github-copilot": {"type": "oauth"},
-                "copilot": {"type": "oauth", "refresh": "foreign-token"}
-            }),
-        ] {
-            let snapshot = fetch_copilot_with(
-                copilot_credential(&path, &json),
-                now,
-                |_, _| {
-                    fetch_calls.set(fetch_calls.get() + 1);
-                    std::future::ready(Err::<agent_copilot::CopilotData, String>(
-                        "network must not run".to_string(),
-                    ))
-                },
-                |snapshot, callback_now| {
-                    enrich_calls.set(enrich_calls.get() + 1);
-                    enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
-                        record_calls.set(record_calls.get() + 1);
-                        Ok(Vec::new())
-                    });
-                },
-            )
-            .await;
-            assert!(snapshot.is_none());
-        }
-        assert_eq!(fetch_calls.get(), 0);
-        assert_eq!(enrich_calls.get(), 0);
-        assert_eq!(record_calls.get(), 0);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[tokio::test]
-    async fn copilot_success_enriches_distinct_series_once_without_wire_metadata() {
-        let path = copilot_auth_path("snapshot");
-        let credential = copilot_credential(
-            &path,
-            &serde_json::json!({"github-copilot": {
-                "type": "oauth",
-                "refresh": " fake-copilot-marker ",
-                "access": "unused-access-token"
-            }}),
-        );
-        let location = crate::agent_account_scope::canonical_file_location(
-            &path,
-            Some("github-copilot"),
-        )
-        .unwrap();
-        let scope_store = TestRefreshScope::new("copilot", "copilot-central-snapshot");
-        let now = "2026-06-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let premium_reset = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let chat_reset = premium_reset;
-        let premium_duration = 30 * 86_400;
-        let chat_duration = premium_duration;
-        let premium = UsageWindow::from_fraction(
-            "Premium".to_string(),
-            0.30,
-            Some(premium_reset),
-            now,
-        )
-        .with_identity(
-            "premium_interactions.v1",
-            Some("premium_interactions.v1".to_string()),
-        )
-        .with_contract_duration_evidence(
-            now,
-            true,
-            DurationEvidence::contract(premium_duration),
-        );
-        let chat = UsageWindow::from_fraction("Chat".to_string(), 0.75, Some(chat_reset), now)
-            .with_identity("chat.v1", Some("chat.v1".to_string()))
-            .with_contract_duration_evidence(
-                now,
-                true,
-                DurationEvidence::contract(chat_duration),
-            );
-        let enrich_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        let snapshot = fetch_copilot_with(
-            credential,
-            now,
-            |request_now, credential| {
-                assert_eq!(request_now, now);
-                assert_eq!(credential.request_token, "fake-copilot-marker");
-                assert_eq!(credential.marker, b"fake-copilot-marker");
-                assert_eq!(credential.semantic_source, "opencode-auth-json");
-                assert_eq!(credential.canonical_location, location);
-                let account_scope = scope_store.resolve_current(
-                    credential.semantic_source,
-                    &credential.canonical_location,
-                    &credential.marker,
-                );
-                std::future::ready(Ok(agent_copilot::CopilotData {
-                    identity: None,
-                    account_scope,
-                    windows: vec![premium, chat],
-                }))
-            },
-            |snapshot, callback_now| {
-                enrich_calls.set(enrich_calls.get() + 1);
-                let account_scope = snapshot.account_scope.as_ref().unwrap().clone();
-                enrich_snapshot_with(snapshot, callback_now, |active, observations, history_now| {
-                    record_calls.set(record_calls.get() + 1);
-                    assert_eq!(history_now, now.timestamp());
-                    assert_eq!(
-                        active,
-                        &[
-                            SeriesKey::new(
-                                "copilot",
-                                account_scope.as_str(),
-                                "premium_interactions.v1",
-                            ),
-                            SeriesKey::new("copilot", account_scope.as_str(), "chat.v1"),
-                        ]
-                    );
-                    assert_eq!(observations.len(), 2);
-                    assert_eq!(observations[0].key, active[0]);
-                    assert_eq!(observations[0].reset_at, Some(premium_reset.timestamp()));
-                    assert_eq!(observations[0].used_percent, 70.0);
-                    assert_eq!(
-                        observations[0].contract,
-                        Some(DurationEvidence::contract(premium_duration))
-                    );
-                    assert!(observations[0].provider.is_none());
-                    assert_eq!(observations[1].key, active[1]);
-                    assert_eq!(observations[1].reset_at, Some(chat_reset.timestamp()));
-                    assert_eq!(observations[1].used_percent, 25.0);
-                    assert!(observations[1].provider.is_none());
-                    assert_eq!(
-                        observations[1].contract,
-                        Some(DurationEvidence::contract(chat_duration))
-                    );
-                    Ok(vec![
-                        Ok((
-                            HistoryOutcome::Ready {
-                                duration_seconds: premium_duration,
-                                source: DurationSource::Contract,
-                                sampled: true,
-                            },
-                            Some(HistoricalPace {
-                                expected_percent: 35.0,
-                                eta_seconds: Some(123.0),
-                                will_last_to_reset: false,
-                                run_out_probability: None,
-                            }),
-                            3,
-                        )),
-                        Ok((
-                            HistoryOutcome::Ready {
-                                duration_seconds: chat_duration,
-                                source: DurationSource::Contract,
-                                sampled: true,
-                            },
-                            Some(HistoricalPace {
-                                expected_percent: 26.0,
-                                eta_seconds: Some(456.0),
-                                will_last_to_reset: false,
-                                run_out_probability: None,
-                            }),
-                            3,
-                        )),
-                    ])
-                });
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(enrich_calls.get(), 1);
-        assert_eq!(record_calls.get(), 1);
-        let account_scope = snapshot.account_scope.as_ref().unwrap();
-        let opaque_scope = account_scope.as_str().to_string();
-        assert_eq!(snapshot.windows.len(), 2);
-        assert_eq!(
-            snapshot.windows[0].pace_window_key_for_test(),
-            Some("premium_interactions.v1")
-        );
-        assert_eq!(snapshot.windows[1].pace_window_key_for_test(), Some("chat.v1"));
-        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Available);
-        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 3);
-        assert_eq!(
-            snapshot.windows[0].pace_status.duration_source,
-            Some(DurationSource::Contract)
-        );
-        assert!(snapshot.windows[0].historical_pace.is_some());
-        assert_eq!(snapshot.windows[1].pace_status.state, PaceState::Available);
-        assert_eq!(snapshot.windows[1].pace_status.complete_cycles, 3);
-        assert_eq!(
-            snapshot.windows[1].pace_status.duration_seconds,
-            Some(chat_duration)
-        );
-        assert_eq!(
-            snapshot.windows[1].pace_status.duration_source,
-            Some(DurationSource::Contract)
-        );
-        assert_eq!(
-            snapshot.windows[1]
-                .historical_pace
-                .as_ref()
-                .map(|pace| pace.expected_used_percent),
-            Some(26.0)
-        );
-
-        let wire = serde_json::to_string(&snapshot).unwrap();
-        assert!(!wire.contains("accountScope"));
-        assert!(!wire.contains("fake-copilot-marker"));
-        assert!(!wire.contains("unused-access-token"));
-        assert!(!wire.contains(path.to_string_lossy().as_ref()));
-        assert!(!wire.contains(&location));
-        assert!(!wire.contains(&opaque_scope));
-        scope_store.cleanup();
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn copilot_one_cycle_stays_in_learning_history_without_historical_pace() {
-        let (scope, account_scope) = enrichment_scope("copilot-one-cycle");
-        let now = "2026-06-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let reset = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let duration = 30 * 86_400;
-        let window = UsageWindow::from_fraction("Premium".to_string(), 0.30, Some(reset), now)
-            .with_identity(
-                "premium_interactions.v1",
-                Some("premium_interactions.v1".to_string()),
-            )
-            .with_contract_duration_evidence(
-                now,
-                true,
-                DurationEvidence::contract(duration),
-            );
-        let enrich_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        let snapshot = finalize_copilot_snapshot_with(
-            Ok(agent_copilot::CopilotData {
-                identity: None,
-                account_scope: Ok(account_scope),
-                windows: vec![window],
-            }),
-            now,
-            |snapshot, callback_now| {
-                enrich_calls.set(enrich_calls.get() + 1);
-                enrich_snapshot_with(snapshot, callback_now, |_, observations, _| {
-                    record_calls.set(record_calls.get() + 1);
-                    assert_eq!(observations.len(), 1);
-                    Ok(vec![Ok((
-                        HistoryOutcome::Ready {
-                            duration_seconds: duration,
-                            source: DurationSource::Contract,
-                            sampled: true,
-                        },
-                        None,
-                        1,
-                    ))])
-                });
-            },
-        );
-        assert_eq!(enrich_calls.get(), 1);
-        assert_eq!(record_calls.get(), 1);
-        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 1);
-        assert_eq!(snapshot.windows[0].pace_status.duration_seconds, Some(duration));
-        assert_eq!(
-            snapshot.windows[0].pace_status.duration_source,
-            Some(DurationSource::Contract)
-        );
-        assert!(snapshot.windows[0].historical_pace.is_none());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn copilot_non_month_reset_enters_observed_history_learning() {
-        let (scope, account_scope) = enrichment_scope("copilot-observed");
-        let now = "2026-07-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let reset = "2026-07-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let window = UsageWindow::from_fraction("Chat".to_string(), 0.40, Some(reset), now)
-            .with_identity("chat.v1", Some("chat.v1".to_string()))
-            .with_observed_duration_evidence(now, true);
-        let record_calls = std::cell::Cell::new(0);
-        let snapshot = finalize_copilot_snapshot_with(
-            Ok(agent_copilot::CopilotData {
-                identity: None,
-                account_scope: Ok(account_scope),
-                windows: vec![window],
-            }),
-            now,
-            |snapshot, callback_now| {
-                enrich_snapshot_with(snapshot, callback_now, |_, observations, _| {
-                    record_calls.set(record_calls.get() + 1);
-                    assert_eq!(observations.len(), 1);
-                    assert_eq!(observations[0].reset_at, Some(reset.timestamp()));
-                    assert_eq!(observations[0].used_percent, 60.0);
-                    assert!(observations[0].provider.is_none());
-                    assert!(observations[0].contract.is_none());
-                    Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
-                });
-            },
-        );
-        assert_eq!(record_calls.get(), 1);
-        assert_eq!(snapshot.windows[0].used_percent, 60.0);
-        assert_eq!(snapshot.windows[0].reset_at_evidence, Some(reset));
-        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::LearningDuration);
-        assert_eq!(
-            snapshot.windows[0].pace_status.duration_source,
-            Some(DurationSource::Observed)
-        );
-        assert!(snapshot.windows[0].pace_status.duration_seconds.is_none());
-        assert!(snapshot.windows[0].historical_pace.is_none());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn copilot_scope_error_enriches_once_without_recording() {
-        let (scope_store, _) = enrichment_scope("copilot-scope-error");
-        let now = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let reset = now + chrono::Duration::days(1);
-        let windows = vec![
-            UsageWindow::from_used_percent("Premium".to_string(), 30.0, Some(reset), now)
-                .with_identity(
-                    "premium_interactions.v1",
-                    Some("premium_interactions.v1".to_string()),
-                ),
-            UsageWindow::from_used_percent("Chat".to_string(), 40.0, Some(reset), now)
-                .with_identity("chat.v1", Some("chat.v1".to_string())),
-        ];
-        let enrich_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        let snapshot = finalize_copilot_snapshot_with(
-            Ok(agent_copilot::CopilotData {
-                identity: None,
-                account_scope: Err(AccountScopeError::MetadataWrite),
-                windows,
-            }),
-            now,
-            |snapshot, callback_now| {
-                enrich_calls.set(enrich_calls.get() + 1);
-                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
-                    record_calls.set(record_calls.get() + 1);
-                    Ok(Vec::new())
-                });
-            },
-        );
-        assert_eq!(enrich_calls.get(), 1);
-        assert_eq!(record_calls.get(), 0);
-        assert_eq!(snapshot.windows.len(), 2);
-        assert_eq!(snapshot.windows[0].used_percent, 30.0);
-        assert_eq!(snapshot.windows[0].remaining_percent, 70.0);
-        assert_eq!(snapshot.windows[1].used_percent, 40.0);
-        assert_eq!(snapshot.windows[1].remaining_percent, 60.0);
-        assert!(snapshot
-            .windows
-            .iter()
-            .all(|window| window.pace_reason_for_test() == Some("accountScope")));
-        scope_store.cleanup();
-    }
-
-    #[test]
-    fn copilot_api_error_and_empty_success_enrich_once_without_recording() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let api_enrich_calls = std::cell::Cell::new(0);
-        let api_record_calls = std::cell::Cell::new(0);
-        let api_error = finalize_copilot_snapshot_with(
-            Err("Copilot usage API returned 503.".to_string()),
-            now,
-            |snapshot, callback_now| {
-                api_enrich_calls.set(api_enrich_calls.get() + 1);
-                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
-                    api_record_calls.set(api_record_calls.get() + 1);
-                    Ok(Vec::new())
-                });
-            },
-        );
-        assert_eq!(api_enrich_calls.get(), 1);
-        assert_eq!(api_record_calls.get(), 0);
-        assert_eq!(api_error.account_scope, Err(AccountScopeError::NoTrustedEvidence));
-        assert!(api_error.windows.is_empty());
-        assert_eq!(api_error.error.as_deref(), Some("Copilot usage API returned 503."));
-
-        let (scope_store, account_scope) = enrichment_scope("copilot-empty-success");
-        let empty_enrich_calls = std::cell::Cell::new(0);
-        let empty_record_calls = std::cell::Cell::new(0);
-        let empty = finalize_copilot_snapshot_with(
-            Ok(agent_copilot::CopilotData {
-                identity: None,
-                account_scope: Ok(account_scope),
-                windows: Vec::new(),
-            }),
-            now,
-            |snapshot, callback_now| {
-                empty_enrich_calls.set(empty_enrich_calls.get() + 1);
-                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
-                    empty_record_calls.set(empty_record_calls.get() + 1);
-                    Ok(Vec::new())
-                });
-            },
-        );
-        assert_eq!(empty_enrich_calls.get(), 1);
-        assert_eq!(empty_record_calls.get(), 0);
-        assert!(empty.windows.is_empty());
-        scope_store.cleanup();
-    }
-
-    #[test]
-    fn copilot_unknown_and_non_recurring_successes_do_not_record_history() {
-        let (scope, account_scope) = enrichment_scope("copilot-no-stable-window");
-        let now = "2026-06-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let reset = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let windows = [
-            vec![UsageWindow::from_used_percent("Unknown".to_string(), 10.0, Some(reset), now)
-                .with_identity("row.copilot.unknown.v1", None)],
-            vec![UsageWindow::from_used_percent(
-                "Non-recurring".to_string(),
-                20.0,
-                Some(reset),
-                now,
-            )
-            .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
-            .with_unavailable_reason("nonRecurring")],
-        ];
-        let enrich_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        for windows in windows {
-            let snapshot = finalize_copilot_snapshot_with(
-                Ok(agent_copilot::CopilotData {
-                    identity: None,
-                    account_scope: Ok(account_scope.clone()),
-                    windows,
-                }),
-                now,
-                |snapshot, callback_now| {
-                    enrich_calls.set(enrich_calls.get() + 1);
-                    enrich_snapshot_with(snapshot, callback_now, |active, observations, _| {
-                        record_calls.set(record_calls.get() + 1);
-                        assert!(active.is_empty());
-                        assert!(observations.is_empty());
-                        Ok(Vec::new())
-                    });
-                },
-            );
-            assert_eq!(snapshot.windows.len(), 1);
-        }
-        assert_eq!(enrich_calls.get(), 2);
-        assert_eq!(record_calls.get(), 0);
-        scope.cleanup();
-    }
-
-    #[test]
-    fn finalizes_grok_scope_and_enriches_success_but_errors_fail_closed() {
-        let scope_store = TestRefreshScope::new("grok", "grok-finalize");
-        let marker = b"grok-sensitive-refresh-marker";
-        let account_scope = scope_store
-            .resolve_current("grok-auth-json", "fixture-location", marker)
-            .unwrap();
-        let opaque_scope = account_scope.as_str().to_string();
-        let now = DateTime::parse_from_rfc3339("2026-07-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let reset = now + chrono::Duration::days(7);
-        let weekly = UsageWindow::from_used_percent(
-            "Weekly".to_string(),
-            25.0,
-            Some(reset),
-            now,
-        )
-        .with_identity(
-            "billing.weekly.v1",
-            Some("billing.weekly.v1".to_string()),
-        )
-        .with_provider_duration_evidence(
-            now,
-            true,
-            Some(DurationEvidence::provider(reset.timestamp(), 604_800)),
-        );
-        let callback_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        let success = finalize_grok_snapshot_with(
-            Ok(agent_grok::GrokData {
-                identity: None,
-                account_scope: Ok(account_scope.clone()),
-                windows: vec![weekly],
-            }),
-            now,
-            |snapshot, callback_now| {
-                callback_calls.set(callback_calls.get() + 1);
-                assert_eq!(callback_now, now);
-                assert_eq!(snapshot.client_id, "grok");
-                assert_eq!(snapshot.account_scope.as_ref().unwrap(), &account_scope);
-                enrich_snapshot_with(
-                    snapshot,
-                    callback_now,
-                    |active, observations, history_now| {
-                        record_calls.set(record_calls.get() + 1);
-                        assert_eq!(history_now, now.timestamp());
-                        assert_eq!(
-                            active,
-                            &[SeriesKey::new(
-                                "grok",
-                                account_scope.as_str(),
-                                "billing.weekly.v1",
-                            )]
-                        );
-                        assert_eq!(observations.len(), 1);
-                        assert_eq!(
-                            observations[0].key,
-                            SeriesKey::new(
-                                "grok",
-                                account_scope.as_str(),
-                                "billing.weekly.v1",
-                            )
-                        );
-                        assert_eq!(observations[0].reset_at, Some(reset.timestamp()));
-                        assert_eq!(observations[0].used_percent, 25.0);
-                        assert_eq!(
-                            observations[0].provider,
-                            Some(DurationEvidence::provider(reset.timestamp(), 604_800))
-                        );
-                        assert!(observations[0].contract.is_none());
-                        Ok(vec![Ok((
-                            HistoryOutcome::Ready {
-                                duration_seconds: 604_800,
-                                source: DurationSource::Provider,
-                                sampled: true,
-                            },
-                            Some(HistoricalPace {
-                                expected_percent: 27.5,
-                                eta_seconds: Some(123.0),
-                                will_last_to_reset: false,
-                                run_out_probability: None,
-                            }),
-                            3,
-                        ))])
-                    },
-                );
-            },
-        );
-        assert_eq!(callback_calls.get(), 1);
-        assert_eq!(record_calls.get(), 1);
-        assert_eq!(success.account_scope, Ok(account_scope));
-        assert_eq!(success.windows[0].pace_status.state, PaceState::Available);
-        assert_eq!(success.windows[0].pace_status.duration_seconds, Some(604_800));
-        assert_eq!(
-            success.windows[0].pace_status.duration_source,
-            Some(DurationSource::Provider)
-        );
-        assert_eq!(success.windows[0].pace_status.complete_cycles, 3);
-        assert_eq!(
-            success.windows[0]
-                .historical_pace
-                .as_ref()
-                .map(|pace| pace.expected_used_percent),
-            Some(27.5)
-        );
-        let wire = serde_json::to_string(&success).unwrap();
-        assert!(!wire.contains("accountScope"));
-        assert!(!wire.contains(String::from_utf8_lossy(marker).as_ref()));
-        assert!(!wire.contains(&opaque_scope));
-
-        let learning = UsageWindow::from_used_percent(
-            "Weekly".to_string(),
-            10.0,
-            Some(now + chrono::Duration::days(7)),
-            now,
-        )
-        .with_identity("billing.weekly.v1", Some("billing.weekly.v1".to_string()));
-        let unscoped = finalize_grok_snapshot_with(
-            Ok(agent_grok::GrokData {
-                identity: None,
-                account_scope: Err(AccountScopeError::NoTrustedEvidence),
-                windows: vec![learning],
-            }),
-            now,
-            enrich_snapshot,
-        );
-        assert_eq!(
-            unscoped.windows[0].pace_status.state,
-            PaceState::Unavailable
-        );
-        assert_eq!(
-            unscoped.windows[0].pace_status.reason.as_deref(),
-            Some("accountScope")
-        );
-
-        let callback_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        let failed = finalize_grok_snapshot_with(
-            Err("Grok billing failed".to_string()),
-            now,
-            |snapshot, callback_now| {
-                callback_calls.set(callback_calls.get() + 1);
-                assert_eq!(callback_now, now);
-                assert!(snapshot.windows.is_empty());
-                assert!(matches!(
-                    snapshot.account_scope,
-                    Err(AccountScopeError::NoTrustedEvidence)
-                ));
-                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
-                    record_calls.set(record_calls.get() + 1);
-                    Ok(Vec::new())
-                });
-            },
-        );
-        assert_eq!(callback_calls.get(), 1);
-        assert_eq!(record_calls.get(), 0);
-        assert_eq!(
-            failed.account_scope,
-            Err(AccountScopeError::NoTrustedEvidence)
-        );
-        assert!(failed.windows.is_empty());
-        assert_eq!(failed.error.as_deref(), Some("Grok billing failed"));
-        scope_store.cleanup();
-    }
-
-    #[test]
-    fn finalizes_grok_same_second_provider_reset_as_coherent_history_observation() {
-        let (scope, account_scope) = enrichment_scope("grok-finalize-normalized-reset");
-        let now = DateTime::parse_from_rfc3339("2026-07-18T00:00:00.000500Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let reset = DateTime::parse_from_rfc3339("2026-07-18T00:00:00.000900Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let window = UsageWindow::from_used_percent(
-            "Weekly".to_string(),
-            33.0,
-            Some(reset),
-            now,
-        )
-        .with_identity(
-            "billing.weekly.v1",
-            Some("billing.weekly.v1".to_string()),
-        )
-        .with_provider_duration_evidence(
-            now,
-            true,
-            Some(DurationEvidence::provider(now.timestamp() + 1, 604_800)),
-        );
-        assert!(window.provider_reset_normalized);
-
-        let record_calls = std::cell::Cell::new(0);
-        let snapshot = finalize_grok_snapshot_with(
-            Ok(agent_grok::GrokData {
-                identity: None,
-                account_scope: Ok(account_scope.clone()),
-                windows: vec![window],
-            }),
-            now,
-            |snapshot, callback_now| {
-                enrich_snapshot_with(
-                    snapshot,
-                    callback_now,
-                    |_, observations, _| {
-                        record_calls.set(record_calls.get() + 1);
-                        assert_eq!(observations.len(), 1);
-                        assert_eq!(observations[0].reset_at, Some(now.timestamp() + 1));
-                        assert_eq!(observations[0].used_percent, 33.0);
-                        assert_eq!(
-                            observations[0].provider,
-                            Some(DurationEvidence::provider(now.timestamp() + 1, 604_800))
-                        );
-                        Ok(vec![Ok((
-                            HistoryOutcome::Ready {
-                                duration_seconds: 604_800,
-                                source: DurationSource::Provider,
-                                sampled: true,
-                            },
-                            None,
-                            1,
-                        ))])
-                    },
-                );
-            },
-        );
-        assert_eq!(record_calls.get(), 1);
-        assert_eq!(
-            snapshot.windows[0].pace_status.state,
-            PaceState::LearningHistory
-        );
-        assert_eq!(snapshot.windows[0].pace_status.reason, None);
-        assert!(snapshot.windows[0].provider_reset_normalized);
-        assert_eq!(snapshot.windows[0].pace_status.duration_seconds, Some(604_800));
-        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 1);
-        assert!(snapshot.windows[0].historical_pace.is_none());
-        let wire = serde_json::to_value(&snapshot.windows[0]).unwrap();
-        assert_eq!(wire["resetsAt"], "2026-07-18T00:00:00.000Z");
-        scope.cleanup();
-    }
-
-    #[test]
-    fn finalizes_antigravity_success_and_enriches_once() {
-        let (scope, account_scope) = enrichment_scope("antigravity-finalize-success");
-        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000500Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let reset = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000900Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let window = UsageWindow::from_used_percent(
-            "Gemini".to_string(),
-            25.0,
-            Some(reset),
-            now,
-        )
-        .with_identity(
-            "model.gemini.v1",
-            Some("model.gemini.v1".to_string()),
-        )
-        .with_observed_duration_evidence(now, true);
-        assert_eq!(window.pace_status.state, PaceState::LearningDuration);
-        assert_eq!(window.pace_status.duration_source, Some(DurationSource::Observed));
-
-        let fetched = agent_antigravity::Fetched {
-            source: "cli".to_string(),
-            identity: Some(AgentIdentity {
-                email: Some("fixture@example.com".to_string()),
-                plan: Some("Pro".to_string()),
-            }),
-            account_scope: Ok(account_scope.clone()),
-            windows: vec![window],
-        };
-        let callback_calls = std::cell::Cell::new(0);
-        let snapshot = finalize_antigravity_snapshot_with(
-            Ok(fetched),
-            now,
-            |snapshot, callback_now| {
-                callback_calls.set(callback_calls.get() + 1);
-                assert_eq!(callback_now, now);
-                assert_eq!(snapshot.client_id, "antigravity");
-                assert_eq!(snapshot.source, "cli");
-                assert_eq!(snapshot.account_scope.as_ref().unwrap(), &account_scope);
-                enrich_snapshot_with(
-                    snapshot,
-                    callback_now,
-                    |active, observations, history_now| {
-                        assert_eq!(
-                            active,
-                            &[SeriesKey::new(
-                                "antigravity",
-                                account_scope.as_str(),
-                                "model.gemini.v1",
-                            )]
-                        );
-                        assert_eq!(history_now, now.timestamp());
-                        assert_eq!(observations.len(), 1);
-                        assert_eq!(
-                            observations[0].key,
-                            SeriesKey::new(
-                                "antigravity",
-                                account_scope.as_str(),
-                                "model.gemini.v1",
-                            )
-                        );
-                        assert_eq!(observations[0].reset_at, Some(now.timestamp() + 1));
-                        assert_eq!(observations[0].used_percent, 25.0);
-                        Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
-                    },
-                );
-            },
-        );
-
-        assert_eq!(callback_calls.get(), 1);
-        assert_eq!(snapshot.windows.len(), 1);
-        assert_eq!(
-            snapshot.windows[0].pace_status.state,
-            PaceState::LearningDuration
-        );
-        assert_eq!(
-            snapshot.windows[0].pace_status.duration_source,
-            Some(DurationSource::Observed)
-        );
-        assert!(snapshot.error.is_none());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn finalizes_antigravity_error_and_skips_history_recording() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let callback_calls = std::cell::Cell::new(0);
-        let record_calls = std::cell::Cell::new(0);
-        let snapshot = finalize_antigravity_snapshot_with(
-            Err("synthetic Antigravity failure".to_string()),
-            now,
-            |snapshot, callback_now| {
-                callback_calls.set(callback_calls.get() + 1);
-                assert_eq!(callback_now, now);
-                assert!(snapshot.windows.is_empty());
-                assert!(matches!(
-                    snapshot.account_scope,
-                    Err(AccountScopeError::NoTrustedEvidence)
-                ));
-                enrich_snapshot_with(snapshot, callback_now, |_, _, _| {
-                    record_calls.set(record_calls.get() + 1);
-                    Ok(Vec::new())
-                });
-            },
-        );
-
-        assert_eq!(callback_calls.get(), 1);
-        assert_eq!(record_calls.get(), 0);
-        assert_eq!(snapshot.error.as_deref(), Some("synthetic Antigravity failure"));
-        assert!(snapshot.windows.is_empty());
-    }
-
-    #[test]
-    fn exact_reset_normalization_fails_closed_and_keeps_wire_milliseconds() {
-        let (scope, account_scope) = enrichment_scope("antigravity-exact-reset");
-        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000500Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let future = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000900Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let future_window = UsageWindow::from_used_percent(
-            "Future".to_string(),
-            20.0,
-            Some(future),
-            now,
-        )
-        .with_identity("future.v1", Some("future.v1".to_string()));
-        let mut future_snapshot = enrichment_snapshot(Ok(account_scope.clone()), vec![future_window]);
-        enrich_snapshot_with(
-            &mut future_snapshot,
-            now,
-            |_, observations, history_now| {
-                assert_eq!(history_now, now.timestamp());
-                assert_eq!(observations.len(), 1);
-                assert_eq!(observations[0].reset_at, Some(now.timestamp() + 1));
-                Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
-            },
-        );
-        assert_eq!(
-            future_snapshot.windows[0].pace_status.state,
-            PaceState::LearningDuration
-        );
-        assert_eq!(
-            future_snapshot.windows[0].pace_status.duration_source,
-            Some(DurationSource::Observed)
-        );
-        let wire = serde_json::to_value(&future_snapshot.windows[0]).unwrap();
-        assert_eq!(
-            wire["resetsAt"],
-            "2026-07-10T00:00:00.000Z"
-        );
-        let serialized = serde_json::to_string(&future_snapshot.windows[0]).unwrap();
-        assert!(!serialized.contains("reset_at_evidence"));
-        assert!(!serialized.contains("resetAtEvidence"));
-        assert!(!serialized.contains("000900Z"));
-
-        let past = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000400Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let past_window = UsageWindow::from_used_percent(
-            "Past".to_string(),
-            20.0,
-            Some(past),
-            now,
-        )
-        .with_identity("past.v1", Some("past.v1".to_string()))
-        .with_observed_duration_evidence(now, true);
-        assert_eq!(past_window.pace_reason_for_test(), Some("invalidEvidence"));
-        assert!(past_window.reset_at_evidence.is_some());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn provider_duration_wrapper_accepts_subsecond_future_reset() {
-        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.100Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let reset = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.900Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let window = UsageWindow::from_used_percent(
-            "Weekly".to_string(),
-            20.0,
-            Some(reset),
-            now,
-        )
-        .with_identity("weekly.v1", Some("weekly.v1".to_string()))
-        .with_provider_duration_evidence(
-            now,
-            true,
-            Some(DurationEvidence::provider(now.timestamp() + 1, 604_800)),
-        );
-        let wire = serde_json::to_value(&window).unwrap();
-        assert_eq!(wire["resetsAt"], "2026-07-10T00:00:00.900Z");
-        assert_eq!(wire["paceStatus"]["state"], "learningHistory");
-        assert_eq!(wire["paceStatus"]["durationSeconds"], 604_800);
-        assert_eq!(wire["paceStatus"]["durationSource"], "provider");
-
-        let earlier_now = DateTime::parse_from_rfc3339("2026-07-09T00:00:00.100Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let mismatched = UsageWindow::from_used_percent(
-            "Mismatched".to_string(),
-            20.0,
-            Some(reset),
-            earlier_now,
-        )
-        .with_identity("mismatched.v1", Some("mismatched.v1".to_string()))
-        .with_provider_duration_evidence(
-            earlier_now,
-            true,
-            Some(DurationEvidence::provider(reset.timestamp() + 1, 604_800)),
-        );
-        let mismatched_wire = serde_json::to_value(&mismatched).unwrap();
-        assert_eq!(mismatched_wire["paceStatus"]["state"], "unavailable");
-        assert_eq!(
-            mismatched_wire["paceStatus"]["reason"],
-            "invalidEvidence"
-        );
-    }
-
-    #[test]
-    fn contract_duration_wrapper_uses_shared_resolver_and_fails_closed() {
-        let now = "2026-07-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let reset = now + chrono::Duration::days(1);
-        let valid = UsageWindow::from_used_percent(
-            "Contract".to_string(),
-            20.0,
-            Some(reset),
-            now,
-        )
-        .with_identity("contract.v1", Some("contract.v1".to_string()))
-        .with_contract_duration_evidence(
-            now,
-            true,
-            DurationEvidence::contract(86_400),
-        );
-        let wire = serde_json::to_value(&valid).unwrap();
-        assert_eq!(wire["paceStatus"]["state"], "learningHistory");
-        assert_eq!(wire["paceStatus"]["durationSource"], "contract");
-        assert_eq!(wire["paceStatus"]["durationSeconds"], 86_400);
-        assert_eq!(wire["windowMinutes"], 1_440);
-
-        let invalid = UsageWindow::from_used_percent(
-            "Invalid contract".to_string(),
-            20.0,
-            Some(reset),
-            now,
-        )
-        .with_identity("invalid-contract.v1", Some("invalid-contract.v1".to_string()))
-        .with_contract_duration_evidence(now, true, DurationEvidence::contract(0));
-        let invalid_wire = serde_json::to_value(&invalid).unwrap();
-        assert_eq!(invalid_wire["paceStatus"]["state"], "unavailable");
-        assert_eq!(invalid_wire["paceStatus"]["reason"], "invalidEvidence");
-        assert!(invalid_wire["paceStatus"].get("durationSeconds").is_none());
-        assert!(invalid_wire.get("windowMinutes").is_none());
-        assert!(invalid_wire.get("historicalPace").is_none());
-    }
-
-    #[test]
-    fn serializes_stage3a_pace_states_without_legacy_scalars() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let ready = UsageWindow::from_used_percent(
-            "Known".to_string(),
-            20.0,
-            Some(now + chrono::Duration::hours(1)),
-            now,
-        )
-        .with_identity("known.v1", Some("known.v1".to_string()));
-        let missing_reset = UsageWindow::from_used_percent("No reset".to_string(), 20.0, None, now)
-            .with_identity("no_reset.v1", Some("no_reset.v1".to_string()));
-        let unknown = UsageWindow::from_used_percent(
-            "Unknown".to_string(),
-            20.0,
-            Some(now + chrono::Duration::hours(1)),
-            now,
-        )
-        .with_identity("row.unknown.v1", None);
-
-        let values = [ready, missing_reset, unknown]
-            .into_iter()
-            .map(|window| serde_json::to_value(window).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(values[0]["cardId"], "known.v1");
-        assert_eq!(values[0]["paceStatus"]["state"], "learningDuration");
-        assert_eq!(values[1]["paceStatus"]["state"], "unavailable");
-        assert_eq!(values[1]["paceStatus"]["reason"], "missingReset");
-        assert_eq!(values[2]["paceStatus"]["state"], "unavailable");
-        assert_eq!(values[2]["paceStatus"]["reason"], "windowIdentity");
-        for value in values {
-            assert!(value.get("paceStatus").is_some());
-            assert!(value.get("historicalPace").is_none());
-            assert!(value.get("windowMinutes").is_none());
-            assert!(value.get("historicalExpectedPercent").is_none());
-            assert!(value.get("runOutProbability").is_none());
-        }
-    }
-
-    #[test]
-    fn observed_duration_evidence_preserves_reset_presence() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let future_reset = now + chrono::Duration::hours(1);
-        let past_reset = now - chrono::Duration::hours(1);
-
-        let absent = UsageWindow::from_used_percent("Absent".to_string(), 20.0, None, now)
-            .with_identity("absent.v1", Some("absent.v1".to_string()))
-            .with_observed_duration_evidence(now, false);
-        assert_eq!(absent.pace_reason_for_test(), Some("missingReset"));
-
-        let mut malformed = UsageWindow::from_used_percent(
-            "Malformed".to_string(),
-            20.0,
-            Some(future_reset),
-            now,
-        )
-        .with_identity("malformed.v1", Some("malformed.v1".to_string()));
-        malformed.resets_at = Some("bogus".to_string());
-        malformed = malformed.with_observed_duration_evidence(now, true);
-        assert_eq!(malformed.pace_reason_for_test(), Some("invalidEvidence"));
-        assert!(malformed.resets_at.is_none());
-        assert!(malformed.reset_at_evidence.is_none());
-
-        let past = UsageWindow::from_used_percent("Past".to_string(), 20.0, Some(past_reset), now)
-            .with_identity("past.v1", Some("past.v1".to_string()))
-            .with_observed_duration_evidence(now, true);
-        assert_eq!(past.pace_reason_for_test(), Some("invalidEvidence"));
-
-        let future = UsageWindow::from_used_percent(
-            "Future".to_string(),
-            20.0,
-            Some(future_reset),
-            now,
-        )
-        .with_identity("future.v1", Some("future.v1".to_string()))
-        .with_observed_duration_evidence(now, true);
-        assert_eq!(future.pace_reason_for_test(), None);
-        assert_eq!(future.pace_status.state, PaceState::LearningDuration);
-        assert_eq!(
-            future.pace_status.duration_source,
-            Some(DurationSource::Observed)
-        );
-
-        let subsecond_now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000500Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let subsecond_reset = DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000900Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let subsecond = UsageWindow::from_used_percent(
-            "Subsecond".to_string(),
-            20.0,
-            Some(subsecond_reset),
-            subsecond_now,
-        )
-        .with_identity("subsecond.v1", Some("subsecond.v1".to_string()))
-        .with_observed_duration_evidence(subsecond_now, true);
-        assert_eq!(subsecond.pace_status.state, PaceState::LearningDuration);
-        assert_eq!(
-            subsecond.pace_status.duration_source,
-            Some(DurationSource::Observed)
-        );
-
-        let mut missing_identity = UsageWindow::from_used_percent(
-            "Missing identity".to_string(),
-            20.0,
-            Some(future_reset),
-            now,
-        )
-        .with_identity("row.missing.v1", None);
-        missing_identity.resets_at = Some("bogus".to_string());
-        missing_identity = missing_identity.with_observed_duration_evidence(now, true);
-        assert_eq!(missing_identity.pace_reason_for_test(), Some("windowIdentity"));
-    }
-
-    #[test]
-    fn rejects_malformed_usage_window_wire() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let mut window = UsageWindow::from_used_percent(
-            "Known".to_string(),
-            20.0,
-            Some(now + chrono::Duration::hours(1)),
-            now,
-        )
-        .with_identity("known.v1", Some("known.v1".to_string()));
-        window.card_id.clear();
-        assert!(serde_json::to_value(&window).is_err());
-        window.card_id = "known.v1".to_string();
-        window.used_percent = f64::NAN;
-        assert!(serde_json::to_value(&window).is_err());
-    }
-
-    #[test]
-    fn serialized_duration_mirror_is_nested_and_state_coherent() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let window = map_window_with_identity(
-            "Session",
-            CodexWindow {
-                used_percent: 20.0,
-                reset_at: now.timestamp() + 3_600,
-                limit_window_seconds: 18_000,
-            },
-            now,
-            "main.session.v1",
-            Some("main.session.v1".to_string()),
-        )
-        .unwrap();
-        let wire = serde_json::to_value(&window).unwrap();
-        assert_eq!(wire["paceStatus"]["durationSeconds"], 18_000);
-        assert_eq!(wire["paceStatus"]["durationSource"], "provider");
-        assert_eq!(wire["windowMinutes"], 300);
-        assert_eq!(
-            wire["windowMinutes"].as_i64(),
-            wire["paceStatus"]["durationSeconds"]
-                .as_i64()
-                .map(|seconds| seconds / 60)
-        );
-
-        let mut contradictory = window;
-        contradictory.pace_status.state = PaceState::Unavailable;
-        contradictory.pace_status.reason = Some("invalidEvidence".to_string());
-        assert!(serde_json::to_value(&contradictory).is_err());
-        contradictory.pace_status.state = PaceState::LearningHistory;
-        contradictory.pace_status.reason = None;
-        contradictory.pace_status.duration_source = None;
-        assert!(serde_json::to_value(&contradictory).is_err());
-        contradictory.pace_status.duration_source = Some(DurationSource::Provider);
-        contradictory.pace_status.duration_seconds = Some(604_800);
-        assert!(serde_json::to_value(&contradictory).is_err());
-    }
-
-    #[test]
-    fn retain_unique_windows_drops_later_card_or_window_identity() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let first = UsageWindow::from_used_percent(
-            "First".to_string(),
-            20.0,
-            Some(now + chrono::Duration::hours(1)),
-            now,
-        )
-        .with_identity("card.a.v1", Some("window.a.v1".to_string()));
-        let duplicate_card = UsageWindow::from_used_percent(
-            "Later card".to_string(),
-            30.0,
-            Some(now + chrono::Duration::hours(1)),
-            now,
-        )
-        .with_identity("card.a.v1", Some("window.b.v1".to_string()));
-        let duplicate_key = UsageWindow::from_used_percent(
-            "Later key".to_string(),
-            40.0,
-            Some(now + chrono::Duration::hours(1)),
-            now,
-        )
-        .with_identity("card.c.v1", Some("window.a.v1".to_string()));
-        let mut windows = vec![first, duplicate_card, duplicate_key];
-        retain_unique_windows(&mut windows);
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label_for_test(), "First");
-    }
-
-    #[test]
-    fn enrichment_scope_failure_preserves_identity_and_non_recurring_rows() {
-        let (scope, _) = enrichment_scope("enrichment-scope-failure");
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let stable = enrichment_window(
-            now,
-            "stable.v1",
-            "stable.v1",
-            20.0,
-            Some(DurationSource::Contract),
-        );
-        let identity = UsageWindow::from_used_percent(
-            "Identity".to_string(),
-            30.0,
-            Some(now + chrono::Duration::days(1)),
-            now,
-        )
-        .with_identity("identity.v1", None);
-        let non_recurring =
-            UsageWindow::from_used_percent("Non-recurring".to_string(), 40.0, None, now)
-                .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
-                .with_unavailable_reason("nonRecurring");
-        let mut snapshot = enrichment_snapshot(
-            Err(AccountScopeError::MetadataWrite),
-            vec![stable, identity, non_recurring],
-        );
-        let calls = std::cell::Cell::new(0);
-
-        enrich_snapshot_with(&mut snapshot, now, |_, _, _| {
-            calls.set(calls.get() + 1);
-            Ok(Vec::new())
-        });
-
-        assert_eq!(calls.get(), 0);
-        assert_eq!(
-            snapshot.windows[0].pace_reason_for_test(),
-            Some("accountScope")
-        );
-        assert_eq!(
-            snapshot.windows[1].pace_reason_for_test(),
-            Some("windowIdentity")
-        );
-        assert_eq!(
-            snapshot.windows[2].pace_reason_for_test(),
-            Some("nonRecurring")
-        );
-        assert!(serde_json::to_value(&snapshot).is_ok());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn enrichment_filters_duplicate_card_and_window_keys_before_batching() {
-        let (scope, account_scope) = enrichment_scope("enrichment-duplicates");
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let mut snapshot = enrichment_snapshot(
-            Ok(account_scope),
-            vec![
-                enrichment_window(now, "shared-card.v1", "first.v1", 10.0, None),
-                enrichment_window(now, "second-card.v1", "first.v1", 20.0, None),
-                enrichment_window(now, "shared-card.v1", "third.v1", 30.0, None),
-            ],
-        );
-
-        enrich_snapshot_with(
-            &mut snapshot,
-            now,
-            |active, observations, batch_now| {
-                assert_eq!(batch_now, now.timestamp());
-                assert_eq!(active.len(), 1);
-                assert_eq!(active[0].window_key, "first.v1");
-                assert_eq!(observations.len(), 1);
-                assert_eq!(observations[0].used_percent, 10.0);
-                Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
-            },
-        );
-
-        assert_eq!(snapshot.windows.len(), 1);
-        assert_eq!(snapshot.windows[0].card_id_for_test(), "shared-card.v1");
-        assert_eq!(
-            snapshot.windows[0].pace_status.duration_source,
-            Some(DurationSource::Observed)
-        );
-        assert!(serde_json::to_value(&snapshot).is_ok());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn enrichment_builds_active_keys_observations_and_coherent_results() {
-        let (scope, account_scope) = enrichment_scope("enrichment-batch-map");
-        let expected_scope = account_scope.as_str().to_string();
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let reset = now + chrono::Duration::days(1);
-        let mut invalid_reset =
-            enrichment_window(now, "invalid-reset.v1", "invalid-reset.v1", 50.0, None);
-        invalid_reset.resets_at = Some("not-rfc3339".to_string());
-        invalid_reset.used_percent = f64::NAN;
-        invalid_reset.remaining_percent = f64::NAN;
-        let expired = UsageWindow::from_used_percent(
-            "Expired".to_string(),
-            60.0,
-            Some(now - chrono::Duration::seconds(1)),
-            now,
-        )
-        .with_identity("expired.v1", Some("expired.v1".to_string()));
-        let mut invalid_percent =
-            enrichment_window(now, "invalid-percent.v1", "invalid-percent.v1", 70.0, None);
-        invalid_percent.used_percent = f64::NAN;
-        invalid_percent.remaining_percent = f64::NAN;
-        let missing = UsageWindow::from_used_percent("Missing".to_string(), 30.0, None, now)
-            .with_identity("missing.v1", Some("missing.v1".to_string()));
-        let non_recurring =
-            UsageWindow::from_used_percent("Non-recurring".to_string(), 40.0, None, now)
-                .with_identity("non-recurring.v1", Some("non-recurring.v1".to_string()))
-                .with_unavailable_reason("nonRecurring");
-        let mut snapshot = enrichment_snapshot(
-            Ok(account_scope),
-            vec![
-                enrichment_window(
-                    now,
-                    "provider.v1",
-                    "provider.v1",
-                    10.0,
-                    Some(DurationSource::Provider),
-                ),
-                enrichment_window(
-                    now,
-                    "contract.v1",
-                    "contract.v1",
-                    20.0,
-                    Some(DurationSource::Contract),
-                ),
-                enrichment_window(now, "observed.v1", "observed.v1", 25.0, None),
-                missing,
-                non_recurring,
-                invalid_reset,
-                expired,
-                invalid_percent,
-            ],
-        );
-
-        enrich_snapshot_with(&mut snapshot, now, |active, observations, _| {
-            assert_eq!(
-                active,
-                &[
-                    SeriesKey::new("fixture", &expected_scope, "provider.v1"),
-                    SeriesKey::new("fixture", &expected_scope, "contract.v1"),
-                    SeriesKey::new("fixture", &expected_scope, "observed.v1"),
-                    SeriesKey::new("fixture", &expected_scope, "missing.v1"),
-                    SeriesKey::new("fixture", &expected_scope, "invalid-reset.v1"),
-                    SeriesKey::new("fixture", &expected_scope, "expired.v1"),
-                    SeriesKey::new("fixture", &expected_scope, "invalid-percent.v1"),
-                ]
-            );
-            assert_eq!(observations.len(), 3);
-            assert_eq!(observations[0].reset_at, Some(reset.timestamp()));
-            assert_eq!(
-                observations[0].provider,
-                Some(DurationEvidence::provider(reset.timestamp(), 86_400))
-            );
-            assert_eq!(observations[0].contract, None);
-            assert_eq!(observations[1].provider, None);
-            assert_eq!(
-                observations[1].contract,
-                Some(DurationEvidence::contract(86_400))
-            );
-            assert_eq!(observations[2].provider, None);
-            assert_eq!(observations[2].contract, None);
-            Ok(vec![
-                Ok((
-                    HistoryOutcome::Ready {
-                        duration_seconds: 86_400,
-                        source: DurationSource::Provider,
-                        sampled: true,
-                    },
-                    None,
-                    2,
-                )),
-                Ok((
-                    HistoryOutcome::Ready {
-                        duration_seconds: 86_400,
-                        source: DurationSource::Contract,
-                        sampled: true,
-                    },
-                    Some(HistoricalPace {
-                        expected_percent: 42.0,
-                        eta_seconds: Some(900.0),
-                        will_last_to_reset: false,
-                        run_out_probability: None,
-                    }),
-                    4,
-                )),
-                Ok((HistoryOutcome::LearningDuration, None, 0)),
-            ])
-        });
-
-        assert_eq!(
-            snapshot.windows[0].pace_status.state,
-            PaceState::LearningHistory
-        );
-        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 2);
-        assert_eq!(snapshot.windows[1].pace_status.state, PaceState::Available);
-        assert_eq!(snapshot.windows[1].pace_status.complete_cycles, 4);
-        let historical = snapshot.windows[1].historical_pace.as_ref().unwrap();
-        assert_eq!(historical.expected_used_percent, 42.0);
-        assert_eq!(historical.eta_seconds, Some(900.0));
-        assert!(!historical.will_last_to_reset);
-        assert_eq!(historical.run_out_probability, None);
-        assert_eq!(
-            snapshot.windows[2].pace_status.state,
-            PaceState::LearningDuration
-        );
-        assert_eq!(
-            snapshot.windows[2].pace_status.duration_source,
-            Some(DurationSource::Observed)
-        );
-        assert_eq!(
-            snapshot.windows[3].pace_reason_for_test(),
-            Some("missingReset")
-        );
-        assert_eq!(
-            snapshot.windows[4].pace_reason_for_test(),
-            Some("nonRecurring")
-        );
-        for window in &snapshot.windows[5..] {
-            assert_eq!(window.pace_reason_for_test(), Some("invalidEvidence"));
-        }
-        let wire = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(wire["windows"][0]["windowMinutes"], 1_440);
-        assert_eq!(wire["windows"][1]["windowMinutes"], 1_440);
-        assert!(wire["windows"][2].get("windowMinutes").is_none());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn enrichment_maps_unavailable_and_rejects_contradictory_results() {
-        let (scope, account_scope) = enrichment_scope("enrichment-result-validation");
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let mut snapshot = enrichment_snapshot(
-            Ok(account_scope),
-            vec![
-                enrichment_window(now, "missing.v1", "missing.v1", 10.0, None),
-                enrichment_window(now, "invalid.v1", "invalid.v1", 20.0, None),
-                enrichment_window(
-                    now,
-                    "learning-conflict.v1",
-                    "learning-conflict.v1",
-                    30.0,
-                    Some(DurationSource::Contract),
-                ),
-                enrichment_window(
-                    now,
-                    "historical-conflict.v1",
-                    "historical-conflict.v1",
-                    40.0,
-                    Some(DurationSource::Contract),
-                ),
-                enrichment_window(
-                    now,
-                    "source-conflict.v1",
-                    "source-conflict.v1",
-                    50.0,
-                    Some(DurationSource::Contract),
-                ),
-                enrichment_window(
-                    now,
-                    "unavailable-conflict.v1",
-                    "unavailable-conflict.v1",
-                    60.0,
-                    None,
-                ),
-                enrichment_window(
-                    now,
-                    "nonfinite-history.v1",
-                    "nonfinite-history.v1",
-                    70.0,
-                    Some(DurationSource::Contract),
-                ),
-            ],
-        );
-        let historical = HistoricalPace {
-            expected_percent: 42.0,
-            eta_seconds: Some(900.0),
-            will_last_to_reset: false,
-            run_out_probability: None,
-        };
-
-        enrich_snapshot_with(&mut snapshot, now, |_, observations, _| {
-            assert_eq!(observations.len(), 7);
-            Ok(vec![
-                Ok((
-                    HistoryOutcome::Unavailable(DurationUnavailableReason::MissingReset),
-                    None,
-                    0,
-                )),
-                Ok((
-                    HistoryOutcome::Unavailable(DurationUnavailableReason::InvalidEvidence),
-                    None,
-                    0,
-                )),
-                Ok((HistoryOutcome::LearningDuration, None, 0)),
-                Ok((
-                    HistoryOutcome::Ready {
-                        duration_seconds: 86_400,
-                        source: DurationSource::Contract,
-                        sampled: true,
-                    },
-                    Some(HistoricalPace {
-                        expected_percent: f64::NAN,
-                        ..historical.clone()
-                    }),
-                    3,
-                )),
-                Ok((
-                    HistoryOutcome::Ready {
-                        duration_seconds: 86_400,
-                        source: DurationSource::Provider,
-                        sampled: true,
-                    },
-                    None,
-                    2,
-                )),
-                Ok((
-                    HistoryOutcome::Unavailable(DurationUnavailableReason::InvalidEvidence),
-                    None,
-                    3,
-                )),
-                Ok((
-                    HistoryOutcome::Ready {
-                        duration_seconds: 86_400,
-                        source: DurationSource::Contract,
-                        sampled: true,
-                    },
-                    Some(HistoricalPace {
-                        expected_percent: f64::NAN,
-                        ..historical.clone()
-                    }),
-                    3,
-                )),
-            ])
-        });
-
-        assert_eq!(snapshot.windows[0].pace_reason_for_test(), Some("history"));
-        assert_eq!(
-            snapshot.windows[1].pace_reason_for_test(),
-            Some("invalidEvidence")
-        );
-        for window in &snapshot.windows[2..] {
-            assert_eq!(window.pace_reason_for_test(), Some("history"));
-        }
-        assert!(serde_json::to_value(&snapshot).is_ok());
-        scope.cleanup();
-    }
-
-    #[test]
-    fn enrichment_maps_global_row_and_count_failures_only_to_observations() {
-        let (scope, account_scope) = enrichment_scope("enrichment-errors");
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-
-        let mut global_capacity =
-            enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
-        enrich_snapshot_with(
-            &mut global_capacity,
-            now,
-            |active, observations, _| {
-                assert_eq!(active.len(), 3);
-                assert_eq!(observations.len(), 2);
-                Err(HistoryError::StoreCapacity)
-            },
-        );
-        assert_eq!(
-            global_capacity.windows[0].pace_reason_for_test(),
-            Some("storeCapacity")
-        );
-        assert_eq!(
-            global_capacity.windows[1].pace_reason_for_test(),
-            Some("storeCapacity")
-        );
-        assert_eq!(
-            global_capacity.windows[2].pace_reason_for_test(),
-            Some("missingReset")
-        );
-        assert_eq!(
-            global_capacity.windows[3].pace_reason_for_test(),
-            Some("nonRecurring")
-        );
-
-        let mut global_history =
-            enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
-        enrich_snapshot_with(&mut global_history, now, |_, _, _| {
-            Err(HistoryError::Read)
-        });
-        assert_eq!(
-            global_history.windows[0].pace_reason_for_test(),
-            Some("history")
-        );
-        assert_eq!(
-            global_history.windows[1].pace_reason_for_test(),
-            Some("history")
-        );
-        assert_eq!(
-            global_history.windows[2].pace_reason_for_test(),
-            Some("missingReset")
-        );
-        assert_eq!(
-            global_history.windows[3].pace_reason_for_test(),
-            Some("nonRecurring")
-        );
-
-        let mut count_mismatch =
-            enrichment_snapshot(Ok(account_scope.clone()), enrichment_failure_windows(now));
-        enrich_snapshot_with(&mut count_mismatch, now, |_, _, _| {
-            Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
-        });
-        assert_eq!(
-            count_mismatch.windows[0].pace_reason_for_test(),
-            Some("history")
-        );
-        assert_eq!(
-            count_mismatch.windows[1].pace_reason_for_test(),
-            Some("history")
-        );
-        assert_eq!(
-            count_mismatch.windows[2].pace_reason_for_test(),
-            Some("missingReset")
-        );
-        assert_eq!(
-            count_mismatch.windows[3].pace_reason_for_test(),
-            Some("nonRecurring")
-        );
-
-        let mut row_errors =
-            enrichment_snapshot(Ok(account_scope), enrichment_failure_windows(now));
-        enrich_snapshot_with(&mut row_errors, now, |_, _, _| {
-            Ok(vec![
-                Err(HistoryError::StoreCapacity),
-                Err(HistoryError::Read),
-            ])
-        });
-        assert_eq!(
-            row_errors.windows[0].pace_reason_for_test(),
-            Some("storeCapacity")
-        );
-        assert_eq!(
-            row_errors.windows[1].pace_reason_for_test(),
-            Some("history")
-        );
-        assert_eq!(
-            row_errors.windows[2].pace_reason_for_test(),
-            Some("missingReset")
-        );
-        assert_eq!(
-            row_errors.windows[3].pace_reason_for_test(),
-            Some("nonRecurring")
-        );
-        for snapshot in [global_capacity, global_history, count_mismatch, row_errors] {
-            assert!(serde_json::to_value(snapshot).is_ok());
-        }
-        scope.cleanup();
     }
 
     #[test]
@@ -5243,417 +4335,530 @@ mod tests {
             assert_eq!(response.expires_in, 3_600, "{label}");
             assert_eq!(response.refresh_token.as_deref(), expected, "{label}");
         }
-    }
-
-    #[test]
-    fn account_scope_and_credential_markers_never_reach_the_wire() {
-        let scope_store = TestRefreshScope::new("codex", "agent-usage-wire-privacy");
-        let marker = b"sensitive-refresh-token-marker";
-        let account_scope = scope_store
-            .resolve_current("codex-auth-json", "fixture-location", marker)
-            .unwrap();
-        let opaque_scope = account_scope.as_str().to_string();
-        let snapshot = AgentUsageSnapshot {
-            client_id: "codex".to_string(),
-            source: "oauth".to_string(),
-            updated_at: "2026-07-18T00:00:00.000Z".to_string(),
-            identity: None,
-            account_scope: Ok(account_scope),
-            windows: Vec::new(),
-            credits: None,
-            error: None,
-        };
-
-        let wire = serde_json::to_string(&snapshot).unwrap();
-        assert!(!wire.contains("accountScope"));
-        assert!(!wire.contains(String::from_utf8_lossy(marker).as_ref()));
-        assert!(!wire.contains(&opaque_scope));
-        scope_store.cleanup();
-    }
-
-    #[test]
-    fn credential_markers_and_locations_follow_the_canonical_routes() {
-        let scope_store = TestRefreshScope::new("codex", "agent-usage-locations");
-        let auth_path = scope_store.root().join("codex/auth.json");
-        fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
-        fs::write(
-            &auth_path,
-            serde_json::json!({
-                "tokens": {
-                    "access_token": " codex-access ",
-                    "refresh_token": " codex-refresh "
-                }
-            })
-            .to_string(),
+        assert!(serde_json::from_value::<ClaudeRefreshResponse>(
+            serde_json::json!({ "expires_in": 3600 })
         )
-        .unwrap();
-        let codex = load_codex_credentials_from(&auth_path).unwrap();
-        assert_eq!(codex.scope_slot.semantic_source, "codex-auth-json");
-        assert_eq!(
-            codex.scope_slot.canonical_location,
-            agent_account_scope::canonical_file_location(&auth_path, Some("tokens")).unwrap()
-        );
-        assert_eq!(codex.scope_marker(), b"codex-refresh");
-        let mut codex_access_only = codex.clone();
-        codex_access_only.refresh_token = None;
-        assert_eq!(codex_access_only.scope_marker(), b"codex-access");
+        .is_err());
+        assert!(serde_json::from_value::<ClaudeRefreshResponse>(
+            serde_json::json!({ "access_token": "new-access" })
+        )
+        .is_err());
+    }
 
-        let claude_file_slot = claude_login_scope_slot(ClaudeCredentialSource::File).unwrap();
-        assert_eq!(claude_file_slot.semantic_source, "claude-login-file");
-        assert_eq!(
-            claude_file_slot.canonical_location,
-            agent_account_scope::canonical_file_location(
-                &claude_credentials_path(),
-                Some("claudeAiOauth")
-            )
-            .unwrap()
+    #[test]
+    fn claude_gate_is_binding_scoped_and_expires() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let scope = TestRefreshScope::new("claude", "local-gate");
+        let binding_a = ProviderCacheBinding::primary(
+            scope
+                .resolve_current("fixture", "account-a", b"marker-a")
+                .unwrap(),
         );
-        let claude_keychain_slot =
-            claude_login_scope_slot(ClaudeCredentialSource::Keychain).unwrap();
-        assert_eq!(
-            claude_keychain_slot.semantic_source,
-            "claude-login-keychain"
+        let binding_b = ProviderCacheBinding::primary(
+            scope
+                .resolve_current("fixture", "account-b", b"marker-b")
+                .unwrap(),
         );
-        assert_eq!(
-            claude_keychain_slot.canonical_location,
-            CLAUDE_KEYCHAIN_SERVICE
-        );
+        let mut gate = ClaudeUsageGate::default();
 
-        let claude_login = ClaudeCredentials {
+        gate.record_rate_limit(binding_a.clone(), None, now);
+        let until = gate.blocked_until_for(&binding_a, now).unwrap();
+        assert_eq!((until - now).num_seconds(), 300);
+
+        assert!(gate.blocked_until_for(&binding_b, now).is_none());
+        assert!(gate.blocked_until_for(&binding_a, now).is_none());
+
+        gate.record_rate_limit(
+            binding_a.clone(),
+            Some(now + chrono::Duration::seconds(60)),
+            now,
+        );
+        assert!(gate
+            .blocked_until_for(&binding_a, now + chrono::Duration::seconds(61))
+            .is_none());
+        gate.clear();
+        assert!(gate.blocked_until_for(&binding_a, now).is_none());
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn claude_login_usage_gates_current_binding_before_refresh_and_request() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let scope = TestRefreshScope::new("claude", "routed-gate");
+        let binding_a = ProviderCacheBinding::primary(
+            scope
+                .resolve_current("fixture", "account-a", b"marker-a")
+                .unwrap(),
+        );
+        let binding_b = ProviderCacheBinding::primary(
+            scope
+                .resolve_current("fixture", "account-b", b"marker-b")
+                .unwrap(),
+        );
+        let mut credentials = ClaudeCredentials {
             access_token: "claude-access".to_string(),
             refresh_token: Some("claude-refresh".to_string()),
-            expires_at: None,
-            scopes: Vec::new(),
+            expires_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+            scopes: vec!["user:profile".to_string()],
             rate_limit_tier: None,
             subscription_type: None,
             source: ClaudeCredentialSource::File,
             raw_root: None,
-            scope_slot: claude_file_slot,
-        };
-        assert_eq!(
-            claude_login.scope_marker(),
-            Some(b"claude-refresh".as_slice())
-        );
-        let mut login_without_refresh = claude_login.clone();
-        login_without_refresh.refresh_token = None;
-        assert_eq!(login_without_refresh.scope_marker(), None);
-
-        let claude_setup = claude_credentials_from_access_token(ResolvedClaudeToken {
-            access_token: "claude-setup-access".to_string(),
+            keychain_account: None,
             scope_slot: CredentialSlot {
-                semantic_source: "claude-code-environment",
-                canonical_location: "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                semantic_source: "fixture",
+                canonical_location: "fixture".to_string(),
             },
-        });
-        assert_eq!(
-            claude_setup.scope_marker(),
-            Some(b"claude-setup-access".as_slice())
-        );
-        assert_eq!(
-            claude_setup.scope_slot.semantic_source,
-            "claude-code-environment"
-        );
-        assert_eq!(
-            claude_setup.scope_slot.canonical_location,
-            "CLAUDE_CODE_OAUTH_TOKEN"
-        );
-        scope_store.cleanup();
-    }
+        };
+        let mut gate = ClaudeUsageGate::default();
+        gate.record_rate_limit(binding_a.clone(), None, now);
+        let refresh_calls = std::cell::Cell::new(0);
+        let header_calls = std::cell::Cell::new(0);
+        let usage_calls = std::cell::Cell::new(0);
 
-    #[test]
-    fn codex_scope_precedence_keeps_refresh_failure_sticky() {
-        let scope_store = TestRefreshScope::new("codex", "codex-scope-precedence");
-        let refresh_scope = scope_store
-            .resolve_current("fixture", "refresh", b"refresh-marker")
-            .unwrap();
-        let authoritative_scope = scope_store
-            .resolve_current("fixture", "authoritative", b"authoritative-marker")
-            .unwrap();
-        let credential_scope = scope_store
-            .resolve_current("fixture", "credential", b"credential-marker")
-            .unwrap();
-        let authoritative_calls = std::cell::Cell::new(0);
-        let credential_calls = std::cell::Cell::new(0);
-
-        let resolved = resolve_codex_account_scope(
-            Some(Err(AccountScopeError::MetadataWrite)),
-            Some("acct-id"),
-            |_| {
-                authoritative_calls.set(authoritative_calls.get() + 1);
-                Ok(authoritative_scope.clone())
+        let (source, outcome) = fetch_claude_login_usage_with(
+            credentials.clone(),
+            binding_a.clone(),
+            now,
+            |binding, at| gate.blocked_until_for(binding, at),
+            |credentials| {
+                refresh_calls.set(refresh_calls.get() + 1);
+                let binding = binding_a.clone();
+                async move { Ok((credentials, binding.primary.clone(), Some(binding))) }
             },
-            || {
-                credential_calls.set(credential_calls.get() + 1);
-                Ok(credential_scope.clone())
+            |_, _, _| async {
+                header_calls.set(header_calls.get() + 1);
+                claude_test_success_outcome()
             },
-        );
-        assert_eq!(resolved, Err(AccountScopeError::MetadataWrite));
-        assert_eq!(authoritative_calls.get(), 0);
-        assert_eq!(credential_calls.get(), 0);
-
-        let resolved = resolve_codex_account_scope(
-            Some(Err(AccountScopeError::MetadataRead)),
-            None,
-            |_| {
-                authoritative_calls.set(authoritative_calls.get() + 1);
-                Ok(authoritative_scope.clone())
+            |_, _, _, _| async {
+                usage_calls.set(usage_calls.get() + 1);
+                ("oauth", claude_test_success_outcome())
             },
-            || {
-                credential_calls.set(credential_calls.get() + 1);
-                Ok(credential_scope.clone())
-            },
-        );
-        assert_eq!(resolved, Err(AccountScopeError::MetadataRead));
-        assert_eq!(authoritative_calls.get(), 0);
-        assert_eq!(credential_calls.get(), 0);
-
-        let resolved = resolve_codex_account_scope(
-            Some(Ok(refresh_scope.clone())),
-            Some("acct-id"),
-            |_| {
-                authoritative_calls.set(authoritative_calls.get() + 1);
-                Ok(authoritative_scope.clone())
-            },
-            || {
-                credential_calls.set(credential_calls.get() + 1);
-                Ok(credential_scope.clone())
-            },
-        );
-        assert_eq!(resolved.unwrap(), authoritative_scope);
-        assert_eq!(authoritative_calls.get(), 1);
-        assert_eq!(credential_calls.get(), 0);
-
-        let resolved = resolve_codex_account_scope(
-            Some(Ok(refresh_scope.clone())),
-            None,
-            |_| {
-                authoritative_calls.set(authoritative_calls.get() + 1);
-                Ok(authoritative_scope.clone())
-            },
-            || {
-                credential_calls.set(credential_calls.get() + 1);
-                Ok(credential_scope.clone())
-            },
-        );
-        assert_eq!(resolved.unwrap(), refresh_scope);
-        assert_eq!(authoritative_calls.get(), 1);
-        assert_eq!(credential_calls.get(), 0);
-
-        let resolved = resolve_codex_account_scope(
-            None,
-            None,
-            |_| {
-                authoritative_calls.set(authoritative_calls.get() + 1);
-                Ok(authoritative_scope.clone())
-            },
-            || {
-                credential_calls.set(credential_calls.get() + 1);
-                Ok(credential_scope.clone())
-            },
-        );
-        assert_eq!(resolved.unwrap(), credential_scope);
-        assert_eq!(authoritative_calls.get(), 1);
-        assert_eq!(credential_calls.get(), 1);
-        scope_store.cleanup();
-    }
-
-    #[test]
-    fn codex_v2_migration_requires_request_id_and_scope_and_is_best_effort() {
-        let scope_store = TestRefreshScope::new("codex", "codex-v2-migration-gate");
-        let account_scope = scope_store
-            .resolve_current("fixture", "codex-v2", b"codex-v2-marker")
-            .unwrap();
-        let opaque_scope = account_scope.as_str().to_string();
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let calls = std::cell::RefCell::new(Vec::new());
-
-        maybe_migrate_codex_v2_with(
-            Some("request-account"),
-            &Ok(account_scope.clone()),
-            now.timestamp(),
-            |request_account_id, scope, call_now| {
-                calls.borrow_mut().push((
-                    request_account_id.to_string(),
-                    scope.to_string(),
-                    call_now,
-                ));
-                Ok(())
-            },
-        );
-        assert_eq!(
-            calls.borrow().as_slice(),
-            &[(
-                "request-account".to_string(),
-                opaque_scope.clone(),
-                now.timestamp(),
-            )]
-        );
-
-        let skipped_calls = std::cell::Cell::new(0);
-        maybe_migrate_codex_v2_with(
-            None,
-            &Ok(account_scope.clone()),
-            now.timestamp(),
-            |_, _, _| {
-                skipped_calls.set(skipped_calls.get() + 1);
-                Ok(())
-            },
-        );
-        maybe_migrate_codex_v2_with(
-            Some(" \t"),
-            &Ok(account_scope.clone()),
-            now.timestamp(),
-            |_, _, _| {
-                skipped_calls.set(skipped_calls.get() + 1);
-                Ok(())
-            },
-        );
-        maybe_migrate_codex_v2_with(
-            Some("request-account"),
-            &Err(AccountScopeError::MetadataRead),
-            now.timestamp(),
-            |_, _, _| {
-                skipped_calls.set(skipped_calls.get() + 1);
-                Ok(())
-            },
-        );
-        assert_eq!(skipped_calls.get(), 0);
-
-        let migration_error_calls = std::cell::Cell::new(0);
-        maybe_migrate_codex_v2_with(
-            Some("request-account"),
-            &Ok(account_scope.clone()),
-            now.timestamp(),
-            |_, _, _| {
-                migration_error_calls.set(migration_error_calls.get() + 1);
-                Err::<(), _>(HistoryError::AtomicSave)
-            },
-        );
-
-        let mut snapshot = enrichment_snapshot(
-            Ok(account_scope),
-            vec![enrichment_window(
-                now,
-                "weekly.v1",
-                "weekly.v1",
-                20.0,
-                Some(DurationSource::Contract),
-            )],
-        );
-        let record_calls = std::cell::Cell::new(0);
-        enrich_snapshot_with(&mut snapshot, now, |_, observations, _| {
-            record_calls.set(record_calls.get() + 1);
-            assert_eq!(observations.len(), 1);
-            Ok(vec![Ok((
-                HistoryOutcome::Ready {
-                    duration_seconds: 86_400,
-                    source: DurationSource::Contract,
-                    sampled: true,
+        )
+        .await;
+        assert_eq!(source, "oauth");
+        assert!(matches!(
+            outcome,
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::Transient {
+                attempt_binding: Some(ref binding),
+                transport_diagnostic: SafeTransportDiagnostic {
+                    category: TransportCategory::RateLimited,
+                    status: Some(429),
+                    ..
                 },
-                None,
-                1,
-            ))])
-        });
-        assert_eq!(migration_error_calls.get(), 1);
-        assert_eq!(record_calls.get(), 1);
-        assert_eq!(
-            snapshot.windows[0].pace_status.state,
-            PaceState::LearningHistory
-        );
-        scope_store.cleanup();
+                ..
+            }) if binding == &binding_a
+        ));
+        assert_eq!(refresh_calls.get(), 0);
+        assert_eq!(header_calls.get(), 0);
+        assert_eq!(usage_calls.get(), 0);
+
+        credentials.expires_at = None;
+        credentials.scopes = vec!["org:create_api_key".to_string()];
+        gate.record_rate_limit(binding_a.clone(), None, now);
+        let (source, outcome) = fetch_claude_login_usage_with(
+            credentials.clone(),
+            binding_a.clone(),
+            now,
+            |binding, at| gate.blocked_until_for(binding, at),
+            |credentials| {
+                refresh_calls.set(refresh_calls.get() + 1);
+                let binding = binding_a.clone();
+                async move { Ok((credentials, binding.primary.clone(), Some(binding))) }
+            },
+            |_, _, _| async {
+                header_calls.set(header_calls.get() + 1);
+                claude_test_success_outcome()
+            },
+            |_, _, _, _| async {
+                usage_calls.set(usage_calls.get() + 1);
+                ("oauth", claude_test_success_outcome())
+            },
+        )
+        .await;
+        assert_eq!(source, "setup-token");
+        assert!(matches!(outcome, ProviderFetchOutcome::Success { .. }));
+        assert_eq!(refresh_calls.get(), 0);
+        assert_eq!(header_calls.get(), 1);
+        assert_eq!(usage_calls.get(), 0);
+        assert!(gate.blocked_until_for(&binding_a, now).is_some());
+
+        credentials.scopes = vec!["user:profile".to_string()];
+        gate.record_rate_limit(binding_a.clone(), None, now);
+        let (source, outcome) = fetch_claude_login_usage_with(
+            credentials,
+            binding_b.clone(),
+            now,
+            |binding, at| gate.blocked_until_for(binding, at),
+            |credentials| {
+                refresh_calls.set(refresh_calls.get() + 1);
+                let binding = binding_b.clone();
+                async move { Ok((credentials, binding.primary.clone(), Some(binding))) }
+            },
+            |_, _, _| async {
+                header_calls.set(header_calls.get() + 1);
+                claude_test_success_outcome()
+            },
+            |_, _, _, _| async {
+                usage_calls.set(usage_calls.get() + 1);
+                ("oauth", claude_test_success_outcome())
+            },
+        )
+        .await;
+        assert_eq!(source, "oauth");
+        assert!(matches!(outcome, ProviderFetchOutcome::Success { .. }));
+        assert_eq!(refresh_calls.get(), 0);
+        assert_eq!(header_calls.get(), 1);
+        assert_eq!(usage_calls.get(), 1);
+        scope.cleanup();
     }
 
-    // Single test for the whole gate lifecycle — the gate is a process-wide
-    // static, so split tests would race under the parallel test runner.
-    #[test]
-    fn claude_gate_blocks_then_clears() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        assert!(claude_gate_blocked_until(now).is_none());
-
-        // 429 with no Retry-After → default 5-minute cooldown.
-        claude_gate_record_rate_limit(None, now);
-        let until = claude_gate_blocked_until(now).unwrap();
-        assert_eq!((until - now).num_seconds(), 300);
-
-        // No cached snapshot yet → countdown error.
-        let fallback = claude_gate_fallback(until, now);
-        assert!(fallback.error.unwrap().contains("~300s"));
-        assert!(fallback.windows.is_empty());
-
-        // Cooldown expiry clears the gate lazily.
-        let later = now + chrono::Duration::seconds(301);
-        assert!(claude_gate_blocked_until(later).is_none());
-
-        // Success caches the display-ready snapshot; a later 429 returns those
-        // rows unchanged, without another enrichment/history pass, while dropping
-        // stale account evidence from the earlier authenticated poll.
-        let scope_store = TestRefreshScope::new("claude", "cached-429");
-        let account_scope = scope_store
-            .resolve_current("fixture", "cached-429", b"cached-429-marker")
-            .unwrap();
-        let reset = now + chrono::Duration::days(1);
-        let mut snapshot = AgentUsageSnapshot {
-            client_id: "claude".to_string(),
+    fn cache_test_snapshot(
+        client_id: &str,
+        account_scope: Result<AccountScope, AccountScopeError>,
+        now: DateTime<Utc>,
+    ) -> AgentUsageSnapshot {
+        AgentUsageSnapshot {
+            client_id: client_id.to_string(),
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            identity: None,
-            account_scope: Ok(account_scope),
-            windows: vec![UsageWindow::from_used_percent(
+            identity: Some(AgentIdentity {
+                email: Some("fixture@example.invalid".to_string()),
+                plan: Some("Fixture".to_string()),
+            }),
+            account_scope,
+            windows: vec![UsageWindow::from_provider_used_percent(
                 "Session".to_string(),
                 20.0,
-                Some(reset),
+                Some(now + chrono::Duration::hours(5)),
                 now,
             )
-            .with_identity("session.v1", Some("session.v1".to_string()))
-            .with_duration_evidence(
-                now,
-                true,
+            .with_identity(
+                "main.session.v1",
+                Some("main.session.v1".to_string()),
                 None,
-                Some(DurationEvidence::contract(86_400)),
+                Some(DurationEvidence::contract(300 * 60)),
             )],
-            credits: None,
+            credits: Some(CreditsSnapshot {
+                remaining: Some(-2.5),
+                unlimited: false,
+            }),
             error: None,
-        };
-        let record_calls = std::cell::Cell::new(0);
-        enrich_snapshot_with(
-            &mut snapshot,
-            now,
-            |active, observations, batch_now| {
-                record_calls.set(record_calls.get() + 1);
-                assert_eq!(batch_now, now.timestamp());
-                assert_eq!(active.len(), 1);
-                assert_eq!(observations.len(), 1);
-                Ok(vec![Ok((
-                    HistoryOutcome::Ready {
-                        duration_seconds: 86_400,
-                        source: DurationSource::Contract,
-                        sampled: true,
-                    },
-                    Some(HistoricalPace {
-                        expected_percent: 35.0,
-                        eta_seconds: None,
-                        will_last_to_reset: true,
-                        run_out_probability: Some(0.42),
-                    }),
-                    6,
-                ))])
+            transport_diagnostic: None,
+        }
+    }
+
+    fn claude_test_login_credentials() -> ClaudeCredentials {
+        ClaudeCredentials {
+            access_token: "claude-access".to_string(),
+            refresh_token: Some("claude-refresh".to_string()),
+            expires_at: None,
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+            subscription_type: None,
+            source: ClaudeCredentialSource::File,
+            raw_root: None,
+            keychain_account: None,
+            scope_slot: CredentialSlot {
+                semantic_source: "fixture",
+                canonical_location: "fixture".to_string(),
+            },
+        }
+    }
+
+    fn claude_test_setup_token() -> ResolvedClaudeToken {
+        ResolvedClaudeToken {
+            access_token: "setup-access".to_string(),
+            scope_slot: CredentialSlot {
+                semantic_source: "fixture-setup",
+                canonical_location: "fixture-setup".to_string(),
+            },
+        }
+    }
+
+    fn claude_test_success_outcome() -> ProviderFetchOutcome {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        ProviderFetchOutcome::Success {
+            snapshot: cache_test_snapshot("claude", Err(AccountScopeError::NoTrustedEvidence), now),
+            cache_binding: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_login_precedence_falls_through_only_for_absent_credentials() {
+        {
+            let primary_calls = std::cell::Cell::new(0);
+            let setup_loads = std::cell::Cell::new(0);
+            let setup_calls = std::cell::Cell::new(0);
+            let (source, outcome) = fetch_claude_login_or_setup_with(
+                resolve_stored_claude_login("{", ClaudeCredentialSource::File),
+                |_| async {
+                    primary_calls.set(primary_calls.get() + 1);
+                    ("oauth", claude_test_success_outcome())
+                },
+                || {
+                    setup_loads.set(setup_loads.get() + 1);
+                    Ok(Some(claude_test_setup_token()))
+                },
+                |_| async {
+                    setup_calls.set(setup_calls.get() + 1);
+                    ("setup-token", claude_test_success_outcome())
+                },
+            )
+            .await;
+            assert_eq!(source, "oauth");
+            assert!(matches!(
+                outcome,
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::Terminal { .. })
+            ));
+            assert_eq!(primary_calls.get(), 0);
+            assert_eq!(setup_loads.get(), 0);
+            assert_eq!(setup_calls.get(), 0);
+        }
+
+        for (label, primary_outcome) in [
+            (
+                "401",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+                    "Claude OAuth token expired or invalid. Run `claude` to re-authenticate.",
+                )),
+            ),
+            (
+                "transient",
+                ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
+                    "Claude usage request failed. Retrying automatically.",
+                    None,
+                    SafeTransportDiagnostic::server_error(503),
+                )),
+            ),
+        ] {
+            let primary_calls = std::cell::Cell::new(0);
+            let setup_loads = std::cell::Cell::new(0);
+            let setup_calls = std::cell::Cell::new(0);
+            let (source, outcome) = fetch_claude_login_or_setup_with(
+                ClaudeLoginResolution::Ready(claude_test_login_credentials()),
+                |_| {
+                    primary_calls.set(primary_calls.get() + 1);
+                    async move { ("oauth", primary_outcome) }
+                },
+                || {
+                    setup_loads.set(setup_loads.get() + 1);
+                    Ok(Some(claude_test_setup_token()))
+                },
+                |_| async {
+                    setup_calls.set(setup_calls.get() + 1);
+                    ("setup-token", claude_test_success_outcome())
+                },
+            )
+            .await;
+            assert_eq!(source, "oauth", "{label}");
+            match label {
+                "401" => assert!(matches!(
+                    outcome,
+                    ProviderFetchOutcome::Failure(ProviderFetchFailure::Terminal { .. })
+                )),
+                _ => assert!(matches!(
+                    outcome,
+                    ProviderFetchOutcome::Failure(ProviderFetchFailure::Transient { .. })
+                )),
+            }
+            assert_eq!(primary_calls.get(), 1, "{label}");
+            assert_eq!(setup_loads.get(), 0, "{label}");
+            assert_eq!(setup_calls.get(), 0, "{label}");
+        }
+
+        {
+            let primary_calls = std::cell::Cell::new(0);
+            let setup_loads = std::cell::Cell::new(0);
+            let setup_calls = std::cell::Cell::new(0);
+            let logged_out = resolve_stored_claude_login(
+                r#"{"claudeAiOauth":{"refreshToken":"stale"}}"#,
+                ClaudeCredentialSource::File,
+            );
+            assert!(matches!(logged_out, ClaudeLoginResolution::ExplicitLogout));
+            let (source, outcome) = fetch_claude_login_or_setup_with(
+                logged_out,
+                |_| async {
+                    primary_calls.set(primary_calls.get() + 1);
+                    ("oauth", claude_test_success_outcome())
+                },
+                || {
+                    setup_loads.set(setup_loads.get() + 1);
+                    Ok(Some(claude_test_setup_token()))
+                },
+                |_| async {
+                    setup_calls.set(setup_calls.get() + 1);
+                    ("setup-token", claude_test_success_outcome())
+                },
+            )
+            .await;
+            assert_eq!(source, "setup-token");
+            assert!(matches!(outcome, ProviderFetchOutcome::Success { .. }));
+            assert_eq!(primary_calls.get(), 0);
+            assert_eq!(setup_loads.get(), 1);
+            assert_eq!(setup_calls.get(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_keychain_logout_blocks_stale_file_login_and_allows_setup_token() {
+        const VALID_FILE_LOGIN: &str =
+            r#"{"claudeAiOauth":{"accessToken":"file-access","refreshToken":"file-refresh"}}"#;
+
+        for malformed in [
+            r#"{"claudeAiOauth":{}}"#,
+            r#"{"claudeAiOauth":{"accessToken":null}}"#,
+        ] {
+            assert!(matches!(
+                resolve_stored_claude_login(malformed, ClaudeCredentialSource::Keychain),
+                ClaudeLoginResolution::Terminal
+            ));
+        }
+
+        let missing_file_loads = std::cell::Cell::new(0);
+        let missing = load_stored_claude_login_with(
+            || Ok(None),
+            || {
+                missing_file_loads.set(missing_file_loads.get() + 1);
+                Ok(Some(VALID_FILE_LOGIN.to_string()))
             },
         );
-        assert_eq!(record_calls.get(), 1);
-        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Available);
-        claude_gate_record_success(&snapshot);
-        assert!(claude_gate_blocked_until(later).is_none());
-        claude_gate_record_rate_limit(Some(later + chrono::Duration::seconds(60)), later);
-        let until = claude_gate_blocked_until(later).unwrap();
-        let fallback = claude_gate_fallback(until, later);
-        assert_eq!(record_calls.get(), 1);
-        assert!(fallback.error.is_none());
+        assert!(matches!(
+            missing,
+            ClaudeLoginResolution::Ready(ClaudeCredentials {
+                source: ClaudeCredentialSource::File,
+                ..
+            })
+        ));
+        assert_eq!(missing_file_loads.get(), 1);
+
+        let file_loads = std::cell::Cell::new(0);
+        let login = load_stored_claude_login_with(
+            || {
+                Ok(Some(
+                    r#"{"claudeAiOauth":{"refreshToken":"stale-file-shape"}}"#.to_string(),
+                ))
+            },
+            || {
+                file_loads.set(file_loads.get() + 1);
+                Ok(Some(VALID_FILE_LOGIN.to_string()))
+            },
+        );
+        assert!(matches!(login, ClaudeLoginResolution::ExplicitLogout));
+        assert_eq!(file_loads.get(), 0);
+
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let scope = TestRefreshScope::new("claude", "keychain-explicit-logout");
+        let binding = ProviderCacheBinding::primary(
+            scope
+                .resolve_current("fixture", "logged-in-account", b"marker")
+                .unwrap(),
+        );
+        let mut gate = ClaudeUsageGate::default();
+        gate.record_rate_limit(binding.clone(), None, now);
+        assert!(gate.blocked_until_for(&binding, now).is_some());
+        clear_claude_gate_for_login_resolution(&login, &mut gate);
+        assert!(gate.blocked_until_for(&binding, now).is_none());
+
+        let oauth_calls = std::cell::Cell::new(0);
+        let setup_loads = std::cell::Cell::new(0);
+        let setup_calls = std::cell::Cell::new(0);
+        let (source, outcome) = fetch_claude_login_or_setup_with(
+            login,
+            |_| async {
+                oauth_calls.set(oauth_calls.get() + 1);
+                ("oauth", claude_test_success_outcome())
+            },
+            || {
+                setup_loads.set(setup_loads.get() + 1);
+                Ok(Some(claude_test_setup_token()))
+            },
+            |_| async {
+                setup_calls.set(setup_calls.get() + 1);
+                ("setup-token", claude_test_success_outcome())
+            },
+        )
+        .await;
+        assert_eq!(source, "setup-token");
+        assert!(matches!(outcome, ProviderFetchOutcome::Success { .. }));
+        assert_eq!(oauth_calls.get(), 0);
+        assert_eq!(setup_loads.get(), 1);
+        assert_eq!(setup_calls.get(), 1);
+        scope.cleanup();
+    }
+
+    fn timeout_diagnostic() -> SafeTransportDiagnostic {
+        SafeTransportDiagnostic::from_facts(TransportErrorFacts::synthetic(
+            true,
+            false,
+            TransportPhase::Request,
+            None,
+        ))
+    }
+
+    #[test]
+    fn last_good_same_binding_fallback_preserves_clean_snapshot_without_enrichment() {
+        let scope = TestRefreshScope::new("codex", "last-good-same-binding");
+        let account_scope = scope
+            .resolve_current("fixture", "account-a", b"marker-a")
+            .unwrap();
+        let binding = ProviderCacheBinding::primary(account_scope.clone());
+        let cache = Mutex::new(ProviderLastGoodCache::default());
+        let fresh_at = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let failure_at = fresh_at + chrono::Duration::minutes(1);
+        let enrich_calls = std::cell::Cell::new(0);
+
+        let fresh = apply_provider_outcome_with(
+            &cache,
+            "codex",
+            "oauth",
+            fresh_at,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot("codex", Ok(account_scope), fresh_at),
+                cache_binding: Some(binding.clone()),
+            },
+            |snapshot| {
+                enrich_calls.set(enrich_calls.get() + 1);
+                snapshot.windows[0].pace_status = PaceStatusPayload {
+                    state: PaceState::Available,
+                    window_key: Some("main.session.v1".to_string()),
+                    duration_seconds: Some(300 * 60),
+                    duration_source: Some(DurationSource::Contract),
+                    complete_cycles: 6,
+                    reason: None,
+                };
+                snapshot.windows[0].historical_pace = Some(HistoricalPacePayload {
+                    expected_used_percent: 35.0,
+                    eta_seconds: Some(1_800.0),
+                    will_last_to_reset: false,
+                    run_out_probability: Some(0.42),
+                });
+            },
+        )
+        .unwrap();
+        assert_eq!(enrich_calls.get(), 1);
+
+        let fallback = apply_provider_outcome_with(
+            &cache,
+            "codex",
+            "oauth",
+            failure_at,
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
+                "Codex usage request failed. Retrying automatically.",
+                Some(binding.clone()),
+                timeout_diagnostic(),
+            )),
+            |_| enrich_calls.set(enrich_calls.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(enrich_calls.get(), 1);
+        assert_eq!(fallback.updated_at, fresh.updated_at);
+        assert_eq!(fallback.source, fresh.source);
+        assert_eq!(
+            fallback.identity.as_ref().unwrap().plan.as_deref(),
+            Some("Fixture")
+        );
         assert_eq!(fallback.windows.len(), 1);
-        assert_eq!(fallback.windows[0].label, "Session");
-        assert_eq!(fallback.windows[0].card_id, "session.v1");
-        assert_eq!(fallback.windows[0].used_percent, 20.0);
-        assert_eq!(fallback.windows[0].remaining_percent, 80.0);
-        assert_eq!(fallback.windows[0].pace_status.state, PaceState::Available);
         assert_eq!(fallback.windows[0].pace_status.complete_cycles, 6);
         assert_eq!(
             fallback.windows[0]
@@ -5662,14 +4867,378 @@ mod tests {
                 .map(|pace| pace.expected_used_percent),
             Some(35.0)
         );
+        assert_eq!(
+            fallback
+                .credits
+                .as_ref()
+                .and_then(|credits| credits.remaining),
+            Some(-2.5)
+        );
         assert!(matches!(
-            &fallback.account_scope,
+            fallback.account_scope,
             Err(AccountScopeError::NoTrustedEvidence)
         ));
+        assert!(fallback.error.is_some());
+        assert_eq!(
+            fallback
+                .transport_diagnostic
+                .map(|diagnostic| diagnostic.category),
+            Some(TransportCategory::Timeout)
+        );
 
-        // Leave the gate clean for any other test touching the static.
-        claude_gate_record_success(&snapshot);
-        scope_store.cleanup();
+        let cached = lock_last_good(&cache)
+            .entries
+            .get("codex")
+            .unwrap()
+            .snapshot
+            .clone();
+        assert!(cached.error.is_none());
+        assert!(cached.transport_diagnostic.is_none());
+        drop(cached);
+
+        let fallback_again = apply_provider_outcome_with(
+            &cache,
+            "codex",
+            "oauth",
+            failure_at + chrono::Duration::minutes(1),
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
+                "Codex usage request failed. Retrying automatically.",
+                Some(binding),
+                SafeTransportDiagnostic::server_error(503),
+            )),
+            |_| enrich_calls.set(enrich_calls.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(enrich_calls.get(), 1);
+        assert_eq!(fallback_again.updated_at, fresh.updated_at);
+        assert_eq!(fallback_again.windows[0].pace_status.complete_cycles, 6);
+        scope.cleanup();
+    }
+
+    #[test]
+    fn last_good_mismatch_unbound_terminal_and_absent_clear_cache() {
+        let scope = TestRefreshScope::new("codex", "last-good-clear");
+        let scope_a = scope
+            .resolve_current("fixture", "account-a", b"marker-a")
+            .unwrap();
+        let scope_b = scope
+            .resolve_current("fixture", "account-b", b"marker-b")
+            .unwrap();
+        let binding_a = ProviderCacheBinding::primary(scope_a.clone());
+        let binding_b = ProviderCacheBinding::primary(scope_b);
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+
+        for failure in [
+            ProviderFetchFailure::transient("mismatch", Some(binding_b), timeout_diagnostic()),
+            ProviderFetchFailure::transient("unbound", None, timeout_diagnostic()),
+            ProviderFetchFailure::terminal("terminal"),
+        ] {
+            let cache = Mutex::new(ProviderLastGoodCache::default());
+            apply_provider_outcome_with(
+                &cache,
+                "codex",
+                "oauth",
+                now,
+                ProviderFetchOutcome::Success {
+                    snapshot: cache_test_snapshot("codex", Ok(scope_a.clone()), now),
+                    cache_binding: Some(binding_a.clone()),
+                },
+                |_| {},
+            );
+            let result = apply_provider_outcome_with(
+                &cache,
+                "codex",
+                "oauth",
+                now + chrono::Duration::seconds(1),
+                ProviderFetchOutcome::Failure(failure),
+                |_| panic!("failure must not enrich"),
+            )
+            .unwrap();
+            assert!(result.windows.is_empty());
+            assert!(!lock_last_good(&cache).entries.contains_key("codex"));
+        }
+
+        let cache = Mutex::new(ProviderLastGoodCache::default());
+        apply_provider_outcome_with(
+            &cache,
+            "codex",
+            "oauth",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot("codex", Ok(scope_a), now),
+                cache_binding: Some(binding_a),
+            },
+            |_| {},
+        );
+        assert!(apply_provider_outcome_with(
+            &cache,
+            "codex",
+            "oauth",
+            now,
+            ProviderFetchOutcome::Absent,
+            |_| panic!("absent must not enrich"),
+        )
+        .is_none());
+        assert!(!lock_last_good(&cache).entries.contains_key("codex"));
+        scope.cleanup();
+    }
+
+    #[test]
+    fn uncacheable_or_invalid_success_clears_prior_last_good() {
+        let scope = TestRefreshScope::new("antigravity", "last-good-uncacheable");
+        let account_scope = scope
+            .resolve_current("fixture", "account-a", b"marker-a")
+            .unwrap();
+        let binding = ProviderCacheBinding::primary(account_scope.clone());
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+
+        let cache = Mutex::new(ProviderLastGoodCache::default());
+        apply_provider_outcome_with(
+            &cache,
+            "antigravity",
+            "oauth",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot("antigravity", Ok(account_scope.clone()), now),
+                cache_binding: Some(binding.clone()),
+            },
+            |_| {},
+        );
+        let anonymous = apply_provider_outcome_with(
+            &cache,
+            "antigravity",
+            "local",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot(
+                    "antigravity",
+                    Err(AccountScopeError::NoTrustedEvidence),
+                    now,
+                ),
+                cache_binding: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(anonymous.windows.len(), 1);
+        assert!(!lock_last_good(&cache).entries.contains_key("antigravity"));
+
+        apply_provider_outcome_with(
+            &cache,
+            "antigravity",
+            "oauth",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot("antigravity", Ok(account_scope.clone()), now),
+                cache_binding: Some(binding.clone()),
+            },
+            |_| {},
+        );
+        let mut empty = cache_test_snapshot("antigravity", Ok(account_scope.clone()), now);
+        empty.windows.clear();
+        let live_empty = apply_provider_outcome_with(
+            &cache,
+            "antigravity",
+            "oauth",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: empty,
+                cache_binding: Some(binding.clone()),
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(live_empty.windows.is_empty());
+        assert!(!lock_last_good(&cache).entries.contains_key("antigravity"));
+
+        apply_provider_outcome_with(
+            &cache,
+            "antigravity",
+            "oauth",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot("antigravity", Ok(account_scope), now),
+                cache_binding: Some(binding),
+            },
+            |_| {},
+        );
+        let enrich_calls = std::cell::Cell::new(0);
+        let invalid = apply_provider_outcome_with(
+            &cache,
+            "antigravity",
+            "oauth",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot(
+                    "antigravity",
+                    Err(AccountScopeError::MetadataRead),
+                    now,
+                ),
+                cache_binding: None,
+            },
+            |_| enrich_calls.set(enrich_calls.get() + 1),
+        )
+        .unwrap();
+        assert!(invalid.windows.is_empty());
+        assert_eq!(enrich_calls.get(), 0);
+        assert!(!lock_last_good(&cache).entries.contains_key("antigravity"));
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn status_before_body_enforces_terminal_transient_and_claude_exception() {
+        use std::cell::Cell;
+
+        for status in [401, 403, 418, 429, 500, 503] {
+            let reads = Cell::new(0);
+            let result = read_response_body(status, false, || async {
+                reads.set(reads.get() + 1);
+                Ok("sensitive body".to_string())
+            })
+            .await;
+            assert_eq!(reads.get(), 0, "status {status} must not read body");
+            match status {
+                429 | 500 | 503 => {
+                    assert!(matches!(result, Err(ResponseReadFailure::Transient(_))))
+                }
+                _ => assert_eq!(result, Err(ResponseReadFailure::Terminal(status))),
+            }
+        }
+
+        let reads = Cell::new(0);
+        let body = read_response_body(200, false, || async {
+            reads.set(reads.get() + 1);
+            Ok("success".to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(body, "success");
+        assert_eq!(reads.get(), 1);
+
+        let reads = Cell::new(0);
+        let failure = read_response_body(200, false, || async {
+            reads.set(reads.get() + 1);
+            Err(TransportErrorFacts::synthetic(
+                false,
+                false,
+                TransportPhase::ResponseBody,
+                Some(54),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(reads.get(), 1);
+        assert!(matches!(
+            failure,
+            ResponseReadFailure::Transient(SafeTransportDiagnostic {
+                category: TransportCategory::ConnectionReset,
+                os_code: Some(54),
+                ..
+            })
+        ));
+
+        let reads = Cell::new(0);
+        let body = read_response_body(403, true, || async {
+            reads.set(reads.get() + 1);
+            Ok("missing user:profile".to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(body, "missing user:profile");
+        assert_eq!(reads.get(), 1);
+
+        let reads = Cell::new(0);
+        let failure = read_response_body(403, true, || async {
+            reads.set(reads.get() + 1);
+            Err(TransportErrorFacts::synthetic(
+                true,
+                false,
+                TransportPhase::ResponseBody,
+                None,
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(failure, ResponseReadFailure::Terminal(403));
+    }
+
+    #[tokio::test]
+    async fn verified_binding_failure_prevents_every_provider_request() {
+        for provider in ["codex", "claude", "grok", "copilot", "antigravity"] {
+            let sends = std::cell::Cell::new(0);
+            let result: Result<(), &str> =
+                request_after_verified_binding(Err::<(), _>("scope unavailable"), |()| async {
+                    sends.set(sends.get() + 1);
+                    Ok(())
+                })
+                .await;
+            assert_eq!(result, Err("scope unavailable"), "{provider}");
+            assert_eq!(sends.get(), 0, "{provider}");
+        }
+    }
+
+    #[test]
+    fn structured_transport_diagnostic_serializes_only_allowlisted_fields() {
+        let diagnostic = SafeTransportDiagnostic::from_facts(TransportErrorFacts::synthetic(
+            false,
+            true,
+            TransportPhase::Request,
+            Some(61),
+        ));
+        let wire = serde_json::to_string(&diagnostic).unwrap();
+        assert_eq!(wire, r#"{"category":"connectionRefused","osCode":61}"#);
+        for secret in [
+            "token-secret",
+            "Authorization",
+            "https://example.invalid/path?query=secret#fragment",
+            "user@example.invalid",
+            "account-123",
+            "/private/credential/path",
+        ] {
+            assert!(!wire.contains(secret));
+        }
+        assert_eq!(
+            serde_json::to_value(SafeTransportDiagnostic::rate_limited(429)).unwrap(),
+            serde_json::json!({ "category": "rateLimited", "status": 429 })
+        );
+        assert_eq!(
+            serde_json::to_value(SafeTransportDiagnostic::server_error(503)).unwrap(),
+            serde_json::json!({ "category": "serverError", "status": 503 })
+        );
+    }
+
+    #[test]
+    fn codex_credit_is_usable_only_when_balance_is_finite() {
+        let credits = |balance, unlimited| CodexCredits { balance, unlimited };
+
+        assert_eq!(
+            finite_codex_balance(Some(&credits(Some(12.5), false))),
+            Some(12.5)
+        );
+        assert_eq!(
+            finite_codex_balance(Some(&credits(Some(-2.5), false))),
+            Some(-2.5),
+            "finite negative balances preserve the existing present-credit semantics"
+        );
+        assert_eq!(
+            finite_codex_balance(Some(&credits(Some(0.0), false))),
+            Some(0.0)
+        );
+        assert_eq!(
+            finite_codex_balance(Some(&credits(Some(f64::NAN), false))),
+            None
+        );
+        assert_eq!(
+            finite_codex_balance(Some(&credits(Some(f64::INFINITY), false))),
+            None
+        );
+        assert_eq!(
+            finite_codex_balance(Some(&credits(None, true))),
+            None,
+            "unlimited without a balance is not usable credit"
+        );
+        assert_eq!(finite_codex_balance(None), None);
     }
 
     #[test]
@@ -5690,77 +5259,180 @@ mod tests {
         let windows = codex_windows(Some(&rate_limit), None, now);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "Session");
-        assert_eq!(windows[0].card_id_for_test(), "main.session.v1");
-        assert_eq!(
-            windows[0].pace_window_key_for_test(),
-            Some("main.session.v1")
-        );
         assert_eq!(windows[0].remaining_percent, 92.0);
-        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
-        assert_eq!(
-            windows[0].pace_status.duration_source,
-            Some(DurationSource::Provider)
-        );
+        assert_eq!(windows[0].window_minutes, Some(300));
         assert_eq!(windows[1].label, "Weekly");
-        assert_eq!(windows[1].card_id_for_test(), "main.weekly.v1");
-        assert_eq!(
-            windows[1].pace_window_key_for_test(),
-            Some("main.weekly.v1")
-        );
         assert_eq!(windows[1].remaining_percent, 65.0);
-        assert_eq!(windows[1].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(windows[1].pace_status.duration_seconds, Some(604_800));
-        assert_eq!(
-            windows[1].pace_status.duration_source,
-            Some(DurationSource::Provider)
-        );
+        assert_eq!(windows[1].window_minutes, Some(10_080));
     }
 
     #[test]
-    fn agent_usage_payload_omits_legacy_history_fields() {
+    fn stage0_freezes_codex_duration_roles_and_unknown_window_baseline() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let rate_limit = CodexRateLimit {
+        let reversed = CodexRateLimit {
             primary_window: Some(CodexWindow {
                 used_percent: 35.0,
                 reset_at: 1_700_172_800,
                 limit_window_seconds: 604_800,
             }),
+            secondary_window: Some(CodexWindow {
+                used_percent: 8.0,
+                reset_at: 1_700_005_400,
+                limit_window_seconds: 18_000,
+            }),
+        };
+        let windows = codex_windows(Some(&reversed), None, now);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Session", "codex.main.18000.session");
+        assert_eq!(windows[0].card_id, "main.session.v1");
+        assert_eq!(windows[0].window_key.as_deref(), Some("main.session.v1"));
+        assert_eq!(windows[0].window_minutes, Some(300));
+        assert_eq!(windows[1].label, "Weekly", "codex.main.604800.weekly");
+        assert_eq!(windows[1].card_id, "main.weekly.v1");
+        assert_eq!(windows[1].window_key.as_deref(), Some("main.weekly.v1"));
+        assert_eq!(windows[1].window_minutes, Some(10_080));
+
+        let unknown_rate_limit = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 10.0,
+                reset_at: now.timestamp() + 3_600,
+                limit_window_seconds: 3_600,
+            }),
             secondary_window: None,
         };
-        let payload = AgentUsagePayload {
-            generated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            agents: vec![AgentUsageSnapshot {
-                client_id: "codex".to_string(),
-                source: "oauth".to_string(),
-                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                identity: None,
-                account_scope: Err(AccountScopeError::NoTrustedEvidence),
-                windows: codex_windows(Some(&rate_limit), None, now),
-                credits: None,
-                error: None,
-            }],
-            opencode_subscriptions: Vec::new(),
+        let unknown = codex_windows(Some(&unknown_rate_limit), None, now);
+        assert_eq!(unknown.len(), 1);
+        let unknown = &unknown[0];
+        assert_eq!(unknown.card_id, "row.main.primary.v1");
+        assert_eq!(unknown.window_key, None);
+        assert_eq!(unknown.window_minutes, None);
+        assert_eq!(unknown.pace_status.state, PaceState::Unavailable);
+        assert_eq!(
+            unknown.pace_status.reason.as_deref(),
+            Some("windowIdentity")
+        );
+        let wire = serde_json::to_value(unknown).unwrap();
+        assert_eq!(wire["cardId"], "row.main.primary.v1");
+        assert!(wire["paceStatus"].get("windowKey").is_none());
+        assert_eq!(wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
+    }
+
+    #[test]
+    fn serializes_nested_historical_pace_without_legacy_scalars() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let mut window = UsageWindow::from_used_percent(
+            "Weekly".to_string(),
+            60.0,
+            Some(now + chrono::Duration::hours(12)),
+            now,
+            Some(10_080),
+        )
+        .with_identity(
+            "weekly.v1",
+            Some("weekly.v1".to_string()),
+            None,
+            Some(DurationEvidence::contract(10_080 * 60)),
+        );
+        window.pace_status.state = PaceState::Available;
+        window.historical_pace = Some(HistoricalPacePayload {
+            expected_used_percent: 55.0,
+            eta_seconds: Some(3_600.0),
+            will_last_to_reset: false,
+            run_out_probability: Some(0.8),
+        });
+
+        let value = serde_json::to_value(&window).unwrap();
+        assert!(value.get("historicalPace").is_some());
+        assert!(value.get("historicalExpectedPercent").is_none());
+        assert!(value.get("runOutProbability").is_none());
+        let historical = value.get("historicalPace").unwrap();
+        assert_eq!(historical["expectedUsedPercent"], 55.0);
+        assert_eq!(historical["etaSeconds"], 3_600.0);
+        assert_eq!(historical["willLastToReset"], false);
+        assert_eq!(historical["runOutProbability"], 0.8);
+    }
+
+    #[test]
+    fn stage1_credential_markers_follow_the_frozen_provider_routes() {
+        let slot = CredentialSlot {
+            semantic_source: "fixture",
+            canonical_location: "fixture".to_string(),
         };
-        let serialized = serde_json::to_value(payload).unwrap();
-        let weekly = serialized["agents"][0]["windows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|window| window["label"] == "Weekly")
-            .expect("normal Codex Weekly mapping");
-        let object = weekly.as_object().unwrap();
-        assert_eq!(object["cardId"], "main.weekly.v1");
-        assert_eq!(object["usedPercent"], 35.0);
-        assert_eq!(object["remainingPercent"], 65.0);
-        assert_eq!(object["paceStatus"]["state"], "learningHistory");
-        assert_eq!(object["paceStatus"]["windowKey"], "main.weekly.v1");
-        assert_eq!(object["paceStatus"]["durationSeconds"], 604_800);
-        assert_eq!(object["paceStatus"]["durationSource"], "provider");
-        assert_eq!(object["windowMinutes"], 10_080);
-        assert!(!object.contains_key("historicalExpectedPercent"));
-        assert!(!object.contains_key("runOutProbability"));
-        assert!(!object.contains_key("historicalPace"));
+        let codex = CodexCredentials {
+            access_token: "codex-access".to_string(),
+            refresh_token: Some("codex-refresh".to_string()),
+            id_token: None,
+            account_id: None,
+            last_refresh: None,
+            auth_path: PathBuf::new(),
+            raw_json: Value::Null,
+            scope_slot: slot.clone(),
+        };
+        assert_eq!(codex.scope_marker(), b"codex-refresh");
+        let mut codex_access_only = codex.clone();
+        codex_access_only.refresh_token = None;
+        assert_eq!(codex_access_only.scope_marker(), b"codex-access");
+
+        let claude_login = ClaudeCredentials {
+            access_token: "claude-access".to_string(),
+            refresh_token: Some("claude-refresh".to_string()),
+            expires_at: None,
+            scopes: Vec::new(),
+            rate_limit_tier: None,
+            subscription_type: None,
+            source: ClaudeCredentialSource::File,
+            raw_root: None,
+            keychain_account: None,
+            scope_slot: slot.clone(),
+        };
+        assert_eq!(
+            claude_login.scope_marker(),
+            Some(b"claude-refresh".as_slice())
+        );
+        let mut login_without_refresh = claude_login.clone();
+        login_without_refresh.refresh_token = None;
+        assert_eq!(login_without_refresh.scope_marker(), None);
+
+        let claude_setup = ClaudeCredentials {
+            source: ClaudeCredentialSource::Environment,
+            scope_slot: slot,
+            ..login_without_refresh
+        };
+        assert_eq!(
+            claude_setup.scope_marker(),
+            Some(b"claude-access".as_slice())
+        );
+    }
+
+    #[test]
+    fn provider_cache_binding_requires_structural_exact_match() {
+        let scope_store = TestRefreshScope::new("codex", "binding-exact-match");
+        let primary_a = scope_store
+            .resolve_current("fixture", "primary-a", b"primary-a")
+            .unwrap();
+        let primary_b = scope_store
+            .resolve_current("fixture", "primary-b", b"primary-b")
+            .unwrap();
+        let corroborating_a = scope_store
+            .resolve_current("fixture", "corroborating-a", b"corroborating-a")
+            .unwrap();
+        let corroborating_b = scope_store
+            .resolve_current("fixture", "corroborating-b", b"corroborating-b")
+            .unwrap();
+
+        let full = ProviderCacheBinding::new(primary_a.clone(), Some(corroborating_a.clone()));
+        assert_eq!(full, full.clone());
+        assert_ne!(
+            full,
+            ProviderCacheBinding::new(primary_b, Some(corroborating_a.clone()))
+        );
+        assert_ne!(
+            full,
+            ProviderCacheBinding::new(primary_a.clone(), Some(corroborating_b))
+        );
+        assert_ne!(full, ProviderCacheBinding::primary(primary_a));
+        scope_store.cleanup();
     }
 
     #[test]
@@ -5781,89 +5453,175 @@ mod tests {
         let windows = codex_windows(None, Some(&[extra]), now);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label, "Codex Spark");
-        assert_eq!(
-            windows[0].card_id_for_test(),
-            format!(
-                "additional.{}.primary.v1",
-                sha256_hex("gpt-5.2-codex-spark")
-            )
-        );
         assert_eq!(windows[0].remaining_percent, 59.0);
-        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
+    }
+
+    #[test]
+    fn stage0_freezes_codex_additional_identity_baseline() {
+        let metered_only = CodexAdditionalRateLimit {
+            limit_name: None,
+            metered_feature: Some("gpt-5.2-codex-spark".to_string()),
+            rate_limit: None,
+        };
         assert_eq!(
-            windows[0].pace_status.duration_source,
-            Some(DurationSource::Provider)
+            additional_limit_label(&metered_only),
+            "Codex Spark",
+            "codex.additional.metered-feature.primary"
+        );
+
+        let named = CodexAdditionalRateLimit {
+            limit_name: Some("named-limit".to_string()),
+            metered_feature: Some("metered-feature".to_string()),
+            rate_limit: None,
+        };
+        assert_eq!(
+            additional_limit_label(&named),
+            "Named Limit",
+            "display label remains separate from the metered-feature identity"
+        );
+
+        let anonymous = CodexAdditionalRateLimit {
+            limit_name: None,
+            metered_feature: None,
+            rate_limit: None,
+        };
+        assert_eq!(additional_limit_source(&anonymous), None);
+
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let both_slots = CodexAdditionalRateLimit {
+            limit_name: Some("named-limit".to_string()),
+            metered_feature: Some(" metered-feature ".to_string()),
+            rate_limit: Some(CodexRateLimit {
+                primary_window: Some(CodexWindow {
+                    used_percent: 10.0,
+                    reset_at: 1_700_003_600,
+                    limit_window_seconds: 18_000,
+                }),
+                secondary_window: Some(CodexWindow {
+                    used_percent: 20.0,
+                    reset_at: 1_700_086_400,
+                    limit_window_seconds: 604_800,
+                }),
+            }),
+        };
+        assert_eq!(
+            additional_limit_source(&both_slots).as_deref(),
+            Some("metered-feature")
+        );
+        let windows = codex_windows(None, Some(&[both_slots]), now);
+        assert_eq!(
+            windows.len(),
+            2,
+            "codex.additional.primary-secondary emits both semantic slots"
+        );
+        let digest = sha256_hex("metered-feature".to_string());
+        let primary_key = format!("additional.{digest}.primary.v1");
+        let secondary_key = format!("additional.{digest}.secondary.v1");
+        assert_eq!(windows[0].card_id, primary_key);
+        assert_eq!(
+            windows[0].window_key.as_deref(),
+            Some(windows[0].card_id.as_str())
+        );
+        assert_eq!(windows[1].card_id, secondary_key);
+        assert_eq!(
+            windows[1].window_key.as_deref(),
+            Some(windows[1].card_id.as_str())
         );
     }
 
     #[test]
-    fn invalid_codex_duration_or_reset_evidence_fails_closed() {
+    fn codex_unknown_and_anonymous_windows_are_structural_and_skip_history() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        for (case, reset_at, duration_seconds) in [
-            ("duration", now.timestamp() + 3_600, 0),
-            ("reset", 0, 3_600),
-        ] {
-            let window = map_window_with_identity(
-                "Additional",
-                CodexWindow {
-                    used_percent: 25.0,
-                    reset_at,
-                    limit_window_seconds: duration_seconds,
-                },
-                now,
-                "additional.stable.primary.v1",
-                Some("additional.stable.primary.v1".to_string()),
-            )
-            .unwrap();
-            assert_eq!(window.pace_status.state, PaceState::Unavailable, "{case}");
-            assert_eq!(
-                window.pace_status.reason.as_deref(),
-                Some("invalidEvidence"),
-                "{case}"
-            );
-            assert!(window.pace_status.duration_seconds.is_none(), "{case}");
-            assert!(window.pace_status.duration_source.is_none(), "{case}");
-            assert!(
-                serde_json::to_value(window)
-                    .unwrap()
-                    .get("windowMinutes")
-                    .is_none(),
-                "{case}"
-            );
+        let unknown_main = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 5.0,
+                reset_at: now.timestamp() + 3_600,
+                limit_window_seconds: 3_600,
+            }),
+            secondary_window: None,
+        };
+        let anonymous = |primary_used: f64, secondary_used: f64| CodexAdditionalRateLimit {
+            limit_name: None,
+            metered_feature: None,
+            rate_limit: Some(CodexRateLimit {
+                primary_window: Some(CodexWindow {
+                    used_percent: primary_used,
+                    reset_at: now.timestamp() + 7_200,
+                    limit_window_seconds: 7_200,
+                }),
+                secondary_window: Some(CodexWindow {
+                    used_percent: secondary_used,
+                    reset_at: now.timestamp() + 86_400,
+                    limit_window_seconds: 86_400,
+                }),
+            }),
+        };
+        let windows = codex_windows(
+            Some(&unknown_main),
+            Some(&[anonymous(10.0, 20.0), anonymous(30.0, 40.0)]),
+            now,
+        );
+        assert_eq!(windows.len(), 3);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.card_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "row.main.primary.v1",
+                "row.additional.unknown.primary.v1",
+                "row.additional.unknown.secondary.v1"
+            ]
+        );
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.used_percent)
+                .collect::<Vec<_>>(),
+            vec![5.0, 10.0, 20.0],
+            "duplicate anonymous slots keep the provider-order first row"
+        );
+        for window in &windows[1..] {
+            assert_eq!(window.label_for_test(), "Unknown");
+            assert_ne!(window.label_for_test(), "Codex extra limit");
+        }
+        for window in &windows {
+            assert_eq!(window.window_key, None);
+            assert_eq!(window.pace_status.state, PaceState::Unavailable);
+            assert_eq!(window.pace_status.reason.as_deref(), Some("windowIdentity"));
         }
 
-        let unknown = map_window_with_identity(
-            "Unknown",
-            CodexWindow {
-                used_percent: 25.0,
-                reset_at: 0,
-                limit_window_seconds: 0,
-            },
-            now,
-            "row.additional.unknown.primary.v1",
-            None,
-        )
-        .unwrap();
-        assert_eq!(unknown.pace_reason_for_test(), Some("windowIdentity"));
+        let scope = TestRefreshScope::new("codex", "unknown-windows");
+        let account_scope = scope
+            .resolve_current("fixture", "unknown-windows", b"marker")
+            .unwrap();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "codex".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows,
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+        let history_calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, _, _| {
+            history_calls.set(history_calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(history_calls.get(), 0);
 
-        let reset = now + chrono::Duration::hours(1);
-        let mismatched =
-            UsageWindow::from_used_percent("Additional".to_string(), 25.0, Some(reset), now)
-                .with_identity(
-                    "additional.stable.primary.v1",
-                    Some("additional.stable.primary.v1".to_string()),
-                )
-                .with_duration_evidence(
-                    now,
-                    true,
-                    Some(DurationEvidence::provider(reset.timestamp() + 1, 3_600)),
-                    None,
-                );
-        assert_eq!(
-            mismatched.pace_status.reason.as_deref(),
-            Some("invalidEvidence")
-        );
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        let rows = wire["windows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(row["paceStatus"].get("windowKey").is_none());
+            assert_eq!(row["paceStatus"]["state"], "unavailable");
+            assert_eq!(row["paceStatus"]["reason"], "windowIdentity");
+        }
+        scope.cleanup();
     }
 
     #[test]
@@ -5902,7 +5660,7 @@ mod tests {
         credentials.refresh_token = Some("new-refresh".to_string());
         credentials.expires_at = Utc.timestamp_millis_opt(1_700_009_999_000).single();
 
-        let merged = merge_claude_credentials_json(&credentials).unwrap();
+        let merged = merge_claude_credentials_json(&credentials, raw).unwrap();
         let reparsed =
             parse_claude_credentials_data(&merged, ClaudeCredentialSource::File).unwrap();
         assert_eq!(reparsed.access_token, "new-access");
@@ -5914,6 +5672,47 @@ mod tests {
         // Untouched fields the Claude CLI wrote survive the merge.
         assert_eq!(reparsed.subscription_type.as_deref(), Some("pro"));
         assert_eq!(reparsed.scopes, vec!["user:profile"]);
+    }
+
+    #[test]
+    fn claude_keychain_write_decision_pins_account_and_rejects_target_mismatch() {
+        let raw_a = r#"{
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 0
+            },
+            "sibling": "a"
+        }"#;
+        let mut credentials =
+            parse_claude_credentials_data(raw_a, ClaudeCredentialSource::Keychain).unwrap();
+        credentials.keychain_account = Some("account-a".to_string());
+        credentials.access_token = "new-access".to_string();
+        credentials.refresh_token = Some("new-refresh".to_string());
+
+        let (account, merged) =
+            prepare_claude_keychain_write(&credentials, Some("account-a"), raw_a).unwrap();
+        assert_eq!(account, "account-a");
+        assert_eq!(
+            serde_json::from_str::<Value>(&merged).unwrap()["claudeAiOauth"]["accessToken"],
+            "new-access"
+        );
+
+        assert!(prepare_claude_keychain_write(&credentials, Some("account-b"), raw_a).is_err());
+        assert!(prepare_claude_keychain_write(&credentials, None, raw_a).is_err());
+
+        let raw_changed_target = r#"{
+            "claudeAiOauth": {
+                "accessToken": "account-b-access",
+                "refreshToken": "account-b-refresh",
+                "expiresAt": 0
+            },
+            "sibling": "b"
+        }"#;
+        assert!(
+            prepare_claude_keychain_write(&credentials, Some("account-a"), raw_changed_target,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5965,144 +5764,103 @@ mod tests {
         let windows = claude_windows(&usage, now);
         assert_eq!(windows.len(), 4);
         assert_eq!(windows[0].label, "Session");
-        assert_eq!(windows[0].card_id_for_test(), "session.v1");
-        assert_eq!(windows[0].pace_window_key_for_test(), Some("session.v1"));
         assert_eq!(windows[0].remaining_percent, 92.0);
-        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
-        assert_eq!(
-            windows[0].pace_status.duration_source,
-            Some(DurationSource::Contract)
-        );
         assert_eq!(windows[1].label, "Weekly");
-        assert_eq!(windows[1].card_id_for_test(), "weekly.v1");
-        assert_eq!(windows[1].pace_window_key_for_test(), Some("weekly.v1"));
         assert_eq!(windows[1].remaining_percent, 77.0);
-        assert_eq!(windows[1].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(windows[1].pace_status.duration_seconds, Some(604_800));
-        assert_eq!(
-            windows[1].pace_status.duration_source,
-            Some(DurationSource::Contract)
-        );
         assert_eq!(windows[2].label, "Sonnet");
-        assert_eq!(windows[2].card_id_for_test(), "sonnet.weekly.v1");
-        assert_eq!(windows[2].pace_reason_for_test(), Some("missingReset"));
         assert_eq!(windows[2].remaining_percent, 97.0);
         assert_eq!(windows[3].label, "Designs");
-        assert_eq!(windows[3].card_id_for_test(), "design.weekly.v1");
         assert_eq!(windows[3].remaining_percent, 100.0);
     }
 
     #[test]
-    fn claude_body_and_aliases_reject_invalid_utilization() {
+    fn stage4_claude_json_and_headers_share_canonical_duration_contracts() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let reset = (now + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
-        for invalid in [-1.0, 150.0, f64::NAN, f64::INFINITY] {
-            assert!(map_claude_window(
-                "Session",
-                "session.v1",
-                DurationEvidence::contract(18_000),
-                &ClaudeWindow {
-                    utilization: Some(invalid),
-                    resets_at: Some(reset.clone()),
-                },
-                now,
-            )
-            .is_none());
-        }
-
+        let reset = Some("2026-07-24T00:00:00Z".to_string());
+        let window = |utilization| ClaudeWindow {
+            utilization: Some(utilization),
+            resets_at: reset.clone(),
+        };
         let usage = ClaudeUsageResponse {
-            five_hour: Some(ClaudeWindow {
-                utilization: Some(150.0),
-                resets_at: Some(reset.clone()),
-            }),
-            seven_day: Some(ClaudeWindow {
-                utilization: Some(20.0),
-                resets_at: Some(reset.clone()),
-            }),
-            seven_day_design: Some(ClaudeWindow {
-                utilization: Some(f64::NAN),
-                resets_at: Some(reset.clone()),
-            }),
-            design: Some(ClaudeWindow {
-                utilization: Some(30.0),
-                resets_at: Some(reset.clone()),
-            }),
-            seven_day_routines: Some(ClaudeWindow {
-                utilization: Some(150.0),
-                resets_at: Some(reset.clone()),
-            }),
-            routines: Some(ClaudeWindow {
-                utilization: Some(40.0),
-                resets_at: Some(reset),
-            }),
+            five_hour: Some(window(5.0)),
+            seven_day: Some(window(10.0)),
+            seven_day_oauth_apps: Some(window(15.0)),
+            seven_day_sonnet: Some(window(20.0)),
+            seven_day_opus: Some(window(25.0)),
             ..Default::default()
         };
         let windows = claude_windows(&usage, now);
+        let contracts = windows
+            .iter()
+            .map(|window| {
+                (
+                    window.card_id.as_str(),
+                    window.pace_status.window_key.as_deref(),
+                    window.duration_seconds,
+                    window.duration_source,
+                    window.pace_status.state,
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            windows
-                .iter()
-                .map(|window| (window.label.as_str(), window.used_percent))
-                .collect::<Vec<_>>(),
+            contracts,
             vec![
-                ("Weekly", 20.0),
-                ("Designs", 30.0),
-                ("Daily Routines", 40.0)
+                (
+                    "session.v1",
+                    Some("session.v1"),
+                    Some(18_000),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "weekly.v1",
+                    Some("weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "oauth_apps.weekly.v1",
+                    Some("oauth_apps.weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "sonnet.weekly.v1",
+                    Some("sonnet.weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "opus.weekly.v1",
+                    Some("opus.weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
             ]
         );
-    }
 
-    #[test]
-    fn claude_extra_usage_is_explicitly_non_recurring() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let window = claude_extra_usage_window(
-            Some(&ClaudeExtraUsage {
-                is_enabled: true,
-                monthly_limit: Some(10_000.0),
-                used_credits: Some(2_500.0),
-                utilization: None,
-                currency: Some("USD".to_string()),
-            }),
-            now,
-        )
-        .unwrap();
-        assert_eq!(window.card_id, "extra_usage.v1");
-        assert_eq!(window.used_percent, 25.0);
-        assert_eq!(
-            window.reset_text.as_deref(),
-            Some("Monthly cap: $25.00 / $100.00")
-        );
-        assert_eq!(window.pace_status.state, PaceState::Unavailable);
-        assert_eq!(window.pace_reason_for_test(), Some("nonRecurring"));
-        let wire = serde_json::to_value(window).unwrap();
-        assert_eq!(wire["paceStatus"]["reason"], "nonRecurring");
-        assert!(wire.get("windowMinutes").is_none());
-    }
-
-    #[test]
-    fn invalid_claude_extra_usage_does_not_poison_valid_windows() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let usage = ClaudeUsageResponse {
-            five_hour: Some(ClaudeWindow {
-                utilization: Some(20.0),
-                resets_at: Some(
-                    (now + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
-                ),
-            }),
-            extra_usage: Some(ClaudeExtraUsage {
-                is_enabled: true,
-                monthly_limit: Some(10_000.0),
-                used_credits: Some(2_500.0),
-                utilization: Some(f64::NAN),
-                currency: Some("USD".to_string()),
-            }),
-            ..Default::default()
-        };
-
-        let windows = claude_windows(&usage, now);
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].card_id, "session.v1");
-        assert!(serde_json::to_value(windows).is_ok());
+        let headers = header_map(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.11"),
+            ("anthropic-ratelimit-unified-5h-reset", "1783111200"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
+            ("anthropic-ratelimit-unified-7d-reset", "1783504800"),
+        ]);
+        let header_windows = parse_unified_ratelimit_windows(&headers, now);
+        assert_eq!(header_windows.len(), 2);
+        for (window, expected_key, expected_duration) in [
+            (&header_windows[0], "session.v1", 18_000),
+            (&header_windows[1], "weekly.v1", 604_800),
+        ] {
+            assert_eq!(window.card_id, expected_key);
+            assert_eq!(window.pace_status.window_key.as_deref(), Some(expected_key));
+            assert_eq!(window.duration_seconds, Some(expected_duration));
+            assert_eq!(window.duration_source, Some(DurationSource::Contract));
+            assert_eq!(window.pace_status.state, PaceState::LearningHistory);
+        }
     }
 
     #[test]
@@ -6125,86 +5883,314 @@ mod tests {
     }
 
     #[test]
-    fn claude_named_and_alias_windows_use_exact_contract_durations() {
+    fn stage4_claude_weekly_alias_groups_share_canonical_contracts() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let reset = (now + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
-        let window = |utilization| ClaudeWindow {
-            utilization: Some(utilization),
-            resets_at: Some(reset.clone()),
-        };
-        let usage = ClaudeUsageResponse {
-            five_hour: Some(window(5.0)),
-            seven_day: Some(window(10.0)),
-            seven_day_oauth_apps: Some(window(15.0)),
-            seven_day_sonnet: Some(window(20.0)),
-            seven_day_opus: Some(window(25.0)),
-            seven_day_omelette: Some(window(30.0)),
-            seven_day_cowork: Some(window(35.0)),
-            ..Default::default()
-        };
-        let windows = claude_windows(&usage, now);
-        let expected = [
-            ("session.v1", 18_000),
-            ("weekly.v1", 604_800),
-            ("oauth_apps.weekly.v1", 604_800),
-            ("sonnet.weekly.v1", 604_800),
-            ("opus.weekly.v1", 604_800),
-            ("design.weekly.v1", 604_800),
-            ("routines.weekly.v1", 604_800),
+        let design_aliases = [
+            "seven_day_design",
+            "seven_day_claude_design",
+            "claude_design",
+            "design",
+            "seven_day_omelette",
+            "omelette",
+            "omelette_promotional",
         ];
-        assert_eq!(windows.len(), expected.len());
-        for (window, (key, duration)) in windows.iter().zip(expected) {
-            assert_eq!(window.card_id, key);
-            assert_eq!(window.pace_status.state, PaceState::LearningHistory);
-            assert_eq!(window.pace_status.duration_seconds, Some(duration));
-            assert_eq!(
-                window.pace_status.duration_source,
-                Some(DurationSource::Contract)
-            );
-        }
-
-        for (alias, label, key) in [
-            ("seven_day_design", "Designs", "design.weekly.v1"),
-            ("seven_day_claude_design", "Designs", "design.weekly.v1"),
-            ("claude_design", "Designs", "design.weekly.v1"),
-            ("design", "Designs", "design.weekly.v1"),
-            ("seven_day_omelette", "Designs", "design.weekly.v1"),
-            ("omelette", "Designs", "design.weekly.v1"),
-            ("omelette_promotional", "Designs", "design.weekly.v1"),
-            ("seven_day_routines", "Daily Routines", "routines.weekly.v1"),
-            (
-                "seven_day_claude_routines",
-                "Daily Routines",
-                "routines.weekly.v1",
-            ),
-            ("claude_routines", "Daily Routines", "routines.weekly.v1"),
-            ("routines", "Daily Routines", "routines.weekly.v1"),
-            ("routine", "Daily Routines", "routines.weekly.v1"),
-            ("seven_day_cowork", "Daily Routines", "routines.weekly.v1"),
-            ("cowork", "Daily Routines", "routines.weekly.v1"),
-        ] {
-            let raw = format!(r#"{{"{alias}":{{"utilization":12,"resets_at":"{reset}"}}}}"#);
+        for alias in design_aliases {
+            let raw =
+                format!(r#"{{"{alias}":{{"utilization":12,"resets_at":"2026-07-24T00:00:00Z"}}}}"#);
             let usage: ClaudeUsageResponse = serde_json::from_str(&raw).unwrap();
             let windows = claude_windows(&usage, now);
-            assert_eq!(windows.len(), 1, "{alias}");
-            assert_eq!(windows[0].label, label, "{alias}");
-            assert_eq!(windows[0].card_id, key, "{alias}");
+            assert_eq!(windows.len(), 1, "claude.design.aliases: {alias}");
             assert_eq!(
-                windows[0].pace_status.duration_seconds,
-                Some(604_800),
+                windows[0].label, "Designs",
+                "claude.design.aliases: {alias}"
+            );
+            assert_eq!(windows[0].card_id, "design.weekly.v1", "{alias}");
+            assert_eq!(
+                windows[0].pace_status.window_key.as_deref(),
+                Some("design.weekly.v1"),
                 "{alias}"
             );
+            assert_eq!(windows[0].duration_seconds, Some(604_800), "{alias}");
             assert_eq!(
-                windows[0].pace_status.duration_source,
+                windows[0].duration_source,
                 Some(DurationSource::Contract),
                 "{alias}"
             );
+            assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
+        }
+
+        let routines_aliases = [
+            "seven_day_routines",
+            "seven_day_claude_routines",
+            "claude_routines",
+            "routines",
+            "routine",
+            "seven_day_cowork",
+            "cowork",
+        ];
+        for alias in routines_aliases {
+            let raw =
+                format!(r#"{{"{alias}":{{"utilization":12,"resets_at":"2026-07-24T00:00:00Z"}}}}"#);
+            let usage: ClaudeUsageResponse = serde_json::from_str(&raw).unwrap();
+            let windows = claude_windows(&usage, now);
+            assert_eq!(windows.len(), 1, "claude.routines.aliases: {alias}");
             assert_eq!(
-                windows[0].pace_status.state,
-                PaceState::LearningHistory,
+                windows[0].label, "Daily Routines",
+                "claude.routines.aliases: {alias}"
+            );
+            assert_eq!(windows[0].card_id, "routines.weekly.v1", "{alias}");
+            assert_eq!(
+                windows[0].pace_status.window_key.as_deref(),
+                Some("routines.weekly.v1"),
                 "{alias}"
             );
+            assert_eq!(windows[0].duration_seconds, Some(604_800), "{alias}");
+            assert_eq!(
+                windows[0].duration_source,
+                Some(DurationSource::Contract),
+                "{alias}"
+            );
+            assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
         }
+    }
+
+    #[test]
+    fn stage0_freezes_claude_named_windows_and_invalid_baseline() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let raw = r#"{
+            "five_hour": { "utilization": 5, "resets_at": "2026-07-18T00:00:00Z" },
+            "seven_day": { "utilization": 10, "resets_at": "2026-07-19T00:00:00Z" },
+            "seven_day_oauth_apps": { "utilization": 15, "resets_at": "2026-07-20T00:00:00Z" },
+            "seven_day_sonnet": { "utilization": 20, "resets_at": "2026-07-21T00:00:00Z" },
+            "seven_day_opus": { "utilization": 25, "resets_at": "2026-07-22T00:00:00Z" }
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let windows = claude_windows(&usage, now);
+        let mapped: Vec<_> = windows
+            .iter()
+            .map(|window| (window.label.as_str(), window.window_minutes))
+            .collect();
+        assert_eq!(
+            mapped,
+            vec![
+                ("Session", Some(300)),
+                ("Weekly", Some(10_080)),
+                ("OAuth Apps", Some(10_080)),
+                ("Sonnet", Some(10_080)),
+                ("Opus", Some(10_080)),
+            ],
+            "claude.named-window-contracts"
+        );
+
+        let out_of_range = UsageWindow::from_used_percent(
+            "Out of range".to_string(),
+            150.0,
+            Some(now - chrono::Duration::seconds(1)),
+            now,
+            Some(-1),
+        );
+        assert_eq!(
+            out_of_range.used_percent, 100.0,
+            "invalid.out-of-range captures the current clamping baseline"
+        );
+        assert!(
+            out_of_range.resets_at.is_some(),
+            "invalid.expired-reset captures the current emitted baseline"
+        );
+        assert_eq!(
+            out_of_range.window_minutes, None,
+            "invalid.contradictory-duration is not emitted as legacy duration"
+        );
+
+        let non_finite =
+            UsageWindow::from_used_percent("Non-finite".to_string(), f64::NAN, None, now, None);
+        assert!(
+            non_finite.used_percent.is_nan(),
+            "invalid.non-finite captures the current emitted baseline"
+        );
+    }
+
+    #[test]
+    fn stage4_claude_extra_usage_is_active_without_recording_an_observation() {
+        let window = claude_extra_usage_window(Some(&ClaudeExtraUsage {
+            is_enabled: true,
+            monthly_limit: Some(10_000.0),
+            used_credits: Some(2_500.0),
+            utilization: None,
+            currency: Some("USD".to_string()),
+        }))
+        .unwrap();
+        assert_eq!(window.label, "Extra usage");
+        assert_eq!(window.card_id, "extra_usage.v1");
+        assert_eq!(window.used_percent, 25.0);
+        assert!(window.resets_at.is_none());
+        assert_eq!(
+            window.pace_status.window_key.as_deref(),
+            Some("extra_usage.v1")
+        );
+        assert_eq!(window.pace_status.state, PaceState::Unavailable);
+        assert_eq!(window.pace_status.reason.as_deref(), Some("missingReset"));
+        assert!(window.duration_seconds.is_none());
+        assert!(window.historical_pace.is_none());
+
+        let scope = TestRefreshScope::new("claude", "extra-usage");
+        let account_scope = scope
+            .resolve_current("fixture", "extra-usage", b"extra-usage-marker")
+            .unwrap();
+        let expected_scope = account_scope.as_str().to_string();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "claude".to_string(),
+            source: "oauth".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![window],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+        let calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, 1_700_000_000, |active, observations, _| {
+            calls.set(calls.get() + 1);
+            assert_eq!(
+                active,
+                &[SeriesKey::new("claude", &expected_scope, "extra_usage.v1")]
+            );
+            assert!(observations.is_empty());
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::Unavailable
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("missingReset")
+        );
+        scope.cleanup();
+    }
+
+    #[test]
+    fn stage4_emitted_unavailable_series_survives_capacity_admission() {
+        let scope = TestRefreshScope::new("claude", "emitted-capacity");
+        let account_scope = scope
+            .resolve_current("fixture", "capacity", b"capacity-marker")
+            .unwrap();
+        let account_scope_value = account_scope.as_str().to_string();
+        let history_path = scope
+            .root()
+            .join(crate::agent_quota_history::HISTORY_FILE_NAME);
+        let seed_now = 1_800_000_000_i64;
+        let seed_reset = seed_now + 86_400;
+        let weekly_key = SeriesKey::new("claude", &account_scope_value, "weekly.v1");
+        let mut seeded_keys = vec![weekly_key.clone()];
+        seeded_keys.extend(
+            (0..crate::agent_quota_history::MAX_SERIES - 1).map(|index| {
+                SeriesKey::new(
+                    "claude",
+                    &account_scope_value,
+                    format!("zzzz.{index:04}.v1"),
+                )
+            }),
+        );
+        for (sample_index, sampled_at) in [
+            seed_now,
+            seed_now + 86_400 / 5,
+            seed_now + 2 * 86_400 / 5,
+            seed_now + 3 * 86_400 / 5,
+            seed_now + 4 * 86_400 / 5,
+            seed_reset - 1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seeded_observations = seeded_keys
+                .iter()
+                .cloned()
+                .map(|key| QuotaObservation {
+                    key,
+                    reset_at: Some(seed_reset),
+                    used_percent: 10.0 + sample_index as f64 * 10.0,
+                    provider: None,
+                    contract: Some(DurationEvidence::contract(86_400)),
+                })
+                .collect::<Vec<_>>();
+            let seeded = crate::agent_quota_history::record_observations_at_path_and_evaluate(
+                &seeded_keys,
+                &seeded_observations,
+                sampled_at,
+                &history_path,
+            )
+            .unwrap();
+            assert_eq!(seeded.len(), crate::agent_quota_history::MAX_SERIES);
+        }
+
+        let now = seed_reset + 15 * 60 + 1;
+        let now_date = Utc.timestamp_opt(now, 0).single().unwrap();
+        let mut weekly =
+            UsageWindow::from_provider_used_percent("Weekly".to_string(), 20.0, None, now_date)
+                .with_identity(
+                    "weekly.v1",
+                    Some("weekly.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(86_400)),
+                );
+        weekly.unavailable("missingReset");
+        let new_window = UsageWindow::from_provider_used_percent(
+            "New quota".to_string(),
+            5.0,
+            Some(Utc.timestamp_opt(now + 86_400, 0).single().unwrap()),
+            now_date,
+        )
+        .with_identity(
+            "new.v1",
+            Some("new.v1".to_string()),
+            None,
+            Some(DurationEvidence::contract(86_400)),
+        );
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "claude".to_string(),
+            source: "oauth".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![weekly, new_window],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+
+        enrich_snapshot_with(
+            &mut snapshot,
+            now,
+            |active, observations, transaction_now| {
+                assert_eq!(active.len(), 2);
+                assert!(active.contains(&weekly_key));
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].key.window_key, "new.v1");
+                crate::agent_quota_history::record_observations_at_path_and_evaluate(
+                    active,
+                    observations,
+                    transaction_now,
+                    &history_path,
+                )
+            },
+        );
+
+        let store: Value = serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
+        let series = store["series"].as_array().unwrap();
+        assert_eq!(series.len(), crate::agent_quota_history::MAX_SERIES);
+        assert!(series.iter().any(|entry| {
+            entry["providerId"] == "claude"
+                && entry["accountScope"] == account_scope_value
+                && entry["windowKey"] == "weekly.v1"
+        }));
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("missingReset")
+        );
+        scope.cleanup();
     }
 
     fn header_map(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
@@ -6223,36 +6209,22 @@ mod tests {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let headers = header_map(&[
             ("anthropic-ratelimit-unified-5h-utilization", "0.11"),
-            ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+            ("anthropic-ratelimit-unified-5h-reset", "1783111200"),
             ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
-            ("anthropic-ratelimit-unified-7d-reset", "1700172800"),
+            ("anthropic-ratelimit-unified-7d-reset", "1783504800"),
         ]);
         let windows = parse_unified_ratelimit_windows(&headers, now);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "Session");
-        assert_eq!(windows[0].card_id_for_test(), "session.v1");
-        assert_eq!(windows[0].pace_window_key_for_test(), Some("session.v1"));
         assert!((windows[0].used_percent - 11.0).abs() < 1e-9);
         assert!((windows[0].remaining_percent - 89.0).abs() < 1e-9);
+        assert_eq!(windows[0].window_minutes, Some(300));
         assert!(windows[0].resets_at.is_some());
         assert!(windows[0].reset_text.is_some());
-        assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(windows[0].pace_status.duration_seconds, Some(18_000));
-        assert_eq!(
-            windows[0].pace_status.duration_source,
-            Some(DurationSource::Contract)
-        );
         assert_eq!(windows[1].label, "Weekly");
-        assert_eq!(windows[1].card_id_for_test(), "weekly.v1");
-        assert_eq!(windows[1].pace_window_key_for_test(), Some("weekly.v1"));
         assert!((windows[1].used_percent - 60.0).abs() < 1e-9);
         assert!((windows[1].remaining_percent - 40.0).abs() < 1e-9);
-        assert_eq!(windows[1].pace_status.state, PaceState::LearningHistory);
-        assert_eq!(windows[1].pace_status.duration_seconds, Some(604_800));
-        assert_eq!(
-            windows[1].pace_status.duration_source,
-            Some(DurationSource::Contract)
-        );
+        assert_eq!(windows[1].window_minutes, Some(10_080));
     }
 
     #[test]
@@ -6293,24 +6265,10 @@ mod tests {
         let window = unified_ratelimit_window("Weekly", Some(0.4), None, now).unwrap();
         assert!(window.resets_at.is_none());
         assert!(window.reset_text.is_none());
-        assert_eq!(window.pace_reason_for_test(), Some("missingReset"));
-
-        let invalid_reset = parse_unified_ratelimit_windows(
-            &header_map(&[
-                ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
-                ("anthropic-ratelimit-unified-5h-reset", "bogus"),
-            ]),
-            now,
-        );
-        assert_eq!(invalid_reset.len(), 1);
-        assert_eq!(
-            invalid_reset[0].pace_reason_for_test(),
-            Some("invalidEvidence")
-        );
     }
 
     #[test]
-    fn unified_window_accepts_boundaries_and_rejects_invalid_fraction() {
+    fn unified_window_rejects_invalid_fraction_before_wire() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let zero = unified_ratelimit_window("Session", Some(0.0), None, now).unwrap();
         assert!((zero.used_percent - 0.0).abs() < 1e-9);
@@ -6318,18 +6276,149 @@ mod tests {
         let full = unified_ratelimit_window("Session", Some(1.0), None, now).unwrap();
         assert!((full.used_percent - 100.0).abs() < 1e-9);
         assert!((full.remaining_percent - 0.0).abs() < 1e-9);
-        for invalid in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
-            assert!(unified_ratelimit_window("Session", Some(invalid), None, now).is_none());
-        }
+
+        assert!(unified_ratelimit_window("Session", Some(1.5), None, now).is_none());
+        assert!(unified_ratelimit_window("Session", Some(f64::NAN), None, now).is_none());
         assert!(parse_unified_ratelimit_windows(
             &header_map(&[
-                ("anthropic-ratelimit-unified-5h-utilization", "1.5"),
-                ("anthropic-ratelimit-unified-7d-utilization", "NaN"),
+                ("anthropic-ratelimit-unified-5h-utilization", "NaN"),
+                ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
             ]),
             now,
         )
         .is_empty());
+
+        // None utilization -> no window
         assert!(unified_ratelimit_window("Session", None, Some(1_783_111_200), now).is_none());
+    }
+
+    #[test]
+    fn provider_adapters_reject_invalid_percentages_before_wire() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        assert!(map_claude_window(
+            "Session",
+            "session.v1",
+            DurationEvidence::contract(300 * 60),
+            &ClaudeWindow {
+                utilization: Some(150.0),
+                resets_at: None,
+            },
+            now,
+        )
+        .is_none());
+        assert!(claude_extra_usage_window(Some(&ClaudeExtraUsage {
+            is_enabled: true,
+            monthly_limit: None,
+            used_credits: None,
+            utilization: Some(f64::NAN),
+            currency: None,
+        }))
+        .is_none());
+        assert!(map_window_with_identity(
+            "Weekly",
+            CodexWindow {
+                used_percent: -1.0,
+                reset_at: 1_700_003_600,
+                limit_window_seconds: 604_800,
+            },
+            now,
+            "main.weekly.v1",
+            Some("main.weekly.v1".to_string()),
+        )
+        .is_none());
+
+        let valid_duplicate = codex_windows(
+            Some(&CodexRateLimit {
+                primary_window: Some(CodexWindow {
+                    used_percent: 150.0,
+                    reset_at: 1_700_003_600,
+                    limit_window_seconds: 18_000,
+                }),
+                secondary_window: Some(CodexWindow {
+                    used_percent: 20.0,
+                    reset_at: 1_700_003_600,
+                    limit_window_seconds: 18_000,
+                }),
+            }),
+            None,
+            now,
+        );
+        assert_eq!(valid_duplicate.len(), 1);
+        assert_eq!(valid_duplicate[0].card_id, "main.session.v1");
+        assert_eq!(valid_duplicate[0].used_percent, 20.0);
+    }
+
+    #[test]
+    fn provider_payloads_isolate_malformed_percentage_rows() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        for invalid in ["1e400", r#""NaN""#] {
+            let codex: CodexUsageResponse = serde_json::from_str(&format!(
+                r#"{{
+                    "rate_limit": {{
+                        "primary_window": {{
+                            "used_percent": {invalid},
+                            "reset_at": 1700003600,
+                            "limit_window_seconds": 18000
+                        }},
+                        "secondary_window": {{
+                            "used_percent": 20,
+                            "reset_at": 1700003600,
+                            "limit_window_seconds": 18000
+                        }}
+                    }}
+                }}"#
+            ))
+            .unwrap();
+            let codex_windows = codex_windows(codex.rate_limit.as_ref(), None, now);
+            assert_eq!(codex_windows.len(), 1);
+            assert_eq!(codex_windows[0].card_id, "main.session.v1");
+            assert_eq!(codex_windows[0].used_percent, 20.0);
+
+            let claude: ClaudeUsageResponse = serde_json::from_str(&format!(
+                r#"{{
+                    "five_hour": {{
+                        "utilization": {invalid},
+                        "resets_at": "2023-11-15T00:13:20Z"
+                    }},
+                    "seven_day": {{
+                        "utilization": 20,
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "seven_day_design": {{
+                        "utilization": {invalid},
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "design": {{
+                        "utilization": 30,
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "seven_day_routines": {{
+                        "utilization": {invalid},
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "routines": {{
+                        "utilization": 40,
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "extra_usage": {{
+                        "is_enabled": true,
+                        "utilization": {invalid}
+                    }}
+                }}"#
+            ))
+            .unwrap();
+            let claude_windows = claude_windows(&claude, now);
+            assert_eq!(claude_windows.len(), 3);
+            assert!(claude_windows
+                .iter()
+                .any(|window| window.card_id == "weekly.v1" && window.used_percent == 20.0));
+            assert!(claude_windows
+                .iter()
+                .any(|window| window.card_id == "design.weekly.v1" && window.used_percent == 30.0));
+            assert!(claude_windows.iter().any(
+                |window| window.card_id == "routines.weekly.v1" && window.used_percent == 40.0
+            ));
+        }
     }
 
     #[test]
@@ -6343,19 +6432,121 @@ mod tests {
         assert!(claude_token_from_lookup(|_| Some("   ".to_string())).is_none());
     }
 
+    #[test]
+    fn refreshes_or_expires_cached_windows() {
+        let base = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let window =
+            unified_ratelimit_window("Session", Some(0.2), Some(1_700_000_000 + 3600), base)
+                .unwrap();
+
+        // 30 min later, still before the reset: reset_text recomputed to the
+        // shorter countdown (not the frozen original).
+        let later = base + chrono::Duration::seconds(1800);
+        let refreshed = refresh_cached_windows(std::slice::from_ref(&window), later).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert!(refreshed[0].reset_text.as_deref().unwrap().contains("30m"));
+
+        // Past the reset: stale -> expire (None) so the caller re-probes.
+        let after = base + chrono::Duration::seconds(3700);
+        assert!(refresh_cached_windows(std::slice::from_ref(&window), after).is_none());
+    }
+
+    struct RecordingRefreshScope<'a> {
+        inner: &'a TestRefreshScope,
+        resolves: Mutex<usize>,
+        transfers: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    }
+
+    impl<'a> RecordingRefreshScope<'a> {
+        fn new(inner: &'a TestRefreshScope) -> Self {
+            Self {
+                inner,
+                resolves: Mutex::new(0),
+                transfers: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn resolve_count(&self) -> usize {
+            *self.resolves.lock().unwrap()
+        }
+
+        fn transfers(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+            self.transfers.lock().unwrap().clone()
+        }
+    }
+
+    impl RefreshScopeTransaction for RecordingRefreshScope<'_> {
+        fn resolve_current(
+            &self,
+            semantic_source: &str,
+            canonical_location: &str,
+            marker: &[u8],
+        ) -> Result<AccountScope, AccountScopeError> {
+            *self.resolves.lock().unwrap() += 1;
+            self.inner
+                .resolve_current(semantic_source, canonical_location, marker)
+        }
+
+        fn transfer(
+            &self,
+            semantic_source: &str,
+            canonical_location: &str,
+            old_marker: &[u8],
+            new_marker: &[u8],
+        ) -> Result<AccountScope, AccountScopeError> {
+            self.transfers
+                .lock()
+                .unwrap()
+                .push((old_marker.to_vec(), new_marker.to_vec()));
+            self.inner
+                .transfer(semantic_source, canonical_location, old_marker, new_marker)
+        }
+    }
+
+    struct MetadataFailingRefreshScope<'a> {
+        inner: &'a TestRefreshScope,
+    }
+
+    impl RefreshScopeTransaction for MetadataFailingRefreshScope<'_> {
+        fn resolve_current(
+            &self,
+            semantic_source: &str,
+            canonical_location: &str,
+            marker: &[u8],
+        ) -> Result<AccountScope, AccountScopeError> {
+            self.inner
+                .resolve_current(semantic_source, canonical_location, marker)
+        }
+
+        fn transfer(
+            &self,
+            semantic_source: &str,
+            canonical_location: &str,
+            old_marker: &[u8],
+            new_marker: &[u8],
+        ) -> Result<AccountScope, AccountScopeError> {
+            self.inner.fail_metadata_save();
+            self.inner
+                .transfer(semantic_source, canonical_location, old_marker, new_marker)
+        }
+    }
+
     fn checkpoint_at(
         target: Option<RefreshCheckpoint>,
-    ) -> impl FnMut(RefreshCheckpoint) -> Result<(), String> {
+    ) -> impl FnMut(RefreshCheckpoint) -> Result<(), ProviderFetchFailure> {
         move |checkpoint| {
             if Some(checkpoint) == target {
-                Err("injected crash".to_string())
+                Err(ProviderFetchFailure::terminal("injected crash"))
             } else {
                 Ok(())
             }
         }
     }
 
-    async fn codex_test_response(refresh_token: String) -> Result<Value, String> {
+    async fn codex_test_response(
+        refresh_token: String,
+        _attempt_binding: ProviderCacheBinding,
+    ) -> Result<Value, ProviderFetchFailure> {
         assert_eq!(refresh_token, "codex-old-refresh");
         Ok(serde_json::json!({
             "access_token": "codex-new-access",
@@ -6394,11 +6585,11 @@ mod tests {
         (scope, path, old_scope, metadata, location)
     }
 
-    async fn run_codex_refresh(
-        scope: &TestRefreshScope,
+    async fn run_codex_refresh<R: RefreshScopeTransaction + ?Sized>(
+        scope: &R,
         path: &Path,
         crash: Option<RefreshCheckpoint>,
-    ) -> Result<(CodexCredentials, Result<AccountScope, AccountScopeError>), String> {
+    ) -> Result<(CodexCredentials, ProviderCacheBinding), ProviderFetchFailure> {
         refresh_codex_credentials_with(
             path,
             scope,
@@ -6410,35 +6601,343 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_refresh_transfer_and_crash_boundaries_use_production_sequence() {
+    async fn codex_refresh_rejects_concurrent_account_switch_without_touching_b() {
+        const B_BYTES: &[u8] = br#"{
+  "tokens": {
+    "access_token": "account-b-access",
+    "refresh_token": "account-b-refresh",
+    "id_token": "account-b-id",
+    "account_id": "account-b"
+  },
+  "sibling": {"writer": "b", "revision": 2}
+}
+"#;
+        let (scope, path, _, metadata_before, _) = setup_codex_refresh("codex-target-switch");
+        let recording = RecordingRefreshScope::new(&scope);
+        let request_path = path.clone();
+
+        let failure = refresh_codex_credentials_with(
+            &path,
+            &recording,
+            move |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "codex-old-refresh");
+                fs::write(&request_path, B_BYTES).unwrap();
+                Ok(serde_json::json!({
+                    "access_token": "codex-new-access",
+                    "refresh_token": "codex-new-refresh"
+                }))
+            },
+            save_codex_credentials,
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
+        assert!(recording.transfers().is_empty());
+        assert_eq!(scope.metadata_bytes(), metadata_before);
+        let stored_bytes = fs::read(&path).unwrap();
+        assert_eq!(stored_bytes, B_BYTES);
+        assert!(!String::from_utf8_lossy(&stored_bytes).contains("codex-new"));
+        let stored = load_codex_credentials_from(&path).unwrap();
+        assert_eq!(stored.access_token, "account-b-access");
+        assert_eq!(stored.refresh_token.as_deref(), Some("account-b-refresh"));
+        assert_eq!(stored.account_id.as_deref(), Some("account-b"));
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_patches_unchanged_target_and_preserves_siblings() {
+        let (scope, path, old_scope, _, location) = setup_codex_refresh("codex-target-unchanged");
+        let original = serde_json::json!({
+            "tokens": {
+                "access_token": "codex-old-access",
+                "refresh_token": "codex-old-refresh",
+                "id_token": "codex-old-id",
+                "token_sibling": {"keep": true}
+            },
+            "sibling": {"writer": "before", "revision": 1}
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        let current = serde_json::json!({
+            "tokens": original["tokens"].clone(),
+            "sibling": {"writer": "codex-cli", "revision": 2},
+            "unrelated": [1, 2, 3]
+        });
+        let current_bytes = serde_json::to_vec_pretty(&current).unwrap();
+        let request_path = path.clone();
+
+        let (refreshed, post_binding) = refresh_codex_credentials_with(
+            &path,
+            &scope,
+            move |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "codex-old-refresh");
+                fs::write(&request_path, current_bytes).unwrap();
+                Ok(serde_json::json!({
+                    "access_token": "codex-new-access",
+                    "refresh_token": "codex-new-refresh"
+                }))
+            },
+            save_codex_credentials,
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed.access_token, "codex-new-access");
+        assert_eq!(post_binding.primary, old_scope);
+        let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["tokens"]["access_token"], "codex-new-access");
+        assert_eq!(stored["tokens"]["refresh_token"], "codex-new-refresh");
+        assert_eq!(stored["tokens"]["id_token"], "codex-old-id");
+        assert_eq!(stored["tokens"]["token_sibling"]["keep"], true);
+        assert_eq!(stored["sibling"]["writer"], "codex-cli");
+        assert_eq!(stored["sibling"]["revision"], 2);
+        assert_eq!(stored["unrelated"], serde_json::json!([1, 2, 3]));
+        assert_eq!(
+            scope
+                .resolve_current("codex-auth-json", &location, b"codex-old-refresh")
+                .unwrap(),
+            old_scope
+        );
+        assert_eq!(
+            scope
+                .resolve_current("codex-auth-json", &location, b"codex-new-refresh")
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_rejects_concurrent_logout_without_restoring_a() {
+        const LOGGED_OUT_BYTES: &[u8] = br#"{
+  "sibling": {"writer": "logout", "revision": 2}
+}
+"#;
+        let (scope, path, _, metadata_before, _) = setup_codex_refresh("codex-target-logout");
+        let recording = RecordingRefreshScope::new(&scope);
+        let request_path = path.clone();
+
+        let failure = refresh_codex_credentials_with(
+            &path,
+            &recording,
+            move |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "codex-old-refresh");
+                fs::write(&request_path, LOGGED_OUT_BYTES).unwrap();
+                Ok(serde_json::json!({
+                    "access_token": "codex-new-access",
+                    "refresh_token": "codex-new-refresh"
+                }))
+            },
+            save_codex_credentials,
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
+        assert!(recording.transfers().is_empty());
+        assert_eq!(scope.metadata_bytes(), metadata_before);
+        let stored_bytes = fs::read(&path).unwrap();
+        assert_eq!(stored_bytes, LOGGED_OUT_BYTES);
+        assert!(!String::from_utf8_lossy(&stored_bytes).contains("codex-new"));
+        let stored: Value = serde_json::from_slice(&stored_bytes).unwrap();
+        assert!(stored.get("tokens").is_none());
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_canonicalizes_tokens_and_preserves_unrotated_marker() {
+        for (tag, refresh_value) in [
+            ("missing", None),
+            ("null", Some(Value::Null)),
+            ("empty", Some(Value::String(String::new()))),
+            ("whitespace", Some(Value::String(" \t\n ".to_string()))),
+            (
+                "non-string",
+                Some(serde_json::json!({ "unexpected": true })),
+            ),
+        ] {
+            let (scope, path, old_scope, _, _) =
+                setup_codex_refresh(&format!("codex-canonical-{tag}"));
+            let recording = RecordingRefreshScope::new(&scope);
+            let mut response = serde_json::json!({
+                "access_token": { "unexpected": true },
+                "accessToken": " codex-new-access ",
+                "id_token": " \t\n ",
+                "idToken": " codex-new-id "
+            });
+            if let Some(refresh_value) = refresh_value {
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("refresh_token".to_string(), refresh_value);
+            }
+
+            let (refreshed, post_binding) = refresh_codex_credentials_with(
+                &path,
+                &recording,
+                move |refresh_token, _attempt_binding| async move {
+                    assert_eq!(refresh_token, "codex-old-refresh");
+                    Ok(response)
+                },
+                save_codex_credentials,
+                checkpoint_at(None),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(refreshed.access_token, "codex-new-access", "{tag}");
+            assert_eq!(
+                refreshed.refresh_token.as_deref(),
+                Some("codex-old-refresh"),
+                "{tag}"
+            );
+            assert_eq!(refreshed.id_token.as_deref(), Some("codex-new-id"), "{tag}");
+            assert_eq!(post_binding.primary, old_scope, "{tag}");
+            assert_eq!(post_binding.corroborating, None, "{tag}");
+            assert_eq!(
+                recording.transfers(),
+                vec![(b"codex-old-refresh".to_vec(), b"codex-old-refresh".to_vec())],
+                "{tag}"
+            );
+
+            let stored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                stored["tokens"]["refresh_token"],
+                Value::String("codex-old-refresh".to_string()),
+                "{tag}"
+            );
+            let reloaded = load_codex_credentials_from(&path).unwrap();
+            assert_eq!(reloaded.access_token, refreshed.access_token, "{tag}");
+            assert_eq!(reloaded.refresh_token, refreshed.refresh_token, "{tag}");
+            assert_eq!(reloaded.id_token, refreshed.id_token, "{tag}");
+            assert_eq!(reloaded.scope_marker(), refreshed.scope_marker(), "{tag}");
+            assert_eq!(
+                scope
+                    .resolve_current(
+                        reloaded.scope_slot.semantic_source,
+                        &reloaded.scope_slot.canonical_location,
+                        reloaded.scope_marker(),
+                    )
+                    .unwrap(),
+                old_scope,
+                "{tag}"
+            );
+            scope.cleanup();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_rejects_invalid_success_schema_before_state_or_usage() {
+        for (tag, response) in [
+            ("array", serde_json::json!([])),
+            ("empty-object", serde_json::json!({})),
+            ("null", Value::Null),
+            ("bool", Value::Bool(true)),
+            ("string", Value::String("codex-new-access".to_string())),
+            (
+                "blank-access",
+                serde_json::json!({ "access_token": " \t\n " }),
+            ),
+            (
+                "invalid-aliases",
+                serde_json::json!({
+                    "access_token": false,
+                    "accessToken": [],
+                    "refreshToken": " codex-new-refresh "
+                }),
+            ),
+        ] {
+            let (scope, path, old_scope, metadata_before, location) =
+                setup_codex_refresh(&format!("codex-invalid-schema-{tag}"));
+            let credentials_before = fs::read(&path).unwrap();
+            let recording = RecordingRefreshScope::new(&scope);
+            let save_calls = std::cell::Cell::new(0);
+            let usage_calls = std::cell::Cell::new(0);
+
+            let refresh_result = refresh_codex_credentials_with(
+                &path,
+                &recording,
+                move |refresh_token, _attempt_binding| async move {
+                    assert_eq!(refresh_token, "codex-old-refresh");
+                    Ok(response)
+                },
+                |_| -> Result<CodexCredentialWriteReceipt, String> {
+                    save_calls.set(save_calls.get() + 1);
+                    Err("unexpected save".to_string())
+                },
+                checkpoint_at(None),
+            )
+            .await;
+            let result: Result<(), ProviderFetchFailure> =
+                request_after_verified_binding(refresh_result, |_| async {
+                    usage_calls.set(usage_calls.get() + 1);
+                    Ok(())
+                })
+                .await;
+
+            assert!(
+                matches!(result, Err(ProviderFetchFailure::Terminal { .. })),
+                "{tag}"
+            );
+            assert!(recording.transfers().is_empty(), "{tag}");
+            assert_eq!(save_calls.get(), 0, "{tag}");
+            assert_eq!(usage_calls.get(), 0, "{tag}");
+            assert_eq!(fs::read(&path).unwrap(), credentials_before, "{tag}");
+            assert_eq!(scope.metadata_bytes(), metadata_before, "{tag}");
+            let reloaded = load_codex_credentials_from(&path).unwrap();
+            assert_eq!(reloaded.access_token, "codex-old-access", "{tag}");
+            assert_eq!(
+                reloaded.refresh_token.as_deref(),
+                Some("codex-old-refresh"),
+                "{tag}"
+            );
+            assert!(reloaded.last_refresh.is_none(), "{tag}");
+            assert_eq!(
+                scope
+                    .resolve_current("codex-auth-json", &location, reloaded.scope_marker())
+                    .unwrap(),
+                old_scope,
+                "{tag}"
+            );
+            scope.cleanup();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_crash_boundaries_and_scope_gate_use_production_sequence() {
+        // These checkpoints model process stops, not a cross-resource transaction:
+        // after credential persistence, metadata may still be the pre-refresh bytes.
         for boundary in [
             RefreshCheckpoint::Reloaded,
             RefreshCheckpoint::NetworkReturned,
-            RefreshCheckpoint::MetadataHandled,
             RefreshCheckpoint::CredentialsPersisted,
+            RefreshCheckpoint::MetadataHandled,
         ] {
             let (scope, path, old_scope, before, location) = setup_codex_refresh("codex-crash");
-            assert_eq!(
-                run_codex_refresh(&scope, &path, Some(boundary))
-                    .await
-                    .unwrap_err(),
-                "injected crash"
+            let failure = run_codex_refresh(&scope, &path, Some(boundary))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                failure,
+                ProviderFetchFailure::Terminal { ref display } if display == "injected crash"
+            ));
+            let credentials_persisted = matches!(
+                boundary,
+                RefreshCheckpoint::CredentialsPersisted | RefreshCheckpoint::MetadataHandled
             );
             let stored = load_codex_credentials_from(&path).unwrap();
             assert_eq!(
                 stored.refresh_token.as_deref(),
-                Some(if boundary == RefreshCheckpoint::CredentialsPersisted {
+                Some(if credentials_persisted {
                     "codex-new-refresh"
                 } else {
                     "codex-old-refresh"
                 })
             );
-            if matches!(
-                boundary,
-                RefreshCheckpoint::Reloaded | RefreshCheckpoint::NetworkReturned
-            ) {
-                assert_eq!(scope.metadata_bytes(), before);
-            } else {
+            if boundary == RefreshCheckpoint::MetadataHandled {
                 assert_ne!(scope.metadata_bytes(), before);
                 assert_eq!(
                     scope
@@ -6452,16 +6951,19 @@ mod tests {
                         .unwrap(),
                     old_scope
                 );
+            } else {
+                assert_eq!(scope.metadata_bytes(), before);
             }
             scope.cleanup();
         }
 
         let (scope, path, old_scope, before, location) = setup_codex_refresh("codex-metadata-fail");
-        scope.fail_metadata_save();
-        let (refreshed, scope_outcome) = run_codex_refresh(&scope, &path, None).await.unwrap();
-        assert_eq!(refreshed.access_token, "codex-new-access");
-        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        let auth_before = fs::read(&path).unwrap();
+        let failing = MetadataFailingRefreshScope { inner: &scope };
+        let failure = run_codex_refresh(&failing, &path, None).await.unwrap_err();
+        assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
         assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(fs::read(&path).unwrap(), auth_before);
         let persisted = load_codex_credentials_from(&path).unwrap();
         assert_eq!(persisted.access_token, "codex-old-access");
         assert_eq!(
@@ -6476,58 +6978,129 @@ mod tests {
         );
         scope.cleanup();
 
-        let (scope, path, _old_scope, before, _) =
-            setup_codex_refresh("codex-metadata-fail-unchanged");
-        scope.fail_metadata_save();
-        let (refreshed, scope_outcome) = refresh_codex_credentials_with(
+        const CONCURRENT_LOGIN_BYTES: &[u8] = br#"{
+  "tokens": {
+    "access_token": "concurrent-access",
+    "refresh_token": "concurrent-refresh",
+    "id_token": "concurrent-id",
+    "account_id": "concurrent-account"
+  },
+  "sibling": {"writer": "codex-cli", "revision": 3}
+}
+"#;
+        let (scope, path, _, metadata_before, _) =
+            setup_codex_refresh("codex-metadata-fail-concurrent-login");
+        let failing = MetadataFailingRefreshScope { inner: &scope };
+        let save_path = path.clone();
+        let failure = refresh_codex_credentials_with(
             &path,
-            &scope,
-            |refresh_token| async move {
-                assert_eq!(refresh_token, "codex-old-refresh");
-                Ok(serde_json::json!({ "access_token": "codex-new-access" }))
+            &failing,
+            codex_test_response,
+            move |credentials| {
+                let receipt = save_codex_credentials(credentials)?;
+                fs::write(&save_path, CONCURRENT_LOGIN_BYTES)
+                    .map_err(|error| format!("inject concurrent Codex login: {error}"))?;
+                Ok(receipt)
             },
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
+        assert_eq!(scope.metadata_bytes(), metadata_before);
+        assert_eq!(fs::read(&path).unwrap(), CONCURRENT_LOGIN_BYTES);
+        scope.cleanup();
+
+        let (scope, path, _, metadata_before, _) = setup_codex_refresh("codex-save-fail");
+        let auth_before = fs::read(&path).unwrap();
+        let recording = RecordingRefreshScope::new(&scope);
+        let failure = refresh_codex_credentials_with(
+            &path,
+            &recording,
+            codex_test_response,
+            |_| Err("injected save failure".to_string()),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
+        assert!(recording.transfers().is_empty());
+        assert_eq!(scope.metadata_bytes(), metadata_before);
+        assert_eq!(fs::read(&path).unwrap(), auth_before);
+        scope.cleanup();
+
+        let (scope, path, old_scope, _, location) = setup_codex_refresh("codex-success");
+        let recording = RecordingRefreshScope::new(&scope);
+        let (_, post_binding) = refresh_codex_credentials_with(
+            &path,
+            &recording,
+            codex_test_response,
             save_codex_credentials,
             checkpoint_at(None),
         )
         .await
         .unwrap();
-        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
-        assert_eq!(scope.metadata_bytes(), before);
-        assert_eq!(
-            refreshed.refresh_token.as_deref(),
-            Some("codex-old-refresh")
-        );
-        let persisted = load_codex_credentials_from(&path).unwrap();
-        assert_eq!(persisted.access_token, "codex-new-access");
-        assert_eq!(
-            persisted.refresh_token.as_deref(),
-            Some("codex-old-refresh")
-        );
-        scope.cleanup();
-
-        let (scope, path, old_scope, _, location) = setup_codex_refresh("codex-success");
-        let (_, scope_outcome) = run_codex_refresh(&scope, &path, None).await.unwrap();
-        assert_eq!(scope_outcome.unwrap(), old_scope);
+        assert_eq!(recording.resolve_count(), 1);
+        assert_eq!(post_binding.primary, old_scope);
+        assert_eq!(post_binding.corroborating, None);
         assert_eq!(
             scope
                 .resolve_current("codex-auth-json", &location, b"codex-new-refresh")
                 .unwrap(),
             old_scope
         );
-        assert_eq!(
-            load_codex_credentials_from(&path)
-                .unwrap()
-                .refresh_token
-                .as_deref(),
-            Some("codex-new-refresh")
-        );
         scope.cleanup();
     }
 
-    async fn claude_test_response(refresh_token: String) -> Result<ClaudeRefreshResponse, String> {
+    #[tokio::test]
+    async fn codex_refresh_transient_uses_lock_reloaded_binding_not_outer_binding() {
+        let (scope, path, inner_scope, _, location) = setup_codex_refresh("codex-lock-binding");
+        let outer_scope = scope
+            .resolve_current("codex-auth-json", &location, b"outer-refresh-a")
+            .unwrap();
+        assert_ne!(outer_scope, inner_scope);
+        let expected = ProviderCacheBinding::primary(inner_scope);
+        let request_expected = expected.clone();
+
+        let failure = refresh_codex_credentials_with(
+            &path,
+            &scope,
+            move |refresh_token, attempt_binding| async move {
+                assert_eq!(refresh_token, "codex-old-refresh");
+                assert_eq!(attempt_binding, request_expected);
+                Err(ProviderFetchFailure::transient(
+                    "Codex token refresh failed. Retrying automatically.",
+                    Some(attempt_binding),
+                    SafeTransportDiagnostic::from_facts(TransportErrorFacts::synthetic(
+                        true,
+                        false,
+                        TransportPhase::Request,
+                        None,
+                    )),
+                ))
+            },
+            save_codex_credentials,
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+
+        match failure {
+            ProviderFetchFailure::Transient {
+                attempt_binding, ..
+            } => assert_eq!(attempt_binding, Some(expected)),
+            ProviderFetchFailure::Terminal { .. } => panic!("timeout must remain transient"),
+        }
+        scope.cleanup();
+    }
+
+    async fn claude_test_response(
+        refresh_token: String,
+        _attempt_binding: ProviderCacheBinding,
+    ) -> Result<ClaudeRefreshResponse, ProviderFetchFailure> {
         assert_eq!(refresh_token, "claude-old-refresh");
         Ok(ClaudeRefreshResponse {
-            access_token: "claude-new-access".to_string(),
+            access_token: " claude-new-access ".to_string(),
             refresh_token: Some("claude-new-refresh".to_string()),
             expires_in: 3_600,
         })
@@ -6582,7 +7155,14 @@ mod tests {
         path: &Path,
         original: &ClaudeCredentials,
         crash: Option<RefreshCheckpoint>,
-    ) -> Result<(ClaudeCredentials, Result<AccountScope, AccountScopeError>), String> {
+    ) -> Result<
+        (
+            ClaudeCredentials,
+            AccountScope,
+            Option<ProviderCacheBinding>,
+        ),
+        ProviderFetchFailure,
+    > {
         let reload_path = path.to_path_buf();
         let save_path = path.to_path_buf();
         refresh_claude_credentials_with(
@@ -6603,22 +7183,141 @@ mod tests {
         .await
     }
 
-    fn stored_claude_credentials(path: &Path) -> ClaudeCredentials {
+    fn stored_claude_refresh_token(path: &Path) -> Option<String> {
         parse_claude_credentials_data(
             &fs::read_to_string(path).unwrap(),
             ClaudeCredentialSource::File,
         )
         .unwrap()
+        .refresh_token
     }
 
     #[tokio::test]
-    async fn claude_refresh_invalid_new_marker_preserves_old_lineage_and_store() {
+    async fn claude_file_refresh_rejects_concurrent_target_change_without_touching_b() {
+        const B_BYTES: &[u8] = br#"{
+  "claudeAiOauth": {
+    "accessToken": "account-b-access",
+    "refreshToken": "account-b-refresh",
+    "expiresAt": 4102444800000
+  },
+  "sibling": {"writer": "b", "revision": 2}
+}
+"#;
+        let (scope, path, original, old_scope, _, _) =
+            setup_claude_refresh("claude-file-target-race");
+        let reload_path = path.clone();
+        let request_path = path.clone();
+        let save_path = path.clone();
+        let save_failed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_save_failure = std::rc::Rc::clone(&save_failed);
+
+        let (refreshed, scope_outcome, cache_binding) = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "claude-old-refresh");
+                fs::write(&request_path, B_BYTES).unwrap();
+                Ok(ClaudeRefreshResponse {
+                    access_token: "claude-new-access".to_string(),
+                    refresh_token: Some("claude-new-refresh".to_string()),
+                    expires_in: 3_600,
+                })
+            },
+            move |credentials| {
+                let result = save_claude_credentials_to_file(credentials, &save_path);
+                observed_save_failure.set(result.is_err());
+                result
+            },
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed.access_token, "claude-new-access");
+        assert_eq!(scope_outcome, old_scope);
+        assert_eq!(cache_binding, None);
+        assert!(save_failed.get());
+        assert_eq!(fs::read(&path).unwrap(), B_BYTES);
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn claude_file_refresh_preserves_concurrent_top_level_sibling() {
+        const CURRENT_WITH_NEW_SIBLING: &str = r#"{
+            "claudeAiOauth": {
+                "accessToken": "claude-old-access",
+                "refreshToken": "claude-old-refresh",
+                "expiresAt": 0
+            },
+            "sibling": {"writer": "claude-cli", "revision": 2}
+        }"#;
+        let (scope, path, original, old_scope, _, _) =
+            setup_claude_refresh("claude-file-sibling-race");
+        let reload_path = path.clone();
+        let request_path = path.clone();
+        let save_path = path.clone();
+
+        let (refreshed, scope_outcome, cache_binding) = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "claude-old-refresh");
+                fs::write(&request_path, CURRENT_WITH_NEW_SIBLING).unwrap();
+                Ok(ClaudeRefreshResponse {
+                    access_token: "claude-new-access".to_string(),
+                    refresh_token: Some("claude-new-refresh".to_string()),
+                    expires_in: 3_600,
+                })
+            },
+            move |credentials| save_claude_credentials_to_file(credentials, &save_path),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed.access_token, "claude-new-access");
+        assert_eq!(scope_outcome, old_scope);
+        assert_eq!(
+            cache_binding,
+            Some(ProviderCacheBinding::primary(old_scope.clone()))
+        );
+        let stored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored["claudeAiOauth"]["accessToken"], "claude-new-access");
+        assert_eq!(
+            stored["claudeAiOauth"]["refreshToken"],
+            "claude-new-refresh"
+        );
+        assert_eq!(stored["sibling"]["writer"], "claude-cli");
+        assert_eq!(stored["sibling"]["revision"], 2);
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_invalid_new_refresh_preserves_old_marker_and_store() {
         for (tag, refresh_value) in [
-            ("empty", serde_json::json!("")),
-            ("non-string", serde_json::json!({ "unexpected": true })),
+            ("claude-invalid-refresh-empty", serde_json::json!("")),
+            (
+                "claude-invalid-refresh-non-string",
+                serde_json::json!({ "unexpected": true }),
+            ),
         ] {
-            let (scope, path, original, old_scope, _, location) =
-                setup_claude_refresh(&format!("claude-invalid-refresh-{tag}"));
+            let (scope, path, original, old_scope, _, location) = setup_claude_refresh(tag);
             let response: ClaudeRefreshResponse = serde_json::from_value(serde_json::json!({
                 "access_token": "claude-new-access",
                 "refresh_token": refresh_value,
@@ -6627,7 +7326,7 @@ mod tests {
             .unwrap();
             let reload_path = path.clone();
             let save_path = path.clone();
-            let (refreshed, scope_outcome) = refresh_claude_credentials_with(
+            let (refreshed, scope_outcome, cache_binding) = refresh_claude_credentials_with(
                 &original,
                 &scope,
                 move |template| {
@@ -6638,7 +7337,7 @@ mod tests {
                     credentials.scope_slot = template.scope_slot.clone();
                     Ok(credentials)
                 },
-                move |refresh_token| async move {
+                move |refresh_token, _attempt_binding| async move {
                     assert_eq!(refresh_token, "claude-old-refresh");
                     Ok(response)
                 },
@@ -6648,33 +7347,90 @@ mod tests {
             .await
             .unwrap();
 
-            assert_eq!(refreshed.access_token, "claude-new-access", "{tag}");
+            assert_eq!(refreshed.access_token, "claude-new-access");
             assert_eq!(
                 refreshed.refresh_token.as_deref(),
-                Some("claude-old-refresh"),
-                "{tag}"
+                Some("claude-old-refresh")
             );
-            assert_eq!(scope_outcome.unwrap(), old_scope, "{tag}");
+            assert_eq!(scope_outcome, old_scope);
+            assert_eq!(
+                cache_binding,
+                Some(ProviderCacheBinding::primary(old_scope.clone()))
+            );
             assert_eq!(
                 scope
                     .resolve_current("claude-login-file", &location, b"claude-old-refresh")
                     .unwrap(),
-                old_scope,
-                "{tag}"
+                old_scope
             );
-            let stored = stored_claude_credentials(&path);
-            assert_eq!(stored.access_token, "claude-new-access", "{tag}");
             assert_eq!(
-                stored.refresh_token.as_deref(),
-                Some("claude-old-refresh"),
-                "{tag}"
+                stored_claude_refresh_token(&path).as_deref(),
+                Some("claude-old-refresh")
+            );
+            let stored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                stored["claudeAiOauth"]["refreshToken"],
+                Value::String("claude-old-refresh".to_string())
             );
             scope.cleanup();
         }
     }
 
     #[tokio::test]
-    async fn claude_refresh_transfer_and_crash_boundaries_use_production_sequence() {
+    async fn claude_refresh_blank_access_token_is_terminal_before_metadata_or_save() {
+        let (scope, path, original, old_scope, before, location) =
+            setup_claude_refresh("claude-blank-access");
+        let store_before = fs::read(&path).unwrap();
+        let reload_path = path.clone();
+        let save_calls = std::cell::Cell::new(0);
+
+        let failure = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "claude-old-refresh");
+                Ok(ClaudeRefreshResponse {
+                    access_token: " \t\n ".to_string(),
+                    refresh_token: Some("claude-new-refresh".to_string()),
+                    expires_in: 3_600,
+                })
+            },
+            |_| {
+                save_calls.set(save_calls.get() + 1);
+                Ok(())
+            },
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            failure,
+            ProviderFetchFailure::Terminal { ref display }
+                if display == "Claude OAuth refresh response has no access token."
+        ));
+        assert_eq!(save_calls.get(), 0);
+        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(fs::read(&path).unwrap(), store_before);
+        assert_eq!(
+            scope
+                .resolve_current("claude-login-file", &location, b"claude-old-refresh")
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_crash_boundaries_and_scope_gate_use_production_sequence() {
         for boundary in [
             RefreshCheckpoint::Reloaded,
             RefreshCheckpoint::NetworkReturned,
@@ -6683,14 +7439,15 @@ mod tests {
         ] {
             let (scope, path, original, old_scope, before, location) =
                 setup_claude_refresh("claude-crash");
+            let failure = run_claude_refresh(&scope, &path, &original, Some(boundary))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                failure,
+                ProviderFetchFailure::Terminal { ref display } if display == "injected crash"
+            ));
             assert_eq!(
-                run_claude_refresh(&scope, &path, &original, Some(boundary))
-                    .await
-                    .unwrap_err(),
-                "injected crash"
-            );
-            assert_eq!(
-                stored_claude_credentials(&path).refresh_token.as_deref(),
+                stored_claude_refresh_token(&path).as_deref(),
                 Some(if boundary == RefreshCheckpoint::CredentialsPersisted {
                     "claude-new-refresh"
                 } else {
@@ -6723,14 +7480,13 @@ mod tests {
         let (scope, path, original, old_scope, before, location) =
             setup_claude_refresh("claude-metadata-fail");
         scope.fail_metadata_save();
-        let (refreshed, scope_outcome) = run_claude_refresh(&scope, &path, &original, None)
+        let failure = run_claude_refresh(&scope, &path, &original, None)
             .await
-            .unwrap();
-        assert_eq!(refreshed.access_token, "claude-new-access");
-        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+            .unwrap_err();
+        assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
         assert_eq!(scope.metadata_bytes(), before);
         assert_eq!(
-            stored_claude_credentials(&path).refresh_token.as_deref(),
+            stored_claude_refresh_token(&path).as_deref(),
             Some("claude-old-refresh")
         );
         assert_eq!(
@@ -6741,12 +7497,10 @@ mod tests {
         );
         scope.cleanup();
 
-        let (scope, path, original, _old_scope, before, _) =
-            setup_claude_refresh("claude-metadata-fail-unchanged");
-        scope.fail_metadata_save();
+        let (scope, path, original, old_scope, _, location) =
+            setup_claude_refresh("claude-save-fail");
         let reload_path = path.clone();
-        let save_path = path.clone();
-        let (refreshed, scope_outcome) = refresh_claude_credentials_with(
+        let (refreshed, scope_outcome, cache_binding) = refresh_claude_credentials_with(
             &original,
             &scope,
             move |template| {
@@ -6757,68 +7511,844 @@ mod tests {
                 credentials.scope_slot = template.scope_slot.clone();
                 Ok(credentials)
             },
-            |refresh_token| async move {
-                assert_eq!(refresh_token, "claude-old-refresh");
-                Ok(ClaudeRefreshResponse {
-                    access_token: "claude-new-access".to_string(),
-                    refresh_token: None,
-                    expires_in: 3_600,
-                })
-            },
-            move |credentials| save_claude_credentials_to_file(credentials, &save_path),
+            claude_test_response,
+            |_| Err("injected save failure".to_string()),
             checkpoint_at(None),
         )
         .await
         .unwrap();
-        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
-        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(refreshed.access_token, "claude-new-access");
+        assert_eq!(scope_outcome, old_scope);
+        assert_eq!(cache_binding, None);
         assert_eq!(
-            refreshed.refresh_token.as_deref(),
+            stored_claude_refresh_token(&path).as_deref(),
             Some("claude-old-refresh")
         );
-        let persisted = stored_claude_credentials(&path);
-        assert_eq!(persisted.access_token, "claude-new-access");
-        assert_eq!(
-            persisted.refresh_token.as_deref(),
-            Some("claude-old-refresh")
-        );
-        scope.cleanup();
-
-        let (scope, path, original, old_scope, _, location) =
-            setup_claude_refresh("claude-success");
-        let (_, scope_outcome) = run_claude_refresh(&scope, &path, &original, None)
-            .await
-            .unwrap();
-        assert_eq!(scope_outcome.unwrap(), old_scope);
         assert_eq!(
             scope
                 .resolve_current("claude-login-file", &location, b"claude-new-refresh")
                 .unwrap(),
             old_scope
         );
+        scope.cleanup();
+
+        let (scope, path, original, old_scope, _, location) =
+            setup_claude_refresh("claude-success");
+        let (_, scope_outcome, cache_binding) = run_claude_refresh(&scope, &path, &original, None)
+            .await
+            .unwrap();
+        assert_eq!(scope_outcome, old_scope);
         assert_eq!(
-            stored_claude_credentials(&path).refresh_token.as_deref(),
-            Some("claude-new-refresh")
+            cache_binding,
+            Some(ProviderCacheBinding::primary(old_scope.clone()))
+        );
+        assert_eq!(
+            scope
+                .resolve_current("claude-login-file", &location, b"claude-new-refresh")
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_transient_uses_lock_reloaded_binding_not_outer_binding() {
+        let (scope, path, mut original, inner_scope, _, location) =
+            setup_claude_refresh("claude-lock-binding");
+        original.refresh_token = Some("outer-refresh-a".to_string());
+        let outer_scope = scope
+            .resolve_current("claude-login-file", &location, b"outer-refresh-a")
+            .unwrap();
+        assert_ne!(outer_scope, inner_scope);
+        let expected = ProviderCacheBinding::primary(inner_scope);
+        let request_expected = expected.clone();
+        let reload_path = path.clone();
+
+        let failure = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |refresh_token, attempt_binding| async move {
+                assert_eq!(refresh_token, "claude-old-refresh");
+                assert_eq!(attempt_binding, request_expected);
+                Err(ProviderFetchFailure::transient(
+                    "Claude OAuth refresh failed. Retrying automatically.",
+                    Some(attempt_binding),
+                    SafeTransportDiagnostic::from_facts(TransportErrorFacts::synthetic(
+                        true,
+                        false,
+                        TransportPhase::Request,
+                        None,
+                    )),
+                ))
+            },
+            |_| Ok(()),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+
+        match failure {
+            ProviderFetchFailure::Transient {
+                attempt_binding, ..
+            } => assert_eq!(attempt_binding, Some(expected)),
+            ProviderFetchFailure::Terminal { .. } => panic!("timeout must remain transient"),
+        }
+        scope.cleanup();
+    }
+
+    #[test]
+    fn stage4_codex_and_claude_matrix_assigns_semantic_keys() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let rate_limit = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 8.0,
+                reset_at: now.timestamp() + 18_000,
+                limit_window_seconds: 18_000,
+            }),
+            secondary_window: Some(CodexWindow {
+                used_percent: 35.0,
+                reset_at: now.timestamp() + 604_800,
+                limit_window_seconds: 604_800,
+            }),
+        };
+        let codex = codex_windows(Some(&rate_limit), None, now);
+        assert_eq!(
+            codex[0].pace_status.window_key.as_deref(),
+            Some("main.session.v1")
+        );
+        assert_eq!(
+            codex[1].pace_status.window_key.as_deref(),
+            Some("main.weekly.v1")
+        );
+
+        let claude = ClaudeUsageResponse {
+            five_hour: Some(ClaudeWindow {
+                utilization: Some(10.0),
+                resets_at: Some("2026-07-18T00:00:00Z".to_string()),
+            }),
+            seven_day: Some(ClaudeWindow {
+                utilization: Some(20.0),
+                resets_at: Some("2026-07-19T00:00:00Z".to_string()),
+            }),
+            ..Default::default()
+        };
+        let claude = claude_windows(&claude, now);
+        assert_eq!(
+            claude[0].pace_status.window_key.as_deref(),
+            Some("session.v1")
+        );
+        assert_eq!(
+            claude[1].pace_status.window_key.as_deref(),
+            Some("weekly.v1")
+        );
+        assert_eq!(claude[0].window_minutes_for_test(), Some(300));
+        assert_eq!(claude[1].window_minutes_for_test(), Some(10_080));
+    }
+
+    #[test]
+    fn stage4_duplicate_snapshot_rows_are_removed_before_history_and_wire() {
+        let scope = TestRefreshScope::new("stage4", "duplicate-rows");
+        let account_scope = scope
+            .resolve_current("fixture", "duplicate", b"duplicate-marker")
+            .unwrap();
+        let now = 1_700_000_000;
+        let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
+        let make_window = |label: &str, card_id: &str, window_key: &str, used: f64| {
+            UsageWindow::from_provider_used_percent(
+                label.to_string(),
+                used,
+                Some(reset),
+                Utc.timestamp_opt(now, 0).single().unwrap(),
+            )
+            .with_identity(
+                card_id,
+                Some(window_key.to_string()),
+                None,
+                Some(DurationEvidence::contract(86_400)),
+            )
+        };
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "fixture".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![
+                make_window("First", "shared-card.v1", "first.v1", 10.0),
+                make_window("Duplicate key", "second-card.v1", "first.v1", 20.0),
+                make_window("Duplicate card", "shared-card.v1", "third.v1", 30.0),
+            ],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+
+        enrich_snapshot_with(&mut snapshot, now, |active, observations, _| {
+            assert_eq!(active.len(), 1);
+            assert_eq!(observations.len(), 1);
+            assert_eq!(active[0].window_key, "first.v1");
+            assert_eq!(observations[0].used_percent, 10.0);
+            Ok(vec![Ok((HistoryOutcome::LearningDuration, None, 0))])
+        });
+
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].label_for_test(), "First");
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        let rows = wire["windows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["cardId"], "shared-card.v1");
+        assert_eq!(rows[0]["paceStatus"]["windowKey"], "first.v1");
+        scope.cleanup();
+    }
+
+    #[test]
+    fn stage4_chained_identity_collisions_keep_only_actual_uniques() {
+        let scope = TestRefreshScope::new("stage4", "chained-collisions");
+        let account_scope = scope
+            .resolve_current("fixture", "chained", b"chained-marker")
+            .unwrap();
+        let now = 1_700_000_000;
+        let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
+        let make_window = |label: &str, card_id: &str, window_key: &str, used: f64| {
+            UsageWindow::from_provider_used_percent(
+                label.to_string(),
+                used,
+                Some(reset),
+                Utc.timestamp_opt(now, 0).single().unwrap(),
+            )
+            .with_identity(
+                card_id,
+                Some(window_key.to_string()),
+                None,
+                Some(DurationEvidence::contract(86_400)),
+            )
+        };
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "fixture".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![
+                make_window("A/X", "a.v1", "x.v1", 10.0),
+                make_window("A/Y", "a.v1", "y.v1", 20.0),
+                make_window("C/Y", "c.v1", "y.v1", 30.0),
+                make_window("B/X", "b.v1", "x.v1", 40.0),
+                make_window("B/Z", "b.v1", "z.v1", 50.0),
+            ],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+
+        enrich_snapshot_with(&mut snapshot, now, |active, observations, _| {
+            assert_eq!(active.len(), 3);
+            assert_eq!(observations.len(), 3);
+            assert_eq!(active[0].window_key, "x.v1");
+            assert_eq!(active[1].window_key, "y.v1");
+            assert_eq!(active[2].window_key, "z.v1");
+            assert_eq!(
+                observations
+                    .iter()
+                    .map(|observation| observation.used_percent)
+                    .collect::<Vec<_>>(),
+                vec![10.0, 30.0, 50.0]
+            );
+            Ok(vec![
+                Ok((HistoryOutcome::LearningDuration, None, 0)),
+                Ok((HistoryOutcome::LearningDuration, None, 0)),
+                Ok((HistoryOutcome::LearningDuration, None, 0)),
+            ])
+        });
+
+        assert_eq!(snapshot.windows.len(), 3);
+        assert_eq!(
+            snapshot
+                .windows
+                .iter()
+                .map(UsageWindow::label_for_test)
+                .collect::<Vec<_>>(),
+            vec!["A/X", "C/Y", "B/Z"]
+        );
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        let rows = wire["windows"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["cardId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a.v1", "c.v1", "b.v1"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["paceStatus"]["windowKey"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["x.v1", "y.v1", "z.v1"]
         );
         scope.cleanup();
     }
 
     #[test]
-    fn refreshes_or_expires_cached_windows() {
-        let base = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let window =
-            unified_ratelimit_window("Session", Some(0.2), Some(1_700_000_000 + 3600), base)
-                .unwrap();
+    fn stage4_batch_maps_results_once_without_network() {
+        let scope = TestRefreshScope::new("stage4", "batch-map");
+        let account_scope = scope
+            .resolve_current("fixture", "batch", b"batch-marker")
+            .unwrap();
+        let now = 1_700_000_000;
+        let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "fixture".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![
+                UsageWindow::from_provider_used_percent(
+                    "First".to_string(),
+                    20.0,
+                    Some(reset),
+                    Utc.timestamp_opt(now, 0).single().unwrap(),
+                )
+                .with_identity(
+                    "first.v1",
+                    Some("first.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(86_400)),
+                ),
+                UsageWindow::from_provider_used_percent(
+                    "Second".to_string(),
+                    40.0,
+                    Some(reset),
+                    Utc.timestamp_opt(now, 0).single().unwrap(),
+                )
+                .with_identity(
+                    "second.v1",
+                    Some("second.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(86_400)),
+                ),
+            ],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+        let calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, now, |active, observations, _| {
+            calls.set(calls.get() + 1);
+            assert_eq!(active.len(), 2);
+            assert_eq!(observations.len(), 2);
+            assert_eq!(active[0].window_key, "first.v1");
+            assert_eq!(active[1].window_key, "second.v1");
+            Ok(vec![
+                Ok((HistoryOutcome::LearningDuration, None, 0)),
+                Ok((
+                    HistoryOutcome::Ready {
+                        duration_seconds: 86_400,
+                        source: DurationSource::Contract,
+                        sampled: true,
+                    },
+                    Some(HistoricalPace {
+                        expected_percent: 42.0,
+                        eta_seconds: Some(900.0),
+                        will_last_to_reset: false,
+                        run_out_probability: Some(0.25),
+                    }),
+                    4,
+                )),
+            ])
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "one snapshot means one batch and no new request"
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::LearningDuration
+        );
+        assert_eq!(snapshot.windows[1].pace_status.state, PaceState::Available);
+        assert_eq!(snapshot.windows[1].window_minutes_for_test(), Some(1_440));
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(wire["windows"][0]["paceStatus"]["completeCycles"], 0);
+        assert_eq!(wire["windows"][1]["paceStatus"]["completeCycles"], 4);
+        scope.cleanup();
+    }
 
-        // 30 min later, still before the reset: reset_text recomputed to the
-        // shorter countdown (not the frozen original).
-        let later = base + chrono::Duration::seconds(1800);
-        let refreshed = refresh_cached_windows(std::slice::from_ref(&window), later).unwrap();
-        assert_eq!(refreshed.len(), 1);
-        assert!(refreshed[0].reset_text.as_deref().unwrap().contains("30m"));
+    #[test]
+    fn stage4_learning_history_uses_batch_complete_cycles() {
+        let scope = TestRefreshScope::new("stage4", "learning-history");
+        let account_scope = scope
+            .resolve_current("fixture", "learning", b"learning-marker")
+            .unwrap();
+        let now = 1_700_000_000;
+        let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "fixture".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![UsageWindow::from_provider_used_percent(
+                "Weekly".to_string(),
+                20.0,
+                Some(reset),
+                Utc.timestamp_opt(now, 0).single().unwrap(),
+            )
+            .with_identity(
+                "weekly.v1",
+                Some("weekly.v1".to_string()),
+                None,
+                Some(DurationEvidence::contract(86_400)),
+            )],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
 
-        // Past the reset: stale -> expire (None) so the caller re-probes.
-        let after = base + chrono::Duration::seconds(3700);
-        assert!(refresh_cached_windows(std::slice::from_ref(&window), after).is_none());
+        enrich_snapshot_with(&mut snapshot, now, |_, _, _| {
+            Ok(vec![Ok((
+                HistoryOutcome::Ready {
+                    duration_seconds: 86_400,
+                    source: DurationSource::Contract,
+                    sampled: true,
+                },
+                None,
+                2,
+            ))])
+        });
+
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::LearningHistory
+        );
+        assert_eq!(snapshot.windows[0].pace_status.complete_cycles, 2);
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(wire["windows"][0]["paceStatus"]["completeCycles"], 2);
+        scope.cleanup();
+    }
+
+    #[test]
+    fn stage4_incoherent_historical_result_is_typed_unavailable() {
+        let scope = TestRefreshScope::new("stage4", "incoherent-history");
+        let account_scope = scope
+            .resolve_current("fixture", "incoherent", b"incoherent-marker")
+            .unwrap();
+        let now = 1_700_000_000;
+        let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "fixture".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![UsageWindow::from_provider_used_percent(
+                "Weekly".to_string(),
+                20.0,
+                Some(reset),
+                Utc.timestamp_opt(now, 0).single().unwrap(),
+            )
+            .with_identity(
+                "weekly.v1",
+                Some("weekly.v1".to_string()),
+                None,
+                Some(DurationEvidence::contract(86_400)),
+            )],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+
+        enrich_snapshot_with(&mut snapshot, now, |_, _, _| {
+            Ok(vec![Ok((
+                HistoryOutcome::Ready {
+                    duration_seconds: 86_400,
+                    source: DurationSource::Contract,
+                    sampled: true,
+                },
+                Some(HistoricalPace {
+                    expected_percent: 42.0,
+                    eta_seconds: Some(900.0),
+                    will_last_to_reset: true,
+                    run_out_probability: Some(0.25),
+                }),
+                4,
+            ))])
+        });
+
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::Unavailable
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("history")
+        );
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(wire["windows"][0]["paceStatus"]["state"], "unavailable");
+        assert!(wire["windows"][0].get("historicalPace").is_none());
+        scope.cleanup();
+    }
+
+    #[test]
+    fn stage4_historical_eta_and_will_last_are_exactly_coherent() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let reset = now + chrono::Duration::days(1);
+        let base =
+            UsageWindow::from_provider_used_percent("Daily".to_string(), 30.0, Some(reset), now)
+                .with_identity(
+                    "daily.v1",
+                    Some("daily.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(86_400)),
+                );
+        let cases = [
+            (
+                "will-last",
+                HistoricalPace {
+                    expected_percent: 42.0,
+                    eta_seconds: None,
+                    will_last_to_reset: true,
+                    run_out_probability: Some(0.1),
+                },
+                true,
+            ),
+            (
+                "will-run-out",
+                HistoricalPace {
+                    expected_percent: 42.0,
+                    eta_seconds: Some(900.0),
+                    will_last_to_reset: false,
+                    run_out_probability: Some(0.25),
+                },
+                true,
+            ),
+            (
+                "will-last-with-eta",
+                HistoricalPace {
+                    expected_percent: 42.0,
+                    eta_seconds: Some(900.0),
+                    will_last_to_reset: true,
+                    run_out_probability: Some(0.25),
+                },
+                false,
+            ),
+            (
+                "will-run-out-without-eta",
+                HistoricalPace {
+                    expected_percent: 42.0,
+                    eta_seconds: None,
+                    will_last_to_reset: false,
+                    run_out_probability: Some(0.25),
+                },
+                false,
+            ),
+        ];
+
+        for (label, pace, expected) in cases {
+            assert_eq!(historical_pace_is_coherent(&pace), expected, "{label}");
+            let mut window = base.clone();
+            window.pace_status.state = PaceState::Available;
+            window.historical_pace = Some(historical_pace_payload(pace));
+            assert_eq!(serde_json::to_value(&window).is_ok(), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn stage4_scope_error_is_sticky_and_skips_history() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "fixture".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Err(AccountScopeError::MetadataWrite),
+            windows: vec![
+                UsageWindow::from_provider_used_percent(
+                    "Session".to_string(),
+                    20.0,
+                    Some(now + chrono::Duration::hours(5)),
+                    now,
+                )
+                .with_identity(
+                    "session.v1",
+                    Some("session.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(300 * 60)),
+                ),
+                UsageWindow::from_provider_used_percent(
+                    "Unknown".to_string(),
+                    30.0,
+                    Some(now + chrono::Duration::hours(5)),
+                    now,
+                )
+                .with_identity("row.unknown.v1", None, None, None),
+            ],
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+        let calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("accountScope")
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::Unavailable
+        );
+        assert_eq!(
+            snapshot.windows[1].pace_status.reason.as_deref(),
+            Some("windowIdentity")
+        );
+        assert!(snapshot.windows[1].pace_status.window_key.is_none());
+        assert!(serde_json::to_value(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn stage4_wire_rejects_internal_nested_drift_and_preserves_observed_learning() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let reset = now + chrono::Duration::days(1);
+        let base =
+            UsageWindow::from_provider_used_percent("Daily".to_string(), 30.0, Some(reset), now)
+                .with_identity(
+                    "daily.v1",
+                    Some("daily.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(86_400)),
+                );
+
+        let mut key_drift = base.clone();
+        key_drift.pace_status.window_key = Some("other.v1".to_string());
+        assert!(serde_json::to_value(&key_drift).is_err());
+
+        let mut duration_drift = base.clone();
+        duration_drift.pace_status.duration_seconds = Some(3_600);
+        assert!(serde_json::to_value(&duration_drift).is_err());
+
+        let mut source_drift = base.clone();
+        source_drift.pace_status.duration_source = Some(DurationSource::Provider);
+        assert!(serde_json::to_value(&source_drift).is_err());
+
+        let mut minutes_drift = base.clone();
+        minutes_drift.window_minutes = Some(1);
+        assert!(serde_json::to_value(&minutes_drift).is_err());
+
+        let mut learning =
+            UsageWindow::from_provider_used_percent("Learning".to_string(), 30.0, Some(reset), now)
+                .with_identity("learning.v1", Some("learning.v1".to_string()), None, None);
+        learning.duration_source = Some(DurationSource::Observed);
+        learning.pace_status.duration_source = Some(DurationSource::Observed);
+        let wire = serde_json::to_value(&learning).unwrap();
+        assert_eq!(wire["paceStatus"]["state"], "learningDuration");
+        assert_eq!(wire["paceStatus"]["durationSource"], "observed");
+        assert!(wire["paceStatus"].get("durationSeconds").is_none());
+    }
+
+    #[test]
+    fn stage4_wire_rejects_available_without_historical_pace() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let mut window = UsageWindow::from_provider_used_percent(
+            "Weekly".to_string(),
+            30.0,
+            Some(now + chrono::Duration::days(7)),
+            now,
+        )
+        .with_identity(
+            "weekly.v1",
+            Some("weekly.v1".to_string()),
+            None,
+            Some(DurationEvidence::contract(7 * 24 * 60 * 60)),
+        );
+        window.pace_status.state = PaceState::Available;
+        window.historical_pace = None;
+        assert!(serde_json::to_value(&window).is_err());
+    }
+
+    #[test]
+    fn provider_quota_pace_v3_fixture_locks_production_serializer() {
+        fn window(
+            card_id: &str,
+            label: &str,
+            used_percent: f64,
+            resets_at: Option<&str>,
+            window_key: Option<&str>,
+            state: PaceState,
+            duration_seconds: Option<i64>,
+            duration_source: Option<DurationSource>,
+            complete_cycles: usize,
+            reason: Option<&str>,
+            historical_pace: Option<HistoricalPacePayload>,
+        ) -> UsageWindow {
+            UsageWindow {
+                card_id: card_id.to_string(),
+                label: label.to_string(),
+                used_percent,
+                remaining_percent: 100.0 - used_percent,
+                resets_at: resets_at.map(|value| value.to_string()),
+                reset_text: None,
+                window_minutes: duration_seconds.map(|seconds| seconds / 60),
+                window_key: window_key.map(|value| value.to_string()),
+                duration_seconds,
+                duration_source,
+                provider_duration: None,
+                contract_duration: None,
+                pace_status: PaceStatusPayload {
+                    state,
+                    window_key: window_key.map(|value| value.to_string()),
+                    duration_seconds,
+                    duration_source,
+                    complete_cycles,
+                    reason: reason.map(|value| value.to_string()),
+                },
+                historical_pace,
+            }
+        }
+
+        let payload = AgentUsagePayload {
+            generated_at: "2026-07-10T12:00:00.000Z".to_string(),
+            publication_generation: 1,
+            agents: vec![AgentUsageSnapshot {
+                client_id: "provider-fixture.invalid".to_string(),
+                source: "fixture.invalid".to_string(),
+                updated_at: "2026-07-10T12:00:00.000Z".to_string(),
+                identity: None,
+                account_scope: Err(AccountScopeError::NoTrustedEvidence),
+                windows: vec![
+                    window(
+                        "ahead.invalid",
+                        "Ahead quota",
+                        72.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.ahead.invalid"),
+                        PaceState::Available,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        5,
+                        None,
+                        Some(HistoricalPacePayload {
+                            expected_used_percent: 32.0,
+                            eta_seconds: Some(3_600.0),
+                            will_last_to_reset: false,
+                            run_out_probability: Some(0.75),
+                        }),
+                    ),
+                    window(
+                        "behind.invalid",
+                        "Behind quota",
+                        28.0,
+                        Some("2026-07-15T12:00:00Z"),
+                        Some("quota.behind.invalid"),
+                        PaceState::Available,
+                        Some(604_800),
+                        Some(DurationSource::Contract),
+                        7,
+                        None,
+                        Some(HistoricalPacePayload {
+                            expected_used_percent: 56.0,
+                            eta_seconds: None,
+                            will_last_to_reset: true,
+                            run_out_probability: Some(0.2),
+                        }),
+                    ),
+                    window(
+                        "learning-history.invalid",
+                        "Learning history",
+                        40.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.learning-history.invalid"),
+                        PaceState::LearningHistory,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        2,
+                        None,
+                        None,
+                    ),
+                    window(
+                        "learning-duration.invalid",
+                        "Learning duration",
+                        40.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.learning-duration.invalid"),
+                        PaceState::LearningDuration,
+                        None,
+                        Some(DurationSource::Observed),
+                        0,
+                        None,
+                        None,
+                    ),
+                    window(
+                        "missing-reset.invalid",
+                        "Missing reset",
+                        50.0,
+                        None,
+                        Some("quota.missing-reset.invalid"),
+                        PaceState::Unavailable,
+                        None,
+                        None,
+                        0,
+                        Some("missingReset"),
+                        None,
+                    ),
+                    window(
+                        "shared-first.invalid",
+                        "Shared label",
+                        10.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.shared-first.invalid"),
+                        PaceState::LearningHistory,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        2,
+                        None,
+                        None,
+                    ),
+                    window(
+                        "shared-second.invalid",
+                        "Shared label",
+                        20.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.shared-second.invalid"),
+                        PaceState::LearningHistory,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        2,
+                        None,
+                        None,
+                    ),
+                ],
+                credits: None,
+                error: None,
+                transport_diagnostic: None,
+            }],
+            opencode_subscriptions: Vec::new(),
+        };
+
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Fixtures/CrossCheck/provider-quota-pace-v3.json");
+        let fixture: Value = serde_json::from_str(
+            &fs::read_to_string(&fixture_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", fixture_path.display())),
+        )
+        .unwrap_or_else(|error| panic!("decode {}: {error}", fixture_path.display()));
+        assert_eq!(fixture["schemaVersion"], 3);
+        let mut serialized = serde_json::to_value(payload).unwrap();
+        assert_eq!(serialized["publicationGeneration"], 1);
+        serialized
+            .as_object_mut()
+            .expect("payload serializes as an object")
+            .remove("publicationGeneration");
+        assert_eq!(fixture["payload"], serialized);
     }
 }

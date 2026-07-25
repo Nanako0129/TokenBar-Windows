@@ -122,6 +122,39 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("build tokio runtime for tb_core_ffi")
 });
 
+#[derive(Default)]
+struct PublicationGate {
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublicationGenerationExhausted;
+
+static AGENT_USAGE_PUBLICATION_GATE: LazyLock<Mutex<PublicationGate>> =
+    LazyLock::new(|| Mutex::new(PublicationGate::default()));
+
+/// Serialize the complete publication path and assign its order at gate entry;
+/// this gate is the sole generation source, not a timestamp or caller ordering.
+/// Exhaustion fails closed instead of publishing a duplicate generation.
+fn with_publication_gate<T>(
+    gate: &Mutex<PublicationGate>,
+    body: impl FnOnce(u64) -> T,
+) -> Result<T, PublicationGenerationExhausted> {
+    let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = state
+        .generation
+        .checked_add(1)
+        .ok_or(PublicationGenerationExhausted)?;
+    state.generation = generation;
+    Ok(body(generation))
+}
+
+fn with_agent_usage_publication_gate<T>(
+    body: impl FnOnce(u64) -> T,
+) -> Result<T, PublicationGenerationExhausted> {
+    with_publication_gate(&AGENT_USAGE_PUBLICATION_GATE, body)
+}
+
 /// Cap rayon's global thread pool to 2 workers. tokscale-core uses rayon for
 /// parallel log parsing (55+ par_iter sites); the default pool size is num_cpus
 /// which is fine for a one-shot CLI but ruinous for a resident menu-bar daemon:
@@ -137,9 +170,9 @@ static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
 
 /// year → (computed-at, source token, mapped graph payload). Same role as
 /// the Tauri AppState cache, plus a change token: when the cache entry ages
-/// past the oneshot window but `latest_source_mtime_ms` still matches the
-/// token, the entry is re-stamped and served — an idle machine never pays
-/// for a full re-aggregation just because time passed.
+/// past the oneshot window but the topology-sensitive token still matches,
+/// the entry is re-stamped and served — an idle machine never pays for a full
+/// re-aggregation just because time passed.
 type GraphCacheEntry = (Instant, u64, serde_json::Value);
 static GRAPH_CACHE: LazyLock<Mutex<HashMap<String, GraphCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -181,10 +214,10 @@ fn envelope(result: Result<serde_json::Value, String>) -> *mut c_char {
 /// rest of the menu-bar app running rather than aborting the whole process. The
 /// default panic hook still prints the panic location to stderr before we catch.
 ///
-/// `AssertUnwindSafe` is sound here. State shared across calls is the three
-/// std::sync Mutex statics (GRAPH_CACHE / TAIL_TICK / CLAUDE_USAGE_GATE), each
-/// recovered from poison on the next lock via `into_inner()`, plus the live
-/// tail's parking_lot Mutexes, which never poison and release cleanly on unwind.
+/// `AssertUnwindSafe` is sound here. Process-wide std::sync Mutex state is
+/// updated only while locked, and each lock helper recovers poison on the next
+/// call via `into_inner()`. The live tail's parking_lot Mutexes never poison and
+/// release cleanly on unwind.
 /// A caught panic can leave a cache entry stale or a tail tick un-run, never
 /// torn: the next call re-derives the graph, and `tail_tick_if_stale` clears its
 /// in-flight flag without stamping on a tick panic so the tail re-parses next.
@@ -242,9 +275,9 @@ unsafe fn clients_from(clients: *const c_char) -> Result<Option<Vec<String>>, St
 
 fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     // Read the entry and release the lock before any filesystem I/O — never hold
-    // GRAPH_CACHE across the mtime stat sweep below (mirrors graph_compute, which
-    // probes outside the lock too), so concurrent tb_graph callers don't queue
-    // behind one another's stat.
+    // GRAPH_CACHE across the source-state probe below (mirrors graph_compute,
+    // which probes outside the lock too), so concurrent tb_graph callers don't
+    // queue behind one another's stat sweep.
     let (fresh_enough, token, data) = {
         let cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         let (at, token, data) = cache.get(year)?;
@@ -253,13 +286,14 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     if fresh_enough {
         return Some(data);
     }
-    // Aged out — but if no source file changed since the compute, the graph
+    // Aged out — but if no source state changed since the compute, the graph
     // cannot have changed either. Probe with the lock released, then re-acquire
     // briefly to re-stamp so the next calls inside the oneshot window skip the
     // probe entirely. A lost re-stamp (entry evicted/replaced meanwhile) just
     // degrades to the next call re-probing — benign.
     let context = LocalSourceContext::current();
-    let fresh = tokscale_core::latest_source_mtime_ms(&context.parse_options(None, None)).ok()?;
+    let fresh =
+        tokscale_core::local_source_change_token(&context.parse_options(None, None)).ok()?;
     if fresh == token {
         let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = cache.get_mut(year) {
@@ -271,13 +305,13 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
 }
 
 fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
-    // Probe before parsing: a write that lands mid-compute moves the mtime
-    // past this token, so the next aged-out read recomputes rather than
-    // serving a graph that missed it. Keep the same context for both paths so
-    // the mtime token and report scan observe identical source roots.
+    // Probe before parsing: a source write or topology change that lands
+    // mid-compute changes the token, so the next aged-out read recomputes
+    // rather than serving a graph that missed it. Keep the same context for
+    // both paths so the probe and report scan observe identical source roots.
     let context = LocalSourceContext::current();
-    let token = tokscale_core::latest_source_mtime_ms(&context.parse_options(None, None))
-        .unwrap_or(0);
+    let token =
+        tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0);
     let data = usage_graph::run(&context, year)?;
     GRAPH_CACHE
         .lock()
@@ -462,19 +496,30 @@ pub extern "C" fn tb_tokens_per_min() -> *mut c_char {
 /// codex/claude/antigravity/copilot/grok, fetched concurrently. Network-bound —
 /// call from a background thread. Per-provider failures land in each
 /// snapshot's `error` field; the call itself only fails on serialization.
+/// The publication gate assigns `publicationGeneration` and serializes the
+/// provider run, JSON/envelope construction, and pointer creation. The gate is
+/// released before this extern function returns, so Swift still needs its own
+/// generation guard for caller return/apply order.
 #[no_mangle]
 pub extern "C" fn tb_agent_usage() -> *mut c_char {
-    guarded("tb_agent_usage", || {
-        // No outer timeout on purpose: each provider carries its own 30s
-        // per-request reqwest timeout (which covers connect, so nothing hangs
-        // unbounded), and they run concurrently via tokio::join!. A single outer
-        // ceiling would instead collapse the whole payload to one error — losing
-        // the providers that already succeeded — and could cut off the legitimate
-        // expired-token path (sequential refresh + fetch, up to ~60s).
-        let payload = RUNTIME.block_on(agent_usage::run());
-        envelope(
-            serde_json::to_value(payload).map_err(|e| format!("serialize agent usage: {}", e)),
-        )
+    with_agent_usage_publication_gate(|generation| {
+        guarded("tb_agent_usage", || {
+            // No outer timeout on purpose: each provider carries its own 30s
+            // per-request reqwest timeout (which covers connect, so nothing hangs
+            // unbounded), and they run concurrently via tokio::join!. A single outer
+            // ceiling would instead collapse the whole payload to one error — losing
+            // the providers that already succeeded — and could cut off the legitimate
+            // expired-token path (sequential refresh + fetch, up to ~60s).
+            let payload = RUNTIME.block_on(agent_usage::run(generation));
+            envelope(
+                serde_json::to_value(payload).map_err(|e| format!("serialize agent usage: {}", e)),
+            )
+        })
+    })
+    .unwrap_or_else(|_| {
+        envelope(Err(
+            "agent usage publication generation exhausted".to_string()
+        ))
     })
 }
 
@@ -573,6 +618,203 @@ mod tests {
         let s = unsafe { take(p) };
         assert!(s.contains(r#""ok":false"#), "got: {s}");
         assert!(s.contains("tb_test panicked: boom"), "got: {s}");
+    }
+
+    #[test]
+    fn publication_gate_serializes_pointer_publication() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::thread;
+
+        let gate = Arc::new(Mutex::new(PublicationGate::default()));
+        let (events_tx, events_rx) = mpsc::channel();
+        let (release_a_tx, release_a_rx) = mpsc::channel();
+        let (b_called_tx, b_called_rx) = mpsc::channel();
+        let a_ready = Arc::new(Barrier::new(2));
+
+        let a_gate = Arc::clone(&gate);
+        let a_ready_thread = Arc::clone(&a_ready);
+        let a_events = events_tx.clone();
+        let a = thread::spawn(move || {
+            with_publication_gate(a_gate.as_ref(), |_| {
+                a_events.send("A run").unwrap();
+                a_ready_thread.wait();
+                release_a_rx.recv().unwrap();
+
+                let pointer = CString::new("A").unwrap().into_raw();
+                a_events.send("A publish").unwrap();
+                unsafe { tb_free(pointer) };
+            })
+            .unwrap();
+        });
+        a_ready.wait();
+
+        let b_gate = Arc::clone(&gate);
+        let b_events = events_tx.clone();
+        let b = thread::spawn(move || {
+            b_called_tx.send(()).unwrap();
+            with_publication_gate(b_gate.as_ref(), |_| {
+                b_events.send("B run").unwrap();
+                let pointer = CString::new("B").unwrap().into_raw();
+                b_events.send("B publish").unwrap();
+                unsafe { tb_free(pointer) };
+            })
+            .unwrap();
+        });
+        b_called_rx.recv().unwrap();
+        release_a_tx.send(()).unwrap();
+
+        a.join().unwrap();
+        b.join().unwrap();
+        drop(events_tx);
+
+        let events: Vec<_> = events_rx.iter().collect();
+        assert_eq!(events, vec!["A run", "A publish", "B run", "B publish"]);
+    }
+
+    #[test]
+    fn publication_generation_handles_return_order_reversal() {
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let gate = Arc::new(Mutex::new(PublicationGate::default()));
+        let (a_gate_returned_tx, a_gate_returned_rx) = mpsc::channel();
+        let (release_a_tx, release_a_rx) = mpsc::channel();
+        let (returns_tx, returns_rx) = mpsc::channel();
+
+        let a_gate = Arc::clone(&gate);
+        let a_returns = returns_tx.clone();
+        let a = thread::spawn(move || {
+            let (generation, pointer) = with_publication_gate(a_gate.as_ref(), |generation| {
+                let pointer = CString::new(format!(
+                    "{{\"run\":\"A\",\"generation\":{generation},\"result\":\"success\"}}"
+                ))
+                .unwrap()
+                .into_raw();
+                (generation, pointer)
+            })
+            .unwrap();
+            // The gate is released here. Pause before the wrapper records the
+            // return so B can publish and return first.
+            a_gate_returned_tx.send(generation).unwrap();
+            release_a_rx.recv().unwrap();
+            let payload = unsafe { take(pointer) };
+            a_returns.send(("A returned", generation, payload)).unwrap();
+        });
+
+        assert_eq!(a_gate_returned_rx.recv().unwrap(), 1);
+
+        let b_gate = Arc::clone(&gate);
+        let b_returns = returns_tx.clone();
+        let b = thread::spawn(move || {
+            let (generation, pointer) = with_publication_gate(b_gate.as_ref(), |generation| {
+                let pointer = CString::new(format!(
+                    "{{\"run\":\"B\",\"generation\":{generation},\"result\":\"terminal\"}}"
+                ))
+                .unwrap()
+                .into_raw();
+                (generation, pointer)
+            })
+            .unwrap();
+            let payload = unsafe { take(pointer) };
+            b_returns.send(("B returned", generation, payload)).unwrap();
+        });
+
+        let b_return = returns_rx.recv().unwrap();
+        assert_eq!(b_return.0, "B returned");
+        assert_eq!(b_return.1, 2);
+        assert_eq!(
+            b_return.2,
+            r#"{"run":"B","generation":2,"result":"terminal"}"#
+        );
+
+        release_a_tx.send(()).unwrap();
+        let a_return = returns_rx.recv().unwrap();
+        assert_eq!(a_return.0, "A returned");
+        assert_eq!(a_return.1, 1);
+        assert_eq!(
+            a_return.2,
+            r#"{"run":"A","generation":1,"result":"success"}"#
+        );
+
+        a.join().unwrap();
+        b.join().unwrap();
+    }
+
+    #[test]
+    fn publication_generation_exhaustion_fails_closed() {
+        let gate = Mutex::new(PublicationGate {
+            generation: u64::MAX - 1,
+        });
+        assert_eq!(
+            with_publication_gate(&gate, |generation| generation).unwrap(),
+            u64::MAX
+        );
+
+        let mut body_called = false;
+        let exhausted = with_publication_gate(&gate, |generation| {
+            body_called = true;
+            generation
+        });
+        assert_eq!(exhausted, Err(PublicationGenerationExhausted));
+        assert!(
+            !body_called,
+            "exhaustion must not publish a duplicate generation"
+        );
+    }
+
+    #[test]
+    fn publication_gate_keeps_panic_envelope_before_next_run() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::thread;
+
+        let gate = Arc::new(Mutex::new(PublicationGate::default()));
+        let (events_tx, events_rx) = mpsc::channel();
+        let (release_a_tx, release_a_rx) = mpsc::channel();
+        let (b_called_tx, b_called_rx) = mpsc::channel();
+        let a_ready = Arc::new(Barrier::new(2));
+
+        let a_gate = Arc::clone(&gate);
+        let a_ready_thread = Arc::clone(&a_ready);
+        let a_events = events_tx.clone();
+        let a = thread::spawn(move || {
+            with_publication_gate(a_gate.as_ref(), |_| {
+                let pointer = guarded("tb_test", || {
+                    a_events.send("A run").unwrap();
+                    a_ready_thread.wait();
+                    release_a_rx.recv().unwrap();
+                    panic!("boom");
+                });
+                a_events.send("A panic publish").unwrap();
+                unsafe { tb_free(pointer) };
+            })
+            .unwrap();
+        });
+        a_ready.wait();
+
+        let b_gate = Arc::clone(&gate);
+        let b_events = events_tx.clone();
+        let b = thread::spawn(move || {
+            b_called_tx.send(()).unwrap();
+            with_publication_gate(b_gate.as_ref(), |_| {
+                b_events.send("B run").unwrap();
+                let pointer = CString::new("B").unwrap().into_raw();
+                b_events.send("B publish").unwrap();
+                unsafe { tb_free(pointer) };
+            })
+            .unwrap();
+        });
+        b_called_rx.recv().unwrap();
+        release_a_tx.send(()).unwrap();
+
+        a.join().unwrap();
+        b.join().unwrap();
+        drop(events_tx);
+
+        let events: Vec<_> = events_rx.iter().collect();
+        assert_eq!(
+            events,
+            vec!["A run", "A panic publish", "B run", "B publish"]
+        );
     }
 
     #[test]

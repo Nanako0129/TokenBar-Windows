@@ -47,10 +47,7 @@ struct ModelReportData {
 }
 
 /// Build the per-model report for `year` (empty string = all time).
-pub(crate) fn run(
-    context: &crate::LocalSourceContext,
-    year: &str,
-) -> Result<Value, String> {
+pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Value, String> {
     let year = normalize_year(year)?;
     let options = context.report_options(year, None);
 

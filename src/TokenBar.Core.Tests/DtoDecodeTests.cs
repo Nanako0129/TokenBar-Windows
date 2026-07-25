@@ -185,6 +185,15 @@ public class DtoDecodeTests
     }
 
     [Fact]
+    public void AgentUsagePayloadIgnoresUnknownPublicationGeneration()
+    {
+        var payload = TbCore.DecodeEnvelope<AgentUsagePayload>(
+            """{"ok":true,"data":{"generatedAt":"now","publicationGeneration":42,"agents":[]}}""");
+        Assert.Equal("now", payload.GeneratedAt);
+        Assert.Empty(payload.Agents);
+    }
+
+    [Fact]
     public void AgentUsagePayloadDecodesStringSubscriptions()
     {
         var payload = DecodeAgentUsagePayload("""["Codex","Claude"]""");
