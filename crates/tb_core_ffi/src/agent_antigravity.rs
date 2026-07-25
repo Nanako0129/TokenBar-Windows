@@ -940,11 +940,13 @@ fn write_creds_atomic(path: &Path, creds: &Value) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    if let Err(error) = std::fs::rename(&tmp, path) {
+    if let Err(error) = tokscale_core::fs_atomic::replace_file(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    std::fs::File::open(directory)?.sync_all()
+    #[cfg(unix)]
+    let _ = std::fs::File::open(directory).and_then(|file| file.sync_all());
+    Ok(())
 }
 
 enum CodeAssistPostFailure {
