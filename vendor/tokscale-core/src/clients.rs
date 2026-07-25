@@ -15,8 +15,10 @@ impl PathRoot {
             PathRoot::Home => home_dir.to_string(),
             PathRoot::XdgData => {
                 if use_env_roots {
-                    std::env::var("XDG_DATA_HOME")
-                        .unwrap_or_else(|_| format!("{}/.local/share", home_dir))
+                    match std::env::var("XDG_DATA_HOME") {
+                        Ok(root) if !root.is_empty() => root,
+                        Ok(_) | Err(_) => format!("{}/.local/share", home_dir),
+                    }
                 } else {
                     format!("{}/.local/share", home_dir)
                 }
@@ -40,6 +42,14 @@ impl PathRoot {
                     if let Some(dir) = dirs::config_dir() {
                         return dir.join("tokscale").to_string_lossy().into_owned();
                     }
+                }
+
+                #[cfg(target_os = "windows")]
+                if !use_env_roots {
+                    return std::path::Path::new(home_dir)
+                        .join("AppData/Roaming/tokscale")
+                        .to_string_lossy()
+                        .into_owned();
                 }
 
                 format!("{home_dir}/.config/tokscale")
@@ -492,6 +502,24 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    Junie = 31 => {
+        id: "junie",
+        root: PathRoot::Home,
+        relative: ".junie/sessions",
+        pattern: "events.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    OpenCodeReview = 32 => {
+        id: "opencodereview",
+        root: PathRoot::Home,
+        relative: ".opencodereview/sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -581,7 +609,27 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 31);
+        assert_eq!(ClientId::COUNT, 33);
+    }
+
+    #[test]
+    fn test_m21_clients_registered() {
+        let junie = ClientId::Junie.data();
+        assert_eq!(junie.resolve_path("/tmp/home"), "/tmp/home/.junie/sessions");
+        assert_eq!(junie.pattern, "events.jsonl");
+        assert!(junie.parse_local);
+        assert!(junie.submit_default);
+        assert!(!junie.headless);
+
+        let review = ClientId::OpenCodeReview.data();
+        assert_eq!(
+            review.resolve_path("/tmp/home"),
+            "/tmp/home/.opencodereview/sessions"
+        );
+        assert_eq!(review.pattern, "*.jsonl");
+        assert!(review.parse_local);
+        assert!(review.submit_default);
+        assert!(!review.headless);
     }
 
     #[test]
@@ -620,6 +668,26 @@ mod tests {
 
         let resolved = PathRoot::XdgData.resolve("/tmp/home");
         assert_eq!(resolved, "/tmp/xdg-data-home");
+    }
+
+    #[test]
+    #[serial]
+    fn test_path_root_xdg_data_preserves_whitespace_when_set() {
+        let mut _env = EnvGuard::capture(&["XDG_DATA_HOME"]);
+        _env.set("XDG_DATA_HOME", "   ");
+
+        let resolved = PathRoot::XdgData.resolve("/tmp/home");
+        assert_eq!(resolved, "   ");
+    }
+
+    #[test]
+    #[serial]
+    fn test_path_root_xdg_data_falls_back_when_empty() {
+        let mut _env = EnvGuard::capture(&["XDG_DATA_HOME"]);
+        _env.set("XDG_DATA_HOME", "");
+
+        let resolved = PathRoot::XdgData.resolve("/tmp/home");
+        assert_eq!(resolved, "/tmp/home/.local/share");
     }
 
     #[test]
@@ -697,7 +765,15 @@ mod tests {
         _env.set("XDG_CONFIG_HOME", "/tmp/xdg-config-home");
 
         let resolved = PathRoot::Config.resolve_with_env_strategy("/tmp/home", false);
-        assert_eq!(resolved, "/tmp/home/.config/tokscale");
+        let expected = if cfg!(target_os = "windows") {
+            std::path::Path::new("/tmp/home")
+                .join("AppData/Roaming/tokscale")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "/tmp/home/.config/tokscale".to_string()
+        };
+        assert_eq!(resolved, expected);
     }
 
     #[test]

@@ -26,8 +26,10 @@ pub struct UsageEvent {
     pub model: String,
     pub input: i64,
     pub output: i64,
+    pub reasoning: i64,
     pub cache_read: i64,
     pub cache_write: i64,
+    pub message_count: i32,
 }
 
 impl UsageEvent {
@@ -38,6 +40,7 @@ impl UsageEvent {
         // pattern).
         self.input
             .saturating_add(self.output)
+            .saturating_add(self.reasoning)
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_write)
     }
@@ -55,8 +58,8 @@ pub struct TraceBucket {
 
 pub struct UsageTailer {
     events: Mutex<Vec<UsageEvent>>,
-    /// `latest_source_mtime_ms` token from the last parse; when it hasn't
-    /// moved, the event window is still correct (rate queries re-filter by
+    /// Topology-sensitive source token from the last parse; when it hasn't
+    /// changed, the event window is still correct (rate queries re-filter by
     /// timestamp on read) and the tick skips the parse entirely.
     last_source_token: Mutex<Option<u64>>,
 }
@@ -91,7 +94,7 @@ impl UsageTailer {
 
         // No source changed since the last parse → the window is already
         // correct; skip the parse. Probe failure falls through to a parse.
-        let token = tokscale_core::latest_source_mtime_ms(&options).ok();
+        let token = tokscale_core::local_source_change_token(&options).ok();
         if token.is_some() && *self.last_source_token.lock() == token {
             return self.events.lock().len();
         }
@@ -119,8 +122,10 @@ impl UsageTailer {
                     model: m.model_id,
                     input: m.input,
                     output: m.output,
+                    reasoning: m.reasoning,
                     cache_read: m.cache_read,
                     cache_write: m.cache_write,
+                    message_count: m.message_count,
                 }
             })
             .collect();
@@ -180,7 +185,7 @@ impl UsageTailer {
             let slot = groups.entry(key).or_insert((0, 0));
             // saturating_add: same cross-event overflow class as window_total.
             slot.0 = slot.0.saturating_add(e.total());
-            slot.1 += 1;
+            slot.1 = slot.1.saturating_add(e.message_count.max(0) as u32);
         }
         let window_min = (window_secs as f32 / 60.0).max(1.0 / 60.0);
         let mut out: Vec<TraceBucket> = groups
@@ -222,8 +227,10 @@ mod tests {
             model: "gemini-3-pro".to_string(),
             input: i64::MAX,
             output: 0,
+            reasoning: 0,
             cache_read: i64::MAX,
             cache_write: 0,
+            message_count: 1,
         }
     }
 
@@ -247,6 +254,44 @@ mod tests {
 
         let rate = tailer.rate_in_window(3600);
         assert!(rate.is_finite(), "rate_in_window must not produce NaN/inf");
+    }
+
+    #[test]
+    fn trace_counts_messages_without_dropping_zero_message_loop_tokens() {
+        let tailer = UsageTailer::new();
+        let now = now_ms();
+        *tailer.events.lock() = vec![
+            UsageEvent {
+                ts_ms: now,
+                client: "grok".to_string(),
+                agent: "grok".to_string(),
+                model: "grok-build".to_string(),
+                input: 10,
+                output: 2,
+                reasoning: 0,
+                cache_read: 3,
+                cache_write: 0,
+                message_count: 1,
+            },
+            UsageEvent {
+                ts_ms: now,
+                client: "grok".to_string(),
+                agent: "grok".to_string(),
+                model: "grok-build".to_string(),
+                input: 0,
+                output: 0,
+                reasoning: 30,
+                cache_read: 0,
+                cache_write: 0,
+                message_count: 0,
+            },
+        ];
+
+        let buckets = tailer.trace(3600);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].tokens, 45);
+        assert_eq!(buckets[0].messages, 1);
+        assert_eq!(tailer.window_total(3600), 45);
     }
 
     #[test]

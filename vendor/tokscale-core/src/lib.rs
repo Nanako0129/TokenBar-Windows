@@ -5,6 +5,7 @@ mod cc_mirror;
 pub mod clients;
 pub mod fs_atomic;
 mod message_cache;
+pub mod model_alias;
 mod parser;
 pub mod paths;
 pub mod pricing;
@@ -15,11 +16,16 @@ pub mod sessions;
 
 pub use aggregator::*;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
+pub use model_alias::{
+    clear_model_aliases, model_alias_generation, model_aliases,
+    register_usage_data_invalidation_hook, set_model_aliases, snapshot_grouping_aliases,
+    GroupingAliasSnapshot, ModelAliasMap,
+};
 pub use parser::*;
 pub use scanner::*;
 pub use sessionize::{
-    compute_daily_active_time, compute_time_metrics, sessionize, SessionizeAccumulator,
-    SessionInterval, TimeMetrics, DEFAULT_IDLE_GAP_MS,
+    compute_daily_active_time, compute_time_metrics, sessionize, SessionInterval,
+    SessionizeAccumulator, TimeMetrics, DEFAULT_IDLE_GAP_MS,
 };
 pub use sessions::{CostSource, UnifiedMessage};
 
@@ -55,7 +61,45 @@ pub(crate) fn strip_parenthesized_reasoning_tier(model_id: &str) -> Option<&str>
     Some(base_model)
 }
 
+/// Canonical model identity — the model id that leaves the machine.
+///
+/// This is [`normalize_syntactic`] with **no alias folding**: purely structural
+/// canonicalization (lowercase, strip a `(reasoning-tier)` suffix, strip a
+/// trailing `-YYYYMMDD` date, rewrite `.`→`-` inside claude version numbers, and
+/// fold an `anthropic/claude-…` prefix). It never consults the user's
+/// machine-local model aliases.
+///
+/// Every path that submits, uploads, exports as raw data, or persists a model id
+/// MUST use this, not [`normalize_model_for_grouping`]. A machine-local alias
+/// config must never rewrite the model identity persisted server-side, or usage
+/// history would fragment and fork across a user's devices. Graph
+/// `ClientContribution` keys also use this so export/raw identity stays stable.
+pub fn canonical_model_id(model_id: &str) -> String {
+    normalize_syntactic(model_id)
+}
+
+/// Local display/grouping model name: [`canonical_model_id`] plus the user's
+/// configured model-alias fold. Every local report-grouping surface — the models
+/// report, every `GroupBy`, monthly, and hourly — routes through this so name
+/// variants fold uniformly for presentation.
+///
+/// The alias fold is **presentation only** and must never reach the
+/// submit/upload/export/persist path (those use [`canonical_model_id`]), pricing
+/// (which resolves the raw message `model_id`), or the message-cache key space.
+/// An empty/unset alias config makes this identical to [`canonical_model_id`].
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
+    model_alias::apply_global(normalize_syntactic(model_id))
+}
+
+/// Structural-only model-name normalization: lowercase, strip a
+/// `(reasoning-tier)` suffix, strip a trailing `-YYYYMMDD` date, rewrite `.`→`-`
+/// inside claude version numbers, and fold an `anthropic/claude-…` prefix.
+///
+/// This is the syntactic half of [`normalize_model_for_grouping`] /
+/// [`canonical_model_id`]. It is also used by [`model_alias`] to normalize
+/// configured alias keys and values into the same space, so a configured alias
+/// matches its model regardless of case, dated suffix, or `.`-vs-`-` spelling.
+pub(crate) fn normalize_syntactic(model_id: &str) -> String {
     let mut name = model_id.to_lowercase();
 
     if let Some(base_model) = strip_parenthesized_reasoning_tier(&name) {
@@ -122,6 +166,22 @@ fn retain_for_requested_clients(
         || (requested.contains("claude") && client.starts_with("cc-mirror/"))
         || (requested.contains("synthetic")
             && sessions::synthetic::matches_synthetic_filter(client, model_id, provider_id))
+}
+
+fn prefer_copilot_otel_messages(
+    mut otel_messages: Vec<UnifiedMessage>,
+    desktop_messages: Vec<UnifiedMessage>,
+) -> Vec<UnifiedMessage> {
+    let otel_sessions: HashSet<String> = otel_messages
+        .iter()
+        .map(|message| message.session_id.clone())
+        .collect();
+    otel_messages.extend(
+        desktop_messages
+            .into_iter()
+            .filter(|message| !otel_sessions.contains(message.session_id.as_str())),
+    );
+    otel_messages
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -306,11 +366,12 @@ pub struct LocalParseOptions {
     /// Persistent scanner config loaded from `~/.config/tokscale/settings.json`.
     /// Defaults to empty when callers don't care about user-configured paths.
     pub scanner_settings: scanner::ScannerSettings,
-    /// Skip parsing file-backed session logs whose mtime (unix ms) is older
-    /// than this. Lets high-frequency callers (live tails) avoid re-parsing
-    /// an entire history when they only need recent messages — callers align
-    /// it with `since`. Database-backed sources (SQLite) are always parsed:
-    /// WAL writes may not touch the main db file's mtime.
+    /// Skip parsing session sources whose newest relevant mtime (unix ms) is
+    /// older than this. Lets high-frequency callers (live tails) avoid
+    /// re-parsing an entire history when they only need recent messages —
+    /// callers align it with `since`. SQLite lanes are either retained or use
+    /// source-specific DB/WAL/dependency probes because WAL writes may not touch
+    /// the main database mtime.
     pub modified_after: Option<u64>,
 }
 
@@ -501,6 +562,14 @@ pub fn get_home_dir_string(home_dir_option: &Option<String>) -> Result<String, S
         })
 }
 
+fn parse_kimi_source(path: &Path) -> Vec<UnifiedMessage> {
+    if sessions::kimi::is_kimi_code_path(path) {
+        sessions::kimi::parse_kimi_code_file(path)
+    } else {
+        sessions::kimi::parse_kimi_file(path)
+    }
+}
+
 #[allow(dead_code)]
 fn parse_all_messages_with_pricing(
     home_dir: &str,
@@ -514,6 +583,155 @@ fn parse_all_messages_with_pricing(
         true,
         &scanner::ScannerSettings::default(),
     )
+}
+
+#[derive(Debug)]
+struct CodexRawCacheOutcome {
+    messages: Vec<UnifiedMessage>,
+    fallback_timestamp_indices: Vec<usize>,
+    cache_entry: Option<message_cache::CachedSourceEntry>,
+    invalidate_cache: bool,
+}
+
+fn build_codex_cache_entry(
+    path: &Path,
+    fingerprint: message_cache::SourceFingerprint,
+    raw_messages: Vec<UnifiedMessage>,
+    consumed_offset: u64,
+    state: sessions::codex::CodexParseState,
+    fallback_timestamp_indices: Vec<usize>,
+) -> Option<message_cache::CachedSourceEntry> {
+    if fingerprint.size != consumed_offset {
+        return None;
+    }
+
+    let codex_incremental = message_cache::build_codex_incremental_cache_with_prefix_hash(
+        path,
+        consumed_offset,
+        state,
+        fingerprint.content_hash,
+    )?;
+
+    Some(message_cache::CachedSourceEntry::new(
+        message_cache::CacheIdentity::for_client(ClientId::Codex),
+        path,
+        fingerprint,
+        raw_messages,
+        fallback_timestamp_indices,
+        Some(codex_incremental),
+    ))
+}
+
+fn parse_full_codex_raw_source(path: &Path) -> CodexRawCacheOutcome {
+    let parsed = sessions::codex::parse_codex_file_incremental(
+        path,
+        0,
+        sessions::codex::CodexParseState::default(),
+    );
+    if !parsed.parse_succeeded || parsed.unresolved_model_events {
+        return CodexRawCacheOutcome {
+            messages: parsed.messages,
+            fallback_timestamp_indices: parsed.fallback_timestamp_indices,
+            cache_entry: None,
+            invalidate_cache: false,
+        };
+    }
+
+    let cache_entry = message_cache::SourceFingerprint::from_path(path).and_then(|fingerprint| {
+        build_codex_cache_entry(
+            path,
+            fingerprint,
+            parsed.messages.clone(),
+            parsed.consumed_offset,
+            parsed.state,
+            parsed.fallback_timestamp_indices.clone(),
+        )
+    });
+
+    CodexRawCacheOutcome {
+        messages: parsed.messages,
+        fallback_timestamp_indices: parsed.fallback_timestamp_indices,
+        cache_entry,
+        invalidate_cache: false,
+    }
+}
+
+fn load_or_parse_codex_raw_source(
+    path: &Path,
+    source_cache: &message_cache::SourceMessageCache,
+) -> CodexRawCacheOutcome {
+    let identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
+    let Some(cached) = source_cache.get(identity, path) else {
+        return parse_full_codex_raw_source(path);
+    };
+    let Some(fingerprint_status) =
+        message_cache::SourceFingerprint::check_path(path, Some(&cached.fingerprint))
+    else {
+        return parse_full_codex_raw_source(path);
+    };
+    let fingerprint = match fingerprint_status {
+        message_cache::FingerprintStatus::Unchanged => cached.fingerprint.clone(),
+        message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
+    };
+    let reparse_from_start = |invalidate_cache: bool| {
+        let mut outcome = parse_full_codex_raw_source(path);
+        outcome.invalidate_cache = invalidate_cache && outcome.cache_entry.is_none();
+        outcome
+    };
+
+    if cached.fingerprint == fingerprint {
+        if message_cache::codex_cache_entry_matches_fingerprint(cached, &fingerprint) {
+            return CodexRawCacheOutcome {
+                messages: cached.messages.clone(),
+                fallback_timestamp_indices: cached.fallback_timestamp_indices.clone(),
+                cache_entry: None,
+                invalidate_cache: false,
+            };
+        }
+        return reparse_from_start(true);
+    }
+
+    if let Some(codex_incremental) = cached.codex_incremental.as_ref() {
+        if fingerprint.size > codex_incremental.consumed_offset
+            && message_cache::codex_prefix_matches(path, codex_incremental)
+        {
+            let parsed = sessions::codex::parse_codex_file_incremental(
+                path,
+                codex_incremental.consumed_offset,
+                codex_incremental.state.clone(),
+            );
+            if parsed.parse_succeeded && !parsed.unresolved_model_events {
+                let mut messages = cached.messages.clone();
+                let mut fallback_timestamp_indices = cached.fallback_timestamp_indices.clone();
+                let existing_len = messages.len();
+                fallback_timestamp_indices.extend(
+                    parsed
+                        .fallback_timestamp_indices
+                        .iter()
+                        .map(|index| existing_len + index),
+                );
+                messages.extend(parsed.messages);
+                let Some(cache_entry) = build_codex_cache_entry(
+                    path,
+                    fingerprint,
+                    messages.clone(),
+                    parsed.consumed_offset,
+                    parsed.state,
+                    fallback_timestamp_indices.clone(),
+                ) else {
+                    return reparse_from_start(true);
+                };
+                return CodexRawCacheOutcome {
+                    messages,
+                    fallback_timestamp_indices,
+                    cache_entry: Some(cache_entry),
+                    invalidate_cache: false,
+                };
+            }
+        }
+    }
+
+    reparse_from_start(true)
 }
 
 // All report consumers (graph/model/monthly/hourly/agents) now fold over
@@ -553,55 +771,6 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         messages
     }
 
-    fn parse_full_log_source(
-        path: &Path,
-        pricing: Option<&pricing::PricingService>,
-        is_headless: bool,
-    ) -> CachedParseOutcome {
-        let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
-        let parsed = sessions::codex::parse_codex_file_incremental(
-            path,
-            0,
-            sessions::codex::CodexParseState::default(),
-        );
-        let messages = finalize_codex_messages(
-            parsed.messages.clone(),
-            pricing,
-            is_headless,
-            &parsed.fallback_timestamp_indices,
-            fallback_timestamp,
-        );
-        if !parsed.parse_succeeded {
-            return CachedParseOutcome {
-                messages,
-                cache_entry: None,
-                invalidate_cache: false,
-            };
-        }
-
-        if parsed.unresolved_model_events {
-            return CachedParseOutcome {
-                messages,
-                cache_entry: None,
-                invalidate_cache: false,
-            };
-        }
-
-        let cache_entry = build_codex_cache_entry(
-            path,
-            parsed.messages,
-            parsed.consumed_offset,
-            parsed.state,
-            parsed.fallback_timestamp_indices,
-        );
-
-        CachedParseOutcome {
-            messages,
-            cache_entry,
-            invalidate_cache: false,
-        }
-    }
-
     fn finalize_codex_messages(
         mut messages: Vec<UnifiedMessage>,
         pricing: Option<&pricing::PricingService>,
@@ -621,32 +790,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         messages
     }
 
-    fn build_codex_cache_entry(
-        path: &Path,
-        raw_messages: Vec<UnifiedMessage>,
-        consumed_offset: u64,
-        state: sessions::codex::CodexParseState,
-        fallback_timestamp_indices: Vec<usize>,
-    ) -> Option<message_cache::CachedSourceEntry> {
-        let fingerprint = message_cache::SourceFingerprint::from_path(path)?;
-        if fingerprint.size != consumed_offset {
-            return None;
-        }
-
-        let codex_incremental =
-            message_cache::build_codex_incremental_cache(path, consumed_offset, state)?;
-
-        Some(message_cache::CachedSourceEntry::new(
-            path,
-            fingerprint,
-            raw_messages,
-            fallback_timestamp_indices,
-            Some(codex_incremental),
-        ))
-    }
-
     fn load_or_parse_source_with_fingerprint_and_policy<F, FingerprintFn>(
         path: &Path,
+        identity: message_cache::CacheIdentity,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         fingerprint_from_path: FingerprintFn,
@@ -654,9 +800,15 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     ) -> CachedParseOutcome
     where
         F: Fn(&Path) -> (Vec<UnifiedMessage>, bool),
-        FingerprintFn: Fn(&Path) -> Option<message_cache::SourceFingerprint>,
+        FingerprintFn: Fn(
+            &Path,
+            Option<&message_cache::SourceFingerprint>,
+        ) -> Option<message_cache::FingerprintStatus>,
     {
-        let Some(fingerprint) = fingerprint_from_path(path) else {
+        let cached = source_cache.get(identity, path);
+        let Some(fingerprint_status) =
+            fingerprint_from_path(path, cached.map(|entry| &entry.fingerprint))
+        else {
             let (mut messages, _) = parse(path);
             apply_pricing_to_messages(&mut messages, pricing);
             return CachedParseOutcome {
@@ -666,7 +818,24 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             };
         };
 
-        if let Some(cached) = source_cache.get(path) {
+        let fingerprint = match fingerprint_status {
+            message_cache::FingerprintStatus::Unchanged => {
+                let Some(cached) = cached else {
+                    unreachable!("an uncached source always builds a complete fingerprint")
+                };
+                if !cached.messages.is_empty() {
+                    return CachedParseOutcome {
+                        messages: cached_messages(cached, pricing),
+                        cache_entry: None,
+                        invalidate_cache: false,
+                    };
+                }
+                cached.fingerprint.clone()
+            }
+            message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
+        };
+
+        if let Some(cached) = cached {
             if cached.fingerprint == fingerprint && !cached.messages.is_empty() {
                 return CachedParseOutcome {
                     messages: cached_messages(cached, pricing),
@@ -681,6 +850,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             None
         } else {
             Some(message_cache::CachedSourceEntry::new(
+                identity,
                 path,
                 fingerprint,
                 messages.clone(),
@@ -699,6 +869,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 
     fn load_or_parse_source_with_fingerprint<F, FingerprintFn>(
         path: &Path,
+        identity: message_cache::CacheIdentity,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         fingerprint_from_path: FingerprintFn,
@@ -706,10 +877,14 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     ) -> CachedParseOutcome
     where
         F: Fn(&Path) -> Vec<UnifiedMessage>,
-        FingerprintFn: Fn(&Path) -> Option<message_cache::SourceFingerprint>,
+        FingerprintFn: Fn(
+            &Path,
+            Option<&message_cache::SourceFingerprint>,
+        ) -> Option<message_cache::FingerprintStatus>,
     {
         load_or_parse_source_with_fingerprint_and_policy(
             path,
+            identity,
             source_cache,
             pricing,
             fingerprint_from_path,
@@ -719,6 +894,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 
     fn load_or_parse_source<F>(
         path: &Path,
+        identity: message_cache::CacheIdentity,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         parse: F,
@@ -728,15 +904,17 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     {
         load_or_parse_source_with_fingerprint(
             path,
+            identity,
             source_cache,
             pricing,
-            message_cache::SourceFingerprint::from_path,
+            message_cache::SourceFingerprint::check_path_samples_only,
             parse,
         )
     }
 
     fn load_or_parse_sqlite_source<F>(
         path: &Path,
+        identity: message_cache::CacheIdentity,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         parse: F,
@@ -746,9 +924,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     {
         load_or_parse_source_with_fingerprint(
             path,
+            identity,
             source_cache,
             pricing,
-            message_cache::SourceFingerprint::from_sqlite_path,
+            message_cache::SourceFingerprint::check_sqlite_path,
             parse,
         )
     }
@@ -759,88 +938,19 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         pricing: Option<&pricing::PricingService>,
         headless_roots: &[PathBuf],
     ) -> CachedParseOutcome {
-        let is_headless = is_headless_path(path, headless_roots);
-        let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
-            return parse_full_log_source(path, pricing, is_headless);
-        };
-        let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
-
-        if let Some(cached) = source_cache.get(path) {
-            let reparse_from_start = |invalidate_cache: bool| {
-                let mut outcome = parse_full_log_source(path, pricing, is_headless);
-                outcome.invalidate_cache = invalidate_cache && outcome.cache_entry.is_none();
-                outcome
-            };
-
-            if cached.fingerprint == fingerprint {
-                if message_cache::codex_cache_entry_matches_fingerprint(cached, &fingerprint) {
-                    return CachedParseOutcome {
-                        messages: finalize_codex_messages(
-                            cached.messages.clone(),
-                            pricing,
-                            is_headless,
-                            &cached.fallback_timestamp_indices,
-                            fallback_timestamp,
-                        ),
-                        cache_entry: None,
-                        invalidate_cache: false,
-                    };
-                }
-
-                return reparse_from_start(true);
-            }
-
-            if let Some(codex_incremental) = cached.codex_incremental.as_ref() {
-                if fingerprint.size > codex_incremental.consumed_offset
-                    && message_cache::codex_prefix_matches(path, codex_incremental)
-                {
-                    let parsed = sessions::codex::parse_codex_file_incremental(
-                        path,
-                        codex_incremental.consumed_offset,
-                        codex_incremental.state.clone(),
-                    );
-                    if parsed.parse_succeeded && !parsed.unresolved_model_events {
-                        let mut raw_messages = cached.messages.clone();
-                        let mut fallback_timestamp_indices =
-                            cached.fallback_timestamp_indices.clone();
-                        let existing_len = raw_messages.len();
-                        fallback_timestamp_indices.extend(
-                            parsed
-                                .fallback_timestamp_indices
-                                .iter()
-                                .map(|index| existing_len + index),
-                        );
-                        raw_messages.extend(parsed.messages.clone());
-                        let cache_entry = build_codex_cache_entry(
-                            path,
-                            raw_messages.clone(),
-                            parsed.consumed_offset,
-                            parsed.state,
-                            fallback_timestamp_indices.clone(),
-                        );
-                        let Some(cache_entry) = cache_entry else {
-                            return reparse_from_start(true);
-                        };
-                        let messages = finalize_codex_messages(
-                            raw_messages,
-                            pricing,
-                            is_headless,
-                            &fallback_timestamp_indices,
-                            fallback_timestamp,
-                        );
-                        return CachedParseOutcome {
-                            messages,
-                            cache_entry: Some(cache_entry),
-                            invalidate_cache: false,
-                        };
-                    }
-                }
-            }
-
-            return reparse_from_start(true);
+        let raw = load_or_parse_codex_raw_source(path, source_cache);
+        let messages = finalize_codex_messages(
+            raw.messages,
+            pricing,
+            is_headless_path(path, headless_roots),
+            &raw.fallback_timestamp_indices,
+            sessions::utils::file_modified_timestamp_ms(path),
+        );
+        CachedParseOutcome {
+            messages,
+            cache_entry: raw.cache_entry,
+            invalidate_cache: raw.invalidate_cache,
         }
-
-        parse_full_log_source(path, pricing, is_headless)
     }
 
     let scan_result = scanner::scan_all_clients_with_scanner_settings(
@@ -862,46 +972,64 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .opencode_dbs
         .iter()
         .map(|db_path| {
-            load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
-                sessions::opencode::parse_opencode_sqlite(path)
-            })
+            load_or_parse_sqlite_source(
+                db_path,
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                &source_cache,
+                pricing,
+                sessions::opencode::parse_opencode_sqlite,
+            )
         })
         .collect();
     let opencode_json_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::opencode::parse_opencode_file(path)
-                    .into_iter()
-                    .collect()
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                &source_cache,
+                pricing,
+                |path| {
+                    sessions::opencode::parse_opencode_file(path)
+                        .into_iter()
+                        .collect()
+                },
+            )
         })
         .collect();
-    let opencode_authoritative: HashSet<String> = opencode_sqlite_outcomes
-        .iter()
-        .chain(opencode_json_outcomes.iter())
-        .flat_map(|outcome| outcome.messages.iter())
-        .filter(|message| message.cost_source == CostSource::ProviderReported)
-        .filter_map(|message| message.dedup_key.clone())
-        .collect();
-    let mut opencode_seen: HashSet<String> = HashSet::new();
+    let opencode_authoritative = opencode_authoritative_sources(
+        opencode_sqlite_outcomes
+            .iter()
+            .chain(opencode_json_outcomes.iter())
+            .flat_map(|outcome| outcome.messages.iter())
+            .map(opencode_identity_group),
+    );
+    let mut opencode_selection = OpenCodeSelection::new(opencode_authoritative);
 
-    for outcome in opencode_sqlite_outcomes
-        .into_iter()
-        .chain(opencode_json_outcomes)
-    {
-        all_messages.extend(outcome.messages.into_iter().filter(|message| {
-            message.dedup_key.as_ref().is_none_or(|key| {
-                (!opencode_authoritative.contains(key)
-                    || message.cost_source == CostSource::ProviderReported)
-                    && opencode_seen.insert(key.clone())
-            })
-        }));
+    for outcome in opencode_sqlite_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter_map(|message| opencode_selection.select_sqlite(message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
+    for outcome in opencode_json_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter_map(|message| opencode_selection.select_json(message, true)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    all_messages.extend(opencode_selection.finish());
 
     let claude_home = PathBuf::from(home_dir);
     let claude_outcomes: Vec<CachedParseOutcome> = scan_result
@@ -910,11 +1038,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .map(|path| {
             load_or_parse_source_with_fingerprint(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::Claude),
                 &source_cache,
                 pricing,
-                |path| {
-                    message_cache::SourceFingerprint::from_claude_code_path_with_home(
+                |path, cached| {
+                    message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
                         path,
+                        cached,
                         Some(&claude_home),
                     )
                 },
@@ -962,7 +1092,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         } else if outcome.invalidate_cache {
-            source_cache.remove(&path);
+            source_cache.remove(
+                message_cache::CacheIdentity::for_client(ClientId::Codex),
+                &path,
+            );
         }
     }
 
@@ -970,17 +1103,45 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Copilot)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::copilot::parse_copilot_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                &source_cache,
+                None,
+                sessions::copilot::parse_copilot_file,
+            )
         })
         .collect();
+    let mut copilot_otel_messages = Vec::new();
     for outcome in copilot_outcomes {
-        all_messages.extend(outcome.messages);
+        copilot_otel_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
+    let mut copilot_desktop_messages = Vec::new();
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        let outcome = load_or_parse_source_with_fingerprint(
+            db_path,
+            message_cache::CacheIdentity::for_client(ClientId::Copilot),
+            &source_cache,
+            None,
+            message_cache::SourceFingerprint::check_copilot_desktop_path_samples_only,
+            sessions::copilot_desktop::parse_copilot_desktop_db,
+        );
+        copilot_desktop_messages = outcome.messages;
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    all_messages.extend(
+        prefer_copilot_otel_messages(copilot_otel_messages, copilot_desktop_messages)
+            .into_iter()
+            .map(|mut message| {
+                apply_pricing_if_available(&mut message, pricing);
+                message
+            }),
+    );
 
     let gemini_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Gemini)
@@ -988,9 +1149,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .map(|path| {
             let outcome = load_or_parse_source_with_fingerprint_and_policy(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::Gemini),
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::from_path,
+                message_cache::SourceFingerprint::check_path_samples_only,
                 |path| {
                     let parsed = sessions::gemini::parse_gemini_file_with_cache_status(path);
                     (parsed.messages, parsed.cacheable)
@@ -1004,7 +1166,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         } else if outcome.invalidate_cache {
-            source_cache.remove(&path);
+            source_cache.remove(
+                message_cache::CacheIdentity::for_client(ClientId::Gemini),
+                &path,
+            );
         }
     }
 
@@ -1012,9 +1177,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Cursor)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::cursor::parse_cursor_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Cursor),
+                &source_cache,
+                pricing,
+                sessions::cursor::parse_cursor_file,
+            )
         })
         .collect();
     for outcome in cursor_outcomes {
@@ -1028,9 +1197,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Warp)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::warp::parse_warp_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Warp),
+                &source_cache,
+                pricing,
+                sessions::warp::parse_warp_file,
+            )
         })
         .collect();
     for outcome in warp_outcomes {
@@ -1044,9 +1217,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Amp)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::amp::parse_amp_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Amp),
+                &source_cache,
+                pricing,
+                sessions::amp::parse_amp_file,
+            )
         })
         .collect();
     for outcome in amp_outcomes {
@@ -1060,9 +1237,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Codebuff)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::codebuff::parse_codebuff_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Codebuff),
+                &source_cache,
+                pricing,
+                sessions::codebuff::parse_codebuff_file,
+            )
         })
         .collect();
     for outcome in codebuff_outcomes {
@@ -1078,9 +1259,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .map(|path| {
             load_or_parse_source_with_fingerprint(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::Droid),
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::from_droid_path,
+                message_cache::SourceFingerprint::check_droid_path_samples_only,
                 sessions::droid::parse_droid_file,
             )
         })
@@ -1096,9 +1278,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::OpenClaw)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::openclaw::parse_openclaw_transcript(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::OpenClaw),
+                &source_cache,
+                pricing,
+                sessions::openclaw::parse_openclaw_transcript,
+            )
         })
         .collect();
     for outcome in openclaw_outcomes {
@@ -1112,9 +1298,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Pi)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::pi::parse_pi_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Pi),
+                &source_cache,
+                pricing,
+                sessions::pi::parse_pi_file,
+            )
         })
         .collect();
     for outcome in pi_outcomes {
@@ -1124,21 +1314,87 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    let kimi_outcomes: Vec<CachedParseOutcome> = scan_result
+    let kimi_outcomes: Vec<(bool, CachedParseOutcome)> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
-                path,
-                &source_cache,
-                pricing,
-                message_cache::SourceFingerprint::from_kimi_path,
-                sessions::kimi::parse_kimi_file,
+            (
+                sessions::kimi::is_kimi_code_path(path),
+                load_or_parse_source_with_fingerprint(
+                    path,
+                    message_cache::CacheIdentity::for_client(ClientId::Kimi),
+                    &source_cache,
+                    pricing,
+                    message_cache::SourceFingerprint::check_kimi_path_samples_only,
+                    parse_kimi_source,
+                ),
             )
         })
         .collect();
-    for outcome in kimi_outcomes {
-        all_messages.extend(outcome.messages);
+    let mut kimi_code_seen: HashSet<String> = HashSet::new();
+    for (is_kimi_code, outcome) in kimi_outcomes {
+        if is_kimi_code {
+            all_messages.extend(
+                outcome
+                    .messages
+                    .into_iter()
+                    .filter(|message| should_keep_deduped_message(&mut kimi_code_seen, message)),
+            );
+        } else {
+            all_messages.extend(outcome.messages);
+        }
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let junie_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Junie)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Junie),
+                &source_cache,
+                pricing,
+                sessions::junie::parse_junie_file,
+            )
+        })
+        .collect();
+    let mut junie_seen: HashSet<String> = HashSet::new();
+    for outcome in junie_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut junie_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let opencodereview_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::OpenCodeReview)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::OpenCodeReview),
+                &source_cache,
+                pricing,
+                sessions::opencodereview::parse_opencodereview_file,
+            )
+        })
+        .collect();
+    let mut opencodereview_seen: HashSet<String> = HashSet::new();
+    for outcome in opencodereview_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut opencodereview_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -1149,9 +1405,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Qwen)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::qwen::parse_qwen_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Qwen),
+                &source_cache,
+                pricing,
+                sessions::qwen::parse_qwen_file,
+            )
         })
         .collect();
     for outcome in qwen_outcomes {
@@ -1170,9 +1430,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             // a history-only rewrite invalidates the cache (#741).
             load_or_parse_source_with_fingerprint(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::RooCode),
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::from_roo_path,
+                message_cache::SourceFingerprint::check_roo_path_samples_only,
                 sessions::roocode::parse_roocode_file,
             )
         })
@@ -1190,9 +1451,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .map(|path| {
             load_or_parse_source_with_fingerprint(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::KiloCode),
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::from_roo_path,
+                message_cache::SourceFingerprint::check_roo_path_samples_only,
                 sessions::kilocode::parse_kilocode_file,
             )
         })
@@ -1210,9 +1472,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .map(|path| {
             load_or_parse_source_with_fingerprint(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::Cline),
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::from_roo_path,
+                message_cache::SourceFingerprint::check_roo_path_samples_only,
                 sessions::cline::parse_cline_file,
             )
         })
@@ -1230,9 +1493,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .map(|path| {
             load_or_parse_source_with_fingerprint(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::Jcode),
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::from_jcode_path,
+                message_cache::SourceFingerprint::check_jcode_path_samples_only,
                 sessions::jcode::parse_jcode_file,
             )
         })
@@ -1261,9 +1525,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::MiMoCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_sqlite_source(path, &source_cache, None, |path| {
-                sessions::micode::parse_micode_sqlite(path)
-            })
+            load_or_parse_sqlite_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::MiMoCode),
+                &source_cache,
+                None,
+                sessions::micode::parse_micode_sqlite,
+            )
         })
         .collect();
     let mut micode_seen: HashSet<String> = HashSet::new();
@@ -1308,37 +1576,52 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             .filter(|message| should_keep_deduped_message(&mut gjc_seen, message)),
     );
 
-    // Grok Build: updates.jsonl + metadata-sibling fingerprint (signals/summary/
-    // events; a compaction rollup or late model id must invalidate the cache).
-    // Cumulative totalTokens deltas land as
-    // input tokens; pricing treats them as input at the resolved xai rates.
+    // Grok Build has two representations of the same sessions: legacy
+    // per-session updates and a global per-inference unified log. Collect both
+    // raw sets without pricing and apply unified-over-legacy precedence exactly
+    // once before pricing or any report fold; a downstream aggregate cannot
+    // subtract covered legacy usage safely.
     let grok_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Grok)
         .par_iter()
         .map(|path| {
             load_or_parse_source_with_fingerprint(
                 path,
+                message_cache::CacheIdentity::for_client(ClientId::Grok),
                 &source_cache,
-                pricing,
-                message_cache::SourceFingerprint::from_grok_path,
-                sessions::grok::parse_grok_updates_file,
+                None,
+                message_cache::SourceFingerprint::check_grok_path_samples_only,
+                sessions::grok::parse_grok_file,
             )
         })
         .collect();
+    let mut grok_messages = Vec::new();
     for outcome in grok_outcomes {
-        all_messages.extend(outcome.messages);
+        grok_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
+    all_messages.extend(
+        sessions::grok::prefer_unified_log_messages(grok_messages)
+            .into_iter()
+            .map(|mut message| {
+                apply_pricing_if_available(&mut message, pricing);
+                message
+            }),
+    );
 
     let mux_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Mux)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::mux::parse_mux_file(path)
-            })
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Mux),
+                &source_cache,
+                pricing,
+                sessions::mux::parse_mux_file,
+            )
         })
         .collect();
     for outcome in mux_outcomes {
@@ -1382,34 +1665,50 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     }
 
     for db_path in scan_result.zed_db_paths() {
-        let outcome = load_or_parse_sqlite_source(&db_path, &source_cache, pricing, |path| {
-            sessions::zed::parse_zed_sqlite(path)
-        });
+        let outcome = load_or_parse_sqlite_source(
+            &db_path,
+            message_cache::CacheIdentity::for_client(ClientId::Zed),
+            &source_cache,
+            pricing,
+            sessions::zed::parse_zed_sqlite,
+        );
         all_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
 
-    let kiro_outcomes: Vec<CachedParseOutcome> = scan_result
+    // Kiro globalStorage has a precedence relation between self-contained
+    // snapshots and execution records. Cache each source's raw parser output,
+    // then suppress only after every file has been collected. The suppression
+    // result must never be written back into the per-source cache.
+    let kiro_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Kiro)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
-                path,
-                &source_cache,
-                pricing,
-                message_cache::SourceFingerprint::from_kiro_path,
-                sessions::kiro::parse_kiro_file,
+            (
+                path.clone(),
+                load_or_parse_source_with_fingerprint(
+                    path,
+                    message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                    &source_cache,
+                    None,
+                    message_cache::SourceFingerprint::check_kiro_path_samples_only,
+                    sessions::kiro::parse_kiro_file,
+                ),
             )
         })
         .collect();
-    for outcome in kiro_outcomes {
-        all_messages.extend(outcome.messages);
+    let mut kiro_sources = Vec::new();
+    for (path, outcome) in kiro_outcomes {
+        kiro_sources.push((path, outcome.messages));
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
+    let mut kiro_messages = sessions::kiro::merge_kiro_source_messages(kiro_sources);
+    apply_pricing_to_messages(&mut kiro_messages, pricing);
+    all_messages.extend(kiro_messages);
 
     if let Some(db_path) = &scan_result.kiro_db {
         let kiro_db_messages: Vec<UnifiedMessage> = sessions::kiro::parse_kiro_sqlite(db_path)
@@ -1476,9 +1775,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
-            let outcome = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
-                sessions::synthetic::parse_octofriend_sqlite(path)
-            });
+            let outcome = load_or_parse_sqlite_source(
+                db_path,
+                message_cache::CacheIdentity::synthetic(),
+                &source_cache,
+                pricing,
+                sessions::synthetic::parse_octofriend_sqlite,
+            );
             all_messages.extend(outcome.messages);
             if let Some(entry) = outcome.cache_entry {
                 source_cache.insert(entry);
@@ -1588,9 +1891,12 @@ fn aggregate_model_usage_entries(
     group_by: &GroupBy,
 ) -> Vec<ModelUsage> {
     let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
+    // One alias snapshot for the whole fold so a mid-fold set_model_aliases
+    // cannot split messages across two grouping configs.
+    let aliases = model_alias::snapshot_grouping_aliases();
 
     for msg in messages {
-        let normalized = normalize_model_for_grouping(&msg.model_id);
+        let normalized = aliases.fold(normalize_syntactic(&msg.model_id));
         let (workspace_group_key, workspace_key, workspace_label) = workspace_bucket(&msg);
         let key = match group_by {
             GroupBy::Model => normalized.clone(),
@@ -1813,91 +2119,326 @@ fn dedup_gate_passes(key: &str, seen: &mut HashSet<String>) -> bool {
     true
 }
 
-/// Applies one OpenCode source-priority snapshot without requiring sink
-/// retraction. Only estimated SQLite messages hidden by that snapshot are
-/// retained as fallbacks; JSON messages remain fully streaming.
-struct OpenCodeStreamingSelection {
-    authoritative_snapshot: HashSet<String>,
-    seen: HashSet<String>,
-    deferred_sqlite: Vec<Option<UnifiedMessage>>,
-    deferred_by_key: HashMap<String, usize>,
+/// Cross-store OpenCode source identity. A migrated SQLite message can carry
+/// both an embedded id and a v1 row/file fallback, so callers compare every
+/// primary and alternate key at the same creation timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OpenCodeSourceIdentity {
+    key: String,
+    timestamp: i64,
 }
 
-impl OpenCodeStreamingSelection {
-    fn new(authoritative_snapshot: HashSet<String>) -> Self {
+impl OpenCodeSourceIdentity {
+    fn all_from_message(message: &UnifiedMessage) -> Vec<Self> {
+        let mut identities = Vec::new();
+        let mut seen = HashSet::new();
+        for key in message
+            .dedup_key
+            .iter()
+            .chain(message.dedup_aliases.iter())
+        {
+            if !key.is_empty() && seen.insert(key.clone()) {
+                identities.push(Self {
+                    key: key.clone(),
+                    timestamp: message.timestamp,
+                });
+            }
+        }
+        identities
+    }
+}
+
+/// Logical OpenCode payload identity used after parser-local fork collapse.
+///
+/// Source keys are indexed separately because one migrated request can have
+/// both an embedded id and a row/file fallback. Session and workspace remain
+/// excluded because true fork copies move between both. Cost is excluded so a
+/// provider-reported copy can still replace an estimated one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OpenCodePayloadIdentity {
+    timestamp: i64,
+    duration_ms: Option<i64>,
+    model_id: String,
+    provider_id: String,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+    agent: Option<String>,
+}
+
+impl OpenCodePayloadIdentity {
+    fn from_message(message: &UnifiedMessage) -> Self {
+        Self {
+            timestamp: message.timestamp,
+            duration_ms: message.duration_ms,
+            model_id: message.model_id.clone(),
+            provider_id: message.provider_id.clone(),
+            input: message.tokens.input,
+            output: message.tokens.output,
+            cache_read: message.tokens.cache_read,
+            cache_write: message.tokens.cache_write,
+            reasoning: message.tokens.reasoning,
+            agent: message.agent.clone(),
+        }
+    }
+}
+
+fn opencode_identity_group(
+    message: &UnifiedMessage,
+) -> (bool, Vec<OpenCodeSourceIdentity>) {
+    (
+        message.cost_source == CostSource::ProviderReported,
+        OpenCodeSourceIdentity::all_from_message(message),
+    )
+}
+
+fn opencode_authoritative_sources(
+    groups: impl IntoIterator<Item = (bool, Vec<OpenCodeSourceIdentity>)>,
+) -> HashSet<OpenCodeSourceIdentity> {
+    let groups: Vec<_> = groups.into_iter().collect();
+    let mut authoritative = HashSet::new();
+    for (is_provider_reported, sources) in &groups {
+        if *is_provider_reported {
+            authoritative.extend(sources.iter().cloned());
+        }
+    }
+    loop {
+        let previous_len = authoritative.len();
+        for (_, sources) in &groups {
+            if sources
+                .iter()
+                .any(|source| authoritative.contains(source))
+            {
+                authoritative.extend(sources.iter().cloned());
+            }
+        }
+        if authoritative.len() == previous_len {
+            return authoritative;
+        }
+    }
+}
+
+/// Applies one OpenCode source-priority snapshot without requiring sink
+/// retraction. SQLite fork copies deduplicate only when a source key (primary or
+/// alias) and the full payload identity both match; distinct embedded ids remain
+/// separate even when every payload field collides.
+struct OpenCodeSelection {
+    authoritative_snapshot: HashSet<OpenCodeSourceIdentity>,
+    seen_sqlite: HashMap<OpenCodeSourceIdentity, HashSet<OpenCodePayloadIdentity>>,
+    emitted_sources: HashSet<OpenCodeSourceIdentity>,
+    deferred_sqlite: Vec<Option<UnifiedMessage>>,
+    deferred_sources: Vec<Vec<OpenCodeSourceIdentity>>,
+    deferred_by_identity:
+        HashMap<OpenCodeSourceIdentity, HashMap<OpenCodePayloadIdentity, Vec<usize>>>,
+    deferred_by_source: HashMap<OpenCodeSourceIdentity, Vec<usize>>,
+}
+
+impl OpenCodeSelection {
+    fn new(authoritative_snapshot: HashSet<OpenCodeSourceIdentity>) -> Self {
         Self {
             authoritative_snapshot,
-            seen: HashSet::new(),
+            seen_sqlite: HashMap::new(),
+            emitted_sources: HashSet::new(),
             deferred_sqlite: Vec::new(),
-            deferred_by_key: HashMap::new(),
+            deferred_sources: Vec::new(),
+            deferred_by_identity: HashMap::new(),
+            deferred_by_source: HashMap::new(),
         }
+    }
+
+    fn has_authority(&self, sources: &[OpenCodeSourceIdentity]) -> bool {
+        sources
+            .iter()
+            .any(|source| self.authoritative_snapshot.contains(source))
+    }
+
+    fn has_emitted(&self, sources: &[OpenCodeSourceIdentity]) -> bool {
+        sources
+            .iter()
+            .any(|source| self.emitted_sources.contains(source))
+    }
+
+    fn connected_deferred_sources(
+        &self,
+        sources: &[OpenCodeSourceIdentity],
+    ) -> Vec<OpenCodeSourceIdentity> {
+        let mut connected: HashSet<_> = sources.iter().cloned().collect();
+        let mut pending: Vec<_> = sources.to_vec();
+        while let Some(source) = pending.pop() {
+            let Some(indices) = self.deferred_by_source.get(&source) else {
+                continue;
+            };
+            for &index in indices {
+                for alias in &self.deferred_sources[index] {
+                    if connected.insert(alias.clone()) {
+                        pending.push(alias.clone());
+                    }
+                }
+            }
+        }
+        connected.into_iter().collect()
+    }
+
+    fn mark_emitted(&mut self, sources: &[OpenCodeSourceIdentity]) {
+        let connected = self.connected_deferred_sources(sources);
+        self.emitted_sources.extend(connected);
+    }
+
+    fn mark_sqlite_seen(
+        &mut self,
+        sources: &[OpenCodeSourceIdentity],
+        payload: &OpenCodePayloadIdentity,
+    ) -> bool {
+        let duplicate = sources.iter().any(|source| {
+            self.seen_sqlite
+                .get(source)
+                .is_some_and(|payloads| payloads.contains(payload))
+        });
+        for source in sources {
+            self.seen_sqlite
+                .entry(source.clone())
+                .or_default()
+                .insert(payload.clone());
+        }
+        duplicate
+    }
+
+    fn index_deferred(
+        &mut self,
+        index: usize,
+        sources: &[OpenCodeSourceIdentity],
+        payload: &OpenCodePayloadIdentity,
+    ) {
+        for source in sources {
+            if !self.deferred_sources[index].contains(source) {
+                self.deferred_sources[index].push(source.clone());
+            }
+            let identity_indices = self
+                .deferred_by_identity
+                .entry(source.clone())
+                .or_default()
+                .entry(payload.clone())
+                .or_default();
+            if !identity_indices.contains(&index) {
+                identity_indices.push(index);
+            }
+            let source_indices = self.deferred_by_source.entry(source.clone()).or_default();
+            if !source_indices.contains(&index) {
+                source_indices.push(index);
+            }
+        }
+    }
+
+    fn defer_sqlite(
+        &mut self,
+        sources: &[OpenCodeSourceIdentity],
+        payload: &OpenCodePayloadIdentity,
+        message: UnifiedMessage,
+    ) {
+        let index = self.deferred_sqlite.len();
+        self.deferred_sqlite.push(Some(message));
+        self.deferred_sources.push(Vec::new());
+        self.index_deferred(index, sources, payload);
+    }
+
+    fn first_active(&self, indices: &[usize]) -> Option<usize> {
+        indices
+            .iter()
+            .copied()
+            .find(|&index| self.deferred_sqlite[index].is_some())
+    }
+
+    fn find_deferred_identity(
+        &self,
+        sources: &[OpenCodeSourceIdentity],
+        payload: &OpenCodePayloadIdentity,
+    ) -> Option<usize> {
+        sources.iter().find_map(|source| {
+            self.deferred_by_identity
+                .get(source)
+                .and_then(|payloads| payloads.get(payload))
+                .and_then(|indices| self.first_active(indices))
+        })
+    }
+
+    fn find_deferred_source(&self, sources: &[OpenCodeSourceIdentity]) -> Option<usize> {
+        sources.iter().find_map(|source| {
+            self.deferred_by_source
+                .get(source)
+                .and_then(|indices| self.first_active(indices))
+        })
+    }
+
+    fn take_deferred(&mut self, index: usize) -> Vec<OpenCodeSourceIdentity> {
+        self.deferred_sqlite[index] = None;
+        self.deferred_sources[index].clone()
     }
 
     fn select_sqlite(&mut self, message: UnifiedMessage) -> Option<UnifiedMessage> {
-        let Some(key) = message.dedup_key.as_deref() else {
+        let sources = OpenCodeSourceIdentity::all_from_message(&message);
+        if sources.is_empty() {
             return Some(message);
-        };
-        if self.seen.contains(key) {
-            return None;
         }
-        if let Some(&index) = self.deferred_by_key.get(key) {
-            if message.cost_source != CostSource::ProviderReported {
+        let payload = OpenCodePayloadIdentity::from_message(&message);
+        if self.mark_sqlite_seen(&sources, &payload) {
+            if let Some(index) = self.find_deferred_identity(&sources, &payload) {
+                self.index_deferred(index, &sources, &payload);
+                if message.cost_source == CostSource::ProviderReported {
+                    let deferred_sources = self.take_deferred(index);
+                    self.mark_emitted(&deferred_sources);
+                    self.mark_emitted(&sources);
+                    return Some(message);
+                }
                 return None;
             }
-            self.deferred_by_key.remove(key);
-            self.deferred_sqlite[index] = None;
-            self.seen.insert(key.to_owned());
-            return Some(message);
-        }
-        if self.authoritative_snapshot.contains(key)
-            && message.cost_source != CostSource::ProviderReported
-        {
-            let index = self.deferred_sqlite.len();
-            self.deferred_by_key.insert(key.to_owned(), index);
-            self.deferred_sqlite.push(Some(message));
+            if self.has_emitted(&sources) {
+                self.mark_emitted(&sources);
+            }
             return None;
         }
-        self.seen.insert(key.to_owned());
+        if self.has_emitted(&sources) {
+            self.mark_emitted(&sources);
+        }
+        if self.has_authority(&sources) && message.cost_source != CostSource::ProviderReported {
+            self.defer_sqlite(&sources, &payload, message);
+            return None;
+        }
+        self.mark_emitted(&sources);
         Some(message)
     }
 
-    fn select_json(
-        &mut self,
-        message: UnifiedMessage,
-        will_emit: bool,
-    ) -> Option<UnifiedMessage> {
-        let Some(key) = message.dedup_key.as_deref() else {
+    fn select_json(&mut self, message: UnifiedMessage, will_emit: bool) -> Option<UnifiedMessage> {
+        let sources = OpenCodeSourceIdentity::all_from_message(&message);
+        if sources.is_empty() {
             return will_emit.then_some(message);
-        };
-        if self.seen.contains(key) {
-            return None;
         }
-        if self.authoritative_snapshot.contains(key) {
+        if self.has_authority(&sources) {
             if message.cost_source != CostSource::ProviderReported || !will_emit {
                 return None;
             }
-            self.seen.insert(key.to_owned());
-            if let Some(index) = self.deferred_by_key.remove(key) {
-                self.deferred_sqlite[index] = None;
+            let payload = OpenCodePayloadIdentity::from_message(&message);
+            let exact = self.find_deferred_identity(&sources, &payload);
+            if exact.is_none() && self.has_emitted(&sources) {
+                return None;
             }
+            if let Some(index) = exact.or_else(|| self.find_deferred_source(&sources)) {
+                let deferred_sources = self.take_deferred(index);
+                self.mark_emitted(&deferred_sources);
+            }
+            self.mark_emitted(&sources);
             return Some(message);
         }
-        self.seen.insert(key.to_owned());
+        if self.has_emitted(&sources) {
+            return None;
+        }
+        self.mark_emitted(&sources);
         will_emit.then_some(message)
     }
 
     fn finish(self) -> impl Iterator<Item = UnifiedMessage> {
-        let Self {
-            mut seen,
-            deferred_sqlite,
-            ..
-        } = self;
-        deferred_sqlite.into_iter().flatten().filter(move |message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_none_or(|key| seen.insert(key.clone()))
-        })
+        self.deferred_sqlite.into_iter().flatten()
     }
 }
 
@@ -1974,6 +2515,9 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
     };
 
     let mut month_map: HashMap<String, MonthAggregator> = HashMap::new();
+    // One alias snapshot for the whole fold so a mid-fold set_model_aliases
+    // cannot split messages across two grouping configs.
+    let aliases = model_alias::snapshot_grouping_aliases();
 
     scan_messages_streaming(
         &home_dir, &clients, pricing.as_deref(), options.use_env_roots, &options.scanner_settings,
@@ -1989,7 +2533,7 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
 
             entry
                 .models
-                .insert(normalize_model_for_grouping(&msg.model_id));
+                .insert(aliases.fold(normalize_syntactic(&msg.model_id)));
             // saturating_add so clamped (i64::MAX) buckets from a corrupt source
             // can't overflow the fold.
             entry.input = entry.input.saturating_add(msg.tokens.input);
@@ -2234,6 +2778,9 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
     };
 
     let mut hour_map: HashMap<String, HourAggregator> = HashMap::new();
+    // One alias snapshot for the whole fold so a mid-fold set_model_aliases
+    // cannot split messages across two grouping configs.
+    let aliases = model_alias::snapshot_grouping_aliases();
 
     scan_messages_streaming(
         &home_dir, &clients, pricing.as_deref(), options.use_env_roots, &options.scanner_settings,
@@ -2254,7 +2801,7 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
             entry.clients.insert(msg.client.clone());
             entry
                 .models
-                .insert(normalize_model_for_grouping(&msg.model_id));
+                .insert(aliases.fold(normalize_syntactic(&msg.model_id)));
             // saturating_add so clamped (i64::MAX) buckets from a corrupt source
             // can't overflow the fold.
             entry.input = entry.input.saturating_add(msg.tokens.input);
@@ -2368,26 +2915,25 @@ where
     let mut trae_latest: HashMap<String, UnifiedMessage> = HashMap::new();
 
     // ---- OpenCode SQLite + legacy JSON ----
-    // The sink cannot retract an estimated duplicate, so pre-scan only the
-    // authoritative identities before streaming the lane in its existing order.
-    // Legacy JSON is parsed again below so this pass never retains message bodies.
-    let mut opencode_authoritative: HashSet<String> = scan_result
+    // The sink cannot retract an estimated duplicate, so pre-scan source-key
+    // alias groups and expand provider authority across each connected group.
+    // Legacy JSON is parsed again below; this pass retains identities, not bodies.
+    let mut opencode_identity_groups: Vec<_> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
         .filter_map(|path| sessions::opencode::parse_opencode_file(path))
-        .filter(|message| message.cost_source == CostSource::ProviderReported)
-        .filter_map(|message| message.dedup_key)
+        .map(|message| opencode_identity_group(&message))
         .collect();
     for db_path in &scan_result.opencode_dbs {
-        opencode_authoritative.extend(
+        opencode_identity_groups.extend(
             sessions::opencode::parse_opencode_sqlite(db_path)
                 .into_iter()
-                .filter(|message| message.cost_source == CostSource::ProviderReported)
-                .filter_map(|message| message.dedup_key),
+                .map(|message| opencode_identity_group(&message)),
         );
     }
+    let opencode_authoritative = opencode_authoritative_sources(opencode_identity_groups);
 
-    let mut opencode_selection = OpenCodeStreamingSelection::new(opencode_authoritative);
+    let mut opencode_selection = OpenCodeSelection::new(opencode_authoritative);
     for db_path in &scan_result.opencode_dbs {
         for mut message in sessions::opencode::parse_opencode_sqlite(db_path) {
             apply_pricing_if_available(&mut message, pricing);
@@ -2413,8 +2959,31 @@ where
     let claude_home = PathBuf::from(home_dir);
     let mut claude_seen: HashSet<String> = HashSet::new();
     for path in scan_result.get(ClientId::Claude) {
-        let fp = message_cache::SourceFingerprint::from_claude_code_path_with_home(path, Some(&claude_home));
-        let cache_hit = fp.as_ref().and_then(|fp| source_cache.get(path).filter(|c| &c.fingerprint == fp && !c.messages.is_empty()));
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let cached = source_cache.get(identity, path);
+        let fingerprint_status =
+            message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
+                path,
+                cached.map(|entry| &entry.fingerprint),
+                Some(&claude_home),
+            );
+        let (cache_hit, fingerprint) = match fingerprint_status {
+            Some(message_cache::FingerprintStatus::Unchanged) => {
+                let cached =
+                    cached.expect("an uncached Claude source always builds a complete fingerprint");
+                if cached.messages.is_empty() {
+                    (None, Some(cached.fingerprint.clone()))
+                } else {
+                    (Some(cached), None)
+                }
+            }
+            Some(message_cache::FingerprintStatus::Changed(fingerprint)) => {
+                let cache_hit = cached
+                    .filter(|entry| entry.fingerprint == fingerprint && !entry.messages.is_empty());
+                (cache_hit, Some(fingerprint))
+            }
+            None => (None, None),
+        };
         if let Some(cached) = cache_hit {
             for msg in cached.messages.iter() {
                 let mut m = msg.clone();
@@ -2426,6 +2995,18 @@ where
             }
         } else {
             let msgs = sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home));
+            if !msgs.is_empty() {
+                if let Some(fingerprint) = fingerprint {
+                    source_cache.insert(message_cache::CachedSourceEntry::new(
+                        identity,
+                        path,
+                        fingerprint,
+                        msgs.clone(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
             for mut m in msgs {
                 apply_pricing_if_available(&mut m, pricing);
                 if !passes_client(&m) { continue; }
@@ -2435,41 +3016,34 @@ where
         }
     }
 
-    // ---- Codex JSONL (cache-aware, headless-aware) ----
+    // ---- Codex JSONL (cache-aware, incremental, headless-aware) ----
     let mut codex_seen: HashSet<String> = HashSet::new();
     for path in scan_result.get(ClientId::Codex) {
-        let fp = message_cache::SourceFingerprint::from_path(path);
-        let cache_hit = fp.as_ref().and_then(|fp| source_cache.get(path).filter(|c| &c.fingerprint == fp));
-        if let Some(cached) = cache_hit {
-            let is_headless = is_headless_path(path, &headless_roots);
-            let fallback_ts = sessions::utils::file_modified_timestamp_ms(path);
-            let fti = &cached.fallback_timestamp_indices;
-            for (idx, msg) in cached.messages.iter().enumerate() {
-                let mut m = msg.clone();
-                if fti.contains(&idx) { m.set_timestamp(fallback_ts); } else { m.refresh_derived_fields(); }
-                apply_pricing_if_available(&mut m, pricing);
-                apply_headless_agent(&mut m, is_headless);
-                if !passes_client(&m) { continue; }
-                let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut codex_seen));
-                if keep && filter(&m) { sink(&m); }
-            }
-        } else {
-            let is_headless = is_headless_path(path, &headless_roots);
-            let fallback_ts = sessions::utils::file_modified_timestamp_ms(path);
-            let parsed = sessions::codex::parse_codex_file_incremental(
-                path, 0, sessions::codex::CodexParseState::default(),
+        let raw = load_or_parse_codex_raw_source(path, &source_cache);
+        if let Some(entry) = raw.cache_entry {
+            source_cache.insert(entry);
+        } else if raw.invalidate_cache {
+            source_cache.remove(
+                message_cache::CacheIdentity::for_client(ClientId::Codex),
+                path,
             );
-            let mut msgs = parsed.messages;
-            for idx in &parsed.fallback_timestamp_indices {
-                if let Some(m) = msgs.get_mut(*idx) { m.set_timestamp(fallback_ts); }
+        }
+
+        let is_headless = is_headless_path(path, &headless_roots);
+        let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
+        for (index, mut message) in raw.messages.into_iter().enumerate() {
+            if raw.fallback_timestamp_indices.contains(&index) {
+                message.set_timestamp(fallback_timestamp);
+            } else {
+                message.refresh_derived_fields();
             }
-            for mut m in msgs {
-                apply_pricing_if_available(&mut m, pricing);
-                apply_headless_agent(&mut m, is_headless);
-                if !passes_client(&m) { continue; }
-                let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut codex_seen));
-                if keep && filter(&m) { sink(&m); }
-            }
+            apply_pricing_if_available(&mut message, pricing);
+            apply_headless_agent(&mut message, is_headless);
+            if !passes_client(&message) { continue; }
+            let keep = message.dedup_key.as_ref().is_none_or(|key| {
+                key.is_empty() || dedup_gate_passes(key, &mut codex_seen)
+            });
+            if keep && filter(&message) { sink(&message); }
         }
     }
 
@@ -2484,7 +3058,7 @@ where
             simple_lane!(
                 $client_id,
                 $parse_fn,
-                message_cache::SourceFingerprint::from_path
+                message_cache::SourceFingerprint::from_path_samples_only
             )
         };
         // Custom fingerprint fn — for sources whose cache validity depends on a
@@ -2508,7 +3082,9 @@ where
             for path in scan_result.get($client_id) {
                 let fp = $fingerprint_fn(path);
                 let cache_hit = fp.as_ref().and_then(|fp| {
-                    source_cache.get(path).filter(|c| c.fingerprint == *fp && !c.messages.is_empty())
+                    source_cache
+                        .get(message_cache::CacheIdentity::for_client($client_id), path)
+                        .filter(|c| c.fingerprint == *fp && !c.messages.is_empty())
                 });
                 if let Some(cached) = cache_hit {
                     for msg in cached.messages.iter() {
@@ -2532,7 +3108,12 @@ where
                 if !msgs.is_empty() {
                     if let Some(fp) = $fingerprint_fn(path) {
                         let entry = message_cache::CachedSourceEntry::new(
-                            path, fp, msgs.clone(), Vec::new(), None,
+                            message_cache::CacheIdentity::for_client($client_id),
+                            path,
+                            fp,
+                            msgs.clone(),
+                            Vec::new(),
+                            None,
                         );
                         source_cache.insert(entry);
                     }
@@ -2546,7 +3127,111 @@ where
             }
         }};
     }
-    simple_lane!(ClientId::Copilot,   sessions::copilot::parse_copilot_file);
+    // ---- Copilot OTEL + Desktop aggregate (whole-session OTEL authority) ----
+    {
+        let otel_paths = scan_result.get(ClientId::Copilot);
+        let mut raw_by_path: Vec<Option<Vec<UnifiedMessage>>> =
+            (0..otel_paths.len()).map(|_| None).collect();
+        let mut miss_paths: Vec<(usize, &PathBuf)> = Vec::new();
+
+        for (index, path) in otel_paths.iter().enumerate() {
+            let fingerprint = message_cache::SourceFingerprint::from_path_samples_only(path);
+            let cache_hit = fingerprint.as_ref().and_then(|fingerprint| {
+                source_cache
+                    .get(
+                        message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                        path,
+                    )
+                    .filter(|cached| {
+                        cached.fingerprint == *fingerprint && !cached.messages.is_empty()
+                    })
+            });
+            if let Some(cached) = cache_hit {
+                raw_by_path[index] = Some(cached.messages.clone());
+            } else {
+                miss_paths.push((index, path));
+            }
+        }
+
+        let parsed_misses: Vec<(usize, &PathBuf, Vec<UnifiedMessage>)> = miss_paths
+            .par_iter()
+            .map(|(index, path)| (*index, *path, sessions::copilot::parse_copilot_file(path)))
+            .collect();
+        for (index, path, messages) in parsed_misses {
+            if !messages.is_empty() {
+                if let Some(fingerprint) =
+                    message_cache::SourceFingerprint::from_path_samples_only(path)
+                {
+                    source_cache.insert(message_cache::CachedSourceEntry::new(
+                        message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
+            raw_by_path[index] = Some(messages);
+        }
+
+        let otel_messages = raw_by_path
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>();
+        let desktop_messages = scan_result
+            .copilot_desktop_db
+            .as_ref()
+            .map(|db_path| {
+                let fingerprint =
+                    message_cache::SourceFingerprint::from_copilot_desktop_path(db_path);
+                if let Some(cached) = fingerprint.as_ref().and_then(|fingerprint| {
+                    source_cache
+                        .get(
+                            message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                            db_path,
+                        )
+                        .filter(|cached| {
+                            cached.fingerprint == *fingerprint && !cached.messages.is_empty()
+                        })
+                }) {
+                    return cached.messages.clone();
+                }
+
+                let messages = sessions::copilot_desktop::parse_copilot_desktop_db(db_path);
+                if !messages.is_empty() {
+                    if let Some(fingerprint) = fingerprint {
+                        source_cache.insert(message_cache::CachedSourceEntry::new(
+                            message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                            db_path,
+                            fingerprint,
+                            messages.clone(),
+                            Vec::new(),
+                            None,
+                        ));
+                    }
+                }
+                messages
+            })
+            .unwrap_or_default();
+
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        for mut message in prefer_copilot_otel_messages(otel_messages, desktop_messages) {
+            message.refresh_derived_fields();
+            reprice_lane_message(&mut message, pricing, false);
+            if !passes_client(&message) {
+                continue;
+            }
+            let keep = message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| key.is_empty() || dedup_gate_passes(key, &mut seen_keys));
+            if keep && filter(&message) {
+                sink(&message);
+            }
+        }
+    }
     simple_lane!(ClientId::Cursor,    sessions::cursor::parse_cursor_file);
     simple_lane!(ClientId::Warp,      sessions::warp::parse_warp_file);
     simple_lane!(ClientId::Amp,       sessions::amp::parse_amp_file);
@@ -2560,8 +3245,13 @@ where
     simple_lane!(ClientId::Pi,        sessions::pi::parse_pi_file);
     simple_lane!(
         ClientId::Kimi,
-        sessions::kimi::parse_kimi_file,
+        parse_kimi_source,
         message_cache::SourceFingerprint::from_kimi_path
+    );
+    simple_lane!(ClientId::Junie, sessions::junie::parse_junie_file);
+    simple_lane!(
+        ClientId::OpenCodeReview,
+        sessions::opencodereview::parse_opencodereview_file
     );
     simple_lane!(ClientId::Qwen,      sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
@@ -2587,14 +3277,77 @@ where
         sessions::jcode::parse_jcode_file,
         message_cache::SourceFingerprint::from_jcode_path
     );
-    // Grok Build: fingerprint updates.jsonl + every metadata sibling the parser
-    // reads (signals/summary/events) so a late compaction rollup or sibling-only
-    // model id invalidates the cache (parse reconciles signals totals).
-    simple_lane!(
-        ClientId::Grok,
-        sessions::grok::parse_grok_updates_file,
-        message_cache::SourceFingerprint::from_grok_path
-    );
+    // ---- Grok legacy updates + unified log (batch precedence) ----
+    // Cache each raw source independently, but do not emit cache hits early: the
+    // global unified log can suppress legacy rows from any session file.
+    {
+        let grok_paths = scan_result.get(ClientId::Grok);
+        let mut raw_by_path: Vec<Option<Vec<UnifiedMessage>>> =
+            (0..grok_paths.len()).map(|_| None).collect();
+        let mut miss_paths: Vec<(usize, &PathBuf)> = Vec::new();
+
+        for (index, path) in grok_paths.iter().enumerate() {
+            let fingerprint = message_cache::SourceFingerprint::from_grok_path(path);
+            let cache_hit = fingerprint.as_ref().and_then(|fingerprint| {
+                source_cache
+                    .get(
+                        message_cache::CacheIdentity::for_client(ClientId::Grok),
+                        path,
+                    )
+                    .filter(|cached| {
+                        cached.fingerprint == *fingerprint && !cached.messages.is_empty()
+                    })
+            });
+            if let Some(cached) = cache_hit {
+                raw_by_path[index] = Some(cached.messages.clone());
+            } else {
+                miss_paths.push((index, path));
+            }
+        }
+
+        let parsed_misses: Vec<(usize, &PathBuf, Vec<UnifiedMessage>)> = miss_paths
+            .par_iter()
+            .map(|(index, path)| (*index, *path, sessions::grok::parse_grok_file(path)))
+            .collect();
+        for (index, path, messages) in parsed_misses {
+            if !messages.is_empty() {
+                if let Some(fingerprint) =
+                    message_cache::SourceFingerprint::from_grok_path(path)
+                {
+                    source_cache.insert(message_cache::CachedSourceEntry::new(
+                        message_cache::CacheIdentity::for_client(ClientId::Grok),
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
+            raw_by_path[index] = Some(messages);
+        }
+
+        let raw_messages = raw_by_path
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        for mut message in sessions::grok::prefer_unified_log_messages(raw_messages) {
+            message.refresh_derived_fields();
+            reprice_lane_message(&mut message, pricing, false);
+            if !passes_client(&message) {
+                continue;
+            }
+            let keep = message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| key.is_empty() || dedup_gate_passes(key, &mut seen_keys));
+            if keep && filter(&message) {
+                sink(&message);
+            }
+        }
+    }
     // micode is WAL-mode SQLite; fingerprint via from_sqlite_path so a `-wal`
     // write invalidates the cache. MiMo Code records an authoritative per-message
     // cost (usage.cost), so this lane is cost-guarded (`true`): apply_pricing
@@ -2612,11 +3365,82 @@ where
         true
     );
     simple_lane!(ClientId::Mux,       sessions::mux::parse_mux_file);
-    simple_lane!(
-        ClientId::Kiro,
-        sessions::kiro::parse_kiro_file,
-        message_cache::SourceFingerprint::from_kiro_path
-    );
+
+    // ---- Kiro globalStorage files (raw cache + batch suppression) ----
+    // Snapshots and successful executions can describe the same conversation.
+    // Collect every raw source first so suppression runs before pricing, client
+    // gating, date/report filters, and the sink. Suppressed aggregates are never
+    // written to the per-source cache, allowing a later execution removal to
+    // restore the cached snapshot.
+    {
+        let kiro_paths = scan_result.get(ClientId::Kiro);
+        let mut raw_by_path: Vec<Option<Vec<UnifiedMessage>>> =
+            (0..kiro_paths.len()).map(|_| None).collect();
+        let mut miss_paths: Vec<(usize, &PathBuf)> = Vec::new();
+
+        for (index, path) in kiro_paths.iter().enumerate() {
+            let fingerprint = message_cache::SourceFingerprint::from_kiro_path(path);
+            let cache_hit = fingerprint.as_ref().and_then(|fingerprint| {
+                source_cache
+                    .get(
+                        message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                        path,
+                    )
+                    .filter(|cached| {
+                        cached.fingerprint == *fingerprint && !cached.messages.is_empty()
+                    })
+            });
+            if let Some(cached) = cache_hit {
+                raw_by_path[index] = Some(cached.messages.clone());
+            } else {
+                miss_paths.push((index, path));
+            }
+        }
+
+        let parsed_misses: Vec<(usize, &PathBuf, Vec<UnifiedMessage>)> = miss_paths
+            .par_iter()
+            .map(|(index, path)| (*index, *path, sessions::kiro::parse_kiro_file(path)))
+            .collect();
+        for (index, path, messages) in parsed_misses {
+            if !messages.is_empty() {
+                if let Some(fingerprint) = message_cache::SourceFingerprint::from_kiro_path(path) {
+                    source_cache.insert(message_cache::CachedSourceEntry::new(
+                        message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            } else {
+                // A changed source that now parses empty must not keep replaying
+                // a stale non-empty entry through a later same-fingerprint hit.
+                source_cache.remove(
+                    message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                    path,
+                );
+            }
+            raw_by_path[index] = Some(messages);
+        }
+
+        let raw_sources = kiro_paths
+            .iter()
+            .cloned()
+            .zip(raw_by_path.into_iter().map(Option::unwrap_or_default))
+            .collect();
+        let messages = sessions::kiro::merge_kiro_source_messages(raw_sources);
+        for mut message in messages {
+            message.refresh_derived_fields();
+            reprice_lane_message(&mut message, pricing, false);
+            if !passes_client(&message) {
+                continue;
+            }
+            if filter(&message) {
+                sink(&message);
+            }
+        }
+    }
 
     // ---- Gemini (cache-aware with invalidate_cache semantics) ----
     // Uses load_or_parse_source_with_fingerprint_and_policy equivalent:
@@ -2627,9 +3451,14 @@ where
         let mut seen_keys: HashSet<String> = HashSet::new();
         let mut gemini_miss_paths: Vec<&PathBuf> = Vec::new();
         for path in scan_result.get(ClientId::Gemini) {
-            let fp = message_cache::SourceFingerprint::from_path(path);
+            let fp = message_cache::SourceFingerprint::from_path_samples_only(path);
             let cache_hit = fp.as_ref().and_then(|fp| {
-                source_cache.get(path).filter(|c| c.fingerprint == *fp && !c.messages.is_empty())
+                source_cache
+                    .get(
+                        message_cache::CacheIdentity::for_client(ClientId::Gemini),
+                        path,
+                    )
+                    .filter(|c| c.fingerprint == *fp && !c.messages.is_empty())
             });
             if let Some(cached) = cache_hit {
                 for msg in cached.messages.iter() {
@@ -2646,18 +3475,31 @@ where
         }
         let gemini_parsed: Vec<(&PathBuf, sessions::gemini::GeminiParseResult)> = gemini_miss_paths
             .par_iter()
-            .map(|path| (*path, sessions::gemini::parse_gemini_file_with_cache_status(path)))
+            .map(|path| {
+                (
+                    *path,
+                    sessions::gemini::parse_gemini_file_with_cache_status(path),
+                )
+            })
             .collect();
         for (path, parsed) in gemini_parsed {
             if parsed.cacheable && !parsed.messages.is_empty() {
-                if let Some(fp) = message_cache::SourceFingerprint::from_path(path) {
+                if let Some(fp) = message_cache::SourceFingerprint::from_path_samples_only(path) {
                     let entry = message_cache::CachedSourceEntry::new(
-                        path, fp, parsed.messages.clone(), Vec::new(), None,
+                        message_cache::CacheIdentity::for_client(ClientId::Gemini),
+                        path,
+                        fp,
+                        parsed.messages.clone(),
+                        Vec::new(),
+                        None,
                     );
                     source_cache.insert(entry);
                 }
             } else if !parsed.cacheable {
-                source_cache.remove(path);
+                source_cache.remove(
+                    message_cache::CacheIdentity::for_client(ClientId::Gemini),
+                    path,
+                );
             }
             for mut m in parsed.messages {
                 apply_pricing_if_available(&mut m, pricing);
@@ -2739,7 +3581,14 @@ where
     // ---- Zed SQLite (cache-aware reference-iterate) ----
     for db_path in scan_result.zed_db_paths() {
         let fp = message_cache::SourceFingerprint::from_sqlite_path(&db_path);
-        let cache_hit = fp.as_ref().and_then(|fp| source_cache.get(&db_path).filter(|c| &c.fingerprint == fp));
+        let cache_hit = fp.as_ref().and_then(|fp| {
+            source_cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Zed),
+                    &db_path,
+                )
+                .filter(|c| &c.fingerprint == fp)
+        });
         if let Some(cached) = cache_hit {
             for msg in cached.messages.iter() {
                 let mut m = msg.clone();
@@ -2748,9 +3597,22 @@ where
                 if passes_client(&m) && filter(&m) { sink(&m); }
             }
         } else {
-            for mut m in sessions::zed::parse_zed_sqlite(&db_path) {
-                apply_pricing_if_available(&mut m, pricing);
-                if passes_client(&m) && filter(&m) { sink(&m); }
+            let messages = sessions::zed::parse_zed_sqlite(&db_path);
+            if !messages.is_empty() {
+                if let Some(fingerprint) = fp {
+                    source_cache.insert(message_cache::CachedSourceEntry::new(
+                        message_cache::CacheIdentity::for_client(ClientId::Zed),
+                        &db_path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
+            for mut message in messages {
+                apply_pricing_if_available(&mut message, pricing);
+                if passes_client(&message) && filter(&message) { sink(&message); }
             }
         }
     }
@@ -2804,9 +3666,13 @@ where
                             && m.dedup_key.as_ref().is_some_and(|k| {
                                 existing.dedup_key.as_ref().is_none_or(|ek| k.as_str() > ek.as_str())
                             }));
-                    if replace { *slot.get_mut() = m; }
+                    if replace {
+                        *slot.get_mut() = m;
+                    }
                 }
-                std::collections::hash_map::Entry::Vacant(slot) => { slot.insert(m); }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(m);
+                }
             }
         }
     }
@@ -2814,7 +3680,11 @@ where
     // ---- Synthetic ----
     if let Some(db_path) = scan_result.synthetic_db.as_ref().filter(|_| include_synthetic) {
         let fp = message_cache::SourceFingerprint::from_sqlite_path(db_path);
-        let cache_hit = fp.as_ref().and_then(|fp| source_cache.get(db_path).filter(|c| &c.fingerprint == fp));
+        let cache_hit = fp.as_ref().and_then(|fp| {
+            source_cache
+                .get(message_cache::CacheIdentity::synthetic(), db_path)
+                .filter(|c| &c.fingerprint == fp)
+        });
         if let Some(cached) = cache_hit {
             for msg in cached.messages.iter() {
                 let mut m = msg.clone();
@@ -2824,10 +3694,26 @@ where
                 if passes_client(&m) && filter(&m) { sink(&m); }
             }
         } else {
-            for mut m in sessions::synthetic::parse_octofriend_sqlite(db_path) {
-                apply_pricing_if_available(&mut m, pricing);
-                sessions::synthetic::normalize_synthetic_gateway_fields(&mut m.model_id, &mut m.provider_id);
-                if passes_client(&m) && filter(&m) { sink(&m); }
+            let messages = sessions::synthetic::parse_octofriend_sqlite(db_path);
+            if !messages.is_empty() {
+                if let Some(fingerprint) = fp {
+                    source_cache.insert(message_cache::CachedSourceEntry::new(
+                        message_cache::CacheIdentity::synthetic(),
+                        db_path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
+            for mut message in messages {
+                apply_pricing_if_available(&mut message, pricing);
+                sessions::synthetic::normalize_synthetic_gateway_fields(
+                    &mut message.model_id,
+                    &mut message.provider_id,
+                );
+                if passes_client(&message) && filter(&message) { sink(&message); }
             }
         }
     }
@@ -2839,7 +3725,6 @@ where
 
     source_cache.save_if_dirty();
 }
-
 
 async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
@@ -2962,9 +3847,9 @@ pub fn build_graph_result_from_messages(
     messages: &[UnifiedMessage],
     since: Option<&str>,
 ) -> GraphResult {
-    let iter = messages.iter().filter(|msg| {
-        since.is_none_or(|s| msg.date.as_str() >= s)
-    });
+    let iter = messages
+        .iter()
+        .filter(|msg| since.is_none_or(|s| msg.date.as_str() >= s));
     let contributions = aggregator::fold_messages_iter(iter);
     aggregator::generate_graph_result(contributions, 0)
 }
@@ -3115,21 +4000,28 @@ fn parse_local_unified_messages_resolved(
     );
     Ok(filter_unified_messages(messages, &options))
 }
-/// Max mtime (unix ms) across every file the local scan would read — the
-/// cheapest "did anything change" probe for callers that cache reports
-/// derived from `parse_local_clients` / the unified-message parsers.
-/// Database-backed sources contribute both the db file and its `-wal`
-/// sidecar (WAL writes may leave the main db file's mtime untouched).
-/// Stat failures contribute nothing, so a vanished file alone never
-/// invalidates a caller's cache — its replacement or sibling will.
+/// Max mtime (unix ms) across every file the local scan would read. This
+/// remains the timestamp-shaped probe used by pruning and diagnostics;
+/// in-process report caches that must observe source deletion use
+/// `local_source_change_token` instead. Database-backed sources contribute both
+/// the db file and its `-wal` sidecar. Stat failures contribute nothing, so a
+/// vanished file alone does not change this max-mtime value.
 pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String> {
+    let scan_result = scan_local_sources(options)?;
+    Ok(latest_source_mtime_ms_from_scan(&scan_result))
+}
+
+fn scan_local_sources(options: &LocalParseOptions) -> Result<scanner::ScanResult, String> {
     let (home_dir, clients) = resolve_local_parse_request(options)?;
-    let scan_result = scanner::scan_all_clients_with_scanner_settings(
+    Ok(scanner::scan_all_clients_with_scanner_settings(
         &home_dir,
         &clients,
         options.use_env_roots,
         &options.scanner_settings,
-    );
+    ))
+}
+
+fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     let mut latest: u64 = 0;
     for files in scan_result.files.iter() {
         for path in files {
@@ -3165,6 +4057,9 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
         wal.push("-wal");
         latest = latest.max(file_mtime_ms(Path::new(&wal)).unwrap_or(0));
     }
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        latest = latest.max(copilot_desktop_source_mtime_ms(db_path).unwrap_or(0));
+    }
     // jcode snapshots (`session_*.json`) carry a sibling `.journal.jsonl`
     // append-log; jcode writes new turns there between snapshot rewrites,
     // leaving the snapshot's mtime untouched. The snapshot itself is already
@@ -3176,14 +4071,14 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
         let journal = message_cache::jcode_journal_path(snapshot);
         latest = latest.max(file_mtime_ms(&journal).unwrap_or(0));
     }
-    // Grok Build reconciles totals from sibling signals.json and reads the model
-    // id from summary.json / events.jsonl. Any of those metadata siblings can
-    // rewrite without touching updates.jsonl (compaction / live session refresh /
-    // a late-arriving model id), so probe every sibling the fingerprint covers for
-    // the live-tail change token too — otherwise a sibling-only write leaves the
-    // token unchanged and the tail never re-parses the new model.
-    for updates in scan_result.get(ClientId::Grok) {
-        if let Some(parent) = updates.parent() {
+    // Legacy Grok sessions reconcile sibling metadata that can change without
+    // touching updates.jsonl. The self-contained unified log is already covered
+    // by the primary-file scan above.
+    for source in scan_result.get(ClientId::Grok) {
+        if source.file_name().and_then(|name| name.to_str()) != Some("updates.jsonl") {
+            continue;
+        }
+        if let Some(parent) = source.parent() {
             for sibling in message_cache::GROK_METADATA_SIBLINGS {
                 latest = latest.max(file_mtime_ms(&parent.join(sibling)).unwrap_or(0));
             }
@@ -3199,7 +4094,7 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
     }
     // These file-backed parsers consult secondary sources whose writes do not
     // update the scanned primary: Droid's fallback transcript, legacy Kimi's
-    // shared config, and Kiro CLI's same-stem message log. Probe each dependency
+    // shared config, and Kiro's CLI/IDE message sidecars. Probe each dependency
     // so a sibling-only change reaches the specialized cache fingerprint.
     for settings in scan_result.get(ClientId::Droid) {
         latest = latest.max(droid_source_mtime_ms(settings).unwrap_or(0));
@@ -3210,7 +4105,137 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
     for session in scan_result.get(ClientId::Kiro) {
         latest = latest.max(kiro_source_mtime_ms(session).unwrap_or(0));
     }
-    Ok(latest)
+    latest
+}
+
+/// Opaque change token for in-process report caches. Hash the current source
+/// topology and each parser dependency's size and nanosecond mtime so creating,
+/// deleting, or rewriting a non-max source still invalidates cached graphs and
+/// the live tail.
+pub fn local_source_change_token(options: &LocalParseOptions) -> Result<u64, String> {
+    use std::hash::{Hash, Hasher};
+
+    let scan_result = scan_local_sources(options)?;
+    let mut paths: Vec<PathBuf> = scan_result.files.iter().flatten().cloned().collect();
+
+    let mut dbs = scan_result.opencode_dbs.clone();
+    let single_dbs = [
+        &scan_result.synthetic_db,
+        &scan_result.kilo_db,
+        &scan_result.goose_db,
+        &scan_result.kiro_db,
+    ];
+    dbs.extend(single_dbs.into_iter().flatten().cloned());
+    dbs.extend(scan_result.hermes_db_paths());
+    dbs.extend(scan_result.zed_db_paths());
+    dbs.extend(
+        scan_result
+            .crush_dbs
+            .iter()
+            .map(|source| source.db_path.clone()),
+    );
+    dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
+    dbs.extend(scan_result.get(ClientId::MiMoCode).iter().cloned());
+    for db in dbs {
+        paths.push(db.clone());
+        let mut wal = db.into_os_string();
+        wal.push("-wal");
+        paths.push(PathBuf::from(wal));
+    }
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        probe_readable_dependency(db_path, false).map_err(|error| {
+            format!(
+                "Failed to read Copilot Desktop database {}: {error}",
+                db_path.display()
+            )
+        })?;
+        paths.push(db_path.clone());
+        let mut wal = db_path.clone().into_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        probe_readable_dependency(&wal, true).map_err(|error| {
+            format!(
+                "Failed to read Copilot Desktop WAL {}: {error}",
+                wal.display()
+            )
+        })?;
+        paths.push(wal);
+        paths.extend(
+            sessions::copilot_desktop::session_state_event_paths(db_path).map_err(|error| {
+                format!(
+                    "Failed to probe Copilot Desktop session-state dependencies for {}: {error}",
+                    db_path.display()
+                )
+            })?,
+        );
+    }
+
+    for snapshot in scan_result.get(ClientId::Jcode) {
+        paths.push(message_cache::jcode_journal_path(snapshot));
+    }
+    for source in scan_result.get(ClientId::Grok) {
+        if source.file_name().and_then(|name| name.to_str()) == Some("updates.jsonl") {
+            if let Some(parent) = source.parent() {
+                paths.extend(
+                    message_cache::GROK_METADATA_SIBLINGS
+                        .into_iter()
+                        .map(|name| parent.join(name)),
+                );
+            }
+        }
+    }
+    for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
+        paths.extend(
+            scan_result
+                .get(client)
+                .iter()
+                .map(|path| sessions::roocode::history_path_for_ui_messages(path)),
+        );
+    }
+    paths.extend(
+        scan_result
+            .get(ClientId::Droid)
+            .iter()
+            .filter_map(|path| sessions::droid::droid_jsonl_path(path)),
+    );
+    paths.extend(
+        scan_result
+            .get(ClientId::Kimi)
+            .iter()
+            .filter_map(|path| sessions::kimi::kimi_config_path(path)),
+    );
+    paths.extend(
+        scan_result
+            .get(ClientId::Kiro)
+            .iter()
+            .filter_map(|path| sessions::kiro::kiro_related_messages_path(path)),
+    );
+
+    paths.sort();
+    paths.dedup();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in paths {
+        path.hash(&mut hasher);
+        let state = std::fs::metadata(&path).ok().map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| (duration.as_secs(), duration.subsec_nanos()));
+            (metadata.len(), modified)
+        });
+        state.hash(&mut hasher);
+    }
+    Ok(hasher.finish())
+}
+
+fn probe_readable_dependency(path: &Path, optional: bool) -> std::io::Result<()> {
+    match std::fs::File::open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// File mtime as unix ms; `None` on any stat failure.
@@ -3269,14 +4294,27 @@ fn kiro_source_mtime_ms(session_path: &Path) -> Option<u64> {
     )
 }
 
-/// Newest mtime for a Grok session's scanned updates file and every metadata
-/// sibling the parser reads (`signals.json` / `summary.json` / `events.jsonl` —
-/// kept in lockstep with the fingerprint via `GROK_METADATA_SIBLINGS`). `None`
-/// keeps the source during pruning because over-parsing is safer than dropping a
-/// session when the updates file or an existing sibling cannot be inspected.
-fn grok_source_mtime_ms(updates_path: &Path) -> Option<u64> {
-    let mut latest = file_mtime_ms(updates_path)?;
-    let Some(parent) = updates_path.parent() else {
+fn copilot_desktop_source_mtime_ms(db_path: &Path) -> Option<u64> {
+    probe_readable_dependency(db_path, false).ok()?;
+    let mut wal = db_path.to_path_buf().into_os_string();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    probe_readable_dependency(&wal, true).ok()?;
+    let events = sessions::copilot_desktop::session_state_event_paths(db_path).ok()?;
+    source_with_related_mtime_ms(db_path, std::iter::once(wal).chain(events))
+}
+
+/// Newest mtime for a Grok source and every file that affects its parse. The
+/// unified log is self-contained; legacy updates include metadata siblings kept
+/// in lockstep with `SourceFingerprint::from_grok_path`. `None` keeps the source
+/// during pruning because over-parsing is safer than silently dropping usage.
+fn grok_source_mtime_ms(source_path: &Path) -> Option<u64> {
+    let mut latest = file_mtime_ms(source_path)?;
+    if source_path.file_name().and_then(|name| name.to_str()) == Some("unified.jsonl") {
+        return Some(latest);
+    }
+
+    let Some(parent) = source_path.parent() else {
         return Some(latest);
     };
     for name in message_cache::GROK_METADATA_SIBLINGS {
@@ -3295,11 +4333,18 @@ fn grok_source_mtime_ms(updates_path: &Path) -> Option<u64> {
 /// (WAL writes may not bump the main `.db` mtime), while the jcode lane holds a
 /// `session_*.json` snapshot whose sibling `.journal.jsonl` is appended between
 /// snapshot rewrites. Those lanes remain exempt. Roo-family, Droid, legacy Kimi,
-/// Kiro CLI, and Grok sources can still be bounded by folding every parser
-/// dependency into their newest mtime.
+/// Kiro file sources, and Grok sources can still be bounded by folding every
+/// parser dependency into their newest mtime.
 /// Any stat failure keeps the file — over-parsing is safe, silently skipping is
 /// not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
+    let copilot_desktop_fresh = scan_result.copilot_desktop_db.as_ref().is_some_and(|path| {
+        copilot_desktop_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+    });
+    if !copilot_desktop_fresh {
+        scan_result.copilot_desktop_db = None;
+    }
+
     // Lanes whose scanned file's mtime does not reflect a sibling write
     // (SQLite `-wal` or jcode's `.journal.jsonl`); kept in lockstep with the
     // sibling probes in `latest_source_mtime_ms`.
@@ -3316,6 +4361,12 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
         ClientId::Cline as usize,
     ];
     for (lane, files) in scan_result.files.iter_mut().enumerate() {
+        if lane == ClientId::Copilot as usize && copilot_desktop_fresh {
+            // A fresh Desktop aggregate may overlap any older OTEL row from the
+            // same session. Keep the complete OTEL cohort so the shared selector
+            // cannot reopen Desktop usage that a full scan suppresses.
+            continue;
+        }
         if db_lanes.contains(&lane) {
             continue;
         }
@@ -3337,14 +4388,45 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
             continue;
         }
         if lane == ClientId::Kiro as usize {
+            // globalStorage precedence crosses files. If any IDE source changed,
+            // retain the complete IDE cohort so an older execution can still
+            // suppress a newer snapshot; CLI sources remain independently prunable.
+            let keep_global_storage_batch = files
+                .iter()
+                .filter(|path| sessions::kiro::is_kiro_global_storage_source(path))
+                .any(|path| kiro_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms));
             files.retain(|path| {
-                kiro_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+                if sessions::kiro::is_kiro_global_storage_source(path) {
+                    keep_global_storage_batch
+                } else {
+                    kiro_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+                }
             });
             continue;
         }
         if lane == ClientId::Grok as usize {
+            let is_unified = |path: &Path| {
+                path.file_name().and_then(|name| name.to_str()) == Some("unified.jsonl")
+            };
+            let is_fresh =
+                |path: &Path| grok_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms);
+            let unified_fresh = files.iter().any(|path| is_unified(path) && is_fresh(path));
+            if unified_fresh {
+                // A fresh global authority file can cover any legacy session and
+                // also needs those rows for workspace attribution.
+                continue;
+            }
+
+            let legacy_fresh = files.iter().any(|path| !is_unified(path) && is_fresh(path));
             files.retain(|path| {
-                grok_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+                if is_unified(path) {
+                    // An older authority file must remain available while a
+                    // legacy session is fresh, or live-tail pruning can reopen
+                    // rows that full reports correctly suppress.
+                    legacy_fresh
+                } else {
+                    is_fresh(path)
+                }
             });
             continue;
         }
@@ -3398,48 +4480,36 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let mut counts = ClientCounts::new();
 
     let opencode_count: i32 = {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut count: i32 = 0;
-
-        for db_path in &scan_result.opencode_dbs {
-            let sqlite_msgs: Vec<(String, ParsedMessage)> =
-                sessions::opencode::parse_opencode_sqlite(db_path)
-                    .into_iter()
-                    .filter_map(|msg| {
-                        let key = msg.dedup_key.clone().unwrap_or_default();
-                        // Dedup across multiple channel-suffixed dbs: the
-                        // same session can end up in both `opencode.db` and
-                        // `opencode-<channel>.db` if the user switches
-                        // channels mid-session.
-                        if !key.is_empty() && !seen.insert(key.clone()) {
-                            return None;
-                        }
-                        Some((key, unified_to_parsed(&msg)))
-                    })
-                    .collect();
-            count += sqlite_msgs.len() as i32;
-            for (_key, parsed) in sqlite_msgs {
-                messages.push(parsed);
-            }
-        }
-
-        let json_msgs: Vec<(String, ParsedMessage)> = scan_result
+        let sqlite_messages: Vec<UnifiedMessage> = scan_result
+            .opencode_dbs
+            .iter()
+            .flat_map(|db_path| sessions::opencode::parse_opencode_sqlite(db_path))
+            .collect();
+        let json_messages: Vec<UnifiedMessage> = scan_result
             .get(ClientId::OpenCode)
             .par_iter()
-            .filter_map(|path| {
-                let msg = sessions::opencode::parse_opencode_file(path)?;
-                let key = msg.dedup_key.clone().unwrap_or_default();
-                Some((key, unified_to_parsed(&msg)))
-            })
+            .filter_map(|path| sessions::opencode::parse_opencode_file(path))
             .collect();
-        let deduped: Vec<ParsedMessage> = json_msgs
+        let authoritative = opencode_authoritative_sources(
+            sqlite_messages
+                .iter()
+                .chain(json_messages.iter())
+                .map(opencode_identity_group),
+        );
+        let mut selection = OpenCodeSelection::new(authoritative);
+        let mut selected: Vec<UnifiedMessage> = sqlite_messages
             .into_iter()
-            .filter(|(key, _)| key.is_empty() || seen.insert(key.clone()))
-            .map(|(_, msg)| msg)
+            .filter_map(|message| selection.select_sqlite(message))
             .collect();
-        count += deduped.len() as i32;
-        messages.extend(deduped);
+        selected.extend(
+            json_messages
+                .into_iter()
+                .filter_map(|message| selection.select_json(message, true)),
+        );
+        selected.extend(selection.finish());
 
+        let count = selected.len() as i32;
+        messages.extend(selected.iter().map(unified_to_parsed));
         count
     };
     counts.set(ClientId::OpenCode, opencode_count);
@@ -3498,16 +4568,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Codex, codex_count);
     messages.extend(codex_msgs);
 
-    let copilot_msgs: Vec<ParsedMessage> = scan_result
+    let copilot_otel_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Copilot)
         .par_iter()
-        .flat_map(|path| {
-            sessions::copilot::parse_copilot_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::copilot::parse_copilot_file(path))
         .collect();
+    let copilot_desktop_messages = scan_result
+        .copilot_desktop_db
+        .as_ref()
+        .map(|path| sessions::copilot_desktop::parse_copilot_desktop_db(path))
+        .unwrap_or_default();
+    let copilot_msgs: Vec<ParsedMessage> =
+        prefer_copilot_otel_messages(copilot_otel_messages, copilot_desktop_messages)
+            .iter()
+            .map(unified_to_parsed)
+            .collect();
     let copilot_count = copilot_msgs.len() as i32;
     counts.set(ClientId::Copilot, copilot_count);
     messages.extend(copilot_msgs);
@@ -3596,20 +4671,62 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
 
-    // Parse Kimi wire.jsonl files in parallel
-    let kimi_msgs: Vec<ParsedMessage> = scan_result
+    let kimi_outcomes: Vec<(bool, Vec<UnifiedMessage>)> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::kimi::parse_kimi_file(path)
+        .map(|path| {
+            (
+                sessions::kimi::is_kimi_code_path(path),
+                parse_kimi_source(path),
+            )
+        })
+        .collect();
+    let mut kimi_code_seen: HashSet<String> = HashSet::new();
+    let kimi_msgs: Vec<ParsedMessage> = kimi_outcomes
+        .into_iter()
+        .flat_map(|(is_kimi_code, messages)| {
+            messages
                 .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
+                .filter(|message| {
+                    !is_kimi_code || should_keep_deduped_message(&mut kimi_code_seen, message)
+                })
+                .map(|message| unified_to_parsed(&message))
                 .collect::<Vec<_>>()
         })
         .collect();
-    let kimi_count = kimi_msgs.len() as i32;
+    let kimi_count = summed_parsed_message_count(&kimi_msgs);
     counts.set(ClientId::Kimi, kimi_count);
     messages.extend(kimi_msgs);
+
+    let junie_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Junie)
+        .par_iter()
+        .flat_map(|path| sessions::junie::parse_junie_file(path))
+        .collect();
+    let mut junie_seen: HashSet<String> = HashSet::new();
+    let junie_msgs: Vec<ParsedMessage> = junie_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut junie_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let junie_count = summed_parsed_message_count(&junie_msgs);
+    counts.set(ClientId::Junie, junie_count);
+    messages.extend(junie_msgs);
+
+    let opencodereview_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::OpenCodeReview)
+        .par_iter()
+        .flat_map(|path| sessions::opencodereview::parse_opencodereview_file(path))
+        .collect();
+    let mut opencodereview_seen: HashSet<String> = HashSet::new();
+    let opencodereview_msgs: Vec<ParsedMessage> = opencodereview_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut opencodereview_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let opencodereview_count = summed_parsed_message_count(&opencodereview_msgs);
+    counts.set(ClientId::OpenCodeReview, opencodereview_count);
+    messages.extend(opencodereview_msgs);
 
     // Parse Qwen JSONL files in parallel
     let qwen_msgs: Vec<ParsedMessage> = scan_result
@@ -3718,16 +4835,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Gjc, gjc_count);
     messages.extend(gjc_msgs);
 
-    let grok_msgs: Vec<ParsedMessage> = scan_result
+    let grok_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Grok)
         .par_iter()
-        .flat_map(|path| {
-            sessions::grok::parse_grok_updates_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::grok::parse_grok_file(path))
         .collect();
+    let grok_msgs: Vec<ParsedMessage> =
+        sessions::grok::prefer_unified_log_messages(grok_messages)
+            .into_iter()
+            .map(|message| unified_to_parsed(&message))
+            .collect();
     let grok_count = summed_parsed_message_count(&grok_msgs);
     counts.set(ClientId::Grok, grok_count);
     messages.extend(grok_msgs);
@@ -3796,15 +4913,14 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         messages.extend(zed_msgs);
     }
 
-    let kiro_msgs: Vec<ParsedMessage> = scan_result
+    let kiro_sources: Vec<(PathBuf, Vec<UnifiedMessage>)> = scan_result
         .get(ClientId::Kiro)
         .par_iter()
-        .flat_map(|path| {
-            sessions::kiro::parse_kiro_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .map(|path| (path.clone(), sessions::kiro::parse_kiro_file(path)))
+        .collect();
+    let kiro_msgs: Vec<ParsedMessage> = sessions::kiro::merge_kiro_source_messages(kiro_sources)
+        .iter()
+        .map(unified_to_parsed)
         .collect();
     let kiro_count = summed_parsed_message_count(&kiro_msgs);
     counts.set(ClientId::Kiro, kiro_count);
@@ -4040,6 +5156,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         message_count: msg.message_count,
         agent: msg.agent.clone(),
         dedup_key: None,
+        dedup_aliases: Vec::new(),
         is_turn_start: false,
     }
 }
@@ -4048,20 +5165,25 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 mod tests {
     use super::{
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
+        canonical_model_id, clear_model_aliases, copilot_desktop_source_mtime_ms,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
-        get_model_report, get_monthly_report, latest_source_mtime_ms, message_cache,
-        normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
-        parse_local_clients,
+        get_model_report, get_monthly_report, latest_source_mtime_ms, local_source_change_token,
+        message_cache, model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
+        opencode_authoritative_sources, opencode_identity_group,
+        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
         parse_local_unified_messages, parsed_to_unified, pricing, prune_scan_result_by_mtime,
-        reprice_lane_message, retain_for_requested_clients, scan_messages_streaming, scanner,
-        select_local_parse_pricing, sessions, unified_to_parsed, AgentAccumulator, ClientId,
-        CostSource, GroupBy, LocalParseOptions, OpenCodeStreamingSelection, ReportOptions,
-        TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
+        register_usage_data_invalidation_hook, reprice_lane_message, retain_for_requested_clients,
+        scan_messages_streaming, scanner, select_local_parse_pricing, sessions, set_model_aliases,
+        snapshot_grouping_aliases, unified_to_parsed, AgentAccumulator, ClientId, CostSource,
+        GroupBy, LocalParseOptions, ModelAliasMap, OpenCodeSelection, OpenCodeSourceIdentity,
+        ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
-    use std::collections::{HashMap, HashSet};
+    use bincode::Options;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -4134,6 +5256,767 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
         )
+    }
+
+    fn copilot_desktop_test_db(home: &Path) -> (PathBuf, rusqlite::Connection) {
+        let root = home.join(".copilot");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("data.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                    id TEXT,
+                    model TEXT,
+                    total_input_tokens INTEGER,
+                    total_output_tokens INTEGER,
+                    total_cached_tokens INTEGER,
+                    total_reasoning_tokens INTEGER,
+                    total_nano_aiu INTEGER,
+                    created_at TEXT,
+                    agent TEXT
+                );
+                "#,
+            )
+            .unwrap();
+        (path, connection)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_copilot_desktop_session(
+        connection: &rusqlite::Connection,
+        session_id: &str,
+        model: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        reasoning: i64,
+        created_at: &str,
+        agent: Option<&str>,
+    ) {
+        connection
+            .execute(
+                r#"
+                INSERT INTO sessions (
+                    id, model, total_input_tokens, total_output_tokens,
+                    total_cached_tokens, total_reasoning_tokens, total_nano_aiu,
+                    created_at, agent
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)
+                "#,
+                rusqlite::params![
+                    session_id, model, input, output, cache_read, reasoning, created_at, agent
+                ],
+            )
+            .unwrap();
+    }
+
+    fn write_copilot_otel_message(
+        home: &Path,
+        session_id: &str,
+        unix_seconds: i64,
+        input: i64,
+        output: i64,
+        agent: Option<&str>,
+    ) -> PathBuf {
+        let root = home.join(".copilot/otel");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("copilot.jsonl");
+        let record = serde_json::json!({
+            "type": "span",
+            "traceId": format!("trace-{session_id}"),
+            "spanId": format!("span-{session_id}"),
+            "name": "chat gpt-5.4-mini",
+            "startTime": [unix_seconds, 0],
+            "attributes": {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.response.model": "gpt-5.4-mini",
+                "gen_ai.conversation.id": session_id,
+                "gen_ai.usage.input_tokens": input,
+                "gen_ai.usage.output_tokens": output,
+                "gen_ai.agent.id": agent,
+            }
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{record}").unwrap();
+        path
+    }
+
+    fn write_copilot_desktop_events(
+        home: &Path,
+        session_id: &str,
+        model: &str,
+        workspace: &str,
+    ) -> PathBuf {
+        let root = home.join(".copilot/session-state").join(session_id);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session.start\",\"data\":{{\"context\":{{\"cwd\":\"{workspace}\"}}}}}}\n{{\"type\":\"session.model_change\",\"data\":{{\"newModel\":\"{model}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn copilot_local_options(home: &Path) -> LocalParseOptions {
+        LocalParseOptions {
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["copilot".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    fn copilot_report_options(home: &Path) -> ReportOptions {
+        ReportOptions {
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["copilot".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn copilot_desktop_selector_prefers_otel_per_session() {
+        let message = |session_id: &str, dedup_key: &str, input: i64| {
+            UnifiedMessage::new_with_dedup(
+                "copilot",
+                "gpt-5.4-mini",
+                "openai",
+                session_id,
+                1_782_909_296_000,
+                TokenBreakdown {
+                    input,
+                    ..Default::default()
+                },
+                0.0,
+                Some(dedup_key.to_string()),
+            )
+        };
+        let selected = super::prefer_copilot_otel_messages(
+            vec![message("shared", "otel:shared", 10)],
+            vec![
+                message("shared", "copilot-desktop:shared", 100),
+                message("desktop-only", "copilot-desktop:desktop-only", 20),
+            ],
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .any(|message| message.dedup_key.as_deref() == Some("otel:shared")));
+        assert!(selected.iter().any(|message| {
+            message.dedup_key.as_deref() == Some("copilot-desktop:desktop-only")
+        }));
+        assert!(!selected
+            .iter()
+            .any(|message| { message.dedup_key.as_deref() == Some("copilot-desktop:shared") }));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_authority_precedes_date_filters_in_all_consumers() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (_, connection) = copilot_desktop_test_db(source_home.path());
+        insert_copilot_desktop_session(
+            &connection,
+            "shared",
+            "gpt-5.4-mini",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            Some("github.copilot.default"),
+        );
+        drop(connection);
+        write_copilot_otel_message(
+            source_home.path(),
+            "shared",
+            1_735_689_600,
+            10,
+            1,
+            Some("github.copilot.default"),
+        );
+
+        let mut options = copilot_local_options(source_home.path());
+        options.since = Some("2026-07-01".to_string());
+        options.until = Some("2026-07-01".to_string());
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+        let materialized =
+            super::parse_local_unified_messages_resolved(options.clone(), home, &clients, None)
+                .unwrap();
+        assert!(materialized.is_empty());
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|message| message.date == "2026-07-01",
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert!(streamed.is_empty());
+
+        let counted = parse_local_clients(options).unwrap();
+        assert!(counted.messages.is_empty());
+        assert_eq!(counted.counts.get(ClientId::Copilot), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_cache_tracks_events_and_wal_updates() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        insert_copilot_desktop_session(
+            &connection,
+            "session-1",
+            "auto",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            Some("github.copilot.default"),
+        );
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+
+        let initial_fingerprint =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        let initial_token =
+            local_source_change_token(&copilot_local_options(source_home.path())).unwrap();
+        let cold = parse_all_messages_with_pricing(home, &clients, None);
+        let warm = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(cold, warm);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].model_id, "auto");
+
+        let events = write_copilot_desktop_events(
+            source_home.path(),
+            "session-1",
+            "claude-sonnet-4-5",
+            "/tmp/copilot-workspace",
+        );
+        let event_fingerprint =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        assert_ne!(event_fingerprint, initial_fingerprint);
+        assert_ne!(
+            local_source_change_token(&copilot_local_options(source_home.path())).unwrap(),
+            initial_token
+        );
+        let event_refresh = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(event_refresh.len(), 1);
+        assert_eq!(event_refresh[0].model_id, "claude-sonnet-4-5");
+        assert_eq!(
+            event_refresh[0].workspace_label.as_deref(),
+            Some("copilot-workspace")
+        );
+
+        let event_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        std::fs::File::open(&events)
+            .unwrap()
+            .set_modified(event_time)
+            .unwrap();
+        assert_eq!(
+            latest_source_mtime_ms(&copilot_local_options(source_home.path())).unwrap(),
+            1_800_000_000_000
+        );
+
+        let before_wal =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        insert_copilot_desktop_session(
+            &connection,
+            "session-2",
+            "gpt-5.4-mini",
+            20,
+            2,
+            0,
+            0,
+            "2026-07-01T13:00:00Z",
+            None,
+        );
+        let after_wal =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        assert_ne!(after_wal, before_wal);
+        let wal_refresh = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(wal_refresh.len(), 2);
+
+        let cache = message_cache::SourceMessageCache::load();
+        assert!(cache
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                &db_path,
+            )
+            .is_some_and(|entry| entry.messages.iter().all(|message| message.cost == 0.0)));
+    }
+
+    #[test]
+    fn copilot_desktop_modified_after_keeps_otel_suppressors_and_fails_open() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        drop(connection);
+        let otel_path =
+            write_copilot_otel_message(source_home.path(), "shared", 1_735_689_600, 10, 1, None);
+        let events = write_copilot_desktop_events(
+            source_home.path(),
+            "shared",
+            "gpt-5.4-mini",
+            "/tmp/workspace",
+        );
+        let stale_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        std::fs::File::open(&db_path)
+            .unwrap()
+            .set_modified(stale_time)
+            .unwrap();
+        std::fs::File::open(&otel_path)
+            .unwrap()
+            .set_modified(stale_time)
+            .unwrap();
+        std::fs::File::open(&events)
+            .unwrap()
+            .set_modified(fresh_time)
+            .unwrap();
+
+        let mut event_fresh = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path.clone()),
+            ..Default::default()
+        };
+        event_fresh
+            .get_mut(ClientId::Copilot)
+            .push(otel_path.clone());
+        prune_scan_result_by_mtime(&mut event_fresh, 1_700_043_200_000);
+        assert_eq!(event_fresh.copilot_desktop_db.as_ref(), Some(&db_path));
+        assert_eq!(event_fresh.get(ClientId::Copilot), &vec![otel_path.clone()]);
+
+        std::fs::File::open(&events)
+            .unwrap()
+            .set_modified(stale_time)
+            .unwrap();
+        let mut all_stale = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path),
+            ..Default::default()
+        };
+        all_stale.get_mut(ClientId::Copilot).push(otel_path);
+        prune_scan_result_by_mtime(&mut all_stale, 1_700_043_200_000);
+        assert!(all_stale.copilot_desktop_db.is_none());
+        assert!(all_stale.get(ClientId::Copilot).is_empty());
+
+        let mut stat_failure = scanner::ScanResult {
+            copilot_desktop_db: Some(source_home.path().join("missing.db")),
+            ..Default::default()
+        };
+        stat_failure
+            .get_mut(ClientId::Copilot)
+            .push(source_home.path().join("missing-otel.jsonl"));
+        prune_scan_result_by_mtime(&mut stat_failure, u64::MAX);
+        assert!(stat_failure.copilot_desktop_db.is_some());
+        assert_eq!(stat_failure.get(ClientId::Copilot).len(), 1);
+    }
+
+    #[test]
+    fn copilot_desktop_dependency_probe_failure_fails_open() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        drop(connection);
+        let session_state = source_home.path().join(".copilot/session-state");
+        std::fs::create_dir_all(&session_state).unwrap();
+        std::fs::File::create(session_state.join("not-a-directory")).unwrap();
+        let otel_path =
+            write_copilot_otel_message(source_home.path(), "shared", 1_735_689_600, 10, 1, None);
+
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+
+        let mut scan_result = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path.clone()),
+            ..Default::default()
+        };
+        scan_result
+            .get_mut(ClientId::Copilot)
+            .push(otel_path.clone());
+        prune_scan_result_by_mtime(&mut scan_result, u64::MAX);
+
+        assert_eq!(scan_result.copilot_desktop_db.as_ref(), Some(&db_path));
+        assert_eq!(scan_result.get(ClientId::Copilot), &vec![otel_path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copilot_desktop_unreadable_event_bypasses_caches_and_pruning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        insert_copilot_desktop_session(
+            &connection,
+            "shared",
+            "auto",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            None,
+        );
+        drop(connection);
+        let events = write_copilot_desktop_events(
+            source_home.path(),
+            "shared",
+            "gpt-5.4-mini",
+            "/tmp/workspace",
+        );
+        let otel_path =
+            write_copilot_otel_message(source_home.path(), "shared", 1_735_689_600, 10, 1, None);
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_some());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_ok());
+
+        std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+
+        let mut scan_result = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path.clone()),
+            ..Default::default()
+        };
+        scan_result
+            .get_mut(ClientId::Copilot)
+            .push(otel_path.clone());
+        prune_scan_result_by_mtime(&mut scan_result, u64::MAX);
+        std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(scan_result.copilot_desktop_db.as_ref(), Some(&db_path));
+        assert_eq!(scan_result.get(ClientId::Copilot), &vec![otel_path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_unreadable_wal_never_reuses_db_only_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        insert_copilot_desktop_session(
+            &connection,
+            "one",
+            "gpt-5.4-mini",
+            10,
+            1,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            None,
+        );
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(connection);
+        let mut wal = db_path.clone().into_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        if wal.exists() {
+            std::fs::remove_file(&wal).unwrap();
+        }
+
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+        assert_eq!(
+            parse_all_messages_with_pricing(home, &clients, None).len(),
+            1
+        );
+        let db_only_fingerprint =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        let sentinel = UnifiedMessage::new_with_dedup(
+            "copilot",
+            "cached-sentinel",
+            "github-copilot",
+            "cached-sentinel",
+            1_782_909_296_000,
+            TokenBreakdown {
+                input: 999,
+                ..Default::default()
+            },
+            0.0,
+            Some("copilot-desktop:cached-sentinel".to_string()),
+        );
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.insert(message_cache::CachedSourceEntry::new(
+            message_cache::CacheIdentity::for_client(ClientId::Copilot),
+            &db_path,
+            db_only_fingerprint,
+            vec![sentinel],
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        insert_copilot_desktop_session(
+            &writer,
+            "two",
+            "gpt-5.4-mini",
+            20,
+            2,
+            0,
+            0,
+            "2026-07-01T13:00:00Z",
+            None,
+        );
+        assert!(wal.is_file());
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_some());
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+        assert!(copilot_desktop_source_mtime_ms(&db_path).is_none());
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        assert!(!materialized
+            .iter()
+            .any(|message| message.model_id == "cached-sentinel"));
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert!(!streamed
+            .iter()
+            .any(|message| message.model_id == "cached-sentinel"));
+
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(writer);
+        assert_eq!(
+            parse_all_messages_with_pricing(home, &clients, None).len(),
+            2
+        );
+
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+        assert!(copilot_desktop_source_mtime_ms(&db_path).is_none());
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_materialized_streaming_count_and_report_parity() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        insert_copilot_desktop_session(
+            &connection,
+            "shared",
+            "gpt-5.4-mini",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            Some("github.copilot.default"),
+        );
+        insert_copilot_desktop_session(
+            &connection,
+            "desktop-only",
+            "gpt-5.4-mini",
+            40,
+            10,
+            0,
+            0,
+            "2026-07-01T13:00:00Z",
+            Some("github.copilot.default"),
+        );
+        drop(connection);
+        let otel_path = write_copilot_otel_message(
+            source_home.path(),
+            "shared",
+            1_782_909_296,
+            20,
+            5,
+            Some("github.copilot.default"),
+        );
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+
+        let mut materialized = parse_all_messages_with_pricing(home, &clients, None);
+        let cold_materialized = materialized.clone();
+        let mut warm_materialized = parse_all_messages_with_pricing(home, &clients, None);
+        materialized.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        warm_materialized.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        assert_eq!(materialized, warm_materialized);
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            60
+        );
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.output)
+                .sum::<i64>(),
+            15
+        );
+        assert!(!materialized
+            .iter()
+            .any(|message| { message.dedup_key.as_deref() == Some("copilot-desktop:shared") }));
+
+        let cache = message_cache::SourceMessageCache::load();
+        assert!(cache
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                &db_path,
+            )
+            .is_some_and(|entry| entry.messages.len() == 2));
+        assert!(cache
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                &otel_path,
+            )
+            .is_some_and(|entry| entry.messages.len() == 1));
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        streamed.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        assert_eq!(streamed, materialized);
+
+        let counted = parse_local_clients(copilot_local_options(source_home.path())).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Copilot), 2);
+        assert_eq!(counted.messages.len(), 2);
+        for message in &counted.messages {
+            let source = materialized
+                .iter()
+                .find(|source| source.session_id == message.session_id)
+                .unwrap();
+            assert_eq!(message.client, source.client);
+            assert_eq!(message.model_id, source.model_id);
+            assert_eq!(message.provider_id, source.provider_id);
+            assert_eq!(message.workspace_key, source.workspace_key);
+            assert_eq!(message.workspace_label, source.workspace_label);
+            assert_eq!(message.timestamp, source.timestamp);
+            assert_eq!(message.date, source.date);
+            assert_eq!(message.input, source.tokens.input);
+            assert_eq!(message.output, source.tokens.output);
+            assert_eq!(message.cache_read, source.tokens.cache_read);
+            assert_eq!(message.cache_write, source.tokens.cache_write);
+            assert_eq!(message.reasoning, source.tokens.reasoning);
+            assert_eq!(message.duration_ms, source.duration_ms);
+            assert_eq!(message.message_count, source.message_count);
+            assert_eq!(message.agent, source.agent);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let options = copilot_report_options(source_home.path());
+        let graph = runtime
+            .block_on(super::generate_graph_with_loaded_pricing(
+                options.clone(),
+                None,
+            ))
+            .unwrap();
+        let model = runtime.block_on(get_model_report(options.clone())).unwrap();
+        let monthly = runtime
+            .block_on(get_monthly_report(options.clone()))
+            .unwrap();
+        let hourly = runtime
+            .block_on(get_hourly_report(options.clone()))
+            .unwrap();
+        let agents = runtime.block_on(get_agents_report(options)).unwrap();
+        let expected_tokens = cold_materialized
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum::<i64>();
+
+        assert_eq!(graph.summary.total_tokens, expected_tokens);
+        assert_eq!(
+            graph
+                .contributions
+                .iter()
+                .map(|entry| entry.totals.messages)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(model.total_messages, 2);
+        assert_eq!(model.total_input, 60);
+        assert_eq!(model.total_output, 15);
+        assert_eq!(
+            monthly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(
+            hourly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(agents.total_messages, 2);
+        assert_eq!(
+            agents.entries.iter().map(|entry| entry.input).sum::<i64>(),
+            60
+        );
     }
 
     #[test]
@@ -4265,13 +6148,20 @@ mod tests {
         message
     }
 
+    fn opencode_authority_set(key: &str) -> HashSet<OpenCodeSourceIdentity> {
+        let message = make_opencode_selection_message(key, 0.0, CostSource::ProviderReported);
+        OpenCodeSourceIdentity::all_from_message(&message)
+            .into_iter()
+            .collect()
+    }
+
     #[test]
     fn test_opencode_streaming_selection_flushes_snapshot_fallback_on_json_drift() {
         // A missing file and an invalid file both produce no second-pass message;
         // a downgraded file produces an estimated message. All must flush SQLite.
         for second_pass in [None, None, Some(CostSource::Estimated)] {
             let key = "snapshot-authoritative";
-            let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+            let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
             assert!(selection.select_sqlite(make_opencode_selection_message(
                 key, 0.25, CostSource::Estimated,
             )).is_none());
@@ -4290,7 +6180,7 @@ mod tests {
     #[test]
     fn test_opencode_streaming_selection_replaces_deferred_sqlite_estimate() {
         let key = "sqlite-authoritative-replacement";
-        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
         assert!(selection
             .select_sqlite(make_opencode_selection_message(
                 key, 0.25, CostSource::Estimated,
@@ -4310,7 +6200,7 @@ mod tests {
     #[test]
     fn test_opencode_streaming_selection_keeps_first_sqlite_estimate() {
         let key = "sqlite-estimated-first-wins";
-        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
         assert!(selection
             .select_sqlite(make_opencode_selection_message(
                 key, 0.25, CostSource::Estimated,
@@ -4331,7 +6221,7 @@ mod tests {
     #[test]
     fn test_opencode_streaming_selection_keeps_first_sqlite_authority() {
         let key = "sqlite-authoritative-first-wins";
-        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
         let first = selection
             .select_sqlite(make_opencode_selection_message(
                 key, 0.50, CostSource::ProviderReported,
@@ -4349,7 +6239,7 @@ mod tests {
     #[test]
     fn test_opencode_streaming_selection_keeps_fallback_until_json_is_emitted() {
         let key = "filtered-authoritative";
-        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
         assert!(selection.select_sqlite(make_opencode_selection_message(
             key, 0.25, CostSource::Estimated,
         )).is_none());
@@ -4364,7 +6254,7 @@ mod tests {
     #[test]
     fn test_opencode_streaming_selection_does_not_double_count_new_authority() {
         let key = "newly-authoritative";
-        let mut selection = OpenCodeStreamingSelection::new(HashSet::new());
+        let mut selection = OpenCodeSelection::new(HashSet::new());
         assert!(selection.select_sqlite(make_opencode_selection_message(
             key, 0.25, CostSource::Estimated,
         )).is_some());
@@ -4375,9 +6265,144 @@ mod tests {
     }
 
     #[test]
+    fn test_opencode_streaming_selection_keeps_incompatible_same_id_rows() {
+        let key = "reused-message-id";
+        let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
+        let first = make_opencode_selection_message(key, 0.25, CostSource::Estimated);
+        let mut second = make_opencode_selection_message(key, 0.50, CostSource::Estimated);
+        second.tokens.input = 20;
+        let json = make_opencode_selection_message(key, 0.75, CostSource::ProviderReported);
+
+        assert!(selection.select_sqlite(first).is_none());
+        assert!(selection.select_sqlite(second).is_none());
+        assert!(selection.select_json(json, true).is_some());
+        let deferred: Vec<_> = selection.finish().collect();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].tokens.input, 20);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_replaces_deferred_identity_after_other_emission() {
+        let key = "reused-authoritative-id";
+        let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
+        let first = make_opencode_selection_message(key, 0.25, CostSource::ProviderReported);
+        let mut second = make_opencode_selection_message(key, 0.50, CostSource::Estimated);
+        second.tokens.input = 20;
+        let mut json = make_opencode_selection_message(key, 0.75, CostSource::ProviderReported);
+        json.tokens.input = 20;
+
+        assert!(selection.select_sqlite(first).is_some());
+        assert!(selection.select_sqlite(second).is_none());
+        let selected = selection
+            .select_json(json, true)
+            .expect("JSON must replace its exact deferred identity");
+        assert_eq!(selected.tokens.input, 20);
+        assert_eq!(selected.cost_source, CostSource::ProviderReported);
+        assert_eq!(selection.finish().count(), 0);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_expands_authority_through_aliases() {
+        let embedded = "shared-embedded";
+        let fallback = "legacy-message";
+        let pure = make_opencode_selection_message(embedded, 0.25, CostSource::Estimated);
+        let mut hybrid = make_opencode_selection_message(embedded, 0.50, CostSource::Estimated);
+        hybrid.dedup_aliases.push(fallback.to_string());
+        let json = make_opencode_selection_message(fallback, 0.75, CostSource::ProviderReported);
+        let duplicate =
+            make_opencode_selection_message(embedded, 1.0, CostSource::ProviderReported);
+        let authoritative = opencode_authoritative_sources(
+            [&pure, &hybrid, &json]
+                .into_iter()
+                .map(opencode_identity_group),
+        );
+        let mut selection = OpenCodeSelection::new(authoritative);
+
+        assert!(selection.select_sqlite(pure).is_none());
+        assert!(selection.select_sqlite(hybrid).is_none());
+        let selected = selection
+            .select_json(json, true)
+            .expect("JSON authority must replace the aliased SQLite identity");
+        assert_eq!(selected.cost, 0.75);
+        assert!(selection.select_json(duplicate, true).is_none());
+        assert_eq!(selection.finish().count(), 0);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_keeps_aliases_on_sqlite_replacement() {
+        let embedded = "shared-embedded";
+        let fallback = "legacy-message";
+        let mut hybrid = make_opencode_selection_message(embedded, 0.25, CostSource::Estimated);
+        hybrid.dedup_aliases.push(fallback.to_string());
+        let sqlite = make_opencode_selection_message(embedded, 0.50, CostSource::ProviderReported);
+        let json = make_opencode_selection_message(fallback, 0.75, CostSource::ProviderReported);
+        let authoritative = opencode_authoritative_sources(
+            [&hybrid, &sqlite, &json]
+                .into_iter()
+                .map(opencode_identity_group),
+        );
+        let mut selection = OpenCodeSelection::new(authoritative);
+
+        assert!(selection.select_sqlite(hybrid).is_none());
+        assert!(selection.select_sqlite(sqlite).is_some());
+        assert!(selection.select_json(json, true).is_none());
+        assert_eq!(selection.finish().count(), 0);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_propagates_emitted_aliases_to_deferred_rows() {
+        let embedded = "shared-embedded";
+        let fallback = "legacy-message";
+        let first = make_opencode_selection_message(embedded, 0.25, CostSource::ProviderReported);
+        let mut deferred = make_opencode_selection_message(embedded, 0.50, CostSource::Estimated);
+        deferred.tokens.input = 20;
+        deferred.dedup_aliases.push(fallback.to_string());
+        let mut json = make_opencode_selection_message(fallback, 0.75, CostSource::ProviderReported);
+        json.tokens.input = 30;
+        let authoritative = opencode_authoritative_sources(
+            [&first, &deferred, &json]
+                .into_iter()
+                .map(opencode_identity_group),
+        );
+        let mut selection = OpenCodeSelection::new(authoritative);
+
+        assert!(selection.select_sqlite(first).is_some());
+        assert!(selection.select_sqlite(deferred).is_none());
+        assert!(selection.select_json(json, true).is_none());
+        let remaining: Vec<_> = selection.finish().collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tokens.input, 20);
+    }
+
+    #[test]
+    fn test_opencode_streaming_selection_propagates_emitted_aliases_from_deferred_graph() {
+        let embedded = "shared-embedded";
+        let fallback = "legacy-message";
+        let mut deferred = make_opencode_selection_message(embedded, 0.25, CostSource::Estimated);
+        deferred.tokens.input = 20;
+        deferred.dedup_aliases.push(fallback.to_string());
+        let sqlite = make_opencode_selection_message(embedded, 0.50, CostSource::ProviderReported);
+        let mut json = make_opencode_selection_message(fallback, 0.75, CostSource::ProviderReported);
+        json.tokens.input = 30;
+        let authoritative = opencode_authoritative_sources(
+            [&deferred, &sqlite, &json]
+                .into_iter()
+                .map(opencode_identity_group),
+        );
+        let mut selection = OpenCodeSelection::new(authoritative);
+
+        assert!(selection.select_sqlite(deferred).is_none());
+        assert!(selection.select_sqlite(sqlite).is_some());
+        assert!(selection.select_json(json, true).is_none());
+        let remaining: Vec<_> = selection.finish().collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tokens.input, 20);
+    }
+
+    #[test]
     fn test_opencode_streaming_selection_prefers_snapshot_authority() {
         let key = "stable-authoritative";
-        let mut selection = OpenCodeStreamingSelection::new(HashSet::from([key.to_string()]));
+        let mut selection = OpenCodeSelection::new(opencode_authority_set(key));
         assert!(selection.select_sqlite(make_opencode_selection_message(
             key, 0.25, CostSource::Estimated,
         )).is_none());
@@ -4479,6 +6504,29 @@ mod tests {
             "CREATE TABLE message (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn create_opencode_v2_sqlite_db(db_path: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
                 data TEXT NOT NULL
             );",
         )
@@ -4671,6 +6719,249 @@ mod tests {
             normalize_model_for_grouping("claude-opus-4.5-20251101"),
             "claude-opus-4-5"
         );
+    }
+
+    fn test_alias_map(pairs: &[(&str, &str)]) -> ModelAliasMap {
+        ModelAliasMap {
+            entries: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn model_aliases_fold_grouping_only_not_canonical_or_pricing() {
+        let _guard = crate::model_alias::lock_global_alias_tests();
+        clear_model_aliases();
+
+        // Alias a channel-specific spelling onto the display/group key.
+        set_model_aliases(&test_alias_map(&[("claude-opus-4-8-cc", "claude-opus-4-8")]));
+
+        // Grouping sees the folded label.
+        assert_eq!(
+            normalize_model_for_grouping("claude-opus-4-8-cc"),
+            "claude-opus-4-8"
+        );
+        // Raw identity path stays alias-free (syntactic only).
+        assert_eq!(
+            canonical_model_id("claude-opus-4-8-cc"),
+            "claude-opus-4-8-cc"
+        );
+
+        // Pricing resolves the *raw* message model id, never the grouping label.
+        // Custom pricing is registered only under the raw channel spelling; the
+        // display/group key has no rate. After the alias fold, cost still uses
+        // the raw path and remains non-zero.
+        let mut custom = HashMap::new();
+        custom.insert(
+            "claude-opus-4-8-cc".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let service = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(custom),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let tokens = TokenBreakdown {
+            input: 1000,
+            output: 500,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let raw_cost = service.calculate_cost_with_provider("claude-opus-4-8-cc", None, &tokens);
+        let group_label_cost =
+            service.calculate_cost_with_provider("claude-opus-4-8", None, &tokens);
+        assert!(raw_cost > 0.0, "raw id must remain the pricing key");
+        assert_eq!(
+            group_label_cost, 0.0,
+            "grouping label must not be used as the pricing key"
+        );
+
+        let mut msg = UnifiedMessage::new(
+            "claude",
+            "claude-opus-4-8-cc",
+            "anthropic",
+            "s1",
+            1_733_011_200_000,
+            tokens.clone(),
+            0.0,
+        );
+        apply_pricing_if_available(&mut msg, Some(&service));
+        assert!(
+            (msg.cost - raw_cost).abs() < 1e-12,
+            "apply_pricing must keep using the raw message model_id (got {}, expected {})",
+            msg.cost,
+            raw_cost
+        );
+        // Message identity is never rewritten by aliases.
+        assert_eq!(msg.model_id, "claude-opus-4-8-cc");
+
+        // Model-report grouping merges channel variants under the alias label,
+        // while pre-computed costs simply sum (aliases never reprice).
+        let mut other = UnifiedMessage::new(
+            "claude",
+            "claude-opus-4-8",
+            "anthropic",
+            "s2",
+            1_733_011_200_001,
+            tokens,
+            1.5,
+        );
+        other.mark_estimated_cost();
+        msg.cost = raw_cost;
+        msg.mark_estimated_cost();
+        let entries = aggregate_model_usage_entries(vec![msg, other], &GroupBy::Model);
+        assert_eq!(
+            entries.len(),
+            1,
+            "alias must fold both variants into one bucket"
+        );
+        assert_eq!(entries[0].model, "claude-opus-4-8");
+        assert!(
+            (entries[0].cost - (raw_cost + 1.5)).abs() < 1e-9,
+            "merged cost is the sum of already-costed buckets, not a reprice"
+        );
+
+        // Graph/export client contribution keeps the alias-free raw identity.
+        let graph = fold_messages_streaming(&[UnifiedMessage::new(
+            "claude",
+            "claude-opus-4-8-cc",
+            "anthropic",
+            "s1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.25,
+        )]);
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].clients.len(), 1);
+        assert_eq!(graph[0].clients[0].model_id, "claude-opus-4-8-cc");
+
+        clear_model_aliases();
+    }
+
+    #[test]
+    fn model_alias_reload_invalidates_usage_data_consumers() {
+        let _guard = crate::model_alias::lock_global_alias_tests();
+        clear_model_aliases();
+
+        static FIRES: AtomicUsize = AtomicUsize::new(0);
+        register_usage_data_invalidation_hook(|| {
+            FIRES.fetch_add(1, Ordering::SeqCst);
+        });
+        let baseline_fires = FIRES.load(Ordering::SeqCst);
+        let gen0 = model_alias_generation();
+
+        set_model_aliases(&test_alias_map(&[("claude-opus-4-8-cc", "claude-opus-4-8")]));
+        assert_eq!(
+            normalize_model_for_grouping("claude-opus-4-8-cc"),
+            "claude-opus-4-8"
+        );
+        let gen1 = model_alias_generation();
+        assert!(gen1 > gen0);
+
+        // Reload replaces the map; consumers see the new fold on the next report.
+        set_model_aliases(&test_alias_map(&[("gpt-5.5-cc", "gpt-5.5")]));
+        assert_eq!(
+            normalize_model_for_grouping("claude-opus-4-8-cc"),
+            "claude-opus-4-8-cc",
+            "previous alias must not survive a reload"
+        );
+        assert_eq!(normalize_model_for_grouping("gpt-5.5-cc"), "gpt-5.5");
+        let gen2 = model_alias_generation();
+        assert!(gen2 > gen1);
+
+        clear_model_aliases();
+        assert_eq!(normalize_model_for_grouping("gpt-5.5-cc"), "gpt-5.5-cc");
+        assert!(model_alias_generation() > gen2);
+
+        let after_fires = FIRES.load(Ordering::SeqCst);
+        assert!(
+            after_fires >= baseline_fires + 3,
+            "set/reload/clear must each fire the usage-data invalidation hook \
+             (baseline={baseline_fires}, after={after_fires})"
+        );
+    }
+
+    #[test]
+    fn aggregate_model_usage_entries_uses_fold_start_alias_snapshot() {
+        // Codex P2: multi-message report folds must keep one alias config for
+        // the whole fold. `aggregate_model_usage_entries` snapshots at start;
+        // prove the snapshot pattern it uses is stable under mid-fold reload,
+        // then that the real aggregator still merges under the fold-start map.
+        let _guard = crate::model_alias::lock_global_alias_tests();
+        clear_model_aliases();
+        set_model_aliases(&test_alias_map(&[("alias-a", "canonical-b")]));
+
+        // Same capture point as aggregate_model_usage_entries.
+        let aliases = snapshot_grouping_aliases();
+        assert_eq!(
+            aliases.fold(normalize_syntactic("alias-a")),
+            "canonical-b",
+            "fold start sees A→B"
+        );
+
+        // Mid-fold mutation of the process-wide map.
+        set_model_aliases(&test_alias_map(&[("alias-a", "canonical-other")]));
+        assert_eq!(
+            normalize_model_for_grouping("alias-a"),
+            "canonical-other",
+            "live per-call path sees the reloaded map"
+        );
+        // Every message in the fold keeps the snapshotted label.
+        for _ in 0..3 {
+            assert_eq!(
+                aliases.fold(normalize_syntactic("alias-a")),
+                "canonical-b",
+                "snapshot must ignore mid-fold reload for the rest of the fold"
+            );
+        }
+
+        // Re-install fold-start aliases and run the real aggregator: both
+        // channel variants merge under the snapshotted canonical label.
+        set_model_aliases(&test_alias_map(&[("alias-a", "canonical-b")]));
+        let tokens = TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let msg_a = UnifiedMessage::new(
+            "claude",
+            "alias-a",
+            "anthropic",
+            "s1",
+            1_733_011_200_000,
+            tokens.clone(),
+            1.0,
+        );
+        let msg_b = UnifiedMessage::new(
+            "claude",
+            "canonical-b",
+            "anthropic",
+            "s2",
+            1_733_011_200_001,
+            tokens,
+            2.0,
+        );
+        let entries = aggregate_model_usage_entries(vec![msg_a, msg_b], &GroupBy::Model);
+        assert_eq!(entries.len(), 1, "fold-start alias must merge both variants");
+        assert_eq!(entries[0].model, "canonical-b");
+        assert!((entries[0].cost - 3.0).abs() < 1e-12);
+
+        clear_model_aliases();
     }
 
     #[test]
@@ -5952,6 +8243,7 @@ mod tests {
 
             let mut cache = message_cache::SourceMessageCache::default();
             cache.insert(message_cache::CachedSourceEntry::new(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
                 &path,
                 fingerprint,
                 vec![stale_message],
@@ -6025,7 +8317,12 @@ mod tests {
             assert!(first_messages.is_empty());
 
             let cache = message_cache::SourceMessageCache::load();
-            assert!(cache.get(&path).is_none());
+            assert!(cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                    &path
+                )
+                .is_none());
 
             let mut readable_permissions = std::fs::metadata(&path).unwrap().permissions();
             readable_permissions.set_mode(0o644);
@@ -6072,6 +8369,7 @@ mod tests {
             let fingerprint = message_cache::SourceFingerprint::from_path(&cache_path).unwrap();
             let mut cache = message_cache::SourceMessageCache::default();
             cache.insert(message_cache::CachedSourceEntry::new(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
                 &cache_path,
                 fingerprint,
                 Vec::new(),
@@ -6088,9 +8386,729 @@ mod tests {
             assert_eq!(messages.len(), 1);
 
             let loaded = message_cache::SourceMessageCache::load();
-            let repaired_entry = loaded.get(&cache_path).unwrap();
+            let repaired_entry = loaded
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                    &cache_path,
+                )
+                .unwrap();
             assert_eq!(repaired_entry.messages.len(), 1);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_opencode_aliases_preserve_cross_store_identity_across_lanes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+
+        let db_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("opencode-next.db");
+        let conn = create_opencode_v2_sqlite_db(&db_path);
+        let v1_payload = build_opencode_sqlite_payload(
+            1_700_000_000_000.0,
+            1_700_000_000_500.0,
+            100,
+            10,
+            1,
+            5,
+            2,
+            0.0,
+        );
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["legacy-message", "session-overlap", &v1_payload],
+        )
+        .unwrap();
+        let v2_payload = build_opencode_sqlite_payload(
+            1_700_000_000_000.0,
+            1_700_000_000_500.0,
+            100,
+            10,
+            1,
+            5,
+            2,
+            0.02,
+        )
+        .replacen('{', r#"{"id":"v2-embedded","#, 1);
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["v2-message", "session-overlap", "assistant", &v2_payload],
+        )
+        .unwrap();
+        let deferred_payload = build_opencode_sqlite_payload(
+            1_700_000_010_000.0,
+            1_700_000_010_500.0,
+            20,
+            5,
+            0,
+            0,
+            0,
+            0.0,
+        );
+        let deferred_v2_payload =
+            deferred_payload.replacen('{', r#"{"id":"shared-order","#, 1);
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["legacy-order", "session-order", &deferred_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "v2-order",
+                "session-order",
+                "assistant",
+                &deferred_v2_payload
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let sibling_db = db_dir.join("opencode-stable.db");
+        let sibling_conn = create_opencode_v2_sqlite_db(&sibling_db);
+        sibling_conn
+            .execute(
+                "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "v2-sibling",
+                    "session-overlap",
+                    "assistant",
+                    &v2_payload
+                ],
+            )
+            .unwrap();
+        let provider_payload = build_opencode_sqlite_payload(
+            1_700_000_010_000.0,
+            1_700_000_010_500.0,
+            10,
+            5,
+            0,
+            0,
+            0,
+            0.02,
+        )
+        .replacen('{', r#"{"id":"shared-order","#, 1);
+        sibling_conn
+            .execute(
+                "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "v2-order-provider",
+                    "session-order",
+                    "assistant",
+                    &provider_payload
+                ],
+            )
+            .unwrap();
+        drop(sibling_conn);
+
+        let json_dir = db_dir.join("storage/message/project-overlap");
+        std::fs::create_dir_all(&json_dir).unwrap();
+        let migrated_json_payload = build_opencode_sqlite_payload(
+            1_700_000_000_000.0,
+            1_700_000_000_500.0,
+            100,
+            10,
+            1,
+            5,
+            2,
+            0.03,
+        );
+        std::fs::write(
+            json_dir.join("legacy-message.json"),
+            migrated_json_payload,
+        )
+        .unwrap();
+        let json_payload = build_opencode_sqlite_payload(
+            1_700_000_010_000.0,
+            1_700_000_010_500.0,
+            30,
+            5,
+            0,
+            0,
+            0,
+            0.03,
+        );
+        std::fs::write(json_dir.join("legacy-order.json"), json_payload).unwrap();
+
+        let clients = vec!["opencode".to_string()];
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(materialized.len(), 3);
+        let mut materialized_inputs: Vec<_> = materialized
+            .iter()
+            .map(|message| message.tokens.input)
+            .collect();
+        materialized_inputs.sort_unstable();
+        assert_eq!(materialized_inputs, vec![10, 20, 100]);
+        let migrated = materialized
+            .iter()
+            .find(|message| message.tokens.input == 100)
+            .unwrap();
+        assert_eq!(migrated.dedup_key.as_deref(), Some("v2-embedded"));
+        assert_eq!(migrated.dedup_aliases, vec!["legacy-message"]);
+        assert_eq!(migrated.cost, 0.02);
+        assert_eq!(migrated.cost_source, CostSource::ProviderReported);
+        let warm = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(warm, materialized, "cache hits must retain OpenCode aliases");
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert_eq!(streamed.len(), 3);
+        let mut streamed_inputs: Vec<_> = streamed
+            .iter()
+            .map(|message| message.tokens.input)
+            .collect();
+        streamed_inputs.sort_unstable();
+        assert_eq!(streamed_inputs, vec![10, 20, 100]);
+        let migrated = streamed
+            .iter()
+            .find(|message| message.tokens.input == 100)
+            .unwrap();
+        assert_eq!(migrated.dedup_key.as_deref(), Some("v2-embedded"));
+        assert_eq!(migrated.dedup_aliases, vec!["legacy-message"]);
+        assert_eq!(migrated.cost, 0.02);
+        assert_eq!(migrated.cost_source, CostSource::ProviderReported);
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(clients),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::OpenCode), 3);
+        assert_eq!(counted.messages.len(), 3);
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            130
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_29_hybrid_opencode_cache_rebuilds_with_v2_rows_across_lanes() {
+        #[derive(serde::Serialize)]
+        struct Schema29Store {
+            schema_version: u32,
+            entries: Vec<message_cache::CachedSourceEntry>,
+        }
+
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let _pricing_env =
+            EnvGuard::set(&[("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1"))]);
+
+        let db_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("opencode-next.db");
+        let conn = create_opencode_v2_sqlite_db(&db_path);
+        conn.execute(
+            "INSERT INTO session (id, directory) VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params!["session-v1", "/workspace/v1", "session-v2", "/workspace/v2"],
+        )
+        .unwrap();
+        let v1_data = r#"{
+            "id": "message-v1",
+            "role": "assistant",
+            "modelID": "claude-sonnet-4",
+            "providerID": "anthropic",
+            "mode": "build",
+            "cost": 0.0,
+            "tokens": { "input": 100, "output": 10, "reasoning": 1, "cache": { "read": 5, "write": 2 } },
+            "time": { "created": 1700000000000.0, "completed": 1700000000500.0 }
+        }"#;
+        let v2_data = r#"{
+            "id": "message-v1",
+            "model": { "id": "claude-sonnet-4", "providerID": "anthropic" },
+            "agent": "build",
+            "cost": 0.02,
+            "tokens": { "input": 200, "output": 20, "reasoning": 2, "cache": { "read": 10, "write": 4 } },
+            "time": { "created": 1700000001000.0, "completed": 1700000001750.0 }
+        }"#;
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["row-v1", "session-v1", v1_data],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["row-v2", "session-v2", "assistant", v2_data],
+        )
+        .unwrap();
+        drop(conn);
+
+        let json_dir = db_dir.join("storage/message/project-v1");
+        std::fs::create_dir_all(&json_dir).unwrap();
+        std::fs::write(
+            json_dir.join("message-v1.json"),
+            r#"{
+                "id": "message-v1",
+                "sessionID": "session-v1",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "mode": "build",
+                "cost": 0.01,
+                "tokens": { "input": 100, "output": 10, "reasoning": 1, "cache": { "read": 5, "write": 2 } },
+                "time": { "created": 1700000000000.0, "completed": 1700000000500.0 }
+            }"#,
+        )
+        .unwrap();
+
+        let fingerprint = message_cache::SourceFingerprint::from_sqlite_path(&db_path).unwrap();
+        let mut stale_message = UnifiedMessage::new_with_dedup(
+            "opencode",
+            "claude-sonnet-4",
+            "anthropic",
+            "session-v1",
+            1_700_000_000_000,
+            TokenBreakdown {
+                input: 100,
+                output: 10,
+                cache_read: 5,
+                cache_write: 2,
+                reasoning: 1,
+            },
+            0.0,
+            Some("message-v1".to_string()),
+        );
+        stale_message.duration_ms = Some(500);
+        let stale_store = Schema29Store {
+            schema_version: 29,
+            entries: vec![message_cache::CachedSourceEntry::new(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                &db_path,
+                fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            )],
+        };
+        let cache_file = crate::paths::get_cache_dir().join("source-message-cache.bin");
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        let writer = std::io::BufWriter::new(std::fs::File::create(&cache_file).unwrap());
+        bincode::options()
+            .serialize_into(writer, &stale_store)
+            .unwrap();
+
+        assert_eq!(
+            message_cache::SourceFingerprint::from_sqlite_path(&db_path).unwrap(),
+            fingerprint,
+            "the schema-29 v1-only entry must match the unchanged hybrid database"
+        );
+        assert!(
+            message_cache::SourceMessageCache::load().entries.is_empty(),
+            "schema-29 cache entries must be rejected before parsing v2 rows"
+        );
+
+        let clients = vec!["opencode".to_string()];
+        let parse_materialized = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        };
+        let mut cold = parse_materialized();
+        let mut warm = parse_materialized();
+        cold.sort_by(|left, right| {
+            (&left.dedup_key, left.tokens.input).cmp(&(&right.dedup_key, right.tokens.input))
+        });
+        warm.sort_by(|left, right| {
+            (&left.dedup_key, left.tokens.input).cmp(&(&right.dedup_key, right.tokens.input))
+        });
+        assert_eq!(cold.len(), 2);
+        assert_eq!(
+            cold.iter()
+                .map(|message| message.dedup_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("message-v1"), Some("message-v1")],
+            "same embedded ids with incompatible timestamps and tokens must remain distinct"
+        );
+        assert_eq!(
+            cold.iter()
+                .map(|message| (&message.dedup_key, &message.tokens))
+                .collect::<Vec<_>>(),
+            warm.iter()
+                .map(|message| (&message.dedup_key, &message.tokens))
+                .collect::<Vec<_>>(),
+            "the rebuilt current-schema entry must preserve v1+v2 output on a warm hit"
+        );
+        let rebuilt_cache = message_cache::SourceMessageCache::load();
+        assert_eq!(
+            rebuilt_cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                    &db_path
+                )
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        streamed.sort_by(|left, right| {
+            (&left.dedup_key, left.tokens.input).cmp(&(&right.dedup_key, right.tokens.input))
+        });
+        assert_eq!(
+            streamed
+                .iter()
+                .map(|message| (&message.dedup_key, &message.tokens))
+                .collect::<Vec<_>>(),
+            cold.iter()
+                .map(|message| (&message.dedup_key, &message.tokens))
+                .collect::<Vec<_>>()
+        );
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::OpenCode), 2);
+        assert_eq!(counted.messages.len(), 2);
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            300
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(clients),
+            ..Default::default()
+        };
+        let model = runtime.block_on(get_model_report(options.clone())).unwrap();
+        let monthly = runtime
+            .block_on(get_monthly_report(options.clone()))
+            .unwrap();
+        let hourly = runtime
+            .block_on(get_hourly_report(options.clone()))
+            .unwrap();
+        let agents = runtime.block_on(get_agents_report(options)).unwrap();
+        assert_eq!(model.total_messages, 2);
+        assert_eq!(
+            (
+                model.total_input,
+                model.total_output,
+                model.total_cache_read,
+                model.total_cache_write,
+                model
+                    .entries
+                    .iter()
+                    .map(|entry| entry.reasoning)
+                    .sum::<i64>(),
+            ),
+            (300, 30, 15, 6, 3)
+        );
+        assert_eq!(
+            monthly.entries.iter().fold((0, 0, 0, 0), |totals, entry| (
+                totals.0 + entry.input,
+                totals.1 + entry.output,
+                totals.2 + entry.cache_read,
+                totals.3 + entry.cache_write,
+            ),),
+            (300, 30, 15, 6)
+        );
+        assert_eq!(
+            hourly
+                .entries
+                .iter()
+                .fold((0, 0, 0, 0, 0), |totals, entry| (
+                    totals.0 + entry.input,
+                    totals.1 + entry.output,
+                    totals.2 + entry.cache_read,
+                    totals.3 + entry.cache_write,
+                    totals.4 + entry.reasoning,
+                ),),
+            (300, 30, 15, 6, 3)
+        );
+        assert_eq!(
+            agents
+                .entries
+                .iter()
+                .fold((0, 0, 0, 0, 0), |totals, entry| (
+                    totals.0 + entry.input,
+                    totals.1 + entry.output,
+                    totals.2 + entry.cache_read,
+                    totals.3 + entry.cache_write,
+                    totals.4 + entry.reasoning,
+                ),),
+            (300, 30, 15, 6, 3)
+        );
+        assert_eq!(
+            monthly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            model.total_messages
+        );
+        assert_eq!(
+            hourly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            model.total_messages
+        );
+        assert_eq!(agents.total_messages, model.total_messages);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn m16_schema_30_jcode_cache_rebuilds_start_anchor_across_lanes() {
+        #[derive(serde::Serialize)]
+        struct Schema30Store {
+            schema_version: u32,
+            entries: Vec<message_cache::CachedSourceEntry>,
+        }
+
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let _pricing_env =
+            EnvGuard::set(&[("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1"))]);
+
+        let sessions_dir = source_home.path().join(".jcode/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let source_path = sessions_dir.join("session_m16.json");
+        std::fs::write(
+            &source_path,
+            r#"{"id":"session_m16","provider_key":"cliproxyapi","model":"claude-sonnet-4","working_dir":"/workspace/m16","messages":[{"id":"u1","role":"user","timestamp":"2026-06-16T12:00:00Z"},{"id":"a1","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":1200,"output_tokens":300},"tool_duration_ms":1000}]}"#,
+        )
+        .unwrap();
+
+        let start = sessions::utils::parse_timestamp_str("2026-06-16T12:00:00Z").unwrap();
+        let end = sessions::utils::parse_timestamp_str("2026-06-16T12:00:01Z").unwrap();
+        let fingerprint = message_cache::SourceFingerprint::from_jcode_path(&source_path).unwrap();
+        let mut stale_message = UnifiedMessage::new_with_dedup(
+            "jcode",
+            "claude-sonnet-4",
+            "cliproxyapi",
+            "session_m16",
+            end,
+            TokenBreakdown {
+                input: 1200,
+                output: 300,
+                ..Default::default()
+            },
+            0.0,
+            Some("stale-schema-30".to_string()),
+        );
+        stale_message.duration_ms = Some(end - start);
+        let stale_store = Schema30Store {
+            schema_version: 30,
+            entries: vec![message_cache::CachedSourceEntry::new(
+                message_cache::CacheIdentity::for_client(ClientId::Jcode),
+                &source_path,
+                fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            )],
+        };
+        let cache_file = crate::paths::get_cache_dir().join("source-message-cache.bin");
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        let writer = std::io::BufWriter::new(std::fs::File::create(&cache_file).unwrap());
+        bincode::options()
+            .serialize_into(writer, &stale_store)
+            .unwrap();
+
+        assert_eq!(
+            message_cache::SourceFingerprint::from_jcode_path(&source_path).unwrap(),
+            fingerprint,
+            "the source fingerprint must stay unchanged across the schema-only rebuild"
+        );
+        assert!(
+            message_cache::SourceMessageCache::load().entries.is_empty(),
+            "schema-30 entries must be rejected before corrected Jcode output is loaded"
+        );
+
+        let clients = vec!["jcode".to_string()];
+        let parse_materialized = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        };
+        let cold = parse_materialized();
+        let warm = parse_materialized();
+        assert_eq!(cold.len(), 1);
+        assert_eq!(
+            (
+                cold[0].timestamp,
+                cold[0].duration_ms,
+                cold[0].tokens.input,
+                cold[0].tokens.output,
+            ),
+            (start, Some(end - start), 1200, 300)
+        );
+        assert_eq!(
+            warm.iter()
+                .map(|message| (
+                    message.timestamp,
+                    message.duration_ms,
+                    message.tokens.clone()
+                ))
+                .collect::<Vec<_>>(),
+            cold.iter()
+                .map(|message| (
+                    message.timestamp,
+                    message.duration_ms,
+                    message.tokens.clone()
+                ))
+                .collect::<Vec<_>>()
+        );
+        let rebuilt_cache = message_cache::SourceMessageCache::load();
+        assert_eq!(
+            rebuilt_cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Jcode),
+                    &source_path
+                )
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(
+            (
+                streamed[0].timestamp,
+                streamed[0].duration_ms,
+                streamed[0].tokens.input,
+                streamed[0].tokens.output,
+            ),
+            (start, Some(end - start), 1200, 300)
+        );
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Jcode), 1);
+        assert_eq!(counted.messages.len(), 1);
+        assert_eq!(
+            (counted.messages[0].input, counted.messages[0].output),
+            (1200, 300)
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(clients),
+            ..Default::default()
+        };
+        let model = runtime.block_on(get_model_report(options.clone())).unwrap();
+        let monthly = runtime
+            .block_on(get_monthly_report(options.clone()))
+            .unwrap();
+        let hourly = runtime
+            .block_on(get_hourly_report(options.clone()))
+            .unwrap();
+        let agents = runtime.block_on(get_agents_report(options)).unwrap();
+        assert_eq!(
+            (model.total_messages, model.total_input, model.total_output),
+            (1, 1200, 300)
+        );
+        assert_eq!(
+            monthly.entries.iter().fold((0, 0, 0), |totals, entry| (
+                totals.0 + entry.message_count,
+                totals.1 + entry.input,
+                totals.2 + entry.output,
+            )),
+            (1, 1200, 300)
+        );
+        assert_eq!(
+            hourly.entries.iter().fold((0, 0, 0), |totals, entry| (
+                totals.0 + entry.message_count,
+                totals.1 + entry.input,
+                totals.2 + entry.output,
+            )),
+            (1, 1200, 300)
+        );
+        assert_eq!(agents.total_messages, 1);
+        assert_eq!(
+            agents.entries.iter().fold((0, 0), |totals, entry| (
+                totals.0 + entry.input,
+                totals.1 + entry.output,
+            )),
+            (1200, 300)
+        );
     }
 
     #[test]
@@ -6490,6 +9508,209 @@ mod tests {
         action()
     }
 
+    fn shard_cache_has_entries(cache_home: &std::path::Path, namespace: &str) -> bool {
+        std::fs::read_dir(
+            cache_home
+                .join("cache/source-message-cache-v2")
+                .join(namespace),
+        )
+        .is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
+        })
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_shipping_report_cold_start_persists_shard() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let transcripts_dir = source_home.path().join(".claude/transcripts");
+        std::fs::create_dir_all(&transcripts_dir).unwrap();
+        let source = transcripts_dir.join("ses_123456789012345678901234567.jsonl");
+        std::fs::write(
+            &source,
+            concat!(
+                r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","message":{"content":"prompt"}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-04-01T10:00:01.000Z","requestId":"req-shipping","message":{"id":"msg-shipping","model":"claude-sonnet-4","usage":{"input_tokens":123,"output_tokens":45}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report_options = || ReportOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            ..Default::default()
+        };
+        let cold = with_isolated_tokscale_cache(cache_home.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+        assert_eq!(cold.total_messages, 1);
+        assert!(shard_cache_has_entries(cache_home.path(), "claude"));
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            assert!(cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Claude),
+                    &source,
+                )
+                .is_some_and(|entry| entry.messages.len() == 1));
+        });
+
+        let warm = with_isolated_tokscale_cache(cache_home.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+        assert_eq!(warm.total_messages, cold.total_messages);
+        assert_eq!(warm.total_input, cold.total_input);
+        assert_eq!(warm.total_output, cold.total_output);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_shipping_warm_cache_reuses_persisted_parent_paths() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let project_dir = source_home.path().join(".claude/projects/project-one");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let source = project_dir.join("agent-child.jsonl");
+        std::fs::write(
+            &source,
+            concat!(
+                r#"{"type":"assistant","isSidechain":true,"sessionId":"flat-parent","agentId":"child","timestamp":"2026-01-01T00:00:00Z","requestId":"req-source","message":{"id":"msg-source","model":"claude-sonnet-4","usage":{"input_tokens":123,"output_tokens":45}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut fingerprint = message_cache::SourceFingerprint::from_claude_code_path_with_home(
+            &source,
+            Some(source_home.path()),
+        )
+        .unwrap();
+        let persisted_parent = fingerprint
+            .related_files
+            .iter_mut()
+            .find(|related| related.suffix.starts_with("parent-session-"))
+            .unwrap();
+        persisted_parent.path =
+            message_cache::CachedPath::from_path(&project_dir.join("cached-only-parent.jsonl"));
+        assert!(!persisted_parent.exists);
+
+        let sentinel = UnifiedMessage::new_with_dedup(
+            "claude",
+            "cached-sentinel",
+            "anthropic",
+            "cached-session",
+            1_767_225_600_000,
+            TokenBreakdown {
+                input: 999,
+                output: 1,
+                ..Default::default()
+            },
+            0.0,
+            Some("cached-sentinel".to_string()),
+        );
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            let mut cache = message_cache::SourceMessageCache::default();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                message_cache::CacheIdentity::for_client(ClientId::Claude),
+                &source,
+                fingerprint,
+                vec![sentinel],
+                Vec::new(),
+                None,
+            ));
+            cache.save_if_dirty();
+        });
+
+        let clients = ["claude".to_string()];
+        let mut streamed = Vec::new();
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            scan_messages_streaming(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |message| streamed.push(message.clone()),
+            );
+        });
+
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].model_id, "cached-sentinel");
+        assert_eq!(streamed[0].tokens.input, 999);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_zed_shipping_report_cold_start_persists_shard() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let threads_dir = source_home.path().join("custom-zed/threads");
+        std::fs::create_dir_all(&threads_dir).unwrap();
+        let source = threads_dir.join("threads.db");
+        let connection = create_zed_sqlite_db(&source);
+        insert_zed_thread(&connection, "zed-shipping", "claude-sonnet-4-5");
+        drop(connection);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report_options = || {
+            let mut extra_scan_paths = std::collections::BTreeMap::new();
+            extra_scan_paths.insert("zed".to_string(), vec![threads_dir.clone()]);
+            ReportOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["zed".to_string()]),
+                scanner_settings: scanner::ScannerSettings {
+                    extra_scan_paths,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+        let cold = with_isolated_tokscale_cache(cache_home.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+        assert_eq!(cold.total_messages, 1);
+        assert!(shard_cache_has_entries(cache_home.path(), "zed"));
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            assert!(cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Zed),
+                    &source,
+                )
+                .is_some_and(|entry| entry.messages.len() == 1));
+        });
+
+        let warm = with_isolated_tokscale_cache(cache_home.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+        assert_eq!(warm.total_messages, cold.total_messages);
+        assert_eq!(warm.total_input, cold.total_input);
+        assert_eq!(warm.total_output, cold.total_output);
+    }
+
     fn write_codex_duration_prefix_fixture(
         source_home: &std::path::Path,
     ) -> (std::path::PathBuf, String) {
@@ -6506,12 +9727,25 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_codex_non_overlapping_durations_survive_incremental_and_streaming_caches() {
-        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_source_home = tempfile::TempDir::new().unwrap();
+        let streaming_source_home = tempfile::TempDir::new().unwrap();
         let materialized_cache = tempfile::TempDir::new().unwrap();
         let streaming_cache = tempfile::TempDir::new().unwrap();
-        let (source, suffix) = write_codex_duration_prefix_fixture(source_home.path());
+        let (source, suffix) =
+            write_codex_duration_prefix_fixture(materialized_source_home.path());
+        let (streaming_source, streaming_suffix) =
+            write_codex_duration_prefix_fixture(streaming_source_home.path());
 
-        let home = source_home.path().to_str().unwrap().to_string();
+        let home = materialized_source_home
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let streaming_home = streaming_source_home
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
         let clients = vec!["codex".to_string()];
         let parse_materialized = || {
             parse_all_messages_with_pricing_with_env_strategy(
@@ -6559,7 +9793,7 @@ mod tests {
             .build()
             .unwrap();
         let report_options = || ReportOptions {
-            home_dir: Some(home.clone()),
+            home_dir: Some(streaming_home.clone()),
             use_env_roots: false,
             clients: Some(clients.clone()),
             ..Default::default()
@@ -6569,26 +9803,66 @@ mod tests {
                 .block_on(get_model_report(report_options()))
                 .unwrap()
         });
-
-        // The cold Codex streaming lane does not persist SourceMessageCache.
-        // Seed this isolated cache through the public materialized path so the
-        // second report exercises the shipping cache-hit branch.
-        let cache_seed = with_isolated_tokscale_cache(streaming_cache.path(), parse_materialized);
-        assert_eq!(cache_seed.len(), 3);
+        assert_eq!(streaming_cold.total_messages, 1);
         assert!(
-            streaming_cache
-                .path()
-                .join("cache/source-message-cache.bin")
-                .is_file(),
-            "materialized seed must persist the cache used by the warm report"
+            shard_cache_has_entries(streaming_cache.path(), "codex"),
+            "the cold shipping report must persist its own Codex shard"
         );
+        with_isolated_tokscale_cache(streaming_cache.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            let incremental = cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &streaming_source,
+                )
+                .and_then(|entry| entry.codex_incremental.as_ref())
+                .expect("cold shipping report must persist Codex incremental state");
+            assert_eq!(
+                incremental.consumed_offset,
+                std::fs::metadata(&streaming_source).unwrap().len()
+            );
+        });
+
+        let mut streaming_source_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&streaming_source)
+            .unwrap();
+        streaming_source_file
+            .write_all(streaming_suffix.as_bytes())
+            .unwrap();
+        streaming_source_file.flush().unwrap();
+        drop(streaming_source_file);
+
+        let streaming_incremental =
+            with_isolated_tokscale_cache(streaming_cache.path(), || {
+                runtime
+                    .block_on(get_model_report(report_options()))
+                    .unwrap()
+            });
+        with_isolated_tokscale_cache(streaming_cache.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            let incremental = cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &streaming_source,
+                )
+                .and_then(|entry| entry.codex_incremental.as_ref())
+                .expect("incremental shipping report must refresh Codex state");
+            assert_eq!(
+                incremental.consumed_offset,
+                std::fs::metadata(&streaming_source).unwrap().len()
+            );
+        });
         let streaming_warm = with_isolated_tokscale_cache(streaming_cache.path(), || {
             runtime
                 .block_on(get_model_report(report_options()))
                 .unwrap()
         });
 
-        for (phase, report) in [("cold", &streaming_cold), ("warm", &streaming_warm)] {
+        for (phase, report) in [
+            ("incremental", &streaming_incremental),
+            ("warm", &streaming_warm),
+        ] {
             assert_eq!(report.total_messages, 3, "{phase} streaming messages");
             assert_eq!(report.entries.len(), 1, "{phase} model groups");
             let performance = &report.entries[0].performance;
@@ -6667,25 +9941,9 @@ mod tests {
                 .unwrap()
         });
 
-        // Codex's cold streaming lane does not populate SourceMessageCache, so
-        // seed the same isolated cache through the public materialized path
-        // before exercising the streaming cache-hit branch.
-        let cache_seed = with_isolated_tokscale_cache(streaming_cache.path(), || {
-            parse_all_messages_with_pricing_with_env_strategy(
-                &home,
-                &clients,
-                None,
-                false,
-                &scanner::ScannerSettings::default(),
-            )
-        });
-        assert_eq!(cache_seed.len(), 3);
         assert!(
-            streaming_cache
-                .path()
-                .join("cache/source-message-cache.bin")
-                .is_file(),
-            "materialized seed must persist the cache used by the warm pass",
+            shard_cache_has_entries(streaming_cache.path(), "codex"),
+            "the cold shipping report must persist the cache used by the warm pass",
         );
         let streaming_warm = with_isolated_tokscale_cache(streaming_cache.path(), || {
             runtime
@@ -7146,7 +10404,10 @@ mod tests {
             assert_eq!(initial_messages.len(), 1);
             assert_eq!(initial_messages[0].model_id, "gpt-5.4");
             assert!(message_cache::SourceMessageCache::load()
-                .get(&path)
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &path
+                )
                 .and_then(|entry| entry.codex_incremental.as_ref())
                 .is_some());
 
@@ -7310,7 +10571,10 @@ mod tests {
                 None,
             );
             assert!(message_cache::SourceMessageCache::load()
-                .get(&path)
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &path
+                )
                 .is_none());
 
             let _fresh_env = EnvGuard::set(&[
@@ -7362,6 +10626,7 @@ mod tests {
 
             let mut cache = message_cache::SourceMessageCache::default();
             cache.insert(message_cache::CachedSourceEntry::new(
+                message_cache::CacheIdentity::for_client(ClientId::Codex),
                 &path,
                 fingerprint,
                 vec![stale_message],
@@ -7472,7 +10737,12 @@ mod tests {
             assert_eq!(messages[0].model_id, "gpt-5.4");
 
             let cache = message_cache::SourceMessageCache::load();
-            assert!(cache.get(&path).is_none());
+            assert!(cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &path
+                )
+                .is_none());
         }
     }
 
@@ -7510,7 +10780,10 @@ mod tests {
             assert_eq!(initial_messages.len(), 1);
             assert_eq!(initial_messages[0].model_id, "unknown");
             assert!(message_cache::SourceMessageCache::load()
-                .get(&path)
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &path
+                )
                 .is_none());
 
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -7550,7 +10823,10 @@ mod tests {
 
             drop(_fresh_env);
             assert!(message_cache::SourceMessageCache::load()
-                .get(&path)
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &path
+                )
                 .is_some());
         }
     }
@@ -7587,7 +10863,10 @@ mod tests {
             );
             assert_eq!(initial_messages.len(), 1);
             assert!(message_cache::SourceMessageCache::load()
-                .get(&path)
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &path
+                )
                 .is_none());
 
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -9159,6 +12438,232 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn m21_sources_keep_materialized_streaming_count_and_report_parity() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let report_cache = tempfile::TempDir::new().unwrap();
+        let clients = vec![
+            "kimi".to_string(),
+            "junie".to_string(),
+            "opencodereview".to_string(),
+        ];
+
+        let legacy_kimi = source_home
+            .path()
+            .join(".kimi/sessions/group/legacy-session/wire.jsonl");
+        std::fs::create_dir_all(legacy_kimi.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy_kimi,
+            r#"{"timestamp":1770983410.0,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":7,"output":3},"message_id":"legacy-1"}}}"#,
+        )
+        .unwrap();
+
+        let kimi_code = source_home
+            .path()
+            .join(".kimi-code/sessions/workspace/code-session/agents/main/wire.jsonl");
+        std::fs::create_dir_all(kimi_code.parent().unwrap()).unwrap();
+        let code_a = r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":10,"inputCacheCreation":0},"usageScope":"turn","time":1770983420000,"turnId":"turn-a"}"#;
+        let code_b = r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":10,"inputCacheCreation":0},"usageScope":"turn","time":1770983420001,"turnId":"turn-b"}"#;
+        std::fs::write(&kimi_code, format!("{code_a}\n{code_a}\n{code_b}\n")).unwrap();
+        let kimi_code_replay = source_home
+            .path()
+            .join(".kimi-code/sessions/workspace/code-session/agents/reviewer/wire.jsonl");
+        std::fs::create_dir_all(kimi_code_replay.parent().unwrap()).unwrap();
+        std::fs::write(&kimi_code_replay, format!("{code_a}\n")).unwrap();
+
+        let junie = source_home
+            .path()
+            .join(".junie/sessions/session-260213-120000/events.jsonl");
+        std::fs::create_dir_all(junie.parent().unwrap()).unwrap();
+        let write_junie = |input: i64, cost: f64| {
+            let usage = serde_json::json!({
+                "timestampMs": 1_770_983_430_000_i64,
+                "event": {
+                    "agentEvent": {
+                        "kind": "LlmResponseMetadataEvent",
+                        "agent": { "name": "reviewer" },
+                        "modelUsage": [{
+                            "model": "gpt-5",
+                            "provider": "openai",
+                            "inputTokens": input,
+                            "outputTokens": 50,
+                            "time": 2_000,
+                            "cost": cost
+                        }]
+                    }
+                }
+            });
+            std::fs::write(
+                &junie,
+                format!("{}\n{usage}\n", r#"{"kind":"UserPromptEvent"}"#),
+            )
+            .unwrap();
+        };
+        write_junie(100, 0.125);
+
+        let review = source_home
+            .path()
+            .join(".opencodereview/sessions/repo/review-session.jsonl");
+        std::fs::create_dir_all(review.parent().unwrap()).unwrap();
+        let review_contents = concat!(
+            r#"{"type":"session_start","cwd":"/work/repo"}"#,
+            "\n",
+            r#"{"type":"llm_response","timestamp":"2026-02-13T12:00:40Z","model":"gpt-4o","duration_ms":1500,"usage":{"prompt_tokens":20,"completion_tokens":5,"cache_read_tokens":1,"cache_write_tokens":2}}"#,
+            "\n"
+        );
+        std::fs::write(&review, review_contents).unwrap();
+
+        let home = source_home.path().to_string_lossy().into_owned();
+        let run_materialized = || {
+            with_isolated_tokscale_cache(materialized_cache.path(), || {
+                let mut messages = parse_all_messages_with_pricing_with_env_strategy(
+                    &home,
+                    &clients,
+                    None,
+                    false,
+                    &scanner::ScannerSettings::default(),
+                );
+                messages.sort_by(|left, right| {
+                    (&left.client, &left.session_id, &left.dedup_key).cmp(&(
+                        &right.client,
+                        &right.session_id,
+                        &right.dedup_key,
+                    ))
+                });
+                messages
+            })
+        };
+        let run_streaming = || {
+            with_isolated_tokscale_cache(streaming_cache.path(), || {
+                let mut messages = Vec::new();
+                scan_messages_streaming(
+                    &home,
+                    &clients,
+                    None,
+                    false,
+                    &scanner::ScannerSettings::default(),
+                    &|_| true,
+                    &mut |message| messages.push(message.clone()),
+                );
+                messages.sort_by(|left, right| {
+                    (&left.client, &left.session_id, &left.dedup_key).cmp(&(
+                        &right.client,
+                        &right.session_id,
+                        &right.dedup_key,
+                    ))
+                });
+                messages
+            })
+        };
+
+        let cold_materialized = run_materialized();
+        let cold_streaming = run_streaming();
+        assert_eq!(cold_materialized, cold_streaming);
+        assert_eq!(cold_materialized.len(), 5);
+        assert_eq!(
+            cold_materialized
+                .iter()
+                .filter(|message| message.client == "kimi")
+                .count(),
+            3
+        );
+        let junie_message = cold_materialized
+            .iter()
+            .find(|message| message.client == "junie")
+            .unwrap();
+        assert_eq!(junie_message.cost_source, CostSource::ProviderReported);
+        assert!((junie_message.cost - 0.125).abs() < 1e-9);
+        assert!(junie_message.is_turn_start);
+        assert_eq!(junie_message.duration_ms, Some(2_000));
+        let review_message = cold_materialized
+            .iter()
+            .find(|message| message.client == "opencodereview")
+            .unwrap();
+        assert_eq!(review_message.duration_ms, Some(1_500));
+        assert_eq!(review_message.workspace_label.as_deref(), Some("repo"));
+        assert_eq!(run_materialized(), cold_materialized);
+        assert_eq!(run_streaming(), cold_streaming);
+
+        write_junie(200, 0.25);
+        let rewritten_materialized = run_materialized();
+        let rewritten_streaming = run_streaming();
+        assert_eq!(rewritten_materialized, rewritten_streaming);
+        let rewritten_junie = rewritten_materialized
+            .iter()
+            .find(|message| message.client == "junie")
+            .unwrap();
+        assert_eq!(rewritten_junie.tokens.input, 200);
+        assert!((rewritten_junie.cost - 0.25).abs() < 1e-9);
+
+        std::fs::remove_file(&review).unwrap();
+        assert_eq!(run_materialized().len(), 4);
+        assert_eq!(run_streaming().len(), 4);
+        std::fs::write(&review, review_contents).unwrap();
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Kimi), 3);
+        assert_eq!(counted.counts.get(ClientId::Junie), 1);
+        assert_eq!(counted.counts.get(ClientId::OpenCodeReview), 1);
+        assert_eq!(counted.messages.len(), 5);
+
+        with_isolated_tokscale_cache(report_cache.path(), || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let options = ReportOptions {
+                home_dir: Some(home),
+                use_env_roots: false,
+                clients: Some(clients),
+                ..Default::default()
+            };
+            let model = runtime.block_on(get_model_report(options.clone())).unwrap();
+            let monthly = runtime
+                .block_on(get_monthly_report(options.clone()))
+                .unwrap();
+            let hourly = runtime
+                .block_on(get_hourly_report(options.clone()))
+                .unwrap();
+            let agents = runtime.block_on(get_agents_report(options)).unwrap();
+            assert_eq!(model.total_messages, 5);
+            assert_eq!(model.total_input, 427);
+            assert_eq!(model.total_output, 158);
+            assert_eq!(model.total_cache_read, 21);
+            assert_eq!(model.total_cache_write, 2);
+            assert!((model.total_cost - 0.25).abs() < 1e-9);
+            assert_eq!(
+                monthly
+                    .entries
+                    .iter()
+                    .map(|entry| entry.message_count)
+                    .sum::<i32>(),
+                5
+            );
+            assert_eq!(
+                hourly
+                    .entries
+                    .iter()
+                    .map(|entry| entry.message_count)
+                    .sum::<i32>(),
+                5
+            );
+            assert_eq!(agents.total_messages, 5);
+            assert_eq!(
+                agents.entries.iter().map(|entry| entry.input).sum::<i64>(),
+                427
+            );
+        });
+    }
+
     // micode (`$XDG_DATA_HOME/micode/*.db`, WAL-mode SQLite) must be discovered
     // via the generic `*.db` glob and flow through the streaming lane, keeping
     // its authoritative per-message cost intact (MiMo models are unpriced, so
@@ -10166,6 +13671,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_modified_after_retains_grok_authority_sources() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let stale_dir = temp_dir.path().join("stale");
+        let active_dir = temp_dir.path().join("active");
+        let logs_dir = temp_dir.path().join("logs");
+        for dir in [&stale_dir, &active_dir, &logs_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let stale_updates = stale_dir.join("updates.jsonl");
+        let active_updates = active_dir.join("updates.jsonl");
+        let unified = logs_dir.join("unified.jsonl");
+        for path in [&stale_updates, &active_updates, &unified] {
+            std::fs::File::create(path).unwrap();
+        }
+
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let active_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for path in [&stale_updates, &unified] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let Ok(()) = file.set_modified(stale_time) else {
+                return;
+            };
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_updates)
+            .unwrap();
+        let Ok(()) = file.set_modified(active_time) else {
+            return;
+        };
+
+        let mut legacy_fresh = scanner::ScanResult::default();
+        legacy_fresh.get_mut(ClientId::Grok).extend([
+            stale_updates.clone(),
+            active_updates.clone(),
+            unified.clone(),
+        ]);
+        crate::prune_scan_result_by_mtime(&mut legacy_fresh, 1_700_043_200_000);
+        assert_eq!(
+            legacy_fresh.get(ClientId::Grok),
+            &[active_updates.clone(), unified.clone()],
+            "a stale unified authority source must survive while a legacy source is fresh"
+        );
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&unified)
+            .unwrap();
+        let Ok(()) = file.set_modified(active_time) else {
+            return;
+        };
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_updates)
+            .unwrap();
+        let Ok(()) = file.set_modified(stale_time) else {
+            return;
+        };
+
+        let mut unified_fresh = scanner::ScanResult::default();
+        unified_fresh.get_mut(ClientId::Grok).extend([
+            stale_updates.clone(),
+            active_updates.clone(),
+            unified.clone(),
+        ]);
+        crate::prune_scan_result_by_mtime(&mut unified_fresh, 1_700_043_200_000);
+        assert_eq!(
+            unified_fresh.get(ClientId::Grok),
+            &[stale_updates, active_updates, unified],
+            "a fresh unified source needs the legacy cohort for workspace attribution"
+        );
+    }
+
     // The pruning helper must treat a fresh write to *any* metadata sibling the
     // parser reads (not just signals.json) as source activity — otherwise a
     // summary.json- or events.jsonl-only write (a late-arriving model id) lets an
@@ -10300,6 +13882,439 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn grok_streaming_cache_hits_refresh_derived_date_before_filtering() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let logs_dir = source_home.path().join(".grok/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let unified = logs_dir.join("unified.jsonl");
+        std::fs::write(
+            &unified,
+            "{\"ts\":\"2023-11-14T22:13:20Z\",\"pid\":7,\"sid\":\"cached\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":10,\"completion_tokens\":2}}\n",
+        )
+        .unwrap();
+
+        let mut cached_messages = sessions::grok::parse_grok_unified_log_file(&unified);
+        assert_eq!(cached_messages.len(), 1);
+        let expected_date = cached_messages[0].date.clone();
+        cached_messages[0].date = "stale-cached-date".to_string();
+        let fingerprint = message_cache::SourceFingerprint::from_grok_path(&unified).unwrap();
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.insert(message_cache::CachedSourceEntry::new(
+            message_cache::CacheIdentity::for_client(ClientId::Grok),
+            &unified,
+            fingerprint,
+            cached_messages,
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let clients = vec!["grok".to_string()];
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|message| message.date == expected_date,
+            &mut |message| streamed.push(message.clone()),
+        );
+
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].date, expected_date);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn grok_materialized_reprices_after_legacy_model_carry_over() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let covered_dir = source_home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fproject/covered");
+        std::fs::create_dir_all(&covered_dir).unwrap();
+        std::fs::write(
+            covered_dir.join("updates.jsonl"),
+            concat!(
+                "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"covered\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"_meta\":{\"modelId\":\"grok-build\"}},\"_meta\":{\"agentTimestampMs\":1700000000000}}}\n",
+                "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"covered\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\"},\"_meta\":{\"totalTokens\":999,\"agentTimestampMs\":1700000001000}}}\n",
+            ),
+        )
+        .unwrap();
+        let logs_dir = source_home.path().join(".grok/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(
+            logs_dir.join("unified.jsonl"),
+            "{\"ts\":\"2023-11-14T22:13:20Z\",\"pid\":7,\"sid\":\"covered\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":100,\"cached_prompt_tokens\":60,\"completion_tokens\":25,\"reasoning_tokens\":5}}\n",
+        )
+        .unwrap();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "grok-build".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                cache_read_input_token_cost: Some(0.0005),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let clients = vec!["grok".to_string()];
+        let scanner_settings = scanner::ScannerSettings::default();
+        let materialized = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                Some(&pricing),
+                false,
+                &scanner_settings,
+            )
+        };
+        let streamed = || {
+            let mut messages = Vec::new();
+            scan_messages_streaming(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                Some(&pricing),
+                false,
+                &scanner_settings,
+                &|_| true,
+                &mut |message| messages.push(message.clone()),
+            );
+            messages
+        };
+
+        let cold = materialized();
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].model_id, "grok-build");
+        let expected_cost = pricing.calculate_cost_with_provider(
+            &cold[0].model_id,
+            Some(&cold[0].provider_id),
+            &cold[0].tokens,
+        );
+        assert!(expected_cost > 0.0);
+        assert_eq!(cold[0].cost, expected_cost);
+        assert_eq!(cold[0].cost_source, CostSource::Estimated);
+        assert_eq!(streamed(), cold);
+        assert_eq!(materialized(), cold, "warm materialized cache must reprice");
+        assert_eq!(streamed(), cold, "warm streaming cache must stay in parity");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn m17_grok_unified_precedence_tracks_source_lifecycle_across_all_lanes() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let clients = vec!["grok".to_string()];
+        let scanner_settings = scanner::ScannerSettings::default();
+
+        let covered_dir = source_home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fproject/covered");
+        let legacy_only_dir = source_home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fproject/legacy-only");
+        std::fs::create_dir_all(&covered_dir).unwrap();
+        std::fs::create_dir_all(&legacy_only_dir).unwrap();
+        let covered_updates = covered_dir.join("updates.jsonl");
+        let legacy_only_updates = legacy_only_dir.join("updates.jsonl");
+        std::fs::write(
+            &covered_updates,
+            concat!(
+                "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"covered\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"_meta\":{\"modelId\":\"grok-build\"}},\"_meta\":{\"agentTimestampMs\":1700000000000}}}\n",
+                "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"covered\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\"},\"_meta\":{\"totalTokens\":999,\"agentTimestampMs\":1700000001000}}}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &legacy_only_updates,
+            concat!(
+                "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"legacy-only\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"_meta\":{\"modelId\":\"grok-build\"}},\"_meta\":{\"agentTimestampMs\":1700000010000}}}\n",
+                "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"legacy-only\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\"},\"_meta\":{\"totalTokens\":17,\"agentTimestampMs\":1700000011000}}}\n",
+            ),
+        )
+        .unwrap();
+        let legacy_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for path in [&covered_updates, &legacy_only_updates] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            if file.set_modified(legacy_time).is_err() {
+                return;
+            }
+        }
+
+        let local_options = || LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner_settings.clone(),
+            modified_after: None,
+        };
+        let report_options = || ReportOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            scanner_settings: scanner_settings.clone(),
+            ..Default::default()
+        };
+        let sorted = |mut messages: Vec<UnifiedMessage>| {
+            messages.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+            messages
+        };
+        let materialized = || {
+            sorted(parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner_settings,
+            ))
+        };
+        let streamed = || {
+            let mut messages = Vec::new();
+            scan_messages_streaming(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner_settings,
+                &|_| true,
+                &mut |message| messages.push(message.clone()),
+            );
+            sorted(messages)
+        };
+
+        let legacy = materialized();
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            1_016
+        );
+        assert_eq!(materialized(), legacy, "legacy cache hits must stay stable");
+        let before_unified = latest_source_mtime_ms(&local_options()).unwrap();
+        let legacy_change_token = local_source_change_token(&local_options()).unwrap();
+        assert_eq!(before_unified, 1_700_086_400_000);
+
+        let logs_dir = source_home.path().join(".grok/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let unified = logs_dir.join("unified.jsonl");
+        std::fs::write(
+            &unified,
+            "{\"ts\":\"2023-11-14T22:13:20Z\",\"pid\":7,\"sid\":\"covered\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":100,\"cached_prompt_tokens\":60,\"completion_tokens\":25,\"reasoning_tokens\":5}}\n",
+        )
+        .unwrap();
+        let unified_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let unified_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&unified)
+            .unwrap();
+        if unified_file.set_modified(unified_time).is_err() {
+            return;
+        }
+        assert_eq!(
+            latest_source_mtime_ms(&local_options()).unwrap(),
+            before_unified,
+            "the newer legacy mtime deliberately masks unified topology changes"
+        );
+        let selected_change_token = local_source_change_token(&local_options()).unwrap();
+        assert_ne!(selected_change_token, legacy_change_token);
+
+        let selected = materialized();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected
+                .iter()
+                .find(|message| message.session_id == "covered")
+                .unwrap()
+                .model_id,
+            "grok-build"
+        );
+        let selected_tokens =
+            selected
+                .iter()
+                .fold(TokenBreakdown::default(), |mut total, message| {
+                    total.input += message.tokens.input;
+                    total.output += message.tokens.output;
+                    total.cache_read += message.tokens.cache_read;
+                    total.cache_write += message.tokens.cache_write;
+                    total.reasoning += message.tokens.reasoning;
+                    total
+                });
+        assert_eq!(
+            selected_tokens,
+            TokenBreakdown {
+                input: 57,
+                output: 20,
+                cache_read: 60,
+                cache_write: 0,
+                reasoning: 5,
+            }
+        );
+        assert!(selected.iter().any(|message| {
+            message.session_id == "covered"
+                && message
+                    .dedup_key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with("grok-unified:"))
+        }));
+        assert!(selected
+            .iter()
+            .any(|message| message.session_id == "legacy-only"));
+        assert_eq!(
+            materialized(),
+            selected,
+            "selected cache hits must stay stable"
+        );
+        assert_eq!(streamed(), selected);
+
+        let counted = parse_local_clients(local_options()).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Grok), 2);
+        assert_eq!(counted.messages.len(), 2);
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            57
+        );
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.cache_read)
+                .sum::<i64>(),
+            60
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let assert_reports = |expected: (i32, i64, i64, i64, i64, i64)| {
+            let (messages, input, output, cache_read, cache_write, reasoning) = expected;
+            let model = runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap();
+            let monthly = runtime
+                .block_on(get_monthly_report(report_options()))
+                .unwrap();
+            let hourly = runtime
+                .block_on(get_hourly_report(report_options()))
+                .unwrap();
+            let agents = runtime
+                .block_on(get_agents_report(report_options()))
+                .unwrap();
+
+            assert_eq!(
+                (
+                    model.total_messages,
+                    model.total_input,
+                    model.total_output,
+                    model.total_cache_read,
+                    model.total_cache_write,
+                    model
+                        .entries
+                        .iter()
+                        .map(|entry| entry.reasoning)
+                        .sum::<i64>(),
+                ),
+                expected
+            );
+            assert_eq!(
+                monthly
+                    .entries
+                    .iter()
+                    .fold((0, 0, 0, 0, 0), |totals, entry| (
+                        totals.0 + entry.message_count,
+                        totals.1 + entry.input,
+                        totals.2 + entry.output,
+                        totals.3 + entry.cache_read,
+                        totals.4 + entry.cache_write,
+                    ),),
+                (messages, input, output, cache_read, cache_write)
+            );
+            assert_eq!(
+                hourly
+                    .entries
+                    .iter()
+                    .fold((0, 0, 0, 0, 0, 0), |totals, entry| (
+                        totals.0 + entry.message_count,
+                        totals.1 + entry.input,
+                        totals.2 + entry.output,
+                        totals.3 + entry.cache_read,
+                        totals.4 + entry.cache_write,
+                        totals.5 + entry.reasoning,
+                    ),),
+                expected
+            );
+            assert_eq!(
+                agents
+                    .entries
+                    .iter()
+                    .fold((0, 0, 0, 0, 0), |totals, entry| (
+                        totals.0 + entry.input,
+                        totals.1 + entry.output,
+                        totals.2 + entry.cache_read,
+                        totals.3 + entry.cache_write,
+                        totals.4 + entry.reasoning,
+                    ),),
+                (input, output, cache_read, cache_write, reasoning)
+            );
+            assert_eq!(agents.total_messages, messages);
+        };
+        assert_reports((2, 57, 20, 60, 0, 5));
+
+        std::fs::remove_file(&unified).unwrap();
+        assert_eq!(
+            latest_source_mtime_ms(&local_options()).unwrap(),
+            before_unified
+        );
+        assert_eq!(
+            local_source_change_token(&local_options()).unwrap(),
+            legacy_change_token,
+            "deleting a non-max authority source must still invalidate consumers"
+        );
+        let restored = materialized();
+        assert_eq!(restored, legacy);
+        assert_eq!(streamed(), legacy);
+        let restored_count = parse_local_clients(local_options()).unwrap();
+        assert_eq!(restored_count.counts.get(ClientId::Grok), 2);
+        assert_reports((2, 1_016, 0, 0, 0, 0));
+        assert!(message_cache::SourceMessageCache::load()
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Grok),
+                &unified,
+            )
+            .is_none());
+    }
+
+    #[test]
     fn test_latest_source_mtime_ms_probes_auto_discovered_hermes_profile_wal() {
         let source_home = tempfile::TempDir::new().unwrap();
         let profile_dir = source_home.path().join(".hermes/profiles/research");
@@ -10396,9 +14411,9 @@ mod tests {
     #[test]
     fn test_parse_local_clients_honors_scanner_extra_scan_paths_for_zed_threads_db() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let windows_threads_dir = temp_dir.path().join("AppData/Local/Zed/threads");
-        std::fs::create_dir_all(&windows_threads_dir).unwrap();
-        let threads_db = windows_threads_dir.join("threads.db");
+        let extra_threads_dir = temp_dir.path().join("custom-zed/threads");
+        std::fs::create_dir_all(&extra_threads_dir).unwrap();
+        let threads_db = extra_threads_dir.join("threads.db");
         let conn = create_zed_sqlite_db(&threads_db);
         insert_zed_thread(&conn, "zed-extra-thread", "claude-sonnet-4-5");
         drop(conn);
@@ -10418,7 +14433,7 @@ mod tests {
         assert!(parsed_default.messages.is_empty());
 
         let mut extra_scan_paths = std::collections::BTreeMap::new();
-        extra_scan_paths.insert("zed".to_string(), vec![windows_threads_dir]);
+        extra_scan_paths.insert("zed".to_string(), vec![extra_threads_dir]);
         let parsed_with_settings = parse_local_clients(LocalParseOptions {
             home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
             use_env_roots: false,
@@ -10959,6 +14974,7 @@ mod tests {
             message_count: 1,
             agent: None,
             dedup_key: dedup_key.map(|s| s.to_string()),
+            dedup_aliases: Vec::new(),
             is_turn_start: false,
         }
     }
@@ -11290,5 +15306,845 @@ mod tests {
             super::model_report_token_totals(&entries);
         assert_eq!(total_input, i64::MAX);
         assert_eq!(total_cache_read, i64::MAX);
+    }
+
+    fn m15a_global_root(home: &Path) -> PathBuf {
+        home.join("Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent")
+    }
+
+    fn write_m15a_snapshot(home: &Path, body: &str) -> PathBuf {
+        let path = m15a_global_root(home).join("workspace-a/conversation.chat");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        m15a_global_root(home).join("workspace-a/conversation.chat")
+    }
+
+    fn write_m15a_execution(home: &Path, status: &str, start_time: &str) -> PathBuf {
+        let path = m15a_global_root(home).join("workspace-a/execution-store/execution");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{
+                    "executionId": "exec-1",
+                    "chatSessionId": "chat-1",
+                    "status": "{status}",
+                    "startTime": {start_time},
+                    "endTime": 1770983427500,
+                    "completionOptions": {{"modelId": "claude-sonnet-4-5"}},
+                    "context": {{"messages": [{{"entries": [{{"type": "text", "text": "execution input"}}]}}]}},
+                    "actions": [{{"actionType": "say", "output": "execution output"}}]
+                }}"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn m15a_snapshot_body(execution_id: &str, prompt: &str, response: &str) -> String {
+        format!(
+            r#"{{
+                "executionId": "{execution_id}",
+                "model": "claude-sonnet-4-5",
+                "messages": [
+                    {{"role": "user", "content": "{prompt}"}},
+                    {{"role": "assistant", "content": "{response}"}}
+                ]
+            }}"#
+        )
+    }
+
+    fn m15a_local_options(home: &Path) -> LocalParseOptions {
+        LocalParseOptions {
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["kiro".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    fn m15a_report_options(home: &Path) -> ReportOptions {
+        ReportOptions {
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["kiro".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    fn m15b_ide_paths(home: &Path) -> (PathBuf, PathBuf) {
+        let dir = home.join(".kiro/sessions/workspace-a/sess_m15b");
+        (dir.join("session.json"), dir.join("messages.jsonl"))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn m15b_ide_sibling_changes_reach_cache_all_lanes_and_reports() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (session, messages) = m15b_ide_paths(source_home.path());
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            r#"{
+                "id":"sess_m15b",
+                "modelId":"claude-opus-4.6",
+                "workspacePaths":["/tmp/m15b-project"]
+            }"#,
+        )
+        .unwrap();
+
+        let clients = ["kiro".to_string()];
+        let scanner_settings = scanner::ScannerSettings::default();
+        let parse_materialized = || {
+            let mut parsed = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner_settings,
+            );
+            parsed.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+            parsed
+        };
+
+        let source_fingerprint = message_cache::SourceFingerprint::from_path(&session).unwrap();
+        let missing_sidecar_fingerprint =
+            message_cache::SourceFingerprint::from_kiro_path(&session).unwrap();
+        let before = latest_source_mtime_ms(&m15a_local_options(source_home.path())).unwrap();
+        assert!(parse_materialized().is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &messages,
+            concat!(
+                "{\"timestamp\":\"2026-06-20T10:00:00Z\",\"payload\":{\"type\":\"user\",\"content\":\"hello\"}}\n",
+                "{\"payload\":{\"type\":\"session_metadata\",\"key\":\"contextUsage\",\"value\":{\"usagePercentage\":10.0}}}\n",
+                "{\"payload\":{\"type\":\"assistant\",\"content\":\"answer\"}}\n",
+                "{\"payload\":{\"type\":\"usage_summary\",\"elapsedTime\":1000}}\n",
+                "{\"timestamp\":\"2026-06-20T10:00:01Z\",\"payload\":{\"type\":\"turn_end\"}}\n",
+            ),
+        )
+        .unwrap();
+        let first_sidecar_fingerprint =
+            message_cache::SourceFingerprint::from_kiro_path(&session).unwrap();
+        assert_ne!(missing_sidecar_fingerprint, first_sidecar_fingerprint);
+        assert_eq!(
+            source_fingerprint,
+            message_cache::SourceFingerprint::from_path(&session).unwrap(),
+            "messages.jsonl must invalidate through the related-file fingerprint"
+        );
+        let after_first = latest_source_mtime_ms(&m15a_local_options(source_home.path())).unwrap();
+        assert!(after_first > before);
+
+        let first = parse_materialized();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].tokens.input, 20_000);
+        assert_eq!(first[0].dedup_key.as_deref(), Some("sess_m15b:ide:0"));
+        assert_eq!(first[0].model_id, "claude-opus-4.6");
+        assert_eq!(first[0].workspace_key.as_deref(), Some("/tmp/m15b-project"));
+        assert_eq!(
+            parse_materialized(),
+            first,
+            "the first warm hit must be stable"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &messages,
+            concat!(
+                "{\"timestamp\":\"2026-06-20T10:00:00Z\",\"payload\":{\"type\":\"user\",\"content\":\"hello\"}}\n",
+                "{\"payload\":{\"type\":\"session_metadata\",\"key\":\"contextUsage\",\"value\":{\"usagePercentage\":10.0}}}\n",
+                "{\"payload\":{\"type\":\"assistant\",\"content\":\"answer\"}}\n",
+                "{\"payload\":{\"type\":\"usage_summary\",\"elapsedTime\":1000}}\n",
+                "{\"timestamp\":\"2026-06-20T10:00:01Z\",\"payload\":{\"type\":\"turn_end\"}}\n",
+                "{\"timestamp\":\"2026-06-20T10:01:00Z\",\"payload\":{\"type\":\"user\",\"content\":\"next\"}}\n",
+                "{\"payload\":{\"type\":\"session_metadata\",\"key\":\"contextUsage\",\"value\":{\"usagePercentage\":20.0}}}\n",
+                "{\"payload\":{\"type\":\"assistant\",\"content\":\"done\"}}\n",
+                "{\"payload\":{\"type\":\"usage_summary\",\"elapsedTime\":1000}}\n",
+                "{\"timestamp\":\"2026-06-20T10:01:01Z\",\"payload\":{\"type\":\"turn_end\"}}\n",
+            ),
+        )
+        .unwrap();
+        let updated_sidecar_fingerprint =
+            message_cache::SourceFingerprint::from_kiro_path(&session).unwrap();
+        assert_ne!(first_sidecar_fingerprint, updated_sidecar_fingerprint);
+        let after_second = latest_source_mtime_ms(&m15a_local_options(source_home.path())).unwrap();
+        assert!(after_second > after_first);
+
+        let updated = parse_materialized();
+        assert_eq!(updated.len(), 2);
+        assert_eq!(
+            updated
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            60_000
+        );
+        assert_eq!(
+            parse_materialized(),
+            updated,
+            "the rebuilt cache must stay warm-complete"
+        );
+        assert_eq!(
+            message_cache::SourceMessageCache::load()
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                    &session,
+                )
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner_settings,
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        streamed.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+        assert_eq!(streamed, updated);
+
+        let counted = parse_local_clients(m15a_local_options(source_home.path())).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Kiro), 2);
+        assert_eq!(counted.messages.len(), 2);
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            60_000
+        );
+        let pruned = parse_local_clients(LocalParseOptions {
+            modified_after: Some(after_first + 1),
+            ..m15a_local_options(source_home.path())
+        })
+        .unwrap();
+        assert_eq!(pruned.counts.get(ClientId::Kiro), 2);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report_options = m15a_report_options(source_home.path());
+        let model = runtime
+            .block_on(get_model_report(report_options.clone()))
+            .unwrap();
+        let monthly = runtime
+            .block_on(get_monthly_report(report_options.clone()))
+            .unwrap();
+        let hourly = runtime
+            .block_on(get_hourly_report(report_options.clone()))
+            .unwrap();
+        let agents = runtime.block_on(get_agents_report(report_options)).unwrap();
+        assert_eq!(model.total_messages, 2);
+        assert_eq!(model.total_input, 60_000);
+        assert_eq!(
+            monthly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(
+            hourly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(agents.total_messages, 2);
+        assert_eq!(
+            agents.entries.iter().map(|entry| entry.input).sum::<i64>(),
+            60_000
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn m15a_cli_keys_cannot_seed_or_collide_with_globalstorage() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let cli_dir = source_home.path().join(".kiro/sessions/cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::write(
+            cli_dir.join("cli.json"),
+            r#"{"session_id":"execution","cwd":"workspace-a","session_state":{"rts_model_state":{"model_info":{"model_id":"cli-model"}},"conversation_metadata":{"user_turn_metadatas":[{"input_token_count":1}]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(cli_dir.join("cli.jsonl"), "").unwrap();
+        std::fs::write(
+            cli_dir.join("cli-collision.json"),
+            r#"{"session_id":"workspace-a/conversation:globalstorage:exec","cwd":"workspace-a","session_state":{"rts_model_state":{"model_info":{"model_id":"cli-model"}},"conversation_metadata":{"user_turn_metadatas":[{"input_token_count":1}]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(cli_dir.join("cli-collision.jsonl"), "").unwrap();
+        write_m15a_snapshot(source_home.path(), &m15a_snapshot_body("0", "ABCD", ""));
+        let execution_zero =
+            m15a_global_root(source_home.path()).join("workspace-a/execution-store/execution-zero");
+        std::fs::create_dir_all(execution_zero.parent().unwrap()).unwrap();
+        std::fs::write(
+            execution_zero,
+            r#"{
+                "executionId": "0",
+                "chatSessionId": "conversation",
+                "status": "succeed",
+                "startTime": 1770983426,
+                "endTime": 1770983427500,
+                "completionOptions": {"modelId": "claude-sonnet-4-5"},
+                "context": {"messages": [{"entries": [{"type": "text", "text": "execution input"}]}]},
+                "actions": [{"actionType": "say", "output": "execution output"}]
+            }"#,
+        )
+        .unwrap();
+
+        let expected = vec![
+            "conversation",
+            "execution",
+            "workspace-a/conversation:globalstorage:exec",
+        ];
+        let mut materialized: Vec<_> = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        )
+        .into_iter()
+        .map(|message| message.session_id)
+        .collect();
+        materialized.sort();
+        assert_eq!(materialized, expected);
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.session_id.clone()),
+        );
+        streamed.sort();
+        assert_eq!(streamed, expected);
+
+        let mut counted: Vec<_> = parse_local_clients(m15a_local_options(source_home.path()))
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|message| message.session_id)
+            .collect();
+        counted.sort();
+        assert_eq!(counted, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn m15a_duplicate_snapshot_extensions_are_exact_once() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let body = m15a_snapshot_body("unused", "ABCD", "WXYZ");
+        let chat = write_m15a_snapshot(source_home.path(), &body);
+        std::fs::write(chat.with_extension("json"), body).unwrap();
+
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(materialized.len(), 1);
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+
+        let counted = parse_local_clients(m15a_local_options(source_home.path())).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Kiro), 1);
+        assert_eq!(counted.messages.len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn m15a_materialized_streaming_count_and_report_parity() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let snapshot = write_m15a_snapshot(
+            source_home.path(),
+            &m15a_snapshot_body("exec-1", "snapshot input", "snapshot output"),
+        );
+        let execution = write_m15a_execution(source_home.path(), "succeed", "1770983426");
+        let mut pricing_data = HashMap::new();
+        pricing_data.insert(
+            "claude-sonnet-4-5".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1.0),
+                output_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let pricing_service = pricing::PricingService::new(pricing_data, HashMap::new());
+
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            Some(&pricing_service),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(
+            materialized[0].dedup_key.as_deref(),
+            Some("execution:exec-1")
+        );
+        assert!(materialized[0].cost > 0.0);
+
+        // Both source entries are raw and independently cached even though the
+        // snapshot is suppressed in the merged result.
+        let cache = message_cache::SourceMessageCache::load();
+        assert!(cache
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                &snapshot
+            )
+            .is_some_and(|entry| entry.messages[0]
+                .dedup_key
+                .as_deref()
+                .is_some_and(|key| key.ends_with(":globalstorage:exec:exec-1"))));
+        assert!(cache
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                &execution
+            )
+            .is_some_and(
+                |entry| entry.messages[0].dedup_key.as_deref() == Some("execution:exec-1")
+            ));
+        assert!(cache
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                &snapshot,
+            )
+            .is_some_and(|entry| entry.messages[0].cost == 0.0));
+        assert!(cache
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                &execution,
+            )
+            .is_some_and(|entry| entry.messages[0].cost == 0.0));
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            Some(&pricing_service),
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].dedup_key.as_deref(), Some("execution:exec-1"));
+        assert!(streamed[0].cost > 0.0);
+        assert_eq!(materialized[0].cost, streamed[0].cost);
+        assert_eq!(
+            (materialized[0].tokens.input, materialized[0].tokens.output),
+            (streamed[0].tokens.input, streamed[0].tokens.output)
+        );
+        assert_eq!(materialized[0].model_id, "claude-sonnet-4-5");
+        assert_eq!(materialized[0].session_id, "chat-1");
+        assert_eq!(
+            materialized[0].workspace_key.as_deref(),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            materialized[0].workspace_label.as_deref(),
+            Some("workspace-a")
+        );
+        assert_eq!(materialized[0].timestamp, 1_770_983_426_000);
+        assert_eq!(materialized[0].duration_ms, Some(1_500));
+        assert_eq!(materialized[0].message_count, 1);
+        assert_eq!(
+            (
+                streamed[0].model_id.as_str(),
+                streamed[0].session_id.as_str(),
+                streamed[0].workspace_key.as_deref(),
+                streamed[0].workspace_label.as_deref(),
+                streamed[0].timestamp,
+                streamed[0].duration_ms,
+                streamed[0].message_count,
+            ),
+            (
+                materialized[0].model_id.as_str(),
+                materialized[0].session_id.as_str(),
+                materialized[0].workspace_key.as_deref(),
+                materialized[0].workspace_label.as_deref(),
+                materialized[0].timestamp,
+                materialized[0].duration_ms,
+                materialized[0].message_count,
+            )
+        );
+
+        let counted = parse_local_clients(m15a_local_options(source_home.path())).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Kiro), 1);
+        assert_eq!(counted.messages.len(), 1);
+        assert_eq!(counted.messages[0].model_id, materialized[0].model_id);
+        assert_eq!(counted.messages[0].session_id, materialized[0].session_id);
+        assert_eq!(
+            counted.messages[0].workspace_key,
+            materialized[0].workspace_key
+        );
+        assert_eq!(
+            counted.messages[0].workspace_label,
+            materialized[0].workspace_label
+        );
+        assert_eq!(counted.messages[0].timestamp, materialized[0].timestamp);
+        assert_eq!(counted.messages[0].duration_ms, materialized[0].duration_ms);
+        assert_eq!(
+            counted.messages[0].message_count,
+            materialized[0].message_count
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let options = m15a_report_options(source_home.path());
+        let model = runtime.block_on(get_model_report(options.clone())).unwrap();
+        let monthly = runtime
+            .block_on(get_monthly_report(options.clone()))
+            .unwrap();
+        let hourly = runtime
+            .block_on(get_hourly_report(options.clone()))
+            .unwrap();
+        let agents = runtime
+            .block_on(get_agents_report(options.clone()))
+            .unwrap();
+        let mut session_options = options.clone();
+        session_options.group_by = GroupBy::Session;
+        let session_model = runtime.block_on(get_model_report(session_options)).unwrap();
+        let mut workspace_options = options;
+        workspace_options.group_by = GroupBy::WorkspaceModel;
+        let workspace_model = runtime
+            .block_on(get_model_report(workspace_options))
+            .unwrap();
+
+        assert_eq!(model.total_messages, 1);
+        assert_eq!(model.entries.len(), 1);
+        assert_eq!(model.entries[0].model, materialized[0].model_id);
+        assert_eq!(
+            model.entries[0].message_count,
+            materialized[0].message_count
+        );
+        assert_eq!(session_model.entries.len(), 1);
+        assert_eq!(
+            session_model.entries[0].session_id.as_deref(),
+            Some("chat-1")
+        );
+        assert_eq!(workspace_model.entries.len(), 1);
+        assert_eq!(
+            workspace_model.entries[0].workspace_key.as_deref(),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            workspace_model.entries[0].workspace_label.as_deref(),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            monthly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            1
+        );
+        assert_eq!(
+            hourly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            1
+        );
+        assert_eq!(agents.total_messages, 1);
+        assert_eq!(model.total_input, monthly.entries[0].input);
+        assert_eq!(model.total_input, hourly.entries[0].input);
+        assert_eq!(model.total_input, agents.entries[0].input);
+        assert_eq!(model.total_output, monthly.entries[0].output);
+        assert_eq!(model.total_output, hourly.entries[0].output);
+        assert_eq!(model.total_output, agents.entries[0].output);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn m15a_warm_cache_mixed_hits_reapply_suppression_and_restore_snapshot() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let snapshot = write_m15a_snapshot(
+            source_home.path(),
+            &m15a_snapshot_body("exec-1", "snapshot input", "snapshot output"),
+        );
+        let execution = write_m15a_execution(source_home.path(), "succeed", "1770983426");
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["kiro".to_string()];
+
+        let first = parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].dedup_key.as_deref(), Some("execution:exec-1"));
+
+        // Snapshot hit + execution miss: only the newly parsed execution wins.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_m15a_execution(source_home.path(), "succeed", "1770983426.5");
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].dedup_key.as_deref(), Some("execution:exec-1"));
+
+        // Execution hit + snapshot miss: the snapshot change is still suppressed.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_m15a_snapshot(
+            source_home.path(),
+            &m15a_snapshot_body(
+                "exec-1",
+                "changed snapshot input",
+                "changed snapshot output",
+            ),
+        );
+        let second = parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].dedup_key.as_deref(), Some("execution:exec-1"));
+
+        // A successful execution rewritten as failed removes its stale cache
+        // entry and exposes the raw cached snapshot.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_m15a_execution(source_home.path(), "failed", "1770983426");
+        let mut failed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| failed.push(message.clone()),
+        );
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.ends_with(":globalstorage:exec:exec-1")));
+
+        // Restore a successful execution after the failed rewrite. This proves
+        // a cached successful execution can become authoritative again.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_m15a_execution(source_home.path(), "succeed", "1770983426");
+        let restored_execution = parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(restored_execution.len(), 1);
+        assert_eq!(
+            restored_execution[0].dedup_key.as_deref(),
+            Some("execution:exec-1")
+        );
+        assert!(message_cache::SourceMessageCache::load()
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                &execution,
+            )
+            .is_some());
+
+        // Removing that cached successful execution must expose the raw cached
+        // snapshot on the other (streaming) lane.
+        std::fs::remove_file(&execution).unwrap();
+        let mut restored = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| restored.push(message.clone()),
+        );
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.ends_with(":globalstorage:exec:exec-1")));
+        assert!(message_cache::SourceMessageCache::load()
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Kiro),
+                &snapshot,
+            )
+            .is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn m15a_suppression_precedes_report_date_filter() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let snapshot = write_m15a_snapshot(
+            source_home.path(),
+            &m15a_snapshot_body("exec-future", "snapshot input", "snapshot output"),
+        );
+        let execution = m15a_global_root(source_home.path())
+            .join("workspace-a/execution-store/execution-future");
+        std::fs::create_dir_all(execution.parent().unwrap()).unwrap();
+        std::fs::write(
+            &execution,
+            r#"{"executionId":"exec-future","chatSessionId":"chat-future","status":"succeed","startTime":4102444800000,"endTime":4102444801000,"actions":[{"actionType":"say","output":"future answer"}],"input":{"data":{"messages":[{"content":"future question"}]}}}"#,
+        )
+        .unwrap();
+        let snapshot_date = sessions::kiro::parse_kiro_file(&snapshot)[0].date.clone();
+
+        let mut options = m15a_report_options(source_home.path());
+        options.until = Some(snapshot_date);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = runtime.block_on(get_model_report(options)).unwrap();
+        assert!(report.entries.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn m15a_globalstorage_mtime_pruning_and_stat_failure_fail_open() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let snapshot = write_m15a_snapshot(
+            source_home.path(),
+            &m15a_snapshot_body("exec-1", "initial input", "initial output"),
+        );
+        let options = m15a_local_options(source_home.path());
+        let before = latest_source_mtime_ms(&options).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_m15a_snapshot(
+            source_home.path(),
+            &m15a_snapshot_body("exec-1", "rewritten input", "rewritten output"),
+        );
+        let after = latest_source_mtime_ms(&options).unwrap();
+        assert!(after > before, "globalStorage primary mtime must advance");
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            modified_after: Some(before + 1),
+            ..options.clone()
+        })
+        .unwrap();
+        assert_eq!(parsed.counts.get(ClientId::Kiro), 1);
+
+        let execution = write_m15a_execution(source_home.path(), "succeed", "1770983426");
+        let execution_mtime = super::kiro_source_mtime_ms(&execution).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_m15a_snapshot(
+            source_home.path(),
+            &m15a_snapshot_body("exec-1", "newer snapshot", "must stay suppressed"),
+        );
+        let snapshot_mtime = super::kiro_source_mtime_ms(&snapshot).unwrap();
+        assert!(snapshot_mtime > execution_mtime);
+        let snapshot_date = sessions::kiro::parse_kiro_file(&snapshot)[0].date.clone();
+        let parsed = parse_local_clients(LocalParseOptions {
+            modified_after: Some(execution_mtime + 1),
+            since: Some(snapshot_date),
+            ..options.clone()
+        })
+        .unwrap();
+        assert_eq!(parsed.counts.get(ClientId::Kiro), 1);
+        assert!(
+            parsed.messages.is_empty(),
+            "mtime pruning must retain the older execution until suppression"
+        );
+
+        let missing = source_home.path().join("missing.chat");
+        let mut scan = scanner::ScanResult::default();
+        scan.get_mut(ClientId::Kiro).push(missing);
+        prune_scan_result_by_mtime(&mut scan, u64::MAX);
+        assert_eq!(scan.get(ClientId::Kiro).len(), 1);
+
+        // Keep the fixture path live for the cache/source identity assertion.
+        assert!(message_cache::SourceFingerprint::from_kiro_path(&snapshot).is_some());
     }
 }

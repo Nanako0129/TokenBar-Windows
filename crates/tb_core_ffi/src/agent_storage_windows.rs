@@ -1931,9 +1931,7 @@ mod tests {
             FILE_ATTRIBUTE_NORMAL,
         )
         .expect("reopen legacy v1 sentinel");
-        assert!(
-            regular_file_identity(&v1_after).expect("reread v1 identity") == v1_identity
-        );
+        assert!(regular_file_identity(&v1_after).expect("reread v1 identity") == v1_identity);
         assert_eq!(fs::read(&v1_path).expect("reread v1 bytes"), v1_bytes);
         assert_eq!(
             fs::metadata(&v1_path)

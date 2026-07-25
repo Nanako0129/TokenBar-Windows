@@ -8,7 +8,11 @@
 
 use crate::agent_account_scope::{self, AccountScope, AccountScopeError};
 use crate::agent_quota_duration::{copilot_calendar_duration, DurationEvidence};
-use crate::agent_usage::{clean_plan, AgentIdentity, UsageWindow};
+use crate::agent_usage::{
+    clean_plan, read_response_body, request_after_verified_binding, AgentIdentity,
+    ProviderCacheBinding, ProviderFetchFailure, ResponseReadFailure, TransportErrorFacts,
+    TransportPhase, UsageWindow,
+};
 use crate::opencode_integrations::GitHubCopilotCredential;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
@@ -19,6 +23,7 @@ const COPILOT_USAGE_URL: &str = "https://api.github.com/copilot_internal/user";
 pub(crate) struct CopilotData {
     pub identity: Option<AgentIdentity>,
     pub account_scope: Result<AccountScope, AccountScopeError>,
+    pub cache_binding: ProviderCacheBinding,
     pub windows: Vec<UsageWindow>,
 }
 
@@ -26,26 +31,26 @@ pub(crate) struct CopilotData {
 struct CopilotUser {
     #[serde(default)]
     copilot_plan: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    quota_reset_date: Option<Box<RawValue>>,
+    #[serde(default)]
+    quota_reset_date: Option<String>,
     #[serde(default)]
     quota_snapshots: Option<QuotaSnapshots>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct QuotaSnapshots {
     #[serde(default)]
-    premium_interactions: Option<QuotaSnapshot>,
+    premium_interactions: Option<Box<RawValue>>,
     #[serde(default)]
-    chat: Option<QuotaSnapshot>,
+    chat: Option<Box<RawValue>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct QuotaSnapshot {
     #[serde(default)]
-    entitlement: f64,
+    entitlement: Option<f64>,
     #[serde(default)]
-    remaining: f64,
+    remaining: Option<f64>,
     #[serde(default)]
     percent_remaining: Option<f64>,
 }
@@ -53,248 +58,240 @@ struct QuotaSnapshot {
 pub(crate) async fn fetch(
     now: DateTime<Utc>,
     credential: GitHubCopilotCredential,
-) -> Result<CopilotData, String> {
-    fetch_with(
-        now,
-        credential,
-        request_usage,
-        |semantic_source, canonical_location, marker| {
-            agent_account_scope::resolve_credential(
-                "copilot",
-                semantic_source,
-                canonical_location,
-                marker,
-            )
-        },
+) -> Result<CopilotData, ProviderFetchFailure> {
+    let verified = agent_account_scope::resolve_credential(
+        "copilot",
+        credential.semantic_source,
+        &credential.canonical_location,
+        &credential.marker,
     )
+    .map(|account_scope| {
+        let cache_binding = ProviderCacheBinding::primary(account_scope.clone());
+        (account_scope, cache_binding)
+    })
+    .map_err(|_| {
+        ProviderFetchFailure::terminal("GitHub Copilot account identity could not be verified.")
+    });
+    let (account_scope, cache_binding, response) =
+        request_after_verified_binding(verified, |(account_scope, cache_binding)| async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|_| {
+                    ProviderFetchFailure::terminal("Copilot usage client could not be created.")
+                })?;
+            let response = client
+                .get(COPILOT_USAGE_URL)
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("token {}", credential.request_token),
+                )
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::USER_AGENT, "GitHubCopilotChat/0.26.7")
+                .header("Editor-Version", "vscode/1.96.2")
+                .header("Editor-Plugin-Version", "copilot-chat/0.26.7")
+                .header("X-Github-Api-Version", "2025-04-01")
+                .send()
+                .await
+                .map_err(|error| {
+                    ProviderFetchFailure::from_send_error(
+                        "Copilot usage request failed. Retrying automatically.",
+                        Some(cache_binding.clone()),
+                        &error,
+                    )
+                })?;
+            Ok((account_scope, cache_binding, response))
+        })
+        .await?;
+    let status = response.status().as_u16();
+    let body = read_response_body(status, false, || async {
+        response.text().await.map_err(|error| {
+            TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+        })
+    })
     .await
-}
+    .map_err(|failure| match failure {
+        ResponseReadFailure::Transient(diagnostic) => ProviderFetchFailure::transient(
+            "Copilot usage request failed. Retrying automatically.",
+            Some(cache_binding.clone()),
+            diagnostic,
+        ),
+        ResponseReadFailure::Terminal(401 | 403) => {
+            ProviderFetchFailure::terminal("GitHub Copilot token expired or lacks access.")
+        }
+        ResponseReadFailure::Terminal(status) => ProviderFetchFailure::terminal(format!(
+            "Copilot usage API rejected the request (status {status})."
+        )),
+    })?;
+    let usage: CopilotUser = serde_json::from_str(&body).map_err(|_| {
+        ProviderFetchFailure::terminal("Copilot usage response could not be decoded.")
+    })?;
 
-async fn request_usage(request_token: String) -> Result<CopilotUser, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("build Copilot client: {e}"))?;
-    let response = client
-        .get(COPILOT_USAGE_URL)
-        .header(reqwest::header::AUTHORIZATION, format!("token {request_token}"))
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::USER_AGENT, "GitHubCopilotChat/0.26.7")
-        .header("Editor-Version", "vscode/1.96.2")
-        .header("Editor-Plugin-Version", "copilot-chat/0.26.7")
-        .header("X-Github-Api-Version", "2025-04-01")
-        .send()
-        .await
-        .map_err(|e| format!("Copilot usage request failed: {e}"))?;
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err("GitHub Copilot token expired or lacks access.".to_string());
+    let (plan, windows, mapping) = map_user(usage, now);
+    if windows.is_empty() && mapping != CopilotMapping::PlaceholderOnly {
+        return Err(ProviderFetchFailure::terminal(
+            "Copilot usage API returned no usable quota windows.",
+        ));
     }
-    if !status.is_success() {
-        return Err(format!("Copilot usage API returned {}.", status.as_u16()));
-    }
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("read Copilot response: {e}"))?;
-    serde_json::from_str(&body).map_err(|e| format!("decode Copilot usage: {e}"))
-}
-
-async fn fetch_with<Request, RequestFuture, ResolveScope>(
-    now: DateTime<Utc>,
-    credential: GitHubCopilotCredential,
-    request: Request,
-    resolve_scope: ResolveScope,
-) -> Result<CopilotData, String>
-where
-    Request: FnOnce(String) -> RequestFuture,
-    RequestFuture: std::future::Future<Output = Result<CopilotUser, String>>,
-    ResolveScope: FnOnce(&str, &str, &[u8]) -> Result<AccountScope, AccountScopeError>,
-{
-    let GitHubCopilotCredential {
-        request_token,
-        marker,
-        semantic_source,
-        canonical_location,
-    } = credential;
-    let usage = request(request_token).await?;
-    let windows = snapshot_windows(&usage, now);
-    let account_scope = resolve_scope(semantic_source, &canonical_location, &marker);
     Ok(CopilotData {
-        identity: Some(AgentIdentity {
-            email: None,
-            plan: usage.copilot_plan.filter(|s| !s.trim().is_empty()).map(clean_plan),
-        }),
-        account_scope,
+        identity: Some(AgentIdentity { email: None, plan }),
+        account_scope: Ok(account_scope),
+        cache_binding,
         windows,
     })
 }
 
-fn snapshot_windows(usage: &CopilotUser, now: DateTime<Utc>) -> Vec<UsageWindow> {
-    let resets_at = usage.quota_reset_date.as_deref().and_then(parse_reset_raw);
-    let reset_was_supplied = usage.quota_reset_date.is_some();
-    let Some(snapshots) = usage.quota_snapshots.as_ref() else {
-        return Vec::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopilotMapping {
+    Usable,
+    PlaceholderOnly,
+    Invalid,
+}
+
+#[derive(Debug)]
+enum CopilotRow {
+    Usable(Box<UsageWindow>),
+    Placeholder,
+    Invalid,
+    Absent,
+}
+
+fn map_user(
+    usage: CopilotUser,
+    now: DateTime<Utc>,
+) -> (Option<String>, Vec<UsageWindow>, CopilotMapping) {
+    let resets_at = usage.quota_reset_date.as_deref().and_then(parse_reset_date);
+    let mut windows = Vec::new();
+    let mut saw_placeholder = false;
+    let mut saw_invalid = false;
+    if let Some(snapshots) = usage.quota_snapshots {
+        for row in [
+            snapshot_window_with_identity(
+                "Premium",
+                "premium_interactions.v1",
+                snapshots.premium_interactions.as_deref(),
+                resets_at,
+                now,
+            ),
+            snapshot_window_with_identity(
+                "Chat",
+                "chat.v1",
+                snapshots.chat.as_deref(),
+                resets_at,
+                now,
+            ),
+        ] {
+            match row {
+                CopilotRow::Usable(window) => windows.push(*window),
+                CopilotRow::Placeholder => saw_placeholder = true,
+                CopilotRow::Invalid => saw_invalid = true,
+                CopilotRow::Absent => {}
+            }
+        }
+    }
+    let plan = usage
+        .copilot_plan
+        .filter(|plan| !plan.trim().is_empty())
+        .map(clean_plan);
+    let mapping = if !windows.is_empty() {
+        CopilotMapping::Usable
+    } else if saw_placeholder && !saw_invalid {
+        CopilotMapping::PlaceholderOnly
+    } else {
+        CopilotMapping::Invalid
     };
-    [
-        snapshot_window_with_identity(
-            "Premium",
-            "premium_interactions.v1",
-            Some("premium_interactions.v1".to_string()),
-            snapshots.premium_interactions.clone(),
-            resets_at,
-            reset_was_supplied,
-            now,
-        ),
-        snapshot_window_with_identity(
-            "Chat",
-            "chat.v1",
-            Some("chat.v1".to_string()),
-            snapshots.chat.clone(),
-            resets_at,
-            reset_was_supplied,
-            now,
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    (plan, windows, mapping)
 }
 
 fn snapshot_window_with_identity(
     label: &str,
-    card_id: &str,
-    window_key: Option<String>,
-    snapshot: Option<QuotaSnapshot>,
+    window_key: &str,
+    raw: Option<&RawValue>,
     resets_at: Option<DateTime<Utc>>,
-    reset_was_supplied: bool,
     now: DateTime<Utc>,
-) -> Option<UsageWindow> {
-    let snapshot = snapshot?;
-    // Skip explicit zero-entitlement placeholders (no usable quota signal).
-    if snapshot.entitlement == 0.0
-        && snapshot.remaining == 0.0
-        && snapshot.percent_remaining.is_none()
+) -> CopilotRow {
+    let Some(raw) = raw else {
+        return CopilotRow::Absent;
+    };
+    let Ok(snapshot) = serde_json::from_str::<QuotaSnapshot>(raw.get()) else {
+        return CopilotRow::Invalid;
+    };
+    let (Some(entitlement), Some(remaining)) = (snapshot.entitlement, snapshot.remaining) else {
+        return CopilotRow::Invalid;
+    };
+    if !entitlement.is_finite()
+        || !remaining.is_finite()
+        || entitlement < 0.0
+        || remaining < 0.0
+        || remaining > entitlement
     {
-        return None;
+        return CopilotRow::Invalid;
     }
-    let percent_remaining = snapshot.percent_remaining.or_else(|| {
-        (snapshot.entitlement > 0.0).then(|| (snapshot.remaining / snapshot.entitlement) * 100.0)
-    })?;
-    if !percent_remaining.is_finite() || !(0.0..=100.0).contains(&percent_remaining) {
-        return None;
+    if entitlement == 0.0 {
+        return CopilotRow::Placeholder;
     }
-
-    let window = UsageWindow::from_fraction(
-        label.to_string(),
-        percent_remaining / 100.0,
-        resets_at,
-        now,
-    )
-    .with_identity(card_id, window_key);
-    let contract_duration = resets_at.and_then(|reset| copilot_calendar_duration(reset.timestamp()));
-    Some(match contract_duration {
-        Some(duration) => window.with_contract_duration_evidence(
+    let derived_percent = (remaining / entitlement) * 100.0;
+    let percent_remaining = match snapshot.percent_remaining {
+        Some(percent)
+            if percent.is_finite()
+                && (0.0..=100.0).contains(&percent)
+                // Provider payloads may round or truncate to a whole percent.
+                && (percent - derived_percent).abs() <= 1.0 =>
+        {
+            percent
+        }
+        Some(_) => return CopilotRow::Invalid,
+        None => derived_percent,
+    };
+    let contract_duration = resets_at
+        .and_then(|reset| copilot_calendar_duration(reset.timestamp()))
+        .map(DurationEvidence::contract);
+    CopilotRow::Usable(Box::new(
+        UsageWindow::from_provider_used_percent(
+            label.to_string(),
+            100.0 - percent_remaining,
+            resets_at,
             now,
-            reset_was_supplied,
-            DurationEvidence::contract(duration),
+        )
+        .with_identity(
+            window_key,
+            Some(window_key.to_string()),
+            None,
+            contract_duration,
         ),
-        None => window.with_observed_duration_evidence(now, reset_was_supplied),
-    })
+    ))
 }
 
 #[cfg(test)]
 fn snapshot_window(
     label: &str,
-    snapshot: Option<QuotaSnapshot>,
+    raw: Option<&RawValue>,
     resets_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let (card_id, window_key) = match label {
-        "Premium" => ("premium_interactions.v1", Some("premium_interactions.v1".to_string())),
-        "Chat" => ("chat.v1", Some("chat.v1".to_string())),
-        _ => ("row.copilot.unknown.v1", None),
+    let window_key = match label {
+        "Premium" => "premium_interactions.v1",
+        "Chat" => "chat.v1",
+        _ => "row.copilot.unknown.v1",
     };
-    snapshot_window_with_identity(
-        label,
-        card_id,
-        window_key,
-        snapshot,
-        resets_at,
-        resets_at.is_some(),
-        now,
-    )
-}
-
-fn deserialize_optional_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Box::<RawValue>::deserialize(deserializer).map(Some)
-}
-
-fn parse_reset_raw(raw: &RawValue) -> Option<DateTime<Utc>> {
-    let value = serde_json::from_str::<String>(raw.get()).ok()?;
-    parse_reset_date(&value)
+    match snapshot_window_with_identity(label, window_key, raw, resets_at, now) {
+        CopilotRow::Usable(window) => Some(*window),
+        CopilotRow::Placeholder | CopilotRow::Invalid | CopilotRow::Absent => None,
+    }
 }
 
 /// Copilot reports `quota_reset_date` as a bare `YYYY-MM-DD`; treat it as UTC midnight.
 fn parse_reset_date(value: &str) -> Option<DateTime<Utc>> {
-    let value = value.trim();
-    let bytes = value.as_bytes();
-    if bytes.len() != 10
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !bytes[..4].iter().all(u8::is_ascii_digit)
-        || !bytes[5..7].iter().all(u8::is_ascii_digit)
-        || !bytes[8..].iter().all(u8::is_ascii_digit)
-    {
-        return None;
-    }
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
-    Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
+    let date = NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()?;
+    Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_account_scope::test_support::TestRefreshScope;
-    use crate::agent_account_scope::RefreshScopeTransaction;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_auth_path(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "tb-copilot-{tag}-{}-{}",
-            std::process::id(),
-            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root.join("auth.json")
-    }
-
-    fn fixture_credential(path: &std::path::Path, marker: &str) -> GitHubCopilotCredential {
-        let json = json!({"github-copilot": {
-            "type": "oauth", "refresh": marker, "access": "fake-access-token"
-        }});
-        std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
-        crate::opencode_integrations::github_copilot_credential_from(path, &json).unwrap()
-    }
-
-    fn fixture_user() -> CopilotUser {
-        serde_json::from_value(json!({
-            "copilot_plan": "individual",
-            "quota_reset_date": "2026-08-01",
-            "quota_snapshots": {
-                "premium_interactions": {
-                    "entitlement": 300, "remaining": 90, "percent_remaining": 30
-                },
-                "chat": {"entitlement": 100, "remaining": 75, "percent_remaining": 75}
-            }
-        }))
-        .unwrap()
+    fn raw(value: &str) -> Box<RawValue> {
+        RawValue::from_string(value.to_string()).unwrap()
     }
 
     #[test]
@@ -310,302 +307,267 @@ mod tests {
         }"#;
         let usage: CopilotUser = serde_json::from_str(body).unwrap();
         let snaps = usage.quota_snapshots.unwrap();
-        let premium = snapshot_window("Premium", snaps.premium_interactions, None, now).unwrap();
-        assert_eq!(premium.card_id_for_test(), "premium_interactions.v1");
-        assert_eq!(premium.pace_window_key_for_test(), Some("premium_interactions.v1"));
+        let premium =
+            snapshot_window("Premium", snaps.premium_interactions.as_deref(), None, now).unwrap();
         assert!((premium.remaining_for_test() - 30.0).abs() < 0.01);
         // chat is a zero-entitlement placeholder → skipped
-        assert!(snapshot_window("Chat", snaps.chat, None, now).is_none());
+        assert!(snapshot_window("Chat", snaps.chat.as_deref(), None, now).is_none());
     }
 
     #[test]
-    fn maps_exact_calendar_duration_for_each_month_length_on_both_cards() {
-        let cases = [
-            ("2023-03-01", "2023-02-15T00:00:00Z", 28 * 86_400),
-            ("2024-03-01", "2024-02-15T00:00:00Z", 29 * 86_400),
-            ("2023-05-01", "2023-04-15T00:00:00Z", 30 * 86_400),
-            ("2023-08-01", "2023-07-15T00:00:00Z", 31 * 86_400),
-        ];
-        for (reset, now_text, expected_seconds) in cases {
-            let now = now_text.parse::<DateTime<Utc>>().unwrap();
-            let usage: CopilotUser = serde_json::from_value(json!({
-                "quota_reset_date": reset,
+    fn zero_entitlement_and_missing_fields_do_not_create_usable_windows() {
+        let now = Utc::now();
+        let placeholder: CopilotUser = serde_json::from_str(
+            r#"{
                 "quota_snapshots": {
                     "premium_interactions": {
-                        "entitlement": 300, "remaining": 90, "percent_remaining": 30
-                    },
-                    "chat": {"entitlement": 100, "remaining": 75, "percent_remaining": 75}
+                        "entitlement": 0,
+                        "remaining": 0,
+                        "percent_remaining": 0
+                    }
                 }
-            }))
-            .unwrap();
-            assert!(usage.quota_reset_date.is_some());
-            let windows = snapshot_windows(&usage, now);
-            assert_eq!(windows.len(), 2, "{reset}");
-            for (window, card_id) in windows.iter().zip([
-                "premium_interactions.v1",
-                "chat.v1",
-            ]) {
-                let wire = serde_json::to_value(window).unwrap();
-                assert_eq!(wire["cardId"], card_id, "{reset}");
-                assert_eq!(wire["paceStatus"]["state"], "learningHistory", "{reset}");
-                assert_eq!(wire["paceStatus"]["durationSource"], "contract", "{reset}");
-                assert_eq!(
-                    wire["paceStatus"]["durationSeconds"],
-                    expected_seconds,
-                    "{reset}"
-                );
-                assert_eq!(wire["windowMinutes"], expected_seconds / 60, "{reset}");
-                assert!(wire.get("historicalPace").is_none(), "{reset}");
-            }
-        }
-    }
-
-    #[test]
-    fn valid_future_non_month_start_uses_observed_duration_learning() {
-        let now = "2023-08-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let usage: CopilotUser = serde_json::from_value(json!({
-            "quota_reset_date": "2023-08-15",
-            "quota_snapshots": {
-                "premium_interactions": {"entitlement": 300, "remaining": 90},
-                "chat": {"entitlement": 100, "remaining": 75}
-            }
-        }))
-        .unwrap();
-        let windows = snapshot_windows(&usage, now);
-        assert_eq!(windows.len(), 2);
-        for window in windows {
-            let wire = serde_json::to_value(window).unwrap();
-            assert_eq!(wire["paceStatus"]["state"], "learningDuration");
-            assert_eq!(wire["paceStatus"]["durationSource"], "observed");
-            assert!(wire["paceStatus"].get("durationSeconds").is_none());
-            assert!(wire.get("windowMinutes").is_none());
-            assert!(wire.get("historicalPace").is_none());
-        }
-    }
-
-    #[test]
-    fn reset_presence_and_validity_fail_closed_without_observed_fallback() {
-        let now = "2023-08-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let cases = [
-            ("missing", json!({}), false, "missingReset"),
-            (
-                "null",
-                json!({"quota_reset_date": null}),
-                true,
-                "invalidEvidence",
-            ),
-            (
-                "object",
-                json!({"quota_reset_date": {"reset": "2023-08-01"}}),
-                true,
-                "invalidEvidence",
-            ),
-            (
-                "number",
-                json!({"quota_reset_date": 42}),
-                true,
-                "invalidEvidence",
-            ),
-            (
-                "bool",
-                json!({"quota_reset_date": true}),
-                true,
-                "invalidEvidence",
-            ),
-            (
-                "blank",
-                json!({"quota_reset_date": ""}),
-                true,
-                "invalidEvidence",
-            ),
-            (
-                "malformed",
-                json!({"quota_reset_date": "not-a-date"}),
-                true,
-                "invalidEvidence",
-            ),
-            (
-                "past",
-                json!({"quota_reset_date": "2023-08-01"}),
-                true,
-                "invalidEvidence",
-            ),
-        ];
-        for (case, reset, supplied, reason) in cases {
-            let mut body = json!({
-                "quota_snapshots": {
-                    "premium_interactions": {"entitlement": 300, "remaining": 90},
-                    "chat": {"entitlement": 100, "remaining": 75}
-                }
-            });
-            if let Some(reset) = reset.get("quota_reset_date") {
-                body["quota_reset_date"] = reset.clone();
-            }
-            let usage: CopilotUser = serde_json::from_value(body).unwrap();
-            assert_eq!(usage.quota_reset_date.is_some(), supplied, "{case}");
-            let windows = snapshot_windows(&usage, now);
-            assert_eq!(windows.len(), 2, "{case}");
-            for window in windows {
-                let wire = serde_json::to_value(window).unwrap();
-                assert_eq!(wire["paceStatus"]["state"], "unavailable", "{case}");
-                assert_eq!(wire["paceStatus"]["reason"], reason, "{case}");
-                assert!(wire["paceStatus"].get("durationSeconds").is_none(), "{case}");
-                assert!(wire.get("windowMinutes").is_none(), "{case}");
-                assert!(wire.get("historicalPace").is_none(), "{case}");
-            }
-        }
-
-        let early_now = "2023-06-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let future_calendar: CopilotUser = serde_json::from_value(json!({
-            "quota_reset_date": "2023-08-01",
-            "quota_snapshots": {
-                "premium_interactions": {"entitlement": 300, "remaining": 90},
-                "chat": {"entitlement": 100, "remaining": 75}
-            }
-        }))
-        .unwrap();
-        for window in snapshot_windows(&future_calendar, early_now) {
-            let wire = serde_json::to_value(window).unwrap();
-            assert_eq!(wire["paceStatus"]["state"], "unavailable");
-            assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence");
-        }
-    }
-
-    #[tokio::test]
-    async fn request_and_lineage_use_the_same_normalized_marker() {
-        let path = temp_auth_path("lineage");
-        let store = TestRefreshScope::new("copilot", "copilot-lineage");
-        let now = Utc.timestamp_opt(1_751_328_000, 0).single().unwrap();
-        let events = std::cell::RefCell::new(Vec::new());
-        let first = fetch_with(
-            now,
-            fixture_credential(&path, " stable-marker "),
-            |token| {
-                events.borrow_mut().push("request");
-                assert_eq!(token, "stable-marker");
-                std::future::ready(Ok(fixture_user()))
-            },
-            |source, location, marker| {
-                events.borrow_mut().push("scope");
-                assert_eq!(source, "opencode-auth-json");
-                assert!(location.ends_with("\0github-copilot"));
-                assert_eq!(marker, b"stable-marker");
-                store.resolve_current(source, location, marker)
-            },
+            }"#,
         )
-        .await
         .unwrap();
-        assert_eq!(&*events.borrow(), &["request", "scope"]);
-        assert_eq!(first.windows.len(), 2);
+        let (_, windows, mapping) = map_user(placeholder, now);
+        assert!(windows.is_empty());
+        assert_eq!(mapping, CopilotMapping::PlaceholderOnly);
+
+        for malformed in [r#"{}"#, r#"{"entitlement": 10}"#, r#"{"remaining": 10}"#] {
+            let row = raw(malformed);
+            assert!(matches!(
+                snapshot_window_with_identity(
+                    "Premium",
+                    "premium_interactions.v1",
+                    Some(row.as_ref()),
+                    None,
+                    now,
+                ),
+                CopilotRow::Invalid
+            ));
+        }
+
+        let valid_with_malformed_sibling: CopilotUser = serde_json::from_str(
+            r#"{
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 100,
+                        "remaining": 60,
+                        "percent_remaining": 60
+                    },
+                    "chat": {}
+                }
+            }"#,
+        )
+        .unwrap();
+        let (_, windows, mapping) = map_user(valid_with_malformed_sibling, now);
+        assert_eq!(mapping, CopilotMapping::Usable);
+        assert_eq!(windows.len(), 1);
+
+        for malformed in [
+            r#"{"entitlement":0,"remaining":1,"percent_remaining":100}"#,
+            r#"{"entitlement":100,"remaining":101,"percent_remaining":100}"#,
+            r#"{"entitlement":-1,"remaining":0,"percent_remaining":0}"#,
+            r#"{"entitlement":100,"remaining":-1,"percent_remaining":0}"#,
+        ] {
+            let row = raw(malformed);
+            assert!(matches!(
+                snapshot_window_with_identity(
+                    "Premium",
+                    "premium_interactions.v1",
+                    Some(row.as_ref()),
+                    None,
+                    now,
+                ),
+                CopilotRow::Invalid
+            ));
+        }
+
+        let invalid_with_valid_sibling: CopilotUser = serde_json::from_str(
+            r#"{
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 0,
+                        "remaining": 1,
+                        "percent_remaining": 100
+                    },
+                    "chat": {
+                        "entitlement": 100,
+                        "remaining": 75,
+                        "percent_remaining": 75
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let (_, windows, mapping) = map_user(invalid_with_valid_sibling, now);
+        assert_eq!(mapping, CopilotMapping::Usable);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label_for_test(), "Chat");
+
+        let invalid_only: CopilotUser = serde_json::from_str(
+            r#"{
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 0,
+                        "remaining": 1,
+                        "percent_remaining": 100
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let (_, windows, mapping) = map_user(invalid_only, now);
+        assert!(windows.is_empty());
+        assert_eq!(mapping, CopilotMapping::Invalid);
+    }
+
+    #[test]
+    fn stage4_copilot_maps_shared_reset_to_both_quota_cards() {
+        let now = Utc.timestamp_opt(1_751_328_000, 0).single().unwrap();
+        let usage: CopilotUser = serde_json::from_str(
+            r#"{
+                "copilot_plan": "individual",
+                "quota_reset_date": "2026-08-01",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 300,
+                        "remaining": 90,
+                        "percent_remaining": 30
+                    },
+                    "chat": {
+                        "entitlement": 100,
+                        "remaining": 75
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let (plan, windows, mapping) = map_user(usage, now);
+        assert_eq!(mapping, CopilotMapping::Usable);
+        assert_eq!(plan.as_deref(), Some("Individual"));
+        assert_eq!(windows.len(), 2);
+        let premium = &windows[0];
+        let chat = &windows[1];
+
+        assert_eq!(premium.label_for_test(), "Premium");
+        assert_eq!(chat.label_for_test(), "Chat");
         assert_eq!(
-            first.windows[0].pace_window_key_for_test(),
+            premium.resets_at_for_test(),
+            Some("2026-08-01T00:00:00.000Z")
+        );
+        assert_eq!(chat.resets_at_for_test(), premium.resets_at_for_test());
+        assert_eq!(
+            premium.window_minutes_for_test(),
+            Some(44_640),
+            "first-of-month reset uses the exact preceding calendar month"
+        );
+        assert_eq!(chat.window_minutes_for_test(), Some(44_640));
+        assert_eq!(
+            premium.pace_window_key_for_test(),
             Some("premium_interactions.v1")
         );
-        assert_eq!(first.windows[1].pace_window_key_for_test(), Some("chat.v1"));
-        let first_scope = first.account_scope.unwrap();
-        let normalized_scope = fetch_with(
-            now,
-            fixture_credential(&path, "stable-marker"),
-            |_| std::future::ready(Ok(fixture_user())),
-            |source, location, marker| store.resolve_current(source, location, marker),
-        )
-        .await
-        .unwrap()
-        .account_scope
-        .unwrap();
-        let different_scope = fetch_with(
-            now,
-            fixture_credential(&path, "different-marker"),
-            |_| std::future::ready(Ok(fixture_user())),
-            |source, location, marker| store.resolve_current(source, location, marker),
-        )
-        .await
-        .unwrap()
-        .account_scope
-        .unwrap();
-        assert_eq!(first_scope, normalized_scope);
-        assert_ne!(first_scope, different_scope);
-        store.cleanup();
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[tokio::test]
-    async fn api_and_scope_errors_fail_closed_without_losing_successful_gauges() {
-        let path = temp_auth_path("errors");
-        let scope_calls = std::cell::Cell::new(0);
-        let result = fetch_with(
-            Utc::now(),
-            fixture_credential(&path, " api-error-secret "),
-            |token| {
-                assert_eq!(token, "api-error-secret");
-                std::future::ready(Err("Copilot usage API returned 503.".to_string()))
-            },
-            |_, _, _| {
-                scope_calls.set(scope_calls.get() + 1);
-                Err(AccountScopeError::MetadataWrite)
-            },
-        )
-        .await;
-        let error = match result {
-            Ok(_) => panic!("API failure unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        assert_eq!(scope_calls.get(), 0);
-        assert_eq!(error, "Copilot usage API returned 503.");
-        assert!(!error.contains("api-error-secret"));
-        assert!(!error.contains(path.to_string_lossy().as_ref()));
-
-        let data = fetch_with(
-            Utc::now(),
-            fixture_credential(&path, " scope-error-secret "),
-            |_| std::future::ready(Ok(fixture_user())),
-            |source, location, marker| {
-                assert_eq!(source, "opencode-auth-json");
-                assert!(location.ends_with("\0github-copilot"));
-                assert_eq!(marker, b"scope-error-secret");
-                Err(AccountScopeError::MetadataWrite)
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(data.account_scope, Err(AccountScopeError::MetadataWrite));
-        assert_eq!(data.windows.len(), 2);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn unknown_test_window_has_no_history_identity() {
-        let window = snapshot_window(
-            "Other",
-            Some(QuotaSnapshot {
-                entitlement: 10.0,
-                remaining: 5.0,
-                percent_remaining: None,
-            }),
-            None,
-            Utc::now(),
-        )
-        .unwrap();
-        assert_eq!(window.card_id_for_test(), "row.copilot.unknown.v1");
-        assert!(window.pace_window_key_for_test().is_none());
-        assert_eq!(window.pace_reason_for_test(), Some("windowIdentity"));
-    }
-
-    #[test]
-    fn parses_only_trimmed_exact_utc_calendar_dates() {
-        assert_eq!(
-            parse_reset_date(" 2026-07-01 \t"),
-            Some("2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
-        );
-        for invalid in [
-            "not-a-date",
-            "2026-7-01",
-            "2026-07-1",
-            "2026-07-01T00:00:00Z",
-            "2026/07/01",
-            "2026-02-29",
-        ] {
-            assert!(parse_reset_date(invalid).is_none(), "{invalid}");
+        assert_eq!(chat.pace_window_key_for_test(), Some("chat.v1"));
+        for window in &windows {
+            let wire = serde_json::to_value(window).unwrap();
+            assert_eq!(wire["paceStatus"]["durationSource"], "contract");
+            assert_eq!(wire["paceStatus"]["durationSeconds"], 2_678_400);
         }
+
+        let non_calendar_reset = parse_reset_date("2026-08-15").unwrap();
+        let observed_raw =
+            raw(r#"{ "entitlement": 300, "remaining": 90, "percent_remaining": 30 }"#);
+        let observed = snapshot_window(
+            "Premium",
+            Some(observed_raw.as_ref()),
+            Some(non_calendar_reset),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            observed.window_minutes_for_test(),
+            None,
+            "copilot.premium.observed-fallback"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_remaining_percentages_before_wire() {
+        let now = Utc::now();
+        let out_of_range =
+            raw(r#"{ "entitlement": 300, "remaining": 90, "percent_remaining": 101 }"#);
+        assert!(snapshot_window("Premium", Some(out_of_range.as_ref()), None, now,).is_none());
+        let non_finite =
+            raw(r#"{ "entitlement": 100, "remaining": "NaN", "percent_remaining": null }"#);
+        assert!(snapshot_window("Chat", Some(non_finite.as_ref()), None, now).is_none());
+    }
+
+    #[test]
+    fn rejects_percentages_that_contradict_absolute_quota() {
+        let now = Utc::now();
+        let contradictory =
+            raw(r#"{ "entitlement": 100, "remaining": 0, "percent_remaining": 100 }"#);
+        assert!(matches!(
+            snapshot_window_with_identity(
+                "Premium",
+                "premium_interactions.v1",
+                Some(contradictory.as_ref()),
+                None,
+                now,
+            ),
+            CopilotRow::Invalid
+        ));
+
+        for rounded in [66, 67] {
+            let payload = raw(&format!(
+                r#"{{ "entitlement": 3, "remaining": 2, "percent_remaining": {rounded} }}"#
+            ));
+            assert!(matches!(
+                snapshot_window_with_identity(
+                    "Premium",
+                    "premium_interactions.v1",
+                    Some(payload.as_ref()),
+                    None,
+                    now,
+                ),
+                CopilotRow::Usable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_snapshot_percentage_does_not_poison_valid_sibling() {
+        let now = Utc.timestamp_opt(1_751_328_000, 0).single().unwrap();
+        for invalid in ["1e400", r#""NaN""#, "100"] {
+            let usage: CopilotUser = serde_json::from_str(&format!(
+                r#"{{
+                    "quota_reset_date": "2026-08-01",
+                    "quota_snapshots": {{
+                        "premium_interactions": {{
+                            "entitlement": 300,
+                            "remaining": 90,
+                            "percent_remaining": {invalid}
+                        }},
+                        "chat": {{
+                            "entitlement": 100,
+                            "remaining": 75,
+                            "percent_remaining": 75
+                        }}
+                    }}
+                }}"#
+            ))
+            .unwrap();
+            let (_, windows, mapping) = map_user(usage, now);
+            assert_eq!(mapping, CopilotMapping::Usable);
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0].label_for_test(), "Chat");
+            assert!((windows[0].remaining_for_test() - 75.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn parses_reset_date() {
+        assert!(parse_reset_date("2026-07-01").is_some());
+        assert!(parse_reset_date("not-a-date").is_none());
     }
 }

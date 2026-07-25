@@ -1,21 +1,30 @@
-//! Grok Build subscription quota (weekly SuperGrok credits).
+//! Grok Build subscription quota — two meters, shown as two windows.
 //!
 //! Grok Build stores OIDC credentials at `$GROK_HOME/auth.json` (default
 //! `~/.grok/auth.json`). TokenBar refreshes the access token against
-//! `auth.x.ai` and reads weekly credit usage from the same private billing
+//! `auth.x.ai` and reads usage from two views of the same private billing
 //! endpoint the CLI uses:
 //!
-//!   GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
+//!   Weekly:  GET /v1/billing?format=credits  -> creditUsagePercent / GrokBuild
+//!   Monthly: GET /v1/billing                 -> used / monthlyLimit
 //!
-//! Prefer the `GrokBuild` product percent when present; fall back to overall
-//! `creditUsagePercent`. Omit the card entirely when no Grok auth is on disk
-//! (same stance as Copilot).
+//! The weekly view is the SuperGrok weekly credit meter (the primary "will I
+//! run out this week" number). Right after a weekly reset with no usage yet, it
+//! OMITS the percent fields while still reporting the period — that is a genuine
+//! 0%, not an error, and was the original cause of the card erroring. The
+//! monthly view is the included-allowance meter (percent = used / monthlyLimit)
+//! over a monthly period. The monthly call is best-effort with a short timeout:
+//! a failure or hang there never sinks the card when the weekly meter succeeded.
+//! Omit the card entirely when no Grok auth is on disk (same stance as Copilot).
 
 use crate::agent_account_scope::{
     self, AccountScope, AccountScopeError, RefreshCheckpoint, RefreshScopeTransaction,
 };
 use crate::agent_quota_duration::DurationEvidence;
-use crate::agent_usage::{AgentIdentity, UsageWindow};
+use crate::agent_usage::{
+    read_response_body, request_after_verified_binding, AgentIdentity, ProviderCacheBinding,
+    ProviderFetchFailure, ResponseReadFailure, TransportErrorFacts, TransportPhase, UsageWindow,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{value::RawValue, Value};
@@ -23,13 +32,30 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const GROK_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
-const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+/// Weekly SuperGrok credits meter. Returns `creditUsagePercent` / a `GrokBuild`
+/// product percent over a weekly `currentPeriod`. Right after a weekly reset,
+/// with no usage recorded yet, xAI OMITS those percent fields — the period is
+/// still reported, so that state is a genuine 0%, not an error.
+const GROK_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+/// Monthly included-allowance meter. The default view reports `monthlyLimit` +
+/// `used` over a monthly billing period (percent = used / monthlyLimit).
+const GROK_MONTHLY_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 /// Refresh a few minutes early so a clock-skewed expiry doesn't 401 the billing call.
 const ACCESS_SKEW_SECS: i64 = 120;
+/// Best-effort monthly GET budget. Grok is joined in `agent_usage::run`, so a
+/// full 30s hang on the additive meter would stall the whole quota payload after
+/// the weekly meter is already ready.
+const MONTHLY_TIMEOUT_SECS: u64 = 5;
+/// The exact `currentPeriod.type` xAI stamps on the weekly credits meter. Matched
+/// exactly (not by substring) so `..._BIWEEKLY` / `..._NOT_WEEKLY` can't pass.
+const WEEKLY_PERIOD_TYPE: &str = "USAGE_PERIOD_TYPE_WEEKLY";
+const WEEKLY_WINDOW_KEY: &str = "billing.weekly.v1";
+const MONTHLY_WINDOW_KEY: &str = "billing.monthly.v1";
 
 pub(crate) struct GrokData {
     pub identity: Option<AgentIdentity>,
     pub account_scope: Result<AccountScope, AccountScopeError>,
+    pub cache_binding: Option<ProviderCacheBinding>,
     pub windows: Vec<UsageWindow>,
 }
 
@@ -47,9 +73,9 @@ struct GrokCredentials {
 }
 
 impl GrokCredentials {
-    fn scope_marker(&self) -> Option<&[u8]> {
+    fn scope_marker(&self) -> Option<&str> {
         let marker = self.refresh_token.trim();
-        (!marker.is_empty()).then_some(marker.as_bytes())
+        (!marker.is_empty()).then_some(marker)
     }
 
     fn scope_location(&self) -> Result<String, AccountScopeError> {
@@ -64,7 +90,7 @@ impl GrokCredentials {
             "grok",
             "grok-auth-json",
             &self.scope_location()?,
-            marker,
+            marker.as_bytes(),
         )
     }
 }
@@ -83,32 +109,49 @@ struct BillingResponse {
 struct BillingConfig {
     #[serde(default)]
     current_period: Option<UsagePeriod>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    /// Unified-billing allowance and consumption (`{ "val": n }`). Percent is
+    /// `used / monthly_limit`. Present in the default billing view.
+    #[serde(default)]
+    monthly_limit: Option<CentVal>,
+    #[serde(default)]
+    used: Option<CentVal>,
+    /// RPC-shaped consumption (`usage.totalUsed`); accepted defensively in case
+    /// an account nests the consumed amount under `usage` instead of `used`.
+    #[serde(default)]
+    usage: Option<UnifiedUsage>,
+    /// Credits-view percent fields (`?format=credits`).
+    #[serde(default)]
     credit_usage_percent: Option<Box<RawValue>>,
     #[serde(default)]
     product_usage: Option<Vec<ProductUsage>>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    billing_period_start: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    billing_period_end: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    used: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    monthly_limit: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    on_demand_used: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    on_demand_cap: Option<Box<RawValue>>,
+    #[serde(default)]
+    billing_period_start: Option<String>,
+    #[serde(default)]
+    billing_period_end: Option<String>,
+}
+
+/// xAI wraps billing amounts as `{ "val": n }` on the wire.
+#[derive(Debug, Deserialize)]
+struct CentVal {
+    #[serde(default)]
+    val: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnifiedUsage {
+    #[serde(default)]
+    total_used: Option<CentVal>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsagePeriod {
     #[serde(default, rename = "type")]
     period_type: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    start: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
-    end: Option<Box<RawValue>>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,23 +159,8 @@ struct UsagePeriod {
 struct ProductUsage {
     #[serde(default)]
     product: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    #[serde(default)]
     usage_percent: Option<Box<RawValue>>,
-}
-
-enum LegacyPercentageEvidence {
-    Absent,
-    Invalid,
-    GrokBuild(f64),
-    Credit(f64),
-    CreditZero(f64),
-}
-
-enum PercentageEvidence {
-    Absent,
-    Disabled,
-    Invalid,
-    Valid(f64),
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,465 +172,390 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-/// Fetch Grok quota when local auth exists. Returns `None` when the user has
-/// never signed into Grok Build (no card). Returns `Err` when auth exists but
-/// the fetch fails so the card can show an error state.
-pub(crate) async fn fetch(now: DateTime<Utc>) -> Option<Result<GrokData, String>> {
+/// Fetch Grok quota when local auth exists. A genuinely absent credential
+/// omits the optional card; every present-credential failure stays typed.
+pub(crate) async fn fetch(now: DateTime<Utc>) -> Result<Option<GrokData>, ProviderFetchFailure> {
     let credentials = match load_credentials() {
-        Ok(Some(c)) => c,
-        Ok(None) => return None,
-        Err(e) => return Some(Err(e)),
+        Ok(Some(credentials)) => credentials,
+        Ok(None) => return Ok(None),
+        Err(_) => {
+            return Err(ProviderFetchFailure::terminal(
+                "Grok credentials could not be loaded.",
+            ));
+        }
     };
-    Some(fetch_with_credentials(credentials, now).await)
+    fetch_with_credentials(credentials, now).await.map(Some)
 }
 
 async fn fetch_with_credentials(
-    mut credentials: GrokCredentials,
+    credentials: GrokCredentials,
     now: DateTime<Utc>,
-) -> Result<GrokData, String> {
-    let mut refreshed_scope = None;
-    if credentials_needs_refresh(&credentials, now) {
-        let refreshed =
-            refresh_credentials(&credentials.auth_path, &credentials.entry_key, false).await?;
-        credentials = refreshed.0;
-        refreshed_scope = merge_refreshed_scope(refreshed_scope, refreshed.1);
+) -> Result<GrokData, ProviderFetchFailure> {
+    let verified = if credentials_needs_refresh(&credentials, now) {
+        refresh_credentials(&credentials.auth_path, &credentials.entry_key, false).await
+    } else {
+        credentials
+            .resolve_account_scope()
+            .map(|account_scope| {
+                let cache_binding = ProviderCacheBinding::primary(account_scope.clone());
+                (credentials, account_scope, Some(cache_binding))
+            })
+            .map_err(|_| {
+                ProviderFetchFailure::terminal("Grok account identity could not be verified.")
+            })
+    };
+
+    let (mut credentials, mut account_scope, mut cache_binding, client, response) =
+        request_after_verified_binding(
+            verified,
+            |(credentials, account_scope, cache_binding)| async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .map_err(|_| {
+                        ProviderFetchFailure::terminal("Grok billing client could not be created.")
+                    })?;
+                let response = client
+                    .get(GROK_CREDITS_URL)
+                    .bearer_auth(&credentials.access_token)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .header(reqwest::header::USER_AGENT, "TokenBar")
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        ProviderFetchFailure::from_send_error(
+                            "Grok weekly billing request failed. Retrying automatically.",
+                            cache_binding.clone(),
+                            &error,
+                        )
+                    })?;
+                Ok((credentials, account_scope, cache_binding, client, response))
+            },
+        )
+        .await?;
+    let status = response.status().as_u16();
+
+    let weekly_body = if matches!(status, 401 | 403) {
+        if credentials.scope_marker().is_none() {
+            return Err(ProviderFetchFailure::terminal(
+                "Grok OAuth token expired or invalid. Run `grok` to log in again.",
+            ));
+        }
+        let (refreshed, scope, binding) =
+            refresh_credentials(&credentials.auth_path, &credentials.entry_key, true).await?;
+        credentials = refreshed;
+        account_scope = scope;
+        cache_binding = binding;
+        let retry = client
+            .get(GROK_CREDITS_URL)
+            .bearer_auth(&credentials.access_token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::USER_AGENT, "TokenBar")
+            .send()
+            .await
+            .map_err(|error| {
+                ProviderFetchFailure::from_send_error(
+                    "Grok weekly billing retry failed. Retrying automatically.",
+                    cache_binding.clone(),
+                    &error,
+                )
+            })?;
+        let retry_status = retry.status().as_u16();
+        read_response_body(retry_status, false, || async {
+            retry.text().await.map_err(|error| {
+                TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+            })
+        })
+        .await
+        .map_err(|failure| grok_response_failure(failure, cache_binding.clone()))?
+    } else {
+        read_response_body(status, false, || async {
+            response.text().await.map_err(|error| {
+                TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+            })
+        })
+        .await
+        .map_err(|failure| grok_response_failure(failure, cache_binding.clone()))?
+    };
+
+    let monthly_body = fetch_monthly_best_effort(&credentials).await;
+    build_grok_data(
+        &weekly_body,
+        monthly_body.as_deref(),
+        &credentials,
+        now,
+        Ok(account_scope),
+        cache_binding,
+    )
+}
+
+fn grok_response_failure(
+    failure: ResponseReadFailure,
+    attempt_binding: Option<ProviderCacheBinding>,
+) -> ProviderFetchFailure {
+    match failure {
+        ResponseReadFailure::Transient(diagnostic) => ProviderFetchFailure::transient(
+            "Grok weekly billing request failed. Retrying automatically.",
+            attempt_binding,
+            diagnostic,
+        ),
+        ResponseReadFailure::Terminal(401 | 403) => ProviderFetchFailure::terminal(
+            "Grok OAuth token expired or invalid. Run `grok` to log in again.",
+        ),
+        ResponseReadFailure::Terminal(status) => ProviderFetchFailure::terminal(format!(
+            "Grok billing API rejected the request (status {status})."
+        )),
     }
+}
 
+/// GET the monthly default billing view. Never refreshes credentials on 4xx —
+/// the weekly call already owns token repair — and uses a short timeout so a
+/// hung additive request cannot stall the joined quota payload.
+async fn fetch_monthly_best_effort(credentials: &GrokCredentials) -> Option<String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(MONTHLY_TIMEOUT_SECS))
         .build()
-        .map_err(|e| format!("build Grok billing client: {e}"))?;
-
+        .ok()?;
     let response = client
-        .get(GROK_BILLING_URL)
+        .get(GROK_MONTHLY_URL)
         .bearer_auth(&credentials.access_token)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::USER_AGENT, "TokenBar")
         .send()
         .await
-        .map_err(|e| format!("Grok billing request failed: {e}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("read Grok billing response: {e}"))?;
-
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        // One retry after a forced refresh in case the access token was revoked
-        // mid-window while the refresh token still works.
-        if !credentials.refresh_token.is_empty() {
-            let refreshed =
-                refresh_credentials(&credentials.auth_path, &credentials.entry_key, true).await?;
-            credentials = refreshed.0;
-            refreshed_scope = merge_refreshed_scope(refreshed_scope, refreshed.1);
-            let retry = client
-                .get(GROK_BILLING_URL)
-                .bearer_auth(&credentials.access_token)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .header(reqwest::header::USER_AGENT, "TokenBar")
-                .send()
-                .await
-                .map_err(|e| format!("Grok billing retry failed: {e}"))?;
-            let retry_status = retry.status();
-            let retry_body = retry
-                .text()
-                .await
-                .map_err(|e| format!("read Grok billing retry: {e}"))?;
-            if !retry_status.is_success() {
-                return Err(format!(
-                    "Grok billing API returned {}.",
-                    retry_status.as_u16()
-                ));
-            }
-            let account_scope =
-                refreshed_scope.unwrap_or_else(|| credentials.resolve_account_scope());
-            return map_billing(&retry_body, &credentials, now, account_scope);
-        }
-        return Err("Grok OAuth token expired or invalid. Run `grok` to log in again.".to_string());
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
     }
-    if !status.is_success() {
-        return Err(format!("Grok billing API returned {}.", status.as_u16()));
-    }
-
-    let account_scope = refreshed_scope.unwrap_or_else(|| credentials.resolve_account_scope());
-    map_billing(&body, &credentials, now, account_scope)
+    response.text().await.ok()
 }
 
-fn merge_refreshed_scope(
-    current: Option<Result<AccountScope, AccountScopeError>>,
-    next: Result<AccountScope, AccountScopeError>,
-) -> Option<Result<AccountScope, AccountScopeError>> {
-    Some(match current {
-        None => next,
-        Some(Err(first_error)) => Err(first_error),
-        Some(Ok(current_scope)) => match next {
-            Err(error) => Err(error),
-            Ok(next_scope) if next_scope == current_scope => Ok(current_scope),
-            Ok(_) => Err(AccountScopeError::MetadataConflict),
-        },
-    })
-}
-
-fn map_billing(
-    body: &str,
+/// Assemble the card's windows from the weekly credits view (required) and the
+/// monthly unified view (additive only). Success requires a weekly window —
+/// monthly-only is not enough to show the card, so a missing/unusable weekly
+/// meter errors even when monthly parsed cleanly.
+fn build_grok_data(
+    credits_body: &str,
+    monthly_body: Option<&str>,
     credentials: &GrokCredentials,
     now: DateTime<Utc>,
     account_scope: Result<AccountScope, AccountScopeError>,
-) -> Result<GrokData, String> {
-    let payload: BillingResponse =
-        serde_json::from_str(body).map_err(|e| format!("decode Grok billing response: {e}"))?;
-    let config = payload
+    cache_binding: Option<ProviderCacheBinding>,
+) -> Result<GrokData, ProviderFetchFailure> {
+    let credits: BillingResponse = serde_json::from_str(credits_body).map_err(|_| {
+        ProviderFetchFailure::terminal("Grok billing response could not be decoded.")
+    })?;
+
+    let weekly = credits
         .config
-        .ok_or_else(|| "Grok billing response missing config.".to_string())?;
+        .as_ref()
+        .and_then(|config| weekly_window(config, now))
+        .ok_or_else(|| {
+            ProviderFetchFailure::terminal("Grok billing response had no usable weekly usage.")
+        })?;
 
-    let (used_percent, included_monthly_fallback, included_invalid, legacy_invalid) =
-        match legacy_percentage_evidence(&config) {
-            LegacyPercentageEvidence::GrokBuild(percent)
-            | LegacyPercentageEvidence::Credit(percent) => (Some(percent), false, false, false),
-            LegacyPercentageEvidence::CreditZero(percent) => {
-                match included_percentage_evidence(&config) {
-                    PercentageEvidence::Valid(included) => (Some(included), true, false, false),
-                    PercentageEvidence::Disabled => (None, false, false, false),
-                    PercentageEvidence::Absent | PercentageEvidence::Invalid => {
-                        (Some(percent), false, false, false)
-                    }
+    let mut windows = vec![weekly];
+    if let Some(body) = monthly_body {
+        if let Ok(monthly) = serde_json::from_str::<BillingResponse>(body) {
+            if let Some(config) = monthly.config.as_ref() {
+                if let Some(window) = monthly_window(config, now) {
+                    windows.push(window);
                 }
             }
-            LegacyPercentageEvidence::Invalid => (None, false, false, true),
-            LegacyPercentageEvidence::Absent => match included_percentage_evidence(&config) {
-                PercentageEvidence::Valid(percent) => (Some(percent), true, false, false),
-                PercentageEvidence::Disabled | PercentageEvidence::Absent => {
-                    (None, false, false, false)
-                }
-                PercentageEvidence::Invalid => (None, false, true, false),
-            },
-        };
-    let (on_demand_recognized, extra_window) = extra_usage_window(&config, now);
-    if legacy_invalid || (included_invalid && extra_window.is_none()) {
-        return Err(
-            "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string(),
-        );
-    }
-    if used_percent.is_none() && !on_demand_recognized {
-        return Err(
-            "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string(),
-        );
-    }
-
-    let mut windows = Vec::with_capacity(2);
-    if let Some(used_percent) = used_percent {
-        let period = period_details(&config);
-        let kind = period.kind.or(
-            included_monthly_fallback.then_some(("Monthly", "billing.monthly.v1")),
-        );
-        let window = match kind {
-            Some((label, window_key)) => {
-                let mut window = UsageWindow::from_used_percent(
-                    label.to_string(),
-                    used_percent,
-                    period.end,
-                    now,
-                )
-                .with_identity(window_key, Some(window_key.to_string()));
-
-                if period.invalid_evidence {
-                    let invalid_provider = period
-                        .end
-                        .map(|end| DurationEvidence::provider(provider_reset_at(end, now), 0));
-                    window = window.with_provider_duration_evidence(now, true, invalid_provider);
-                } else if let (Some(end), Some(duration_seconds)) =
-                    (period.end, period.duration_seconds)
-                {
-                    window = window.with_provider_duration_evidence(
-                        now,
-                        true,
-                        Some(DurationEvidence::provider(
-                            provider_reset_at(end, now),
-                            duration_seconds,
-                        )),
-                    );
-                } else if period.end_was_supplied {
-                    window = window.with_observed_duration_evidence(now, true);
-                }
-                window
-            }
-            None => {
-                UsageWindow::from_used_percent("Unknown".to_string(), used_percent, period.end, now)
-                    .with_identity("row.billing.unknown.v1", None)
-            }
-        };
-        windows.push(window);
-    }
-    if let Some(window) = extra_window {
-        windows.push(window);
+        }
     }
 
     Ok(GrokData {
         identity: Some(AgentIdentity {
             email: credentials.email.clone(),
-            plan: payload
+            plan: credits
                 .subscription_tiers
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().to_string()),
         }),
         account_scope,
+        cache_binding,
         windows,
     })
 }
 
-fn legacy_percentage_evidence(config: &BillingConfig) -> LegacyPercentageEvidence {
+/// Weekly SuperGrok credits window. When the credits view reports a valid
+/// percent, use it. Empty-week 0% is allowed only when percent fields are truly
+/// *absent* and a self-contained weekly `currentPeriod` proves the meter exists
+/// (fresh reset, no usage yet). Present-but-unparsable or out-of-range percent
+/// is a failed reading — never synthesize 0% for bad data. A malformed, partial,
+/// or non-weekly period with no usable percent is "unknown", not zero.
+fn weekly_window(config: &BillingConfig, now: DateTime<Utc>) -> Option<UsageWindow> {
+    let used_percent = match weekly_used_percent(config) {
+        WeeklyPercent::Value(pct) => pct,
+        // Absent percent is a genuine 0% ONLY when a self-contained weekly
+        // `currentPeriod` proves the meter exists: the weekly type AND a
+        // positive start→end window must come from that same object, not a mix
+        // of a weekly-typed period and unrelated flat billing dates.
+        WeeklyPercent::Absent if self_contained_weekly_period(config).is_some() => 0.0,
+        WeeklyPercent::Absent | WeeklyPercent::Invalid => return None,
+    };
+    let period = period_bounds(config);
+    let mut window = UsageWindow::from_provider_used_percent(
+        "Weekly".to_string(),
+        used_percent,
+        period.end,
+        now,
+    )
+    .with_identity(
+        WEEKLY_WINDOW_KEY,
+        Some(WEEKLY_WINDOW_KEY.to_string()),
+        period.duration,
+        None,
+    );
+    if period.invalid_evidence {
+        window.unavailable("invalidEvidence");
+    }
+    Some(window)
+}
+
+/// The positive window length of a self-contained weekly `currentPeriod` — the
+/// exact weekly type plus a `start < end` pair parsed from that same object —
+/// or `None`. This is the "the weekly meter exists" signal that lets an absent
+/// percent be read as 0%; it deliberately does not consult the flat
+/// `billingPeriod*` fields, so a partial or non-weekly period cannot borrow an
+/// unrelated window to masquerade as a weekly meter.
+fn self_contained_weekly_period(config: &BillingConfig) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let period = config.current_period.as_ref()?;
+    if period.period_type.as_deref() != Some(WEEKLY_PERIOD_TYPE) {
+        return None;
+    }
+    let start = period.start.as_deref().and_then(parse_timestamp)?;
+    let end = period.end.as_deref().and_then(parse_timestamp)?;
+    (end > start).then_some((start, end))
+}
+
+/// Result of reading weekly percent fields. Distinguishes true omission (empty
+/// week may be 0%) from a present-but-bad value (must not become 0%).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WeeklyPercent {
+    Value(f64),
+    Absent,
+    Invalid,
+}
+
+/// Prefer `GrokBuild.usagePercent`; only when that field is absent (product
+/// missing or key omitted) fall through to `creditUsagePercent`. A present but
+/// unparsable/out-of-range value on the chosen field is `Invalid`, not `Absent`.
+fn weekly_used_percent(config: &BillingConfig) -> WeeklyPercent {
     if let Some(products) = config.product_usage.as_ref() {
-        let mut grok_build_percent = None;
         for product in products {
-            if !product
-                .product
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case("GrokBuild"))
-            {
-                continue;
+            let name = product.product.as_deref().unwrap_or("");
+            if name.eq_ignore_ascii_case("GrokBuild") {
+                if let Some(usage_percent) = product.usage_percent.as_deref() {
+                    return match valid_percentage(usage_percent) {
+                        Some(pct) => WeeklyPercent::Value(pct),
+                        None => WeeklyPercent::Invalid,
+                    };
+                }
+                // GrokBuild row present but usagePercent key omitted — try overall.
+                break;
             }
-            if let Some(raw) = product.usage_percent.as_deref() {
-                let Some(percent) = valid_percentage(raw) else {
-                    return LegacyPercentageEvidence::Invalid;
-                };
-                grok_build_percent.get_or_insert(percent);
-            }
-        }
-        if let Some(percent) = grok_build_percent {
-            return LegacyPercentageEvidence::GrokBuild(percent);
         }
     }
     match config.credit_usage_percent.as_deref() {
         Some(raw) => match valid_percentage(raw) {
-            Some(percent) if decimal_mantissa_is_zero(raw.get()) => {
-                LegacyPercentageEvidence::CreditZero(percent)
-            }
-            Some(percent) => LegacyPercentageEvidence::Credit(percent),
-            None => LegacyPercentageEvidence::Invalid,
+            Some(pct) => WeeklyPercent::Value(pct),
+            None => WeeklyPercent::Invalid,
         },
-        None => LegacyPercentageEvidence::Absent,
+        None => WeeklyPercent::Absent,
     }
 }
 
-fn included_percentage_evidence(config: &BillingConfig) -> PercentageEvidence {
-    let (used, monthly_limit) = match (config.used.as_deref(), config.monthly_limit.as_deref()) {
-        (None, None) => return PercentageEvidence::Absent,
-        (Some(used), Some(monthly_limit)) => (used, monthly_limit),
-        _ => return PercentageEvidence::Invalid,
-    };
-    let (Some(used), Some(monthly_limit)) =
-        (raw_amount_value(used), raw_amount_value(monthly_limit))
-    else {
-        return PercentageEvidence::Invalid;
-    };
-    if used == 0.0 && monthly_limit == 0.0 {
-        return PercentageEvidence::Disabled;
+/// Monthly included-allowance window: percent = used / monthlyLimit. Only
+/// emitted when the consumed amount is *explicitly present* and non-negative —
+/// xAI reports a genuine zero as `{ "val": 0 }` (the `history` cycles do
+/// exactly this), so an absent `used`/`usage.totalUsed` means "unknown", not
+/// zero. A negative consumption is invalid meter data and must not clamp into
+/// a healthy 0%-used window.
+fn monthly_window(config: &BillingConfig, now: DateTime<Utc>) -> Option<UsageWindow> {
+    let limit = config
+        .monthly_limit
+        .as_ref()
+        .and_then(|c| c.val)
+        .filter(|v| *v > 0)?;
+    let used = config
+        .used
+        .as_ref()
+        .and_then(|c| c.val)
+        .or_else(|| {
+            config
+                .usage
+                .as_ref()
+                .and_then(|u| u.total_used.as_ref())
+                .and_then(|c| c.val)
+        })
+        .filter(|v| *v >= 0)?;
+    let used_percent = (used as f64 / limit as f64 * 100.0).clamp(0.0, 100.0);
+    let period = period_bounds(config);
+    let mut window = UsageWindow::from_provider_used_percent(
+        "Monthly".to_string(),
+        used_percent,
+        period.end,
+        now,
+    )
+    .with_identity(
+        MONTHLY_WINDOW_KEY,
+        Some(MONTHLY_WINDOW_KEY.to_string()),
+        period.duration,
+        None,
+    );
+    if period.invalid_evidence {
+        window.unavailable("invalidEvidence");
     }
-    if used < 0.0 || monthly_limit <= 0.0 {
-        return PercentageEvidence::Invalid;
-    }
-    PercentageEvidence::Valid(((used / monthly_limit) * 100.0).min(100.0))
-}
-
-fn extra_usage_window(config: &BillingConfig, now: DateTime<Utc>) -> (bool, Option<UsageWindow>) {
-    let Some(cap) = config
-        .on_demand_cap
-        .as_deref()
-        .and_then(raw_amount_value)
-    else {
-        return (false, None);
-    };
-    if cap < 0.0 {
-        return (false, None);
-    }
-    if cap == 0.0 {
-        return (true, None);
-    }
-
-    let Some(used) = config
-        .on_demand_used
-        .as_deref()
-        .and_then(raw_amount_value)
-    else {
-        return (false, None);
-    };
-    if used < 0.0 {
-        return (false, None);
-    }
-
-    let used_percent = ((used / cap) * 100.0).min(100.0);
-    let reset = config
-        .billing_period_end
-        .as_deref()
-        .and_then(parse_timestamp_raw);
-    let window =
-        UsageWindow::from_used_percent("Extra usage".to_string(), used_percent, reset, now)
-            .with_identity("extra_usage.v1", Some("extra_usage.v1".to_string()))
-            .with_non_recurring();
-    (true, Some(window))
-}
-
-fn raw_amount_value(raw: &RawValue) -> Option<f64> {
-    let raw_value = raw.get();
-    strict_json_number(raw_value).or_else(|| {
-        let fields: std::collections::BTreeMap<String, Box<RawValue>> =
-            serde_json::from_str(raw_value).ok()?;
-        strict_json_number(fields.get("val")?.get())
-    })
-}
-
-fn strict_json_number(raw_value: &str) -> Option<f64> {
-    let value = serde_json::from_str::<f64>(raw_value).ok()?;
-    // Reject any syntactically nonzero number that underflows to signed zero.
-    if value == 0.0 && !decimal_mantissa_is_zero(raw_value) {
-        return None;
-    }
-    value.is_finite().then_some(value)
-}
-
-fn decimal_mantissa_is_zero(value: &str) -> bool {
-    let value = value.trim();
-    let unsigned = value.strip_prefix('-').unwrap_or(value);
-    let mantissa = unsigned.split(['e', 'E']).next().unwrap_or(unsigned);
-    !mantissa
-        .bytes()
-        .any(|digit| digit.is_ascii_digit() && digit != b'0')
-}
-
-fn deserialize_optional_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Box::<RawValue>::deserialize(deserializer).map(Some)
+    Some(window)
 }
 
 fn valid_percentage(raw: &RawValue) -> Option<f64> {
-    let value = raw.get();
-    serde_json::from_str::<f64>(value)
+    serde_json::from_str::<f64>(raw.get())
         .ok()
-        .filter(|pct| pct.is_finite() && decimal_percentage_in_range(value))
+        .filter(|pct| pct.is_finite() && (0.0..=100.0).contains(pct))
 }
 
-fn decimal_percentage_in_range(value: &str) -> bool {
-    let (negative, unsigned) = match value.strip_prefix('-') {
-        Some(unsigned) => (true, unsigned),
-        None => (false, value),
-    };
-    let exponent_index = unsigned.find(|character| matches!(character, 'e' | 'E'));
-    let (mantissa, exponent_text) = match exponent_index {
-        Some(index) => (&unsigned[..index], Some(&unsigned[index + 1..])),
-        None => (unsigned, None),
-    };
-    let fractional_digits = mantissa
-        .split_once('.')
-        .map_or(0, |(_, fraction)| fraction.len());
-    let digits = mantissa
-        .bytes()
-        .filter(|byte| byte.is_ascii_digit())
-        .collect::<Vec<_>>();
-    let Some(first_nonzero) = digits.iter().position(|digit| *digit != b'0') else {
-        return true;
-    };
-    if negative {
-        return false;
-    }
-    let exponent = match exponent_text {
-        Some(text) => match text.parse::<i128>() {
-            Ok(exponent) => exponent,
-            Err(_) => return text.starts_with('-'),
-        },
-        None => 0,
-    };
-
-    let significant = &digits[first_nonzero..];
-    let integer_digits = exponent
-        .saturating_add(significant.len() as i128)
-        .saturating_sub(fractional_digits as i128);
-    match integer_digits.cmp(&3) {
-        std::cmp::Ordering::Less => true,
-        std::cmp::Ordering::Greater => false,
-        std::cmp::Ordering::Equal => {
-            significant[0] == b'1' && significant[1..].iter().all(|digit| *digit == b'0')
-        }
-    }
-}
-
-struct PeriodDetails {
-    kind: Option<(&'static str, &'static str)>,
+struct PeriodMeta {
     end: Option<DateTime<Utc>>,
-    end_was_supplied: bool,
-    duration_seconds: Option<i64>,
+    duration: Option<DurationEvidence>,
     invalid_evidence: bool,
 }
 
-fn period_details(config: &BillingConfig) -> PeriodDetails {
+/// Reset instant and duration evidence from a config's period. Prefers the
+/// explicit `currentPeriod`, falling back to the flat `billingPeriodStart/End`.
+/// Identity (label / window_key) is fixed per meter and is not derived here.
+fn period_bounds(config: &BillingConfig) -> PeriodMeta {
     let period = config.current_period.as_ref();
-    let period_type = period
-        .and_then(|period| period.period_type.as_deref())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_uppercase();
-    let kind = match period_type.as_str() {
-        "WEEKLY" | "USAGE_PERIOD_TYPE_WEEKLY" => Some(("Weekly", "billing.weekly.v1")),
-        "MONTHLY" | "USAGE_PERIOD_TYPE_MONTHLY" => Some(("Monthly", "billing.monthly.v1")),
-        _ => None,
-    };
-
-    // Select each primary field independently. A present but malformed primary
-    // value on a recognized period must not be hidden by a valid billing-level
-    // fallback. Unrecognized nested periods are unrelated to the synthesized
-    // monthly included card, so only billing-level dates apply to them.
-    let (start_raw, end_raw) = if kind.is_some() {
-        (
-            period
-                .and_then(|period| period.start.as_deref())
-                .or(config.billing_period_start.as_deref()),
-            period
-                .and_then(|period| period.end.as_deref())
-                .or(config.billing_period_end.as_deref()),
-        )
-    } else {
-        (
-            config.billing_period_start.as_deref(),
-            config.billing_period_end.as_deref(),
-        )
-    };
-    let start = start_raw.and_then(parse_timestamp_raw);
-    let end = end_raw.and_then(parse_timestamp_raw);
-    let (duration_seconds, invalid_evidence) = match (start_raw, end_raw, start, end) {
-        (Some(_), Some(_), Some(start), Some(end)) if end > start => {
-            (Some((end - start).num_seconds()), false)
-        }
+    let start_raw = period
+        .and_then(|period| period.start.as_deref())
+        .or(config.billing_period_start.as_deref());
+    let end_raw = period
+        .and_then(|period| period.end.as_deref())
+        .or(config.billing_period_end.as_deref());
+    let start = start_raw.and_then(parse_timestamp);
+    let end = end_raw.and_then(parse_timestamp);
+    let (duration, invalid_evidence) = match (start_raw, end_raw, start, end) {
+        (Some(_), Some(_), Some(start), Some(end)) if end > start => (
+            Some(DurationEvidence::provider(
+                end.timestamp(),
+                (end - start).num_seconds(),
+            )),
+            false,
+        ),
         (Some(_), Some(_), Some(_), Some(_)) => (None, true),
         (Some(_), Some(_), _, _) => (None, true),
-        (Some(_), None, Some(_), _) => (None, false),
-        (Some(_), None, None, _) => (None, true),
+        (Some(_), None, _, _) => (None, false),
         (None, Some(_), _, Some(_)) => (None, false),
         (None, Some(_), _, None) => (None, true),
         _ => (None, false),
     };
-    PeriodDetails {
-        kind,
+    PeriodMeta {
         end,
-        end_was_supplied: end_raw.is_some(),
-        duration_seconds,
+        duration,
         invalid_evidence,
     }
-}
-
-fn provider_reset_at(reset: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
-    if reset > now {
-        reset.timestamp().max(now.timestamp().saturating_add(1))
-    } else {
-        reset.timestamp()
-    }
-}
-
-fn parse_timestamp_raw(value: &RawValue) -> Option<DateTime<Utc>> {
-    serde_json::from_str::<String>(value.get())
-        .ok()
-        .and_then(|value| parse_timestamp(&value))
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -631,9 +584,10 @@ async fn refresh_credentials(
     auth_path: &Path,
     entry_key: &str,
     force: bool,
-) -> Result<(GrokCredentials, Result<AccountScope, AccountScopeError>), String> {
-    let refresh = agent_account_scope::begin_refresh("grok")
-        .map_err(|_| "Grok credential refresh lock is unavailable.".to_string())?;
+) -> Result<(GrokCredentials, AccountScope, Option<ProviderCacheBinding>), ProviderFetchFailure> {
+    let refresh = agent_account_scope::begin_refresh("grok").map_err(|_| {
+        ProviderFetchFailure::terminal("Grok credential refresh lock is unavailable.")
+    })?;
     refresh_credentials_with(
         auth_path,
         entry_key,
@@ -649,11 +603,12 @@ async fn refresh_credentials(
 async fn request_refresh(
     refresh_token: String,
     client_id: String,
-) -> Result<TokenResponse, String> {
+    attempt_binding: ProviderCacheBinding,
+) -> Result<TokenResponse, ProviderFetchFailure> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("build Grok token client: {e}"))?;
+        .map_err(|_| ProviderFetchFailure::terminal("Grok refresh client could not be created."))?;
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token.as_str()),
@@ -681,21 +636,35 @@ async fn request_refresh(
         .body(form)
         .send()
         .await
-        .map_err(|e| format!("Grok token refresh failed: {e}"))?;
+        .map_err(|error| {
+            ProviderFetchFailure::from_send_error(
+                "Grok token refresh failed. Retrying automatically.",
+                Some(attempt_binding.clone()),
+                &error,
+            )
+        })?;
 
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("read Grok token refresh response: {e}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "Grok token refresh returned {}. Run `grok` to log in again.",
-            status.as_u16()
-        ));
-    }
+    let status = response.status().as_u16();
+    let body = read_response_body(status, false, || async {
+        response.text().await.map_err(|error| {
+            TransportErrorFacts::from_reqwest(&error, TransportPhase::ResponseBody)
+        })
+    })
+    .await
+    .map_err(|failure| match failure {
+        ResponseReadFailure::Transient(diagnostic) => ProviderFetchFailure::transient(
+            "Grok token refresh failed. Retrying automatically.",
+            Some(attempt_binding),
+            diagnostic,
+        ),
+        ResponseReadFailure::Terminal(_) => ProviderFetchFailure::terminal(
+            "Grok token refresh was rejected. Run `grok` to log in again.",
+        ),
+    })?;
 
-    serde_json::from_str(&body).map_err(|e| format!("decode Grok token refresh: {e}"))
+    serde_json::from_str(&body).map_err(|_| {
+        ProviderFetchFailure::terminal("Grok token refresh response could not be decoded.")
+    })
 }
 
 async fn refresh_credentials_with<R, Request, RequestFuture, Save, Checkpoint>(
@@ -706,82 +675,107 @@ async fn refresh_credentials_with<R, Request, RequestFuture, Save, Checkpoint>(
     request: Request,
     save: Save,
     mut checkpoint: Checkpoint,
-) -> Result<(GrokCredentials, Result<AccountScope, AccountScopeError>), String>
+) -> Result<(GrokCredentials, AccountScope, Option<ProviderCacheBinding>), ProviderFetchFailure>
 where
     R: RefreshScopeTransaction + ?Sized,
-    Request: FnOnce(String, String) -> RequestFuture,
-    RequestFuture: std::future::Future<Output = Result<TokenResponse, String>>,
+    Request: FnOnce(String, String, ProviderCacheBinding) -> RequestFuture,
+    RequestFuture: std::future::Future<Output = Result<TokenResponse, ProviderFetchFailure>>,
     Save: FnOnce(&GrokCredentials) -> Result<(), String>,
-    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), String>,
+    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), ProviderFetchFailure>,
 {
-    // Another TokenBar process may have refreshed while this caller waited.
-    // Reload the exact request-bearing entry only after the provider lock is held.
-    let mut credentials = load_credentials_entry_from(auth_path, Some(entry_key))?
-        .ok_or_else(|| "Grok auth entry disappeared during refresh.".to_string())?;
+    let mut credentials = load_credentials_entry_from(auth_path, Some(entry_key))
+        .map_err(|_| ProviderFetchFailure::terminal("Grok credentials could not be reloaded."))?
+        .ok_or_else(|| {
+            ProviderFetchFailure::terminal("Grok auth entry disappeared during refresh.")
+        })?;
     checkpoint(RefreshCheckpoint::Reloaded)?;
-    if !force && !credentials_needs_refresh(&credentials, Utc::now()) {
-        let scope = match credentials.scope_marker() {
-            Some(marker) => refresh.resolve_current(
-                "grok-auth-json",
-                &credentials
-                    .scope_location()
-                    .map_err(|_| "Grok auth location cannot be scoped safely.".to_string())?,
-                marker,
-            ),
-            None => Err(AccountScopeError::NoTrustedEvidence),
-        };
-        return Ok((credentials, scope));
-    }
-    if credentials.refresh_token.trim().is_empty() {
-        return Err(
-            "Grok OAuth token needs refresh but auth.json has no refresh token.".to_string(),
-        );
-    }
-    if credentials.client_id.trim().is_empty() {
-        return Err("Grok auth.json is missing oidc_client_id.".to_string());
-    }
-
+    let needs_refresh = force || credentials_needs_refresh(&credentials, Utc::now());
     let old_marker = credentials
         .scope_marker()
-        .ok_or_else(|| "Grok OAuth token needs refresh but auth.json has no refresh token.".to_string())?
-        .to_vec();
-    let refresh_token = credentials.refresh_token.trim().to_string();
-    let tokens = request(refresh_token, credentials.client_id.clone()).await?;
+        .ok_or_else(|| {
+            ProviderFetchFailure::terminal("Grok OAuth credential has no trusted refresh token.")
+        })?
+        .to_string();
+    if needs_refresh && credentials.client_id.trim().is_empty() {
+        return Err(ProviderFetchFailure::terminal(
+            "Grok auth.json is missing oidc_client_id.",
+        ));
+    }
+    let location = credentials
+        .scope_location()
+        .map_err(|_| ProviderFetchFailure::terminal("Grok auth location could not be verified."))?;
+    let pre_scope = refresh
+        .resolve_current("grok-auth-json", &location, old_marker.as_bytes())
+        .map_err(|_| {
+            ProviderFetchFailure::terminal("Grok account identity could not be verified.")
+        })?;
+    let pre_binding = ProviderCacheBinding::primary(pre_scope.clone());
+    if !needs_refresh {
+        return Ok((credentials, pre_scope, Some(pre_binding)));
+    }
+
+    let tokens = request(
+        old_marker.clone(),
+        credentials.client_id.clone(),
+        pre_binding,
+    )
+    .await?;
     checkpoint(RefreshCheckpoint::NetworkReturned)?;
-    credentials.access_token = tokens.access_token;
+    let access_token = tokens.access_token.trim();
+    if access_token.is_empty() {
+        return Err(ProviderFetchFailure::terminal(
+            "Grok token refresh response had no access token.",
+        ));
+    }
+    credentials.access_token = access_token.to_string();
     if let Some(refresh_token) = tokens
         .refresh_token
-        .map(|token| token.trim().to_string())
+        .as_deref()
+        .map(str::trim)
         .filter(|token| !token.is_empty())
     {
-        credentials.refresh_token = refresh_token;
+        credentials.refresh_token = refresh_token.to_string();
     }
     if let Some(expires_in) = tokens.expires_in {
         credentials.expires_at = Some(Utc::now() + chrono::Duration::seconds(expires_in.max(0)));
     }
     let new_marker = credentials
         .scope_marker()
-        .ok_or_else(|| "Grok refreshed credential has no usable refresh token.".to_string())?;
-    let refresh_token_rotated = new_marker != old_marker.as_slice();
-    let location = credentials
-        .scope_location()
-        .map_err(|_| "Grok auth location cannot be scoped safely.".to_string())?;
-    let scope = refresh.transfer("grok-auth-json", &location, &old_marker, new_marker);
+        .ok_or_else(|| {
+            ProviderFetchFailure::terminal(
+                "Grok refreshed credential has no trusted refresh token.",
+            )
+        })?
+        .to_string();
+    let scope = refresh
+        .transfer(
+            "grok-auth-json",
+            &location,
+            old_marker.as_bytes(),
+            new_marker.as_bytes(),
+        )
+        .map_err(|_| {
+            ProviderFetchFailure::terminal("Grok credential lineage could not be preserved.")
+        })?;
     checkpoint(RefreshCheckpoint::MetadataHandled)?;
 
-    // A rotated marker may reach disk only after its lineage transfer is durable.
-    // The refreshed access token remains usable in memory for this poll.
-    if refresh_token_rotated && scope.is_err() {
-        return Ok((credentials, scope));
-    }
-
-    // If write-back fails, the still-stored old marker resolves the same scope.
-    if let Err(error) = save(&credentials) {
-        eprintln!("tb_core_ffi: failed to persist refreshed Grok credentials: {error}");
-    }
+    let persisted = save(&credentials).is_ok();
     checkpoint(RefreshCheckpoint::CredentialsPersisted)?;
+    let cache_binding = if persisted {
+        Some(ProviderCacheBinding::primary(
+            refresh
+                .resolve_current("grok-auth-json", &location, new_marker.as_bytes())
+                .map_err(|_| {
+                    ProviderFetchFailure::terminal(
+                        "Grok account identity could not be verified after refresh.",
+                    )
+                })?,
+        ))
+    } else {
+        None
+    };
 
-    Ok((credentials, scope))
+    Ok((credentials, scope, cache_binding))
 }
 
 fn load_credentials() -> Result<Option<GrokCredentials>, String> {
@@ -790,6 +784,20 @@ fn load_credentials() -> Result<Option<GrokCredentials>, String> {
 
 fn load_credentials_from(auth_path: &Path) -> Result<Option<GrokCredentials>, String> {
     load_credentials_entry_from(auth_path, None)
+}
+
+fn credential_token(
+    entry: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match entry.get(field) {
+        None => Ok(None),
+        Some(Value::String(token)) => {
+            let token = token.trim();
+            Ok((!token.is_empty()).then(|| token.to_string()))
+        }
+        Some(_) => Err(format!("Grok auth entry {field} is not a string.")),
+    }
 }
 
 fn load_credentials_entry_from(
@@ -830,17 +838,9 @@ fn load_credentials_entry_from(
         .as_object()
         .ok_or_else(|| "Grok auth entry is not an object.".to_string())?;
 
-    let access_token = obj
-        .get("key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let refresh_token = obj
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if access_token.is_empty() && refresh_token.is_empty() {
+    let access_token = credential_token(obj, "key")?;
+    let refresh_token = credential_token(obj, "refresh_token")?;
+    if access_token.is_none() && refresh_token.is_none() {
         return Ok(None);
     }
 
@@ -864,8 +864,8 @@ fn load_credentials_entry_from(
     Ok(Some(GrokCredentials {
         auth_path: auth_path.to_path_buf(),
         entry_key,
-        access_token,
-        refresh_token,
+        access_token: access_token.unwrap_or_default(),
+        refresh_token: refresh_token.unwrap_or_default(),
         client_id,
         expires_at,
         email,
@@ -882,13 +882,7 @@ fn load_credentials_entry_from(
 /// key with no `::` separator has no client-id segment and is not the shape
 /// Grok writes, so it is rejected too (fail-closed).
 fn is_grok_auth_entry_key(key: &str) -> bool {
-    matches!(
-        key.split_once("::"),
-        Some((issuer, client_id))
-            if issuer == "https://auth.x.ai"
-                && !client_id.trim().is_empty()
-                && !client_id.contains("::")
-    )
+    matches!(key.split_once("::"), Some((issuer, _)) if issuer == "https://auth.x.ai")
 }
 
 fn client_id_from_entry_key(key: &str) -> Option<String> {
@@ -900,12 +894,27 @@ fn client_id_from_entry_key(key: &str) -> Option<String> {
 }
 
 fn save_credentials(credentials: &GrokCredentials) -> Result<(), String> {
-    let mut raw = credentials.raw_json.clone();
+    let expected_entry = credentials
+        .raw_json
+        .as_object()
+        .and_then(|map| map.get(&credentials.entry_key))
+        .ok_or_else(|| "Grok auth entry missing from the loaded credentials.".to_string())?;
+    let data = fs::read(&credentials.auth_path)
+        .map_err(|error| format!("reload Grok auth.json before saving: {error}"))?;
+    let mut raw: Value = serde_json::from_slice(&data)
+        .map_err(|error| format!("parse Grok auth.json before saving: {error}"))?;
+    let current_entry = raw
+        .as_object()
+        .and_then(|map| map.get(&credentials.entry_key))
+        .ok_or_else(|| "Grok auth entry disappeared before saving.".to_string())?;
+    if current_entry != expected_entry {
+        return Err("Grok auth entry changed during refresh.".to_string());
+    }
     let entry = raw
         .as_object_mut()
-        .and_then(|m| m.get_mut(&credentials.entry_key))
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| "Grok auth entry missing while saving.".to_string())?;
+        .and_then(|map| map.get_mut(&credentials.entry_key))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Grok auth entry is not an object while saving.".to_string())?;
 
     entry.insert(
         "key".to_string(),
@@ -983,6 +992,216 @@ fn grok_home() -> PathBuf {
 mod tests {
     use super::*;
     use crate::agent_account_scope::test_support::TestRefreshScope;
+    use crate::agent_usage::SafeTransportDiagnostic;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    /// The two real payloads captured from the live endpoint, side by side.
+    const WEEKLY_CREDITS_BODY: &str = r#"{
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-07-15T00:00:00+00:00",
+                "end": "2026-07-22T00:00:00+00:00"
+            },
+            "creditUsagePercent": 4.0,
+            "productUsage": [ { "product": "GrokBuild", "usagePercent": 4.0 } ],
+            "isUnifiedBillingUser": true,
+            "billingPeriodStart": "2026-07-15T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-22T00:00:00+00:00"
+        },
+        "subscriptionTiers": "X Premium+"
+    }"#;
+    const MONTHLY_BODY: &str = r#"{
+        "config": {
+            "monthlyLimit": { "val": 15000 },
+            "used": { "val": 216 },
+            "billingPeriodStart": "2026-07-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-08-01T00:00:00+00:00"
+        }
+    }"#;
+    /// The empty-week credits payload: period present, percent fields omitted.
+    const EMPTY_WEEK_CREDITS_BODY: &str = r#"{
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-07-15T00:00:00+00:00",
+                "end": "2026-07-22T00:00:00+00:00"
+            },
+            "onDemandCap": { "val": 0 },
+            "isUnifiedBillingUser": true,
+            "billingPeriodStart": "2026-07-15T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-22T00:00:00+00:00"
+        }
+    }"#;
+
+    fn test_credentials() -> GrokCredentials {
+        GrokCredentials {
+            auth_path: PathBuf::from("/tmp/unused"),
+            entry_key: "k".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            client_id: "c".into(),
+            expires_at: None,
+            email: Some("user@example.com".into()),
+            raw_json: Value::Object(Default::default()),
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn scope_none() -> Result<AccountScope, AccountScopeError> {
+        Err(AccountScopeError::NoTrustedEvidence)
+    }
+
+    #[test]
+    fn builds_both_weekly_and_monthly_windows() {
+        let data = build_grok_data(
+            WEEKLY_CREDITS_BODY,
+            Some(MONTHLY_BODY),
+            &test_credentials(),
+            now(),
+            scope_none(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(data.windows.len(), 2);
+        // [0] Weekly: 4% used -> 96% remaining, resets 2026-07-22.
+        assert_eq!(data.windows[0].label_for_test(), "Weekly");
+        assert_eq!(
+            data.windows[0].pace_window_key_for_test(),
+            Some("billing.weekly.v1")
+        );
+        assert!((data.windows[0].remaining_for_test() - 96.0).abs() < 0.01);
+        // [1] Monthly: 216/15000 = 1.44% used -> 98.56% remaining, resets 2026-08-01.
+        assert_eq!(data.windows[1].label_for_test(), "Monthly");
+        assert_eq!(
+            data.windows[1].pace_window_key_for_test(),
+            Some("billing.monthly.v1")
+        );
+        assert!((data.windows[1].remaining_for_test() - 98.56).abs() < 0.01);
+        assert_eq!(
+            data.identity.as_ref().and_then(|i| i.email.as_deref()),
+            Some("user@example.com")
+        );
+        assert_eq!(
+            data.identity.as_ref().and_then(|i| i.plan.as_deref()),
+            Some("X Premium+")
+        );
+    }
+
+    #[test]
+    fn empty_week_shows_zero_percent_weekly_not_error() {
+        // THE original bug: a freshly reset week with no usage yet omits the
+        // percent fields. With a self-contained weekly period still present,
+        // that is 0% used, and the card must show a Weekly window rather than
+        // erroring.
+        let data = build_grok_data(
+            EMPTY_WEEK_CREDITS_BODY,
+            None,
+            &test_credentials(),
+            now(),
+            scope_none(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(data.windows.len(), 1);
+        assert_eq!(data.windows[0].label_for_test(), "Weekly");
+        assert!((data.windows[0].remaining_for_test() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn monthly_timeout_server_error_malformed_or_invalid_still_shows_weekly() {
+        // Timeout and non-success status both collapse to None at the additive
+        // fetch boundary; malformed or invalid success bodies are ignored here.
+        for (label, monthly_body) in [
+            ("timeout", None),
+            ("server error", None),
+            ("malformed body", Some("not json")),
+            (
+                "invalid meter",
+                Some(r#"{ "config": { "monthlyLimit": { "val": 0 }, "used": { "val": 10 } } }"#),
+            ),
+        ] {
+            let data = build_grok_data(
+                WEEKLY_CREDITS_BODY,
+                monthly_body,
+                &test_credentials(),
+                now(),
+                scope_none(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(data.windows.len(), 1, "{label}");
+            assert_eq!(data.windows[0].label_for_test(), "Weekly", "{label}");
+        }
+    }
+
+    #[test]
+    fn no_usable_windows_is_an_error() {
+        // Credits view with neither a percent nor a period, and no monthly data,
+        // has nothing to show — surface an honest error, not an empty card.
+        let data = build_grok_data(
+            r#"{ "config": {} }"#,
+            None,
+            &test_credentials(),
+            now(),
+            scope_none(),
+            None,
+        );
+        assert!(data.is_err());
+    }
+
+    #[test]
+    fn monthly_only_without_weekly_is_an_error() {
+        // Monthly is additive after weekly succeeds. A credits body that cannot
+        // build a weekly window must not produce a monthly-only card.
+        let err = match build_grok_data(
+            r#"{ "config": {} }"#,
+            Some(MONTHLY_BODY),
+            &test_credentials(),
+            now(),
+            scope_none(),
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("monthly-only must not succeed"),
+        };
+        let ProviderFetchFailure::Terminal { display } = err else {
+            panic!("missing weekly meter must be terminal");
+        };
+        assert!(
+            display.contains("weekly"),
+            "error should name the missing weekly meter: {display}"
+        );
+
+        // Non-weekly period on the credits view is also insufficient, even with
+        // a clean monthly body.
+        let credits_monthly_period = r#"{
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_MONTHLY",
+                    "start": "2026-07-01T00:00:00+00:00",
+                    "end": "2026-08-01T00:00:00+00:00"
+                }
+            }
+        }"#;
+        assert!(build_grok_data(
+            credits_monthly_period,
+            Some(MONTHLY_BODY),
+            &test_credentials(),
+            now(),
+            scope_none(),
+            None,
+        )
+        .is_err());
+    }
 
     #[test]
     fn prefers_grok_build_product_percent() {
@@ -996,10 +1215,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(matches!(
-            legacy_percentage_evidence(&config),
-            LegacyPercentageEvidence::GrokBuild(percent) if (percent - 4.0).abs() < 0.01
-        ));
+        match weekly_used_percent(&config) {
+            WeeklyPercent::Value(pct) => assert!((pct - 4.0).abs() < 0.01),
+            other => panic!("expected Value(4.0), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1014,721 +1233,116 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(matches!(
-            legacy_percentage_evidence(&config),
-            LegacyPercentageEvidence::Credit(percent) if (percent - 12.5).abs() < 0.01
-        ));
+        match weekly_used_percent(&config) {
+            WeeklyPercent::Value(pct) => assert!((pct - 12.5).abs() < 0.01),
+            other => panic!("expected Value(12.5), got {other:?}"),
+        }
     }
 
     #[test]
-    fn rejects_invalid_percentages_without_falling_back() {
-        for invalid in [
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": 150.0 }] }"#,
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": -1.0 }] }"#,
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": -1e-400 }] }"#,
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": -1e-9999999999999999999999999999999999999999 }] }"#,
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": 100.0000000000000000001 }] }"#,
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": 1e400 }] }"#,
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": "NaN" }] }"#,
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokBuild", "usagePercent": null }] }"#,
-        ] {
-            let config: BillingConfig = serde_json::from_str(invalid).unwrap();
-            assert!(
-                matches!(
-                    legacy_percentage_evidence(&config),
-                    LegacyPercentageEvidence::Invalid
-                ),
-                "invalid GrokBuild usage must not fall back to overall credit usage"
-            );
-        }
+    fn rejects_invalid_usage_percentages_before_wire() {
+        let invalid_product: BillingConfig = serde_json::from_str(
+            r#"{
+                "creditUsagePercent": 12.5,
+                "productUsage": [
+                    { "product": "GrokBuild", "usagePercent": 150.0 }
+                ]
+            }"#,
+        )
+        .unwrap();
+        // Present-but-out-of-range GrokBuild fails that field; do not fall back.
+        assert_eq!(
+            weekly_used_percent(&invalid_product),
+            WeeklyPercent::Invalid
+        );
 
-        for valid in [
-            "-0.0",
-            "99.9999999999999999999",
-            "1e2",
-            "0.100e3",
-            "1e-9999999999999999999999999999999999999999",
-            "0.01e-170141183460469231731687303715884105728",
-        ] {
-            let config: BillingConfig = serde_json::from_str(&format!(
-                r#"{{ "creditUsagePercent": {valid} }}"#
+        for invalid in ["1e400", r#""NaN""#] {
+            let malformed_product: BillingConfig = serde_json::from_str(&format!(
+                r#"{{
+                    "creditUsagePercent": 12.5,
+                    "productUsage": [
+                        {{ "product": "GrokBuild", "usagePercent": {invalid} }}
+                    ]
+                }}"#
             ))
             .unwrap();
-            assert!(
-                matches!(
-                    legacy_percentage_evidence(&config),
-                    LegacyPercentageEvidence::Credit(_)
-                        | LegacyPercentageEvidence::CreditZero(_)
-                ),
-                "valid percentage {valid} must survive exact range validation"
+            assert_eq!(
+                weekly_used_percent(&malformed_product),
+                WeeklyPercent::Invalid
             );
         }
 
+        let invalid: BillingConfig = serde_json::from_str(
+            r#"{
+                "creditUsagePercent": -1.0,
+                "productUsage": [
+                    { "product": "GrokBuild", "usagePercent": 150.0 }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(weekly_used_percent(&invalid), WeeklyPercent::Invalid);
+
+        // Overall credit present but invalid, with no GrokBuild percent key.
+        let bad_credit: BillingConfig = serde_json::from_str(
+            r#"{
+                "creditUsagePercent": -1.0,
+                "productUsage": [ { "product": "GrokBuild" } ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(weekly_used_percent(&bad_credit), WeeklyPercent::Invalid);
+
+        // Truly absent percent fields.
+        let absent: BillingConfig =
+            serde_json::from_str(r#"{ "productUsage": [ { "product": "GrokChat" } ] }"#).unwrap();
+        assert_eq!(weekly_used_percent(&absent), WeeklyPercent::Absent);
+    }
+
+    #[test]
+    fn malformed_weekly_percent_with_valid_period_is_not_zero() {
+        // Invalid percent must not take the empty-week 0% path just because a
+        // self-contained weekly period is present.
         let config: BillingConfig = serde_json::from_str(
-            r#"{ "creditUsagePercent": 12.5, "productUsage": [{ "product": "GrokChat" }] }"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            legacy_percentage_evidence(&config),
-            LegacyPercentageEvidence::Credit(percent) if percent == 12.5
-        ));
-    }
-
-    fn map_test_config(config: &str) -> Result<GrokData, String> {
-        let body = format!(r#"{{ "config": {config} }}"#);
-        let credentials = GrokCredentials {
-            auth_path: PathBuf::from("/tmp/unused"),
-            entry_key: "k".into(),
-            access_token: "t".into(),
-            refresh_token: "r".into(),
-            client_id: "c".into(),
-            expires_at: None,
-            email: None,
-            raw_json: Value::Object(Default::default()),
-        };
-        let now = parse_timestamp("2026-07-11T12:00:00Z").unwrap();
-        map_billing(
-            &body,
-            &credentials,
-            now,
-            Err(AccountScopeError::NoTrustedEvidence),
-        )
-    }
-
-    #[test]
-    fn accepts_bare_and_wrapped_numeric_amounts_for_included_and_extra_usage() {
-        for (label, config, card_id) in [
-            (
-                "bare included",
-                r#"{ "used": 25.0, "monthlyLimit": 100.0 }"#,
-                "billing.monthly.v1",
-            ),
-            (
-                "wrapped included",
-                r#"{ "used": { "val": 25.0 }, "monthlyLimit": { "val": 100.0 } }"#,
-                "billing.monthly.v1",
-            ),
-            (
-                "bare extra",
-                r#"{ "onDemandUsed": 25.0, "onDemandCap": 100.0 }"#,
-                "extra_usage.v1",
-            ),
-            (
-                "wrapped extra",
-                r#"{ "onDemandUsed": { "val": 25.0 }, "onDemandCap": { "val": 100.0 } }"#,
-                "extra_usage.v1",
-            ),
-        ] {
-            let data = map_test_config(config).unwrap();
-            assert_eq!(data.windows.len(), 1, "{label}");
-            assert_eq!(data.windows[0].card_id_for_test(), card_id, "{label}");
-            assert!(
-                (data.windows[0].remaining_for_test() - 75.0).abs() < 0.01,
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_bare_numeric_strings_for_included_and_extra_usage() {
-        for (label, config) in [
-            (
-                "included used string",
-                r#"{
-                    "used": "25",
-                    "monthlyLimit": 100.0,
-                    "onDemandUsed": 0.0,
-                    "onDemandCap": 0.0
-                }"#,
-            ),
-            (
-                "included limit string",
-                r#"{
-                    "used": 25.0,
-                    "monthlyLimit": "100",
-                    "onDemandUsed": 0.0,
-                    "onDemandCap": 0.0
-                }"#,
-            ),
-            (
-                "extra string",
-                r#"{ "onDemandUsed": "25", "onDemandCap": 100.0 }"#,
-            ),
-        ] {
-            assert_eq!(
-                map_test_config(config)
-                    .err()
-                    .expect("numeric strings must not become amount evidence"),
-                "Grok billing response has no creditUsagePercent or GrokBuild usage.",
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn default_zero_credit_uses_valid_unified_included_ratio() {
-        let data = map_test_config(
-            r#"{
-                "creditUsagePercent": 0.0,
-                "used": 25.0,
-                "monthlyLimit": 100.0
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(data.windows.len(), 1);
-        assert_eq!(data.windows[0].card_id_for_test(), "billing.monthly.v1");
-        assert!((data.windows[0].remaining_for_test() - 75.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn fully_disabled_unified_billing_has_no_windows() {
-        let data = map_test_config(
-            r#"{
-                "creditUsagePercent": 0.0,
-                "used": 0.0,
-                "monthlyLimit": 0.0,
-                "onDemandUsed": 0.0,
-                "onDemandCap": 0.0
-            }"#,
-        )
-        .unwrap();
-
-        assert!(data.windows.is_empty());
-    }
-
-    #[test]
-    fn default_zero_credit_keeps_legacy_when_included_is_absent_or_invalid() {
-        for (label, config) in [
-            ("absent", r#"{ "creditUsagePercent": 0.0 }"#),
-            (
-                "invalid",
-                r#"{
-                    "creditUsagePercent": 0.0,
-                    "used": "bad",
-                    "monthlyLimit": 100.0
-                }"#,
-            ),
-        ] {
-            let data = map_test_config(config).unwrap();
-            assert_eq!(data.windows.len(), 1, "{label}");
-            assert_eq!(
-                data.windows[0].card_id_for_test(),
-                "row.billing.unknown.v1",
-                "{label}"
-            );
-            assert!((data.windows[0].remaining_for_test() - 100.0).abs() < 0.01);
-        }
-    }
-
-    #[test]
-    fn syntactically_nonzero_credit_still_beats_unified_when_float_underflows() {
-        let data = map_test_config(
-            r#"{
-                "creditUsagePercent": 1e-400,
-                "used": 25.0,
-                "monthlyLimit": 100.0
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(data.windows.len(), 1);
-        assert_eq!(data.windows[0].card_id_for_test(), "row.billing.unknown.v1");
-        assert!((data.windows[0].remaining_for_test() - 100.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn grok_build_zero_remains_higher_confidence_than_unified_included() {
-        let data = map_test_config(
-            r#"{
-                "creditUsagePercent": 50.0,
-                "productUsage": [{ "product": "GrokBuild", "usagePercent": 0.0 }],
-                "used": 25.0,
-                "monthlyLimit": 100.0
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(data.windows.len(), 1);
-        assert_eq!(data.windows[0].card_id_for_test(), "row.billing.unknown.v1");
-        assert!((data.windows[0].remaining_for_test() - 100.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn maps_unified_included_usage_with_period_semantics_before_disabled_extra() {
-        let data = map_test_config(
-            r#"{
-                "currentPeriod": { "type": "DAILY" },
-                "billingPeriodStart": "2026-07-01T00:00:00Z",
-                "billingPeriodEnd": "2026-08-01T00:00:00Z",
-                "used": { "val": 25.0 },
-                "monthlyLimit": { "val": 100.0 },
-                "onDemandUsed": { "val": 0.0 },
-                "onDemandCap": { "val": 0.0 }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(data.windows.len(), 1);
-        let monthly = &data.windows[0];
-        assert_eq!(monthly.label_for_test(), "Monthly");
-        assert_eq!(monthly.card_id_for_test(), "billing.monthly.v1");
-        assert_eq!(monthly.pace_window_key_for_test(), Some("billing.monthly.v1"));
-        assert_eq!(monthly.pace_reason_for_test(), None);
-        let wire = serde_json::to_value(monthly).unwrap();
-        assert_eq!(wire["usedPercent"], 25.0);
-        assert_eq!(wire["paceStatus"]["durationSeconds"], 2_678_400);
-
-        let weekly = map_test_config(
             r#"{
                 "currentPeriod": {
-                    "type": "WEEKLY",
-                    "start": "2026-07-07T00:00:00Z",
-                    "end": "2026-07-14T00:00:00Z"
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-15T00:00:00+00:00",
+                    "end": "2026-07-22T00:00:00+00:00"
                 },
-                "used": { "val": 25.0 },
-                "monthlyLimit": { "val": 100.0 }
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(weekly.windows[0].card_id_for_test(), "billing.weekly.v1");
-    }
-
-    #[test]
-    fn unrecognized_nested_period_is_not_attached_to_synthesized_monthly_card() {
-        let without_billing_period = map_test_config(
-            r#"{
-                "currentPeriod": {
-                    "type": "DAILY",
-                    "start": "2026-07-11T00:00:00Z",
-                    "end": "2026-07-12T00:00:00Z"
-                },
-                "used": 25.0,
-                "monthlyLimit": 100.0
-            }"#,
-        )
-        .unwrap();
-        let wire = serde_json::to_value(&without_billing_period.windows[0]).unwrap();
-        assert_eq!(wire["cardId"], "billing.monthly.v1");
-        assert!(wire.get("resetsAt").is_none());
-        assert!(wire["paceStatus"].get("durationSeconds").is_none());
-
-        let with_billing_period = map_test_config(
-            r#"{
-                "currentPeriod": {
-                    "type": "DAILY",
-                    "start": "2026-07-11T00:00:00Z",
-                    "end": "2026-07-12T00:00:00Z"
-                },
-                "billingPeriodStart": "2026-07-01T00:00:00Z",
-                "billingPeriodEnd": "2026-08-01T00:00:00Z",
-                "used": 25.0,
-                "monthlyLimit": 100.0
-            }"#,
-        )
-        .unwrap();
-        let wire = serde_json::to_value(&with_billing_period.windows[0]).unwrap();
-        assert_eq!(wire["resetsAt"], "2026-08-01T00:00:00.000Z");
-        assert_eq!(wire["paceStatus"]["durationSeconds"], 2_678_400);
-    }
-
-    #[test]
-    fn maps_unified_included_ratio_boundaries_and_clamps_over_limit() {
-        for (used, monthly_limit, expected) in [
-            (0.0, 80.0, 0.0),
-            (80.0, 80.0, 100.0),
-            (160.0, 80.0, 100.0),
-        ] {
-            let config = format!(
-                r#"{{
-                    "used": {{ "val": {used} }},
-                    "monthlyLimit": {{ "val": {monthly_limit} }}
-                }}"#
-            );
-            let data = map_test_config(&config).unwrap();
-            assert_eq!(data.windows.len(), 1);
-            assert_eq!(data.windows[0].card_id_for_test(), "billing.monthly.v1");
-            let wire = serde_json::to_value(&data.windows[0]).unwrap();
-            assert_eq!(
-                wire["usedPercent"], expected,
-                "used={used}, monthlyLimit={monthly_limit}"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_percentage_evidence_precedes_unified_included_usage() {
-        for (label, config, expected_remaining) in [
-            (
-                "GrokBuild",
-                r#"{
-                    "creditUsagePercent": 50.0,
-                    "productUsage": [{ "product": "GrokBuild", "usagePercent": 4.0 }],
-                    "used": { "val": 25.0 },
-                    "monthlyLimit": { "val": 100.0 }
-                }"#,
-                96.0,
-            ),
-            (
-                "creditUsagePercent",
-                r#"{
-                    "creditUsagePercent": 12.5,
-                    "used": { "val": 25.0 },
-                    "monthlyLimit": { "val": 100.0 }
-                }"#,
-                87.5,
-            ),
-        ] {
-            let data = map_test_config(config).unwrap();
-            assert_eq!(data.windows.len(), 1, "{label}");
-            assert_eq!(data.windows[0].card_id_for_test(), "row.billing.unknown.v1");
-            assert!(
-                (data.windows[0].remaining_for_test() - expected_remaining).abs() < 0.01,
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_explicit_legacy_percentage_does_not_fall_through_to_unified() {
-        for config in [
-            r#"{
-                "creditUsagePercent": 12.5,
-                "productUsage": [{ "product": "GrokBuild", "usagePercent": "bad" }],
-                "used": { "val": 25.0 },
-                "monthlyLimit": { "val": 100.0 }
-            }"#,
-            r#"{
-                "creditUsagePercent": "bad",
-                "used": { "val": 25.0 },
-                "monthlyLimit": { "val": 100.0 }
-            }"#,
-        ] {
-            assert_eq!(
-                map_test_config(config)
-                    .err()
-                    .expect("invalid legacy percentage must fail without extra usage"),
-                "Grok billing response has no creditUsagePercent or GrokBuild usage."
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_legacy_is_not_masked_by_disabled_on_demand() {
-        for config in [
-            r#"{
-                "creditUsagePercent": 12.5,
-                "productUsage": [{ "product": "GrokBuild", "usagePercent": "bad" }],
-                "onDemandUsed": 0.0,
-                "onDemandCap": 0.0
-            }"#,
-            r#"{
-                "creditUsagePercent": "bad",
-                "onDemandUsed": 0.0,
-                "onDemandCap": 0.0
-            }"#,
-        ] {
-            assert_eq!(
-                map_test_config(config)
-                    .err()
-                    .expect("disabled on-demand must not mask malformed legacy evidence"),
-                "Grok billing response has no creditUsagePercent or GrokBuild usage."
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_duplicate_grok_build_evidence_fails_in_any_order() {
-        for config in [
-            r#"{
+                "creditUsagePercent": 150.0,
                 "productUsage": [
-                    { "product": "GrokBuild", "usagePercent": 4.0 },
-                    { "product": "GrokBuild", "usagePercent": "bad" }
-                ],
-                "onDemandUsed": 0.0,
-                "onDemandCap": 0.0
-            }"#,
-            r#"{
-                "productUsage": [
-                    { "product": "GrokBuild", "usagePercent": "bad" },
-                    { "product": "GrokBuild", "usagePercent": 4.0 }
-                ],
-                "onDemandUsed": 0.0,
-                "onDemandCap": 0.0
-            }"#,
-        ] {
-            assert_eq!(
-                map_test_config(config)
-                    .err()
-                    .expect("any malformed matching GrokBuild evidence must fail closed"),
-                "Grok billing response has no creditUsagePercent or GrokBuild usage."
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_unified_included_evidence_is_ignored_with_valid_legacy() {
-        let data = map_test_config(
-            r#"{
-                "creditUsagePercent": 12.5,
-                "used": { "val": "bad", "futureField": { "large": 1e400 } },
-                "monthlyLimit": "bad",
-                "onDemandUsed": { "val": 0.0 },
-                "onDemandCap": { "val": 0.0 }
+                    { "product": "GrokBuild", "usagePercent": "NaN" }
+                ]
             }"#,
         )
         .unwrap();
-
-        assert_eq!(data.windows.len(), 1);
-        assert!((data.windows[0].remaining_for_test() - 87.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn invalid_unified_included_evidence_is_not_masked_by_disabled_extra() {
-        for (label, included) in [
-            ("used only", r#""used": { "val": 1.0 }"#),
-            (
-                "monthly limit only",
-                r#""monthlyLimit": { "val": 10.0 }"#,
-            ),
-            (
-                "wrong type",
-                r#""used": { "val": "1" }, "monthlyLimit": { "val": 10.0 }"#,
-            ),
-            (
-                "negative used",
-                r#""used": { "val": -1.0 }, "monthlyLimit": { "val": 10.0 }"#,
-            ),
-            (
-                "zero limit",
-                r#""used": { "val": 1.0 }, "monthlyLimit": { "val": 0.0 }"#,
-            ),
-            (
-                "overflow",
-                r#""used": { "val": 1e400 }, "monthlyLimit": { "val": 10.0 }"#,
-            ),
-            (
-                "used underflow",
-                r#""used": { "val": 1e-400 }, "monthlyLimit": { "val": 10.0 }"#,
-            ),
-            (
-                "limit underflow",
-                r#""used": { "val": 1.0 }, "monthlyLimit": { "val": 1e-400 }"#,
-            ),
-        ] {
-            let config = format!(
-                r#"{{
-                    {included},
-                    "onDemandUsed": {{ "val": 0.0 }},
-                    "onDemandCap": {{ "val": 0.0 }}
-                }}"#
-            );
-            assert_eq!(
-                map_test_config(&config)
-                    .err()
-                    .expect("invalid included evidence must beat disabled extra"),
-                "Grok billing response has no creditUsagePercent or GrokBuild usage.",
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_unified_included_evidence_allows_valid_positive_extra() {
-        let data = map_test_config(
-            r#"{
-                "used": { "val": 1.0 },
-                "onDemandUsed": { "val": 25.0 },
-                "onDemandCap": { "val": 100.0 }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(data.windows.len(), 1);
-        let extra = &data.windows[0];
-        assert_eq!(extra.card_id_for_test(), "extra_usage.v1");
-        assert_eq!(extra.pace_window_key_for_test(), Some("extra_usage.v1"));
-        assert_eq!(extra.pace_reason_for_test(), Some("nonRecurring"));
-        assert!((extra.remaining_for_test() - 75.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn maps_old_and_on_demand_windows_without_changing_precedence() {
-        let data = map_test_config(
-            r#"{
-                "currentPeriod": {
-                    "type": "WEEKLY",
-                    "start": "2026-07-07T00:00:00Z",
-                    "end": "2026-07-14T00:00:00Z"
-                },
-                "billingPeriodEnd": "2026-08-01T00:00:00Z",
-                "creditUsagePercent": 50.0,
-                "productUsage": [
-                    { "product": "GrokChat", "usagePercent": 10.0 },
-                    { "product": "GrokBuild", "usagePercent": 4.0 }
-                ],
-                "onDemandUsed": { "val": 25.0 },
-                "onDemandCap": { "val": 100.0 }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(data.windows.len(), 2);
-        assert_eq!(data.windows[0].card_id_for_test(), "billing.weekly.v1");
-        assert!((data.windows[0].remaining_for_test() - 96.0).abs() < 0.01);
-
-        let extra = &data.windows[1];
-        assert_eq!(extra.label_for_test(), "Extra usage");
-        assert_eq!(extra.card_id_for_test(), "extra_usage.v1");
-        assert_eq!(extra.pace_window_key_for_test(), Some("extra_usage.v1"));
-        assert_eq!(extra.pace_reason_for_test(), Some("nonRecurring"));
-        let wire = serde_json::to_value(extra).unwrap();
-        assert_eq!(wire["usedPercent"], 25.0);
-        assert_eq!(wire["resetsAt"], "2026-08-01T00:00:00.000Z");
-    }
-
-    #[test]
-    fn maps_on_demand_ratio_boundaries_and_clamps_over_cap() {
-        for (used, cap, expected) in [
-            (0.0, 80.0, 0.0),
-            (80.0, 80.0, 100.0),
-            (160.0, 80.0, 100.0),
-        ] {
-            let config = format!(
-                r#"{{
-                    "onDemandUsed": {{ "val": {used} }},
-                    "onDemandCap": {{ "val": {cap} }}
-                }}"#
-            );
-            let data = map_test_config(&config).unwrap();
-            assert_eq!(data.windows.len(), 1);
-            let wire = serde_json::to_value(&data.windows[0]).unwrap();
-            assert_eq!(wire["usedPercent"], expected, "used={used}, cap={cap}");
-            assert_eq!(data.windows[0].pace_reason_for_test(), Some("nonRecurring"));
-        }
-    }
-
-    #[test]
-    fn zero_on_demand_cap_is_recognized_but_disabled() {
-        for cap in ["0", "0.0", "-0.0", "0e10", "-0.0e-10"] {
-            let config = format!(
-                r#"{{
-                    "onDemandUsed": {{ "val": 5.0 }},
-                    "onDemandCap": {{ "val": {cap} }}
-                }}"#
-            );
-            let data = map_test_config(&config).unwrap();
-            assert!(data.windows.is_empty(), "cap={cap}");
-        }
-    }
-
-    #[test]
-    fn zero_on_demand_cap_does_not_require_used() {
-        for (label, config) in [
-            ("missing used", r#"{ "onDemandCap": 0.0 }"#),
-            (
-                "null used",
-                r#"{ "onDemandUsed": null, "onDemandCap": { "val": 0.0 } }"#,
-            ),
-            (
-                "fully disabled",
-                r#"{
-                    "creditUsagePercent": 0.0,
-                    "used": 0.0,
-                    "monthlyLimit": 0.0,
-                    "onDemandCap": 0.0
-                }"#,
-            ),
-        ] {
-            let data = map_test_config(config).unwrap();
-            assert!(data.windows.is_empty(), "{label}");
-        }
-    }
-
-    #[test]
-    fn invalid_on_demand_pairs_do_not_create_quota() {
-        for (label, config) in [
-            (
-                "negative used",
-                r#"{ "onDemandUsed": { "val": -1.0 }, "onDemandCap": { "val": 10.0 } }"#,
-            ),
-            (
-                "negative cap",
-                r#"{ "onDemandUsed": { "val": 1.0 }, "onDemandCap": { "val": -10.0 } }"#,
-            ),
-            (
-                "negative used underflow",
-                r#"{ "onDemandUsed": { "val": -1e-400 }, "onDemandCap": { "val": 10.0 } }"#,
-            ),
-            (
-                "positive used underflow",
-                r#"{ "onDemandUsed": { "val": 1e-400 }, "onDemandCap": { "val": 10.0 } }"#,
-            ),
-            (
-                "positive cap underflow",
-                r#"{ "onDemandUsed": { "val": 1.0 }, "onDemandCap": { "val": 1e-400 } }"#,
-            ),
-            ("missing used", r#"{ "onDemandCap": { "val": 10.0 } }"#),
-            ("missing cap", r#"{ "onDemandUsed": { "val": 1.0 } }"#),
-            (
-                "wrong outer type",
-                r#"{ "onDemandUsed": [1.0], "onDemandCap": { "val": 10.0 } }"#,
-            ),
-            (
-                "wrong val type",
-                r#"{ "onDemandUsed": { "val": "1" }, "onDemandCap": { "val": 10.0 } }"#,
-            ),
-            (
-                "overflow used",
-                r#"{ "onDemandUsed": { "val": 1e400 }, "onDemandCap": { "val": 10.0 } }"#,
-            ),
-            (
-                "overflow cap",
-                r#"{ "onDemandUsed": { "val": 1.0 }, "onDemandCap": { "val": 1e400 } }"#,
-            ),
-        ] {
-            assert_eq!(
-                map_test_config(config)
-                    .err()
-                    .expect("invalid on-demand pair must fail"),
-                "Grok billing response has no creditUsagePercent or GrokBuild usage.",
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_on_demand_does_not_break_old_subscription() {
-        let data = map_test_config(
-            r#"{
-                "creditUsagePercent": 12.5,
-                "onDemandUsed": {
-                    "val": "not-a-number",
-                    "futureField": { "large": 1e400 }
-                },
-                "onDemandCap": { "val": 100.0, "futureField": true }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(data.windows.len(), 1);
-        assert!((data.windows[0].remaining_for_test() - 87.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn prepaid_balance_only_does_not_create_quota() {
-        assert_eq!(
-            map_test_config(
-                r#"{
-                    "prepaidBalance": { "val": 500.0 },
-                    "topUpMethod": "manual",
-                    "isUnifiedBillingUser": true
-                }"#,
-            )
-            .err()
-            .expect("prepaid balance alone must fail"),
-            "Grok billing response has no creditUsagePercent or GrokBuild usage."
+        assert_eq!(weekly_used_percent(&config), WeeklyPercent::Invalid);
+        assert!(
+            weekly_window(&config, now()).is_none(),
+            "invalid percent must not synthesize Weekly 0%"
         );
+
+        // Card-level: invalid weekly + valid monthly still errors (weekly required).
+        let credits = r#"{
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-15T00:00:00+00:00",
+                    "end": "2026-07-22T00:00:00+00:00"
+                },
+                "creditUsagePercent": -5.0
+            }
+        }"#;
+        assert!(build_grok_data(
+            credits,
+            Some(MONTHLY_BODY),
+            &test_credentials(),
+            now(),
+            scope_none(),
+            None,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1748,30 +1362,19 @@ mod tests {
             },
             "subscriptionTiers": "X Premium+"
         }"#;
-        let credentials = GrokCredentials {
-            auth_path: PathBuf::from("/tmp/unused"),
-            entry_key: "k".into(),
-            access_token: "t".into(),
-            refresh_token: "r".into(),
-            client_id: "c".into(),
-            expires_at: None,
-            email: Some("user@example.com".into()),
-            raw_json: Value::Object(Default::default()),
-        };
+        let credentials = test_credentials();
+        assert_eq!(credentials.scope_marker(), Some("r"));
         let now = DateTime::parse_from_rfc3339("2026-07-11T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let data = map_billing(
-            body,
-            &credentials,
-            now,
-            Err(AccountScopeError::NoTrustedEvidence),
-        )
-        .unwrap();
+        let data = build_grok_data(body, None, &credentials, now, scope_none(), None).unwrap();
         assert_eq!(data.windows.len(), 1);
         assert_eq!(data.windows[0].label_for_test(), "Weekly");
-        assert_eq!(data.windows[0].card_id_for_test(), "billing.weekly.v1");
-        assert_eq!(data.windows[0].pace_window_key_for_test(), Some("billing.weekly.v1"));
+        assert_eq!(data.windows[0].window_minutes_for_test(), Some(10_080));
+        assert_eq!(
+            data.windows[0].pace_window_key_for_test(),
+            Some("billing.weekly.v1")
+        );
         assert!((data.windows[0].remaining_for_test() - 96.0).abs() < 0.01);
         assert_eq!(
             data.identity.as_ref().and_then(|i| i.email.as_deref()),
@@ -1784,219 +1387,242 @@ mod tests {
     }
 
     #[test]
-    fn stage4_period_evidence_routes_and_fails_closed() {
-        let credentials = GrokCredentials {
-            auth_path: PathBuf::from("/tmp/unused"),
-            entry_key: "k".into(),
-            access_token: "t".into(),
-            refresh_token: "r".into(),
-            client_id: "c".into(),
-            expires_at: None,
-            email: None,
-            raw_json: Value::Object(Default::default()),
-        };
-        let map = |config: Value, now: DateTime<Utc>| {
-            let body = serde_json::json!({ "config": config }).to_string();
-            map_billing(
-                &body,
-                &credentials,
-                now,
-                Err(AccountScopeError::NoTrustedEvidence),
-            )
-            .unwrap()
-            .windows
-            .into_iter()
-            .next()
-            .unwrap()
-        };
+    fn weekly_window_rejects_malformed_or_nonweekly_period_without_percent() {
+        // An empty period object is not a "meter exists" signal — no dates, no
+        // type => unknown, not 0%.
+        let config: BillingConfig = serde_json::from_str(r#"{ "currentPeriod": {} }"#).unwrap();
+        assert!(weekly_window(&config, now()).is_none());
 
-        let exact_weekly = map(
-            serde_json::json!({
-                "currentPeriod": {
-                    "type": "usage_period_type_weekly",
-                    "start": "2026-07-03T00:00:00.900Z",
-                    "end": "2026-07-10T00:00:00.900Z"
-                },
-                "creditUsagePercent": 12.0
-            }),
-            parse_timestamp("2026-07-10T00:00:00.100Z").unwrap(),
-        );
-        let weekly_wire = serde_json::to_value(&exact_weekly).unwrap();
-        assert_eq!(weekly_wire["cardId"], "billing.weekly.v1");
-        assert_eq!(weekly_wire["paceStatus"]["windowKey"], "billing.weekly.v1");
-        assert_eq!(weekly_wire["paceStatus"]["state"], "learningHistory");
-        assert_eq!(weekly_wire["paceStatus"]["durationSeconds"], 604_800);
-        assert_eq!(weekly_wire["paceStatus"]["durationSource"], "provider");
-        assert_eq!(weekly_wire["resetsAt"], "2026-07-10T00:00:00.900Z");
+        // A weekly type but no parseable start/end window is still unknown.
+        let config: BillingConfig =
+            serde_json::from_str(r#"{ "currentPeriod": { "type": "USAGE_PERIOD_TYPE_WEEKLY" } }"#)
+                .unwrap();
+        assert!(weekly_window(&config, now()).is_none());
 
-        for (start, end, days) in [
-            ("2023-02-01T00:00:00Z", "2023-03-01T00:00:00Z", 28),
-            ("2024-02-01T00:00:00Z", "2024-03-01T00:00:00Z", 29),
-            ("2024-04-01T00:00:00Z", "2024-05-01T00:00:00Z", 30),
-            ("2024-05-01T00:00:00Z", "2024-06-01T00:00:00Z", 31),
-        ] {
-            let window = map(
-                serde_json::json!({
-                    "currentPeriod": {
-                        "type": "USAGE_PERIOD_TYPE_MONTHLY",
-                        "start": start,
-                        "end": end
-                    },
-                    "creditUsagePercent": 12.0
-                }),
-                parse_timestamp(start).unwrap() + chrono::Duration::days(1),
+        // An explicit MONTHLY period with no percent must NOT be fabricated into
+        // a Weekly 0%.
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_MONTHLY",
+                    "start": "2026-07-01T00:00:00+00:00",
+                    "end": "2026-08-01T00:00:00+00:00"
+                } }"#,
+        )
+        .unwrap();
+        assert!(weekly_window(&config, now()).is_none());
+
+        // MIXED SOURCE: a weekly-typed period with NO dates of its own must not
+        // borrow the flat billingPeriod* window to masquerade as a meter.
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "currentPeriod": { "type": "USAGE_PERIOD_TYPE_WEEKLY" },
+                 "billingPeriodStart": "2026-07-15T00:00:00+00:00",
+                 "billingPeriodEnd": "2026-07-22T00:00:00+00:00" }"#,
+        )
+        .unwrap();
+        assert!(weekly_window(&config, now()).is_none());
+
+        // SUBSTRING: types that merely CONTAIN "WEEKLY" must be rejected by the
+        // exact-match gate, even with a valid self-contained window.
+        for ty in ["USAGE_PERIOD_TYPE_BIWEEKLY", "USAGE_PERIOD_TYPE_NOT_WEEKLY"] {
+            let config: BillingConfig = serde_json::from_str(&format!(
+                r#"{{ "currentPeriod": {{
+                        "type": "{ty}",
+                        "start": "2026-07-15T00:00:00+00:00",
+                        "end": "2026-07-22T00:00:00+00:00"
+                    }} }}"#
+            ))
+            .unwrap();
+            assert!(
+                weekly_window(&config, now()).is_none(),
+                "type {ty} must not be accepted as weekly"
             );
-            let wire = serde_json::to_value(&window).unwrap();
-            assert_eq!(wire["cardId"], "billing.monthly.v1");
-            assert_eq!(wire["paceStatus"]["windowKey"], "billing.monthly.v1");
-            assert_eq!(wire["paceStatus"]["durationSeconds"], days * 86_400);
-            assert_eq!(wire["paceStatus"]["durationSource"], "provider");
-            assert_eq!(wire["paceStatus"]["state"], "learningHistory");
         }
-
-        let billing_fallback = map(
-            serde_json::json!({
-                "currentPeriod": { "type": "WEEKLY" },
-                "billingPeriodStart": "2026-07-03T00:00:00Z",
-                "billingPeriodEnd": "2026-07-10T00:00:00Z",
-                "creditUsagePercent": 12.0
-            }),
-            parse_timestamp("2026-07-05T00:00:00Z").unwrap(),
-        );
-        let fallback_wire = serde_json::to_value(&billing_fallback).unwrap();
-        assert_eq!(fallback_wire["paceStatus"]["durationSeconds"], 604_800);
-        assert_eq!(fallback_wire["paceStatus"]["durationSource"], "provider");
-
-        let end_only = map(
-            serde_json::json!({
-                "currentPeriod": {
-                    "type": "weekly",
-                    "end": "2026-07-24T00:00:00Z"
-                },
-                "creditUsagePercent": 12.0
-            }),
-            parse_timestamp("2026-07-17T00:00:00Z").unwrap(),
-        );
-        let end_only_wire = serde_json::to_value(&end_only).unwrap();
-        assert_eq!(end_only_wire["paceStatus"]["state"], "learningDuration");
-        assert_eq!(end_only_wire["paceStatus"]["durationSource"], "observed");
-        assert!(end_only_wire["paceStatus"].get("durationSeconds").is_none());
-
-        let unknown = map(
-            serde_json::json!({
-                "currentPeriod": {
-                    "type": "DAILY",
-                    "start": "2026-07-17T00:00:00Z",
-                    "end": "2026-07-18T00:00:00Z"
-                },
-                "creditUsagePercent": 12.0
-            }),
-            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
-        );
-        let unknown_wire = serde_json::to_value(&unknown).unwrap();
-        assert_eq!(unknown_wire["cardId"], "row.billing.unknown.v1");
-        assert_eq!(unknown_wire["paceStatus"]["state"], "unavailable");
-        assert_eq!(unknown_wire["paceStatus"]["reason"], "windowIdentity");
-        assert!(unknown_wire["paceStatus"].get("windowKey").is_none());
-        assert!(unknown_wire["paceStatus"].get("durationSeconds").is_none());
-        for unknown_type in ["NOT_WEEKLY", "BIWEEKLY", "MONTHLYISH"] {
-            let window = map(
-                serde_json::json!({
-                    "currentPeriod": {
-                        "type": unknown_type,
-                        "start": "2026-07-17T00:00:00Z",
-                        "end": "2026-07-18T00:00:00Z"
-                    },
-                    "creditUsagePercent": 12.0
-                }),
-                parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
-            );
-            let wire = serde_json::to_value(&window).unwrap();
-            assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
-        }
-
-        for (start, end) in [
-            ("2026-07-18T00:00:00Z", "2026-07-17T00:00:00Z"),
-            ("not-a-date", "2026-07-24T00:00:00Z"),
-            ("2026-07-17T00:00:00Z", "not-a-date"),
-        ] {
-            let window = map(
-                serde_json::json!({
-                    "currentPeriod": {
-                        "type": "weekly",
-                        "start": start,
-                        "end": end
-                    },
-                    "billingPeriodStart": "2026-07-17T00:00:00Z",
-                    "billingPeriodEnd": "2026-07-24T00:00:00Z",
-                    "creditUsagePercent": 12.0
-                }),
-                parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
-            );
-            let wire = serde_json::to_value(&window).unwrap();
-            assert_eq!(wire["paceStatus"]["windowKey"], "billing.weekly.v1");
-            assert_eq!(wire["paceStatus"]["state"], "unavailable");
-            assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence");
-            assert!(wire["paceStatus"].get("durationSeconds").is_none());
-        }
-
-        let null_primary = map(
-            serde_json::json!({
-                "currentPeriod": {
-                    "type": "weekly",
-                    "start": null,
-                    "end": "2026-07-24T00:00:00Z"
-                },
-                "billingPeriodStart": "2026-07-17T00:00:00Z",
-                "creditUsagePercent": 12.0
-            }),
-            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
-        );
-        let null_wire = serde_json::to_value(&null_primary).unwrap();
-        assert_eq!(null_wire["paceStatus"]["state"], "unavailable");
-        assert_eq!(null_wire["paceStatus"]["reason"], "invalidEvidence");
-
-        let malformed_start_only = map(
-            serde_json::json!({
-                "currentPeriod": {
-                    "type": "weekly",
-                    "start": "not-a-date"
-                },
-                "creditUsagePercent": 12.0
-            }),
-            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
-        );
-        let malformed_start_wire = serde_json::to_value(&malformed_start_only).unwrap();
-        assert_eq!(malformed_start_wire["paceStatus"]["state"], "unavailable");
-        assert_eq!(
-            malformed_start_wire["paceStatus"]["reason"],
-            "invalidEvidence"
-        );
-
-        let valid_start_only = map(
-            serde_json::json!({
-                "currentPeriod": {
-                    "type": "weekly",
-                    "start": "2026-07-17T00:00:00Z"
-                },
-                "creditUsagePercent": 12.0
-            }),
-            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
-        );
-        let start_only_wire = serde_json::to_value(&valid_start_only).unwrap();
-        assert_eq!(start_only_wire["paceStatus"]["state"], "unavailable");
-        assert_eq!(start_only_wire["paceStatus"]["reason"], "missingReset");
     }
 
     #[test]
-    fn unknown_period_has_no_history_identity() {
+    fn monthly_window_prefers_flat_used_over_usage_total() {
         let config: BillingConfig = serde_json::from_str(
-            r#"{ "currentPeriod": { "type": "USAGE_PERIOD_TYPE_OTHER" } }"#,
+            r#"{ "monthlyLimit": { "val": 200 }, "used": { "val": 50 },
+                 "usage": { "totalUsed": { "val": 999 } } }"#,
         )
         .unwrap();
-        let period = period_details(&config);
-        assert!(period.kind.is_none());
-        assert!(period.end.is_none());
+        // 50/200 = 25% used -> 75% remaining.
+        assert!((monthly_window(&config, now()).unwrap().remaining_for_test() - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn monthly_window_falls_back_to_usage_total_used() {
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "monthlyLimit": { "val": 400 }, "usage": { "totalUsed": { "val": 100 } } }"#,
+        )
+        .unwrap();
+        assert!((monthly_window(&config, now()).unwrap().remaining_for_test() - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn monthly_window_explicit_zero_used_is_zero_percent() {
+        // xAI reports a genuine zero as `{ "val": 0 }` -> 0% used, 100% remaining.
+        let config: BillingConfig =
+            serde_json::from_str(r#"{ "monthlyLimit": { "val": 15000 }, "used": { "val": 0 } }"#)
+                .unwrap();
+        assert!(
+            (monthly_window(&config, now()).unwrap().remaining_for_test() - 100.0).abs() < 0.01
+        );
+    }
+
+    #[test]
+    fn monthly_window_without_explicit_used_is_none() {
+        // A limit with NO explicit `used`/`totalUsed` is "unknown", not zero:
+        // it must not fabricate a misleading 100%-remaining across the FFI.
+        let config: BillingConfig =
+            serde_json::from_str(r#"{ "monthlyLimit": { "val": 15000 } }"#).unwrap();
+        assert!(monthly_window(&config, now()).is_none());
+        // An empty `{ }` wrapper (val absent) is treated the same as absent.
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "monthlyLimit": { "val": 15000 }, "used": {}, "usage": {} }"#,
+        )
+        .unwrap();
+        assert!(monthly_window(&config, now()).is_none());
+    }
+
+    #[test]
+    fn monthly_window_rejects_negative_used() {
+        // Negative consumption is invalid meter data — do not clamp to 0% healthy.
+        let config: BillingConfig =
+            serde_json::from_str(r#"{ "monthlyLimit": { "val": 15000 }, "used": { "val": -1 } }"#)
+                .unwrap();
+        assert!(monthly_window(&config, now()).is_none());
+
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "monthlyLimit": { "val": 15000 }, "usage": { "totalUsed": { "val": -10 } } }"#,
+        )
+        .unwrap();
+        assert!(monthly_window(&config, now()).is_none());
+
+        // Flat used wins over usage.totalUsed; a negative flat used still rejects
+        // even when nested totalUsed is non-negative.
+        let config: BillingConfig = serde_json::from_str(
+            r#"{ "monthlyLimit": { "val": 200 }, "used": { "val": -5 },
+                 "usage": { "totalUsed": { "val": 50 } } }"#,
+        )
+        .unwrap();
+        assert!(monthly_window(&config, now()).is_none());
+    }
+
+    #[test]
+    fn stage4_grok_period_routes_are_exact_and_fail_closed() {
+        // Monthly duration routes: fixed Monthly identity from the monthly
+        // meter, with provider duration from the period bounds.
+        for (label, start, end, days) in [
+            ("28-day", "2023-02-01T00:00:00Z", "2023-03-01T00:00:00Z", 28),
+            ("29-day", "2024-02-01T00:00:00Z", "2024-03-01T00:00:00Z", 29),
+            ("30-day", "2024-04-01T00:00:00Z", "2024-05-01T00:00:00Z", 30),
+            ("31-day", "2024-05-01T00:00:00Z", "2024-06-01T00:00:00Z", 31),
+        ] {
+            let now = parse_timestamp(start).unwrap() + chrono::Duration::days(1);
+            let config: BillingConfig = serde_json::from_value(serde_json::json!({
+                "monthlyLimit": { "val": 100 },
+                "used": { "val": 12 },
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_MONTHLY",
+                    "start": start,
+                    "end": end
+                }
+            }))
+            .unwrap();
+            let window = monthly_window(&config, now).unwrap();
+            let wire = serde_json::to_value(&window).unwrap();
+            assert_eq!(wire["cardId"], "billing.monthly.v1", "{label}");
+            assert_eq!(
+                wire["paceStatus"]["windowKey"], "billing.monthly.v1",
+                "{label}"
+            );
+            assert_eq!(
+                wire["paceStatus"]["durationSeconds"],
+                days * 86_400,
+                "{label}"
+            );
+            assert_eq!(wire["paceStatus"]["durationSource"], "provider", "{label}");
+            assert_eq!(wire["paceStatus"]["state"], "learningHistory", "{label}");
+        }
+
+        // Weekly end-only (no start): still Weekly identity, learningDuration.
+        let end_only: BillingConfig = serde_json::from_value(serde_json::json!({
+            "creditUsagePercent": 12.0,
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2026-07-24T00:00:00Z"
+            }
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(
+            weekly_window(&end_only, parse_timestamp("2026-07-17T00:00:00Z").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["cardId"], "billing.weekly.v1");
+        assert_eq!(wire["paceStatus"]["windowKey"], "billing.weekly.v1");
+        assert_eq!(wire["paceStatus"]["state"], "learningDuration");
+        assert!(wire["resetsAt"].as_str().is_some());
+        assert!(wire["paceStatus"].get("durationSeconds").is_none());
+        assert!(wire["paceStatus"].get("durationSource").is_none());
+
+        // Credits meter is always Weekly identity even when currentPeriod type
+        // is not weekly — the endpoint, not the period substring, owns the key.
+        // Duration evidence still flows from the period bounds when valid.
+        let daily_typed: BillingConfig = serde_json::from_value(serde_json::json!({
+            "creditUsagePercent": 12.0,
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_DAILY",
+                "start": "2026-07-17T00:00:00Z",
+                "end": "2026-07-18T00:00:00Z"
+            }
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(
+            weekly_window(
+                &daily_typed,
+                parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["cardId"], "billing.weekly.v1");
+        assert_eq!(wire["paceStatus"]["windowKey"], "billing.weekly.v1");
+        assert_eq!(wire["paceStatus"]["durationSeconds"], 86_400);
+        assert_eq!(wire["paceStatus"]["durationSource"], "provider");
+
+        for (label, start, end) in [
+            (
+                "contradictory",
+                "2026-07-18T00:00:00Z",
+                "2026-07-17T00:00:00Z",
+            ),
+            ("malformed-start", "not-a-date", "2026-07-24T00:00:00Z"),
+            ("malformed-end", "2026-07-17T00:00:00Z", "not-a-date"),
+        ] {
+            let config: BillingConfig = serde_json::from_value(serde_json::json!({
+                "creditUsagePercent": 12.0,
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": start,
+                    "end": end
+                }
+            }))
+            .unwrap();
+            let window =
+                weekly_window(&config, parse_timestamp("2026-07-17T12:00:00Z").unwrap()).unwrap();
+            let wire = serde_json::to_value(&window).unwrap();
+            assert_eq!(
+                wire["paceStatus"]["windowKey"], "billing.weekly.v1",
+                "{label}"
+            );
+            assert_eq!(wire["paceStatus"]["state"], "unavailable", "{label}");
+            assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence", "{label}");
+            assert!(
+                wire["paceStatus"].get("durationSeconds").is_none(),
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -2066,7 +1692,9 @@ mod tests {
                 }
             }"#,
         );
-        let creds = load_credentials_from(&path).unwrap().expect("auth.x.ai entry loads");
+        let creds = load_credentials_from(&path)
+            .unwrap()
+            .expect("auth.x.ai entry loads");
         assert!(creds.entry_key.contains("auth.x.ai"));
         assert_eq!(creds.access_token, "FAKE-XAI-ACCESS");
         assert_eq!(creds.refresh_token, "FAKE-XAI-REFRESH");
@@ -2092,11 +1720,8 @@ mod tests {
         assert!(!is_grok_auth_entry_key(
             "https://auth.x.ai.evil.example::deadbeef"
         ));
-        // A foreign issuer, blank/nested client id, and shapeless key are rejected.
+        // A foreign issuer and a shapeless key are rejected.
         assert!(!is_grok_auth_entry_key("https://auth.openai.com::deadbeef"));
-        assert!(!is_grok_auth_entry_key("https://auth.x.ai::"));
-        assert!(!is_grok_auth_entry_key("https://auth.x.ai::   "));
-        assert!(!is_grok_auth_entry_key("https://auth.x.ai::client::extra"));
         assert!(!is_grok_auth_entry_key("https://auth.x.ai"));
     }
 
@@ -2144,7 +1769,10 @@ mod tests {
         let creds = load_credentials_from(&path)
             .unwrap()
             .expect("genuine auth.x.ai entry loads");
-        assert_eq!(creds.entry_key, "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828");
+        assert_eq!(
+            creds.entry_key,
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+        );
         assert_eq!(creds.access_token, "FAKE-XAI-ACCESS");
         assert_eq!(creds.refresh_token, "FAKE-XAI-REFRESH");
         assert_ne!(creds.access_token, "FAKE-LOOKALIKE-ACCESS");
@@ -2173,6 +1801,50 @@ mod tests {
             result.is_err(),
             "save_credentials must surface a failure as Err so the caller can log it"
         );
+    }
+
+    #[test]
+    fn save_credentials_preserves_concurrent_login_and_sibling_changes() {
+        let original = serde_json::json!({
+            (TEST_ENTRY): {
+                "key": "account-a-access",
+                "refresh_token": "account-a-refresh",
+                "oidc_client_id": "fixture-client"
+            },
+            "sibling": { "value": "before" }
+        });
+        let (dir, path) = temp_auth_json("save-race", &original.to_string());
+        let mut credentials = load_credentials_from(&path).unwrap().unwrap();
+        credentials.access_token = "account-a-refreshed-access".to_string();
+        credentials.refresh_token = "account-a-refreshed-refresh".to_string();
+
+        let switched = serde_json::json!({
+            (TEST_ENTRY): {
+                "key": "account-b-access",
+                "refresh_token": "account-b-refresh",
+                "oidc_client_id": "fixture-client"
+            },
+            "sibling": { "value": "after-switch" }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&switched).unwrap()).unwrap();
+        assert!(save_credentials(&credentials).is_err());
+        let after_switch: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after_switch, switched, "account B must not be overwritten");
+
+        let sibling_changed = serde_json::json!({
+            (TEST_ENTRY): original.get(TEST_ENTRY).unwrap().clone(),
+            "sibling": { "value": "after-sibling-update" }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&sibling_changed).unwrap()).unwrap();
+        save_credentials(&credentials).unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["sibling"], sibling_changed["sibling"]);
+        assert_eq!(saved[TEST_ENTRY]["key"], "account-a-refreshed-access");
+        assert_eq!(
+            saved[TEST_ENTRY]["refresh_token"],
+            "account-a-refreshed-refresh"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -2205,120 +1877,185 @@ mod tests {
 
     const TEST_ENTRY: &str = "https://auth.x.ai::fixture-client";
 
-    struct RecordingRefreshScope<'a> {
-        inner: &'a TestRefreshScope,
-        calls: std::cell::RefCell<Vec<(String, String, Vec<u8>, Option<Vec<u8>>)>>,
-    }
-
-    impl<'a> RecordingRefreshScope<'a> {
-        fn new(inner: &'a TestRefreshScope) -> Self {
-            Self {
-                inner,
-                calls: std::cell::RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl RefreshScopeTransaction for RecordingRefreshScope<'_> {
-        fn resolve_current(
-            &self,
-            semantic_source: &str,
-            canonical_location: &str,
-            marker: &[u8],
-        ) -> Result<AccountScope, AccountScopeError> {
-            self.calls.borrow_mut().push((
-                semantic_source.to_string(),
-                canonical_location.to_string(),
-                marker.to_vec(),
-                None,
-            ));
-            self.inner
-                .resolve_current(semantic_source, canonical_location, marker)
-        }
-
-        fn transfer(
-            &self,
-            semantic_source: &str,
-            canonical_location: &str,
-            old_marker: &[u8],
-            new_marker: &[u8],
-        ) -> Result<AccountScope, AccountScopeError> {
-            self.calls.borrow_mut().push((
-                semantic_source.to_string(),
-                canonical_location.to_string(),
-                old_marker.to_vec(),
-                Some(new_marker.to_vec()),
-            ));
-            self.inner
-                .transfer(semantic_source, canonical_location, old_marker, new_marker)
-        }
-    }
-
-    fn write_test_auth(path: &Path, access_token: &str, refresh_token: &str, expires_at: &str) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+    #[test]
+    fn matching_entry_logout_remains_absent() {
+        let (dir, path) = temp_auth_json(
+            "logout",
+            &serde_json::json!({
                 (TEST_ENTRY): {
-                    "key": access_token,
-                    "refresh_token": refresh_token,
-                    "oidc_client_id": "fixture-client",
-                    "expires_at": expires_at,
-                    "email": "grok-sensitive@example.com"
-                },
-                "https://auth.x.ai::sibling-client": {
-                    "key": "sibling-access",
-                    "refresh_token": "sibling-refresh",
-                    "oidc_client_id": "sibling-client",
-                    "expires_at": "1970-01-01T00:00:00Z"
+                    "key": "  ",
+                    "refresh_token": "\t\n"
                 }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+            })
+            .to_string(),
+        );
+        assert!(load_credentials_from(&path).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matching_entry_tokens_are_trimmed_at_load() {
+        let (dir, path) = temp_auth_json(
+            "trimmed",
+            &serde_json::json!({
+                (TEST_ENTRY): {
+                    "key": "  access-token\n",
+                    "refresh_token": "\trefresh-token  "
+                }
+            })
+            .to_string(),
+        );
+        let credentials = load_credentials_from(&path).unwrap().unwrap();
+        assert_eq!(credentials.access_token, "access-token");
+        assert_eq!(credentials.refresh_token, "refresh-token");
+        assert_eq!(credentials.scope_marker(), Some("refresh-token"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matching_entry_non_string_tokens_are_terminal() {
+        for (tag, field, value) in [
+            ("object-access", "key", serde_json::json!({ "token": "x" })),
+            ("number-access", "key", serde_json::json!(42)),
+            (
+                "object-refresh",
+                "refresh_token",
+                serde_json::json!({ "token": "x" }),
+            ),
+            ("number-refresh", "refresh_token", serde_json::json!(42)),
+        ] {
+            let mut auth = serde_json::json!({
+                (TEST_ENTRY): {
+                    "key": "access-token",
+                    "refresh_token": "refresh-token"
+                }
+            });
+            auth.get_mut(TEST_ENTRY)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            let (dir, path) = temp_auth_json(tag, &auth.to_string());
+            assert!(
+                load_credentials_from(&path).is_err(),
+                "{tag} must be terminal, not absent"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn whitespace_refresh_token_is_not_a_scope_marker() {
+        let mut credentials = test_credentials();
+        credentials.refresh_token = " \t\r\n ".to_string();
+        assert_eq!(credentials.scope_marker(), None);
+        assert!(matches!(
+            credentials.resolve_account_scope(),
+            Err(AccountScopeError::NoTrustedEvidence)
+        ));
     }
 
     fn checkpoint_at(
         target: Option<RefreshCheckpoint>,
-    ) -> impl FnMut(RefreshCheckpoint) -> Result<(), String> {
+    ) -> impl FnMut(RefreshCheckpoint) -> Result<(), ProviderFetchFailure> {
         move |checkpoint| {
             if Some(checkpoint) == target {
-                Err("injected crash".to_string())
+                Err(ProviderFetchFailure::terminal("injected crash"))
             } else {
                 Ok(())
             }
         }
     }
 
+    #[tokio::test]
+    async fn whitespace_refresh_evidence_never_binds_across_access_tokens() {
+        let scope = TestRefreshScope::new("grok", "grok-whitespace-binding");
+        scope
+            .resolve_current("fixture", "baseline", b"baseline-marker")
+            .unwrap();
+        let before = scope.metadata_bytes();
+        let path = scope.root().join("grok/auth.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for access_token in ["account-a-access", "account-b-access"] {
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    (TEST_ENTRY): {
+                        "key": access_token,
+                        "refresh_token": " \t ",
+                        "oidc_client_id": "fixture-client",
+                        "expires_at": "1970-01-01T00:00:00Z"
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let loaded = load_credentials_entry_from(&path, Some(TEST_ENTRY))
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.access_token, access_token);
+            assert_eq!(loaded.scope_marker(), None);
+
+            let send_count = Arc::new(AtomicUsize::new(0));
+            let request_send_count = Arc::clone(&send_count);
+            let failure = refresh_credentials_with(
+                &path,
+                TEST_ENTRY,
+                true,
+                &scope,
+                move |_, _, _| async move {
+                    request_send_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(TokenResponse {
+                        access_token: "unexpected-access".to_string(),
+                        refresh_token: Some("unexpected-refresh".to_string()),
+                        expires_in: Some(3_600),
+                    })
+                },
+                save_credentials,
+                checkpoint_at(None),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
+            assert_eq!(send_count.load(Ordering::SeqCst), 0);
+            assert_eq!(scope.metadata_bytes(), before);
+        }
+        scope.cleanup();
+    }
+
     async fn grok_test_response(
         refresh_token: String,
         client_id: String,
-    ) -> Result<TokenResponse, String> {
+        _attempt_binding: ProviderCacheBinding,
+    ) -> Result<TokenResponse, ProviderFetchFailure> {
         assert_eq!(refresh_token, "grok-old-refresh");
         assert_eq!(client_id, "fixture-client");
         Ok(TokenResponse {
             access_token: "grok-new-access".to_string(),
-            refresh_token: Some("  grok-new-refresh\n".to_string()),
+            refresh_token: Some("grok-new-refresh".to_string()),
             expires_in: Some(3_600),
         })
-    }
-
-    async fn unexpected_refresh_request(
-        _refresh_token: String,
-        _client_id: String,
-    ) -> Result<TokenResponse, String> {
-        panic!("refresh network request must be skipped")
     }
 
     fn setup_refresh(tag: &str) -> (TestRefreshScope, PathBuf, AccountScope, Vec<u8>, String) {
         let scope = TestRefreshScope::new("grok", tag);
         let path = scope.root().join("grok/auth.json");
-        write_test_auth(
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
             &path,
-            "grok-old-access",
-            "grok-old-refresh",
-            "1970-01-01T00:00:00Z",
-        );
+            serde_json::to_vec_pretty(&serde_json::json!({
+                (TEST_ENTRY): {
+                    "key": "grok-old-access",
+                    "refresh_token": "grok-old-refresh",
+                    "oidc_client_id": "fixture-client",
+                    "expires_at": "1970-01-01T00:00:00Z"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let credentials = load_credentials_entry_from(&path, Some(TEST_ENTRY))
             .unwrap()
             .unwrap();
@@ -2327,7 +2064,7 @@ mod tests {
             .resolve_current(
                 "grok-auth-json",
                 &location,
-                credentials.scope_marker().unwrap(),
+                credentials.scope_marker().unwrap().as_bytes(),
             )
             .unwrap();
         let metadata = scope.metadata_bytes();
@@ -2338,7 +2075,8 @@ mod tests {
         scope: &TestRefreshScope,
         path: &Path,
         crash: Option<RefreshCheckpoint>,
-    ) -> Result<(GrokCredentials, Result<AccountScope, AccountScopeError>), String> {
+    ) -> Result<(GrokCredentials, AccountScope, Option<ProviderCacheBinding>), ProviderFetchFailure>
+    {
         refresh_credentials_with(
             path,
             TEST_ENTRY,
@@ -2351,211 +2089,15 @@ mod tests {
         .await
     }
 
-    fn stored_credentials(path: &Path) -> GrokCredentials {
+    fn stored_refresh_token(path: &Path) -> String {
         load_credentials_entry_from(path, Some(TEST_ENTRY))
             .unwrap()
             .unwrap()
-    }
-
-    #[test]
-    fn account_scope_uses_refresh_marker_and_canonical_entry_domain_without_leaks() {
-        let scope = TestRefreshScope::new("grok", "grok-scope-domain");
-        let path = scope.root().join("grok/auth.json");
-        write_test_auth(
-            &path,
-            "grok-sensitive-access-token",
-            "grok-sensitive-refresh-token",
-            "1970-01-01T00:00:00Z",
-        );
-        let credentials = load_credentials_entry_from(&path, Some(TEST_ENTRY))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            credentials.scope_marker(),
-            Some(b"grok-sensitive-refresh-token".as_slice())
-        );
-        let mut spaced_credentials = credentials.clone();
-        spaced_credentials.refresh_token = "  grok-sensitive-refresh-token\n".to_string();
-        assert_eq!(
-            spaced_credentials.scope_marker(),
-            Some(b"grok-sensitive-refresh-token".as_slice())
-        );
-        let location = credentials.scope_location().unwrap();
-        assert_eq!(
-            location,
-            agent_account_scope::canonical_file_location(&path, Some(TEST_ENTRY)).unwrap()
-        );
-
-        let account_scope = scope
-            .resolve_current(
-                "grok-auth-json",
-                &location,
-                credentials.scope_marker().unwrap(),
-            )
-            .unwrap();
-        let spaced_scope = scope
-            .resolve_current(
-                "grok-auth-json",
-                &location,
-                spaced_credentials.scope_marker().unwrap(),
-            )
-            .unwrap();
-        assert_eq!(spaced_scope, account_scope);
-        let metadata = String::from_utf8_lossy(&scope.metadata_bytes()).into_owned();
-        for raw in [
-            "grok-sensitive@example.com",
-            "grok-sensitive-access-token",
-            "grok-sensitive-refresh-token",
-            TEST_ENTRY,
-            location.as_str(),
-        ] {
-            assert!(!metadata.contains(raw), "metadata leaked {raw}");
-            assert!(!account_scope.as_str().contains(raw), "scope leaked {raw}");
-        }
-        let now = DateTime::parse_from_rfc3339("2026-07-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let error = match map_billing(
-            "not-json",
-            &credentials,
-            now,
-            Err(AccountScopeError::NoTrustedEvidence),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("invalid billing payload must fail"),
-        };
-        for raw in [
-            "grok-sensitive@example.com",
-            "grok-sensitive-access-token",
-            "grok-sensitive-refresh-token",
-        ] {
-            assert!(!error.contains(raw), "error leaked {raw}");
-        }
-
-        let mut blank_marker = credentials;
-        blank_marker.refresh_token = " \t\n ".to_string();
-        assert!(blank_marker.scope_marker().is_none());
-        scope.cleanup();
+            .refresh_token
     }
 
     #[tokio::test]
-    async fn refresh_reloads_exact_entry_skips_redundant_network_and_honors_force() {
-        let scope = TestRefreshScope::new("grok", "grok-refresh-reload");
-        let path = scope.root().join("grok/auth.json");
-        write_test_auth(
-            &path,
-            "stale-access",
-            "stale-refresh",
-            "1970-01-01T00:00:00Z",
-        );
-        let stale = load_credentials_entry_from(&path, Some(TEST_ENTRY))
-            .unwrap()
-            .unwrap();
-        write_test_auth(
-            &path,
-            "grok-old-access",
-            "grok-old-refresh",
-            "2099-01-01T00:00:00Z",
-        );
-        let current = load_credentials_entry_from(&path, Some(TEST_ENTRY))
-            .unwrap()
-            .unwrap();
-        assert_ne!(stale.refresh_token, current.refresh_token);
-        let location = current.scope_location().unwrap();
-        let expected_scope = scope
-            .resolve_current("grok-auth-json", &location, current.scope_marker().unwrap())
-            .unwrap();
-        let before = scope.metadata_bytes();
-        let recording = RecordingRefreshScope::new(&scope);
-        let mut checkpoints = Vec::new();
-        let (reloaded, scope_outcome) = refresh_credentials_with(
-            &path,
-            TEST_ENTRY,
-            false,
-            &recording,
-            unexpected_refresh_request,
-            |_| panic!("credential save must be skipped"),
-            |checkpoint| {
-                checkpoints.push(checkpoint);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(reloaded.access_token, "grok-old-access");
-        assert_eq!(reloaded.refresh_token, "grok-old-refresh");
-        assert_eq!(scope_outcome, Ok(expected_scope.clone()));
-        assert_eq!(checkpoints, vec![RefreshCheckpoint::Reloaded]);
-        assert_eq!(scope.metadata_bytes(), before);
-        assert_eq!(
-            recording.calls.borrow().as_slice(),
-            &[(
-                "grok-auth-json".to_string(),
-                location.clone(),
-                b"grok-old-refresh".to_vec(),
-                None,
-            )]
-        );
-        recording.calls.borrow_mut().clear();
-
-        let mut forced_checkpoints = Vec::new();
-        let (forced, forced_scope) = refresh_credentials_with(
-            &path,
-            TEST_ENTRY,
-            true,
-            &recording,
-            grok_test_response,
-            save_credentials,
-            |checkpoint| {
-                forced_checkpoints.push(checkpoint);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(forced.access_token, "grok-new-access");
-        assert_eq!(forced.refresh_token, "grok-new-refresh");
-        assert_eq!(forced_scope, Ok(expected_scope));
-        assert_eq!(
-            forced_checkpoints,
-            vec![
-                RefreshCheckpoint::Reloaded,
-                RefreshCheckpoint::NetworkReturned,
-                RefreshCheckpoint::MetadataHandled,
-                RefreshCheckpoint::CredentialsPersisted,
-            ]
-        );
-        assert_eq!(
-            recording.calls.borrow().as_slice(),
-            &[(
-                "grok-auth-json".to_string(),
-                location.clone(),
-                b"grok-old-refresh".to_vec(),
-                Some(b"grok-new-refresh".to_vec()),
-            )]
-        );
-        assert_eq!(stored_credentials(&path).refresh_token, "grok-new-refresh");
-        recording.calls.borrow_mut().clear();
-
-        write_test_auth(&path, "usable-access", " \t\n ", "2099-01-01T00:00:00Z");
-        let (_, blank_scope) = refresh_credentials_with(
-            &path,
-            TEST_ENTRY,
-            false,
-            &recording,
-            unexpected_refresh_request,
-            |_| panic!("credential save must be skipped"),
-            |_| Ok(()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(blank_scope, Err(AccountScopeError::NoTrustedEvidence));
-        assert!(recording.calls.borrow().is_empty());
-        scope.cleanup();
-    }
-
-    #[tokio::test]
-    async fn refresh_transfer_gate_save_failure_and_crash_boundaries_are_fail_closed() {
+    async fn refresh_crash_boundaries_and_scope_gate_use_production_sequence() {
         for boundary in [
             RefreshCheckpoint::Reloaded,
             RefreshCheckpoint::NetworkReturned,
@@ -2563,15 +2105,15 @@ mod tests {
             RefreshCheckpoint::CredentialsPersisted,
         ] {
             let (scope, path, old_scope, before, location) = setup_refresh("grok-crash");
+            let failure = run_refresh(&scope, &path, Some(boundary))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                failure,
+                ProviderFetchFailure::Terminal { ref display } if display == "injected crash"
+            ));
             assert_eq!(
-                run_refresh(&scope, &path, Some(boundary))
-                    .await
-                    .unwrap_err(),
-                "injected crash"
-            );
-            let stored = stored_credentials(&path);
-            assert_eq!(
-                stored.refresh_token,
+                stored_refresh_token(&path),
                 if boundary == RefreshCheckpoint::CredentialsPersisted {
                     "grok-new-refresh"
                 } else {
@@ -2603,56 +2145,25 @@ mod tests {
 
         let (scope, path, old_scope, before, location) = setup_refresh("grok-metadata-fail");
         scope.fail_metadata_save();
-        let (refreshed, scope_outcome) = run_refresh(&scope, &path, None).await.unwrap();
-        assert_eq!(refreshed.access_token, "grok-new-access");
-        assert_eq!(refreshed.refresh_token, "grok-new-refresh");
-        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        let failure = run_refresh(&scope, &path, None).await.unwrap_err();
+        assert!(matches!(failure, ProviderFetchFailure::Terminal { .. }));
         assert_eq!(scope.metadata_bytes(), before);
-        let stored = stored_credentials(&path);
-        assert_eq!(stored.access_token, "grok-old-access");
-        assert_eq!(stored.refresh_token, "grok-old-refresh");
+        let persisted_marker = stored_refresh_token(&path);
+        assert_eq!(persisted_marker, "grok-old-refresh");
         assert_eq!(
             scope
-                .resolve_current("grok-auth-json", &location, stored.refresh_token.as_bytes())
+                .resolve_current("grok-auth-json", &location, persisted_marker.as_bytes())
                 .unwrap(),
             old_scope
         );
         scope.cleanup();
 
-        let (scope, path, old_scope, _, location) = setup_refresh("grok-save-fail");
-        let mut checkpoints = Vec::new();
-        let (refreshed, scope_outcome) = refresh_credentials_with(
-            &path,
-            TEST_ENTRY,
-            true,
-            &scope,
-            grok_test_response,
-            |_| Err("injected save failure".to_string()),
-            |checkpoint| {
-                checkpoints.push(checkpoint);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(refreshed.access_token, "grok-new-access");
-        assert_eq!(refreshed.refresh_token, "grok-new-refresh");
-        assert_eq!(scope_outcome, Ok(old_scope.clone()));
-        assert_eq!(stored_credentials(&path).refresh_token, "grok-old-refresh");
+        let (scope, path, old_scope, _, location) = setup_refresh("grok-success");
+        let (_, scope_outcome, cache_binding) = run_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(scope_outcome, old_scope);
         assert_eq!(
-            checkpoints,
-            vec![
-                RefreshCheckpoint::Reloaded,
-                RefreshCheckpoint::NetworkReturned,
-                RefreshCheckpoint::MetadataHandled,
-                RefreshCheckpoint::CredentialsPersisted,
-            ]
-        );
-        assert_eq!(
-            scope
-                .resolve_current("grok-auth-json", &location, b"grok-old-refresh")
-                .unwrap(),
-            old_scope
+            cache_binding,
+            Some(ProviderCacheBinding::primary(old_scope.clone()))
         );
         assert_eq!(
             scope
@@ -2663,55 +2174,75 @@ mod tests {
         scope.cleanup();
     }
 
-    #[test]
-    fn refreshed_scope_merge_is_sticky_and_conflicts_fail_closed() {
-        let (scope, path, scope_a, _, location) = setup_refresh("grok-scope-merge");
-        let scope_b = scope
-            .resolve_current("grok-auth-json", &location, b"different-refresh")
-            .unwrap();
-        assert_ne!(scope_a, scope_b);
-        let credentials = load_credentials_entry_from(&path, Some(TEST_ENTRY))
-            .unwrap()
-            .unwrap();
-        let now = DateTime::parse_from_rfc3339("2026-07-11T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let body = r#"{
-            "config": {
-                "creditUsagePercent": 4.0
-            }
-        }"#;
+    #[tokio::test]
+    async fn refresh_persistence_failure_keeps_usage_fresh_but_uncacheable() {
+        let (scope, path, old_scope, _, location) = setup_refresh("grok-save-fail");
+        let (refreshed, scope_outcome, cache_binding) = refresh_credentials_with(
+            &path,
+            TEST_ENTRY,
+            true,
+            &scope,
+            grok_test_response,
+            |_| Err("injected save failure".to_string()),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
 
-        let cases = vec![
-            (
-                "error then success keeps first failure",
-                vec![Err(AccountScopeError::MetadataWrite), Ok(scope_a.clone())],
-                Err(AccountScopeError::MetadataWrite),
-            ),
-            (
-                "success then error stays failed",
-                vec![Ok(scope_a.clone()), Err(AccountScopeError::MetadataRead)],
-                Err(AccountScopeError::MetadataRead),
-            ),
-            (
-                "matching successes keep scope",
-                vec![Ok(scope_a.clone()), Ok(scope_a.clone())],
-                Ok(scope_a.clone()),
-            ),
-            (
-                "different successes fail closed",
-                vec![Ok(scope_a.clone()), Ok(scope_b)],
-                Err(AccountScopeError::MetadataConflict),
-            ),
-        ];
+        assert_eq!(refreshed.access_token, "grok-new-access");
+        assert_eq!(scope_outcome, old_scope);
+        assert_eq!(cache_binding, None);
+        assert_eq!(stored_refresh_token(&path), "grok-old-refresh");
+        assert_eq!(
+            scope
+                .resolve_current("grok-auth-json", &location, b"grok-new-refresh")
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+    }
 
-        for (label, outcomes, expected) in cases {
-            let merged = outcomes
-                .into_iter()
-                .fold(None, merge_refreshed_scope)
-                .unwrap();
-            let mapped = map_billing(body, &credentials, now, merged).unwrap();
-            assert_eq!(mapped.account_scope, expected, "{label}");
+    #[tokio::test]
+    async fn refresh_transient_uses_lock_reloaded_binding_not_outer_binding() {
+        let (scope, path, inner_scope, _, location) = setup_refresh("grok-lock-binding");
+        let outer_scope = scope
+            .resolve_current("grok-auth-json", &location, b"outer-refresh-a")
+            .unwrap();
+        assert_ne!(outer_scope, inner_scope);
+        let expected = ProviderCacheBinding::primary(inner_scope);
+        let request_expected = expected.clone();
+
+        let failure = refresh_credentials_with(
+            &path,
+            TEST_ENTRY,
+            true,
+            &scope,
+            move |refresh_token, client_id, attempt_binding| async move {
+                assert_eq!(refresh_token, "grok-old-refresh");
+                assert_eq!(client_id, "fixture-client");
+                assert_eq!(attempt_binding, request_expected);
+                Err(ProviderFetchFailure::transient(
+                    "Grok token refresh failed. Retrying automatically.",
+                    Some(attempt_binding),
+                    SafeTransportDiagnostic::from_facts(TransportErrorFacts::synthetic(
+                        true,
+                        false,
+                        TransportPhase::Request,
+                        None,
+                    )),
+                ))
+            },
+            save_credentials,
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+
+        match failure {
+            ProviderFetchFailure::Transient {
+                attempt_binding, ..
+            } => assert_eq!(attempt_binding, Some(expected)),
+            ProviderFetchFailure::Terminal { .. } => panic!("timeout must remain transient"),
         }
         scope.cleanup();
     }
