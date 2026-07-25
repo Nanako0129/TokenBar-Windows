@@ -170,7 +170,9 @@ public sealed class TrayFeed : IDisposable
                     _lastFullRefresh = DateTimeOffset.Now;
                 }
 
-                var quota = TryFetch(() => TbCore.AgentUsage(), "tray quota");
+                var quota = TryFetch(
+                    () => AgentUsageFetchCoordinator.Shared.FetchAsync().GetAwaiter().GetResult(),
+                    "tray quota");
                 _ = _dispatcher.TryEnqueue(() =>
                 {
                     if (_disposed)

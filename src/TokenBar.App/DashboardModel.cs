@@ -519,7 +519,9 @@ public sealed class DashboardModel
         {
             try
             {
-                var quota = TryFetch(() => TbCore.AgentUsage(), "agentUsage");
+                var quota = TryFetch(
+                    () => AgentUsageFetchCoordinator.Shared.FetchAsync().GetAwaiter().GetResult(),
+                    "agentUsage");
                 if (quota is not null)
                 {
                     _latestQuota = quota;
