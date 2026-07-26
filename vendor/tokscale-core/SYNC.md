@@ -3,17 +3,18 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`dcef36ed25129462b5f646f156add3c7f8a8f2dd`](https://github.com/Nanako0129/TokenBar/commit/dcef36ed25129462b5f646f156add3c7f8a8f2dd) |
+| Copied commit | [`56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5`](https://github.com/Nanako0129/TokenBar/commit/56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5) |
 | Copied on | 2026-07-27 |
 
-`dcef36ed25129462b5f646f156add3c7f8a8f2dd` is the exact Native PR #102
+`56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5` is the exact Native PR #102
 candidate tested before the Native merge. It is an unmerged pre-merge source,
 not the final merged Native SHA. In addition to the Antigravity discovery,
 format-2 writer lifecycle, malformed Copilot Desktop entry, and fixture
 portability corrections, this candidate retries Codex credential replacement,
 merges duplicate Copilot span endpoints, advances only the Copilot parser
-identity to 4, and makes shipping cache fixtures use the scanner-returned path
-spelling. It aligns with the canonical M19-B checkpoint. A second exact sync to
+identity to 4, and makes shipping cache fixtures build fingerprints, seed, and
+query with the scanner-returned path spelling. It aligns with the canonical
+M19-B checkpoint. A second exact sync to
 the actual Native merge SHA is required after merge authorization.
 
 The active cache is format 2 at `source-message-cache-v2`; format-1 shards are
@@ -36,7 +37,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=dcef36ed25129462b5f646f156add3c7f8a8f2dd
+source_commit=56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT

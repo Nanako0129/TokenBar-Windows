@@ -13,7 +13,7 @@ diagnostic only because serializer formatting and line endings differ by host.
 | Surface | Canonical source |
 |---|---|
 | Legacy `usage-pace.json` and `format.json` | macOS commit `2ed256ee` |
-| Provider quota pace v3 | exact tested Native PR #102 candidate `dcef36ed25129462b5f646f156add3c7f8a8f2dd` (not the final merged SHA) |
+| Provider quota pace v3 | exact tested Native PR #102 candidate `56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5` (not the final merged SHA) |
 
 Run the Swift side from a clean archive or worktree at the exact tested
 provider-v3 candidate SHA. This is Native PR #102's unmerged candidate, not the
@@ -167,7 +167,7 @@ projection differences.
 ## Running
 
 Set `TOKENBAR_MAC_CANONICAL` to a clean archive or worktree at the exact tested
-Native PR #102 candidate `dcef36ed25129462b5f646f156add3c7f8a8f2dd`. This is
+Native PR #102 candidate `56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5`. This is
 not the final merged SHA.
 
 `Package.swift` links `target/release/libtb_core_ffi.a` by a path relative to
@@ -177,7 +177,7 @@ unrelated checkout's `target/` artifact.
 
 ```bash
 export TOKENBAR_WINDOWS="$(pwd)"
-export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-dcef36ed"
+export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-56a6e3a7"
 
 (
   cd "$TOKENBAR_MAC_CANONICAL"
