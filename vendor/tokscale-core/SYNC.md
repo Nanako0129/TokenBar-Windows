@@ -3,14 +3,16 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`f820b06fd99a53cada8495338bd7d58898525a7b`](https://github.com/Nanako0129/TokenBar/commit/f820b06fd99a53cada8495338bd7d58898525a7b) |
+| Copied commit | [`7abd205ab692950c9b4574a14da72f01733d1935`](https://github.com/Nanako0129/TokenBar/commit/7abd205ab692950c9b4574a14da72f01733d1935) |
 | Copied on | 2026-07-26 |
 
-`f820b06fd99a53cada8495338bd7d58898525a7b` is the M19-B0 / PR #99 merged
-secure-storage canonical source. The active cache is format 2 at
-`source-message-cache-v2`; format-1 shards are stale and rebuild cold under
-format 2. The legacy schema-32 `source-message-cache.bin` remains unread,
-unmodified, and undeleted.
+`7abd205ab692950c9b4574a14da72f01733d1935` is the PR #101 merged M19-B1
+review-fix canonical source layered on the M19-B0 secure-storage baseline. It
+uses the shared atomic replacement commit point for Antigravity credential
+refreshes and treats empty or whitespace-only `KIMI_CODE_HOME` values as unset.
+The active cache is format 2 at `source-message-cache-v2`; format-1 shards are
+stale and rebuild cold under format 2. The legacy schema-32
+`source-message-cache.bin` remains unread, unmodified, and undeleted.
 
 The Windows shared-tree local patch table is **none**. The former 11 commits
 from `e5200634` through `aec5bd88` are marked recovered in the Native vendor
@@ -26,7 +28,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=f820b06fd99a53cada8495338bd7d58898525a7b
+source_commit=7abd205ab692950c9b4574a14da72f01733d1935
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT

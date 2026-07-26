@@ -941,7 +941,10 @@ fn scan_all_clients_with_env_strategy_inner(
 
     if enabled.contains(&ClientId::Kimi) {
         let kimi_code_home = if use_env_roots {
-            std::env::var("KIMI_CODE_HOME").unwrap_or_else(|_| format!("{}/.kimi-code", home_dir))
+            std::env::var("KIMI_CODE_HOME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("{}/.kimi-code", home_dir))
         } else {
             format!("{}/.kimi-code", home_dir)
         };
@@ -3548,6 +3551,19 @@ mod tests {
             with_env.get(ClientId::Kimi),
             std::slice::from_ref(&override_wire)
         );
+
+        for empty_override in ["", "   "] {
+            env.set("KIMI_CODE_HOME", empty_override);
+            let fallback = scan_all_clients_with_env_strategy(
+                home.to_str().unwrap(),
+                &["kimi".to_string()],
+                true,
+            );
+            assert_eq!(
+                fallback.get(ClientId::Kimi),
+                std::slice::from_ref(&default_wire)
+            );
+        }
 
         let without_env = scan_all_clients_with_env_strategy(
             home.to_str().unwrap(),

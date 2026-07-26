@@ -945,7 +945,9 @@ fn write_creds_atomic(path: &Path, creds: &Value) -> std::io::Result<()> {
         return Err(error);
     }
     #[cfg(unix)]
-    let _ = std::fs::File::open(directory).and_then(|file| file.sync_all());
+    {
+        let _ = std::fs::File::open(directory).and_then(|dir| dir.sync_all());
+    }
     Ok(())
 }
 
