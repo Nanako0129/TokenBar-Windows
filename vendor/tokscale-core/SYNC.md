@@ -3,16 +3,18 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0`](https://github.com/Nanako0129/TokenBar/commit/c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0) |
+| Copied commit | [`dcef36ed25129462b5f646f156add3c7f8a8f2dd`](https://github.com/Nanako0129/TokenBar/commit/dcef36ed25129462b5f646f156add3c7f8a8f2dd) |
 | Copied on | 2026-07-27 |
 
-`c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0` is the exact Native PR #102
+`dcef36ed25129462b5f646f156add3c7f8a8f2dd` is the exact Native PR #102
 candidate tested before the Native merge. It is an unmerged pre-merge source,
-not the final merged Native SHA. The candidate includes the Antigravity Windows
-discovery correction, format-2 writer handle lifecycle, Copilot malformed-entry
-fail-open behavior, and cc-mirror/Kiro fixture portability. It aligns with the
-canonical M19-B checkpoint. A second exact sync to the actual Native merge SHA
-is required after merge authorization.
+not the final merged Native SHA. In addition to the Antigravity discovery,
+format-2 writer lifecycle, malformed Copilot Desktop entry, and fixture
+portability corrections, this candidate retries Codex credential replacement,
+merges duplicate Copilot span endpoints, advances only the Copilot parser
+identity to 4, and makes shipping cache fixtures use the scanner-returned path
+spelling. It aligns with the canonical M19-B checkpoint. A second exact sync to
+the actual Native merge SHA is required after merge authorization.
 
 The active cache is format 2 at `source-message-cache-v2`; format-1 shards are
 stale and rebuild cold under format 2. The legacy schema-32 monolith
@@ -34,7 +36,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0
+source_commit=dcef36ed25129462b5f646f156add3c7f8a8f2dd
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT
