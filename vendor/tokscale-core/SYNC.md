@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`4bde99d777c4e1ef33b2ed881fb79b754ec494ff`](https://github.com/Nanako0129/TokenBar/commit/4bde99d777c4e1ef33b2ed881fb79b754ec494ff) |
-| Copied on | 2026-07-26 |
+| Copied commit | [`c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0`](https://github.com/Nanako0129/TokenBar/commit/c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0) |
+| Copied on | 2026-07-27 |
 
-`4bde99d777c4e1ef33b2ed881fb79b754ec494ff` is the exact Native PR #102
+`c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0` is the exact Native PR #102
 candidate tested before the Native merge. It is an unmerged pre-merge source,
 not the final merged Native SHA. The candidate includes the Antigravity Windows
 discovery correction, format-2 writer handle lifecycle, Copilot malformed-entry
@@ -34,7 +34,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=4bde99d777c4e1ef33b2ed881fb79b754ec494ff
+source_commit=c1ba62b5bd4215119ae6b2055bcb0a2c80af55a0
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT
