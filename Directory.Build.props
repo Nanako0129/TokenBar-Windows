@@ -1,0 +1,17 @@
+<Project>
+  <!-- Phase 10: one source of truth for product, package, and assembly identity. The
+       numeric assembly/file version intentionally remains 0.1.0.0 for both
+       this preview and the future 0.1.0 stable package. -->
+  <PropertyGroup>
+    <TbProductName>TokenBar</TbProductName>
+    <TbSemanticVersion>0.1.0-preview.1</TbSemanticVersion>
+    <TbAssemblyVersion>0.1.0.0</TbAssemblyVersion>
+    <Version>$(TbSemanticVersion)</Version>
+    <PackageVersion>$(TbSemanticVersion)</PackageVersion>
+    <InformationalVersion>$(TbSemanticVersion)</InformationalVersion>
+    <AssemblyVersion>$(TbAssemblyVersion)</AssemblyVersion>
+    <FileVersion>$(TbAssemblyVersion)</FileVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+</Project>
