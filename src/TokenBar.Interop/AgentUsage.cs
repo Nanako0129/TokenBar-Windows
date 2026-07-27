@@ -647,6 +647,65 @@ public sealed record CreditsSnapshot(
     bool Unlimited,
     double? Remaining = null);
 
+public sealed record AgentUsageTransportDiagnostic(
+    string? Category = null,
+    long? Status = null,
+    long? OsCode = null);
+
+public sealed class AgentUsageTransportDiagnosticJsonConverter :
+    JsonConverter<AgentUsageTransportDiagnostic?>
+{
+    public override bool HandleNull => true;
+
+    public override AgentUsageTransportDiagnostic? Read(
+        ref Utf8JsonReader reader,
+        Type typeToConvert,
+        JsonSerializerOptions options)
+    {
+        using var document = JsonDocument.ParseValue(ref reader);
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        return new AgentUsageTransportDiagnostic(
+            Category: OptionalString(root, "category"),
+            Status: OptionalInt64(root, "status"),
+            OsCode: OptionalInt64(root, "osCode"));
+    }
+
+    public override void Write(
+        Utf8JsonWriter writer,
+        AgentUsageTransportDiagnostic? value,
+        JsonSerializerOptions options)
+    {
+        if (value is null)
+        {
+            writer.WriteNullValue();
+            return;
+        }
+
+        writer.WriteStartObject();
+        if (value.Category is not null) writer.WriteString("category", value.Category);
+        if (value.Status is { } status) writer.WriteNumber("status", status);
+        if (value.OsCode is { } osCode) writer.WriteNumber("osCode", osCode);
+        writer.WriteEndObject();
+    }
+
+    private static string? OptionalString(JsonElement obj, string name) =>
+        obj.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static long? OptionalInt64(JsonElement obj, string name) =>
+        obj.TryGetProperty(name, out var value) &&
+        value.ValueKind == JsonValueKind.Number &&
+        value.TryGetInt64(out var number)
+            ? number
+            : null;
+}
+
 public sealed record AgentUsageSnapshot(
     string ClientId,
     string Source,
@@ -654,7 +713,9 @@ public sealed record AgentUsageSnapshot(
     IReadOnlyList<UsageWindow> Windows,
     AgentIdentity? Identity = null,
     CreditsSnapshot? Credits = null,
-    string? Error = null) : IJsonOnDeserialized
+    string? Error = null,
+    [property: JsonConverter(typeof(AgentUsageTransportDiagnosticJsonConverter))]
+    AgentUsageTransportDiagnostic? TransportDiagnostic = null) : IJsonOnDeserialized
 {
     void IJsonOnDeserialized.OnDeserialized()
     {

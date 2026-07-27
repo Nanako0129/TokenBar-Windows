@@ -117,6 +117,19 @@ public class DtoDecodeTests
             Web) ?? throw new InvalidOperationException("agent usage payload decoded to null");
     }
 
+    private static AgentUsageSnapshot DecodeTransportDiagnostic(string? diagnosticJson = null)
+    {
+        var diagnostic = diagnosticJson is null
+            ? ""
+            : $$""","transportDiagnostic":{{diagnosticJson}}""";
+        var payload = TbCore.DecodeEnvelope<AgentUsagePayload>(
+            $$$"""{"ok":true,"data":{"generatedAt":"now","agents":[{"clientId":"codex","source":"oauth","updatedAt":"now","windows":[{"label":"Weekly","usedPercent":40,"remainingPercent":60}]{{{diagnostic}}}}]}}""");
+        Assert.Equal("now", payload.GeneratedAt);
+        var snapshot = Assert.Single(payload.Agents);
+        Assert.Single(snapshot.Windows);
+        return snapshot;
+    }
+
     private static void AssertRejects(string json) =>
         Assert.Throws<JsonException>(() => DecodeWindow(json));
 
@@ -191,6 +204,76 @@ public class DtoDecodeTests
             """{"ok":true,"data":{"generatedAt":"now","publicationGeneration":42,"agents":[]}}""");
         Assert.Equal("now", payload.GeneratedAt);
         Assert.Empty(payload.Agents);
+    }
+
+    [Fact]
+    public void AgentUsageTransportDiagnosticDecodesHttpAndOsFacts()
+    {
+        var http = Assert.IsType<AgentUsageTransportDiagnostic>(
+            DecodeTransportDiagnostic(
+                """{"category":"rateLimited","status":429}""").TransportDiagnostic);
+        Assert.Equal(new AgentUsageTransportDiagnostic("rateLimited", Status: 429), http);
+
+        var os = Assert.IsType<AgentUsageTransportDiagnostic>(
+            DecodeTransportDiagnostic(
+                """{"category":"connectionRefused","osCode":10061}""").TransportDiagnostic);
+        Assert.Equal(new AgentUsageTransportDiagnostic("connectionRefused", OsCode: 10061), os);
+    }
+
+    [Fact]
+    public void AgentUsageTransportDiagnosticOmittedNullOrNonObjectDecodesAsNull()
+    {
+        foreach (var diagnosticJson in new string?[] { null, "null", "[]" })
+        {
+            Assert.Null(DecodeTransportDiagnostic(diagnosticJson).TransportDiagnostic);
+        }
+    }
+
+    [Fact]
+    public void AgentUsageTransportDiagnosticCategoryTypeMismatchPreservesOtherFields()
+    {
+        var diagnostic = Assert.IsType<AgentUsageTransportDiagnostic>(
+            DecodeTransportDiagnostic(
+                """{"category":42,"status":429,"osCode":10061}""").TransportDiagnostic);
+        Assert.Equal(new AgentUsageTransportDiagnostic(Status: 429, OsCode: 10061), diagnostic);
+    }
+
+    [Theory]
+    [InlineData("\"429\"")]
+    [InlineData("9223372036854775808")]
+    public void AgentUsageTransportDiagnosticMalformedStatusPreservesCategoryAndOsCode(
+        string statusJson)
+    {
+        var diagnostic = Assert.IsType<AgentUsageTransportDiagnostic>(
+            DecodeTransportDiagnostic(
+                $$"""{"category":"connectionRefused","status":{{statusJson}},"osCode":10061}""")
+                .TransportDiagnostic);
+        Assert.Equal(
+            new AgentUsageTransportDiagnostic("connectionRefused", OsCode: 10061),
+            diagnostic);
+    }
+
+    [Fact]
+    public void AgentUsageTransportDiagnosticPreservesUnknownCategory()
+    {
+        var diagnostic = Assert.IsType<AgentUsageTransportDiagnostic>(
+            DecodeTransportDiagnostic(
+                """{"category":"futureTransport","status":599}""").TransportDiagnostic);
+        Assert.Equal(new AgentUsageTransportDiagnostic("futureTransport", Status: 599), diagnostic);
+    }
+
+    [Fact]
+    public void AgentUsageTransportDiagnosticDoesNotRetainUnknownSensitiveMember()
+    {
+        var snapshot = DecodeTransportDiagnostic(
+            """{"category":"timeout","authorization":"Bearer token-secret"}""");
+        Assert.Equal(
+            new AgentUsageTransportDiagnostic("timeout"),
+            Assert.IsType<AgentUsageTransportDiagnostic>(snapshot.TransportDiagnostic));
+
+        var serialized = JsonSerializer.Serialize(snapshot, Web);
+        Assert.False(serialized.Contains("authorization", StringComparison.OrdinalIgnoreCase));
+        Assert.False(serialized.Contains("token-secret", StringComparison.Ordinal));
     }
 
     [Fact]
