@@ -13,11 +13,11 @@ diagnostic only because serializer formatting and line endings differ by host.
 | Surface | Canonical source |
 |---|---|
 | Legacy `usage-pace.json` and `format.json` | macOS commit `2ed256ee` |
-| Provider quota pace v3 | exact tested Native PR #102 candidate `56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5` (not the final merged SHA) |
+| Provider quota pace v3 | final merged Native PR #102 commit `4dfed5ffab26e2707a8cd82ee99864520b75892b` |
 
 Run the Swift side from a clean archive or worktree at the exact tested
-provider-v3 candidate SHA. This is Native PR #102's unmerged candidate, not the
-final merged SHA; do not use an unrelated dirty macOS checkout as the reference.
+provider-v3 merged SHA. Do not use an unrelated dirty macOS checkout as the
+reference.
 
 Canonical fixture fingerprints:
 
@@ -166,9 +166,8 @@ projection differences.
 
 ## Running
 
-Set `TOKENBAR_MAC_CANONICAL` to a clean archive or worktree at the exact tested
-Native PR #102 candidate `56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5`. This is
-not the final merged SHA.
+Set `TOKENBAR_MAC_CANONICAL` to a clean archive or worktree at final merged
+Native PR #102 commit `4dfed5ffab26e2707a8cd82ee99864520b75892b`.
 
 `Package.swift` links `target/release/libtb_core_ffi.a` by a path relative to
 the canonical macOS repo root. Build the Rust static library first, and run the
@@ -177,7 +176,7 @@ unrelated checkout's `target/` artifact.
 
 ```bash
 export TOKENBAR_WINDOWS="$(pwd)"
-export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-56a6e3a7"
+export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-4dfed5ff"
 
 (
   cd "$TOKENBAR_MAC_CANONICAL"
