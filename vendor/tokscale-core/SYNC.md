@@ -3,19 +3,19 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5`](https://github.com/Nanako0129/TokenBar/commit/56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5) |
+| Copied commit | [`4dfed5ffab26e2707a8cd82ee99864520b75892b`](https://github.com/Nanako0129/TokenBar/commit/4dfed5ffab26e2707a8cd82ee99864520b75892b) |
 | Copied on | 2026-07-27 |
 
-`56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5` is the exact Native PR #102
-candidate tested before the Native merge. It is an unmerged pre-merge source,
-not the final merged Native SHA. In addition to the Antigravity discovery,
-format-2 writer lifecycle, malformed Copilot Desktop entry, and fixture
-portability corrections, this candidate retries Codex credential replacement,
-merges duplicate Copilot span endpoints, advances only the Copilot parser
-identity to 4, and makes shipping cache fixtures build fingerprints, seed, and
-query with the scanner-returned path spelling. It aligns with the canonical
-M19-B checkpoint. A second exact sync to
-the actual Native merge SHA is required after merge authorization.
+`4dfed5ffab26e2707a8cd82ee99864520b75892b` is the final merged Native PR
+#102 commit on `main`. In addition to the Antigravity discovery, format-2 writer
+lifecycle, malformed Copilot Desktop entry, and fixture portability
+corrections, this source retries Codex credential replacement, merges duplicate
+Copilot span endpoints, advances only the Copilot parser identity to 4, and
+makes shipping cache fixtures build fingerprints, seed, and query with the
+scanner-returned path spelling. The post-review merge also preserves valid
+Copilot quota rows when the optional reset field has a non-string type and
+emits DNS/TLS transport categories from typed error sources without exposing
+free-form error text. This is the canonical post-merge M19-B checkpoint.
 
 The active cache is format 2 at `source-message-cache-v2`; format-1 shards are
 stale and rebuild cold under format 2. The legacy schema-32 monolith
@@ -37,7 +37,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5
+source_commit=4dfed5ffab26e2707a8cd82ee99864520b75892b
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT
@@ -62,5 +62,4 @@ cp "$sync_record" vendor/tokscale-core/SYNC.md
 ```
 
 Do not write private local paths or credentials. This record does not claim that
-real ARM64 runtime validation is complete. After Native merge authorization,
-repeat the exact sync procedure with the actual Native merge SHA.
+real ARM64 runtime validation is complete.

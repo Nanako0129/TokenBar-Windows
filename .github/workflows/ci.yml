@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: Nanako0129/TokenBar
-          ref: 56a6e3a7d187d09b206642f3aa5bfd6bb43a1bc5
+          ref: 4dfed5ffab26e2707a8cd82ee99864520b75892b
           path: tokenbar-mac
       - uses: actions/checkout@v6
         with:
