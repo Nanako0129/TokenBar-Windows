@@ -27,6 +27,7 @@
     <TbNativeExpectedMachine Condition="('$(Platform)' == '' or '$(Platform)' == 'AnyCPU') and '$(RuntimeIdentifier)' == 'win-arm64'">0xAA64</TbNativeExpectedMachine>
 
     <TbNativeSource>$(TbNativeRepoDir)\target\$(TbNativeRustTarget)\release\tb_core_ffi.dll</TbNativeSource>
+    <TbNativeCargoLockedArg Condition="'$(TbNativeCargoLocked)' == 'true'"> --locked</TbNativeCargoLockedArg>
   </PropertyGroup>
 
   <ItemGroup Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true' and '$(TbNativeRustTarget)' != ''">
@@ -63,7 +64,7 @@
   <Target Name="BuildTbNative"
           DependsOnTargets="ValidateTbNativeConfiguration"
           Condition="'$(OS)' == 'Windows_NT' and '$(TbNativePackagingEnabled)' == 'true'">
-    <Exec Command="cargo build --release --target &quot;$(TbNativeRustTarget)&quot;"
+    <Exec Command="cargo build --release$(TbNativeCargoLockedArg) --target &quot;$(TbNativeRustTarget)&quot;"
           WorkingDirectory="$(TbNativeRepoDir)" />
     <CallTarget Targets="ValidateTbNativeSource" />
   </Target>

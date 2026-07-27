@@ -2,6 +2,7 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using System.Reflection;
 using TokenBar.Core;
 using TokenBar.Interop;
 // TokenBar.Core.Grid (the contribution-grid builder) collides with the XAML
@@ -369,7 +370,11 @@ public sealed class SettingsWindow : Window
         var about = new StackPanel { Spacing = 4 };
         about.Children.Add(Ui.Row(
             Ui.Text("Version", 12),
-            Ui.Dim(typeof(SettingsWindow).Assembly.GetName().Version?.ToString(3) ?? "dev", 12)));
+            Ui.Dim(
+                typeof(SettingsWindow).Assembly
+                    .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+                    ?.InformationalVersion ?? "dev",
+                12)));
         about.Children.Add(Hint(
             "Parsing engine vendored from tokscale by junhoyeo; menu-bar " +
             "concept from handlecusion's tokcat."));

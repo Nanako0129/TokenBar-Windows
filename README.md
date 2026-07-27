@@ -30,25 +30,36 @@ Windows native packaging is opt-in for `TokenBar.App`, `TokenBar.Smoke`, and
 # macOS (inner loop — no Windows needed)
 scripts/check.sh
 
-# Windows x64: build the explicit native source, then run the x64 gates
+# Windows x64: restore the locked graph, build the explicit native source, then run the x64 gates
+dotnet restore src/TokenBar.slnx --locked-mode
+dotnet restore src/TokenBar.App/TokenBar.App.csproj --locked-mode
 .\scripts\dev.ps1
-
-dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-dotnet build src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64
-dotnet test src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64 --no-build
-dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-dotnet build src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -p:Platform=x64
-dotnet run --project src/TokenBar.Smoke -c Release -p:Platform=x64 --no-build
-dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-x64 --self-contained -o out/smoke-win-x64
+dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:TbNativeCargoLocked=true -p:RestoreLockedMode=true
+dotnet build src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64 --no-restore
+dotnet test src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64 --no-build --no-restore
+dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 --no-restore
+dotnet build src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -p:Platform=x64 --no-restore
+dotnet run --project src/TokenBar.Smoke -c Release -p:Platform=x64 --no-build --no-restore
+dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-x64 --self-contained -o out/smoke-win-x64 --no-restore
 ```
 
 ARM64 is cross-build/package validation only on an x64 runner:
 
 ```bash
-dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64
-dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64
-dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-arm64 --self-contained -o out/smoke-win-arm64
-dotnet publish src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -r win-arm64 -o out/app-win-arm64
+dotnet restore src/TokenBar.App/TokenBar.App.csproj --locked-mode
+dotnet restore src/TokenBar.Smoke/TokenBar.Smoke.csproj --locked-mode
+dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64 -p:TbNativeCargoLocked=true -p:RestoreLockedMode=true
+dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64 --no-restore
+dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-arm64 --self-contained -o out/smoke-win-arm64 --no-restore
+```
+
+The private, unsigned App package command performs the locked restore, native
+build, publish, ZIP creation, and structure/version/PE/hash checks. Use a clean
+Git checkout and a new empty output root on a Windows host or CI runner:
+
+```powershell
+.\scripts\build-app-artifact.ps1 -Rid win-x64 -OutputRoot "$env:RUNNER_TEMP\tokenbar-phase10-x64"
+.\scripts\build-app-artifact.ps1 -Rid win-arm64 -OutputRoot "$env:RUNNER_TEMP\tokenbar-phase10-arm64"
 ```
 
 The cross-language CrossCheck stays platform-neutral and has no Platform/RID:
@@ -61,20 +72,31 @@ TZ=Asia/Taipei dotnet run \
   crosscheck/csharp-out
 ```
 
-CI publishes the ARM64 artifacts `smoke-win-arm64` and `app-win-arm64` without
-executing those binaries on the x64 runner. A real ARM64 runtime on the Windows
-VM remains the merge gate.
+CI publishes only short-retention Smoke test-harness artifacts and sanitized
+Phase 10 App evidence/checksums. App ZIP/EXE/DLL files are never uploaded. The
+hosted runners perform structure, version, PE, and hash checks; they do not
+claim an interactive WinUI startup gate.
 
-Prereqs: Rust (stable), .NET 10 SDK; on Windows the MSVC toolchain.
+The M19-B1 real-ARM64 result is historical evidence from a separate Windows
+ARM64 gate on 2026-07-27: 351 Rust tests, 12 provider-v3 CrossCheck cases, PE
+checks, and synthetic WinUI startup were recorded in [the public issue
+comment](https://github.com/Nanako0129/TokenBar/issues/45#issuecomment-5091092629).
+That result does not satisfy or replace the Phase 10 published-artifact x64 and
+ARM64 gates; any new startup-smoke result must use a disposable Windows
+VM/account snapshot with production credentials absent and outbound network
+blocked.
+
+Prereqs: Rust `1.96.1`, .NET SDK `10.0.301`, PowerShell `7.0+`; on Windows the
+MSVC toolchain.
 
 Windows CI runs the x64 Rust workspace tests, Core.Tests, WinUI App, and Smoke
 from their project roots (the solution has no x64 configuration), then executes
 both the all-entry-point and strict relocated-`CODEX_HOME` Smoke checks with
 network and host-profile isolation. It runs the no-Platform/RID CrossCheck,
 publishes and executes the self-contained `smoke-win-x64` bundle, and uploads
-that artifact. The `arm64-cross` job only cross-builds and packages the native
-DLL, Smoke bundle, and App bundle, uploading `smoke-win-arm64` and
-`app-win-arm64`; it is not an ARM64 runtime test. The provider-pace branch
+that test-harness artifact. The `arm64-cross` job only cross-builds and packages
+the native DLL and Smoke bundle, and uploads the test-harness artifact plus
+sanitized Phase 10 evidence/checksums; it is not an ARM64 runtime test. The provider-pace branch
 passed local command-equivalent x64 and ARM64 gates plus fresh review on
 2026-07-19; GitHub PR #3 preserves its remote CI and review record. `cargo fmt`
 is not currently a repository CI gate; its existing workspace-wide formatting
@@ -94,7 +116,8 @@ debt is tracked separately.
 | 7 | Settings + tray extras | 🔶 feature-complete (macOS parity) — settings store (`%APPDATA%\TokenBar\settings.json`, atomic, unit-tested) with the year filter, chart persistence, manual-refresh spinner; tray: seven modes with the value drawn into the icon (tooltip carries the full string), bars/ring/popsicle gauges (macOS geometry verbatim), cat/parrot animation (HICON-cached, ~0.5% of a core at idle), full context menu with live quota sources; Mica settings window (ten sections, live keys, autostart via HKCU Run honoring StartupApproved); flyout footer gear+Quit; in-flyout Ctrl-shortcut set. Global `RegisterHotKey` dropped: the macOS reference ships no global shortcut, so it's not a parity gap (parked as an optional Windows-only nicety in Phase 9). Verification: icon gallery + live tray screenshots + synthesized input on the x64 box; the non-quota Settings flow passed the 125% DPI interactive gate on 2026-07-17, including live 520→600 DIP flyout resizing, persistence, singleton hide/reopen, autostart restoration, and the 48ms entrance-animation race. The separate 150% pass also passed on 2026-07-17 in an isolated RDP session: both windows reported 144 DPI, 520→600 DIP mapped immediately to 780→900 physical px, and the persisted height survived a process restart. A 33-active-day synthetic fixture supported user-checked 3D hover/orbit/zoom/Fit/Reset, and the Flyout Acrylic was subsequently verified with loaded 3D content in both light and dark themes at 200% DPI |
 | 8 | 3D integration | ✅ 2026-07-17 — product card renders the real contribution grid with macOS-parity colors/lighting (sRGB-correct opaque faces), 4× MSAA, render-on-demand orbit/pan/zoom, persisted `tokenbar.orbit.v1`, Fit/Reset, custom ray-picked tooltip, and a persisted 2D/3D toggle. Real x64 checks include corrected pointer/DPI alignment, 2D↔3D in 6.7–20.1ms, a 241-frame drag trace, idle no-present, the 50-cycle lifecycle gate, and a retained 60-minute soak: 8230 cycles, `created=8230 released=8230 removed=0 errors=0`, 3600.7s elapsed, with private-memory and handle thresholds passing. Fresh review confirmed the lifecycle and cleanup result |
 | 9 | Polish + parity + vendor re-sync | 🔶 vendor portability and non-quota client tabs complete (2026-07-17), with all 11 Windows-only code-drift commits recorded in `SYNC.md`. **Provider pace v3 reconciliation completed 2026-07-19** against the exact macOS `1e00e7b` tree: Codex, Claude, Grok, Antigravity, and Copilot recurring percentage cards use stable `cardId`, opaque account scope, exact/observed duration, typed lifecycle states, and backend-owned coherent history; Windows adds CNG-backed installation identity, protected DACLs, reparse/file-ID checks, locking, capacity bounds, and atomic replacement. Strict C# decoding, `clientId|cardId` selection retention/migration, shared Dashboard/Settings row semantics, responsive Full layout, Classic/Off suppression, and typed learning/unavailable previews are active. Verification includes 275 .NET tests; the latest Windows x64 `tb_core_ffi` release suite with 300 tests; macOS and Windows x64 workspace/App/synthetic-smoke gates; ARM64 release build, 15 native security/history tests, 12 provider cases, and WinUI startup; Swift↔C# zero-difference checks across 12 provider-v3 and 116 legacy cases; light/dark responsive UI checks at 100%, 150%, and 200% DPI; sanitized production-profile preservation; and fresh focused/end-to-end verifiers. Windows runtime follow-ups resolve provider homes without `HOME`, hide and cache the Claude version probe, and discover/probe every Antigravity language server without visible console windows. Provider compatibility closure on 2026-07-20 adds Windows Antigravity OAuth-client artifact discovery, proves the installed scanner against Antigravity 2.3.1, accepts Grok's unified-billing schema as a separate non-recurring financial cap, and completes sanitized Codex/Grok/Antigravity live gates. Final review fixes unify Antigravity local/remote history scope through verified Google Email and bind the tray last-good gauge to its effective selection. This completes the pace contract only; broader quota-source ordering/visibility and new Agent-limits feature scope remain unopened · backlog: demo mode; optional Windows-only global hotkey to toggle the flyout (no macOS equivalent — needs a key-binding UI) |
-| 10–12 | Releases → Velopack → winget/Scoop | — |
+| 10 | Private unsigned App artifact contract | 🔶 `0.1.0-preview.1` contract implemented; clean CI and the Windows disposable-host startup gate remain required before any release claim. See [`docs/release.md`](docs/release.md) |
+| 11–12 | Velopack → winget/Scoop | — |
 
 ### Provider runtime validation
 

@@ -23,6 +23,8 @@ jobs:
         with:
           path: tokenbar-windows
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: tokenbar-mac -> target
@@ -34,7 +36,7 @@ jobs:
         run: |
           (
             cd "$TOKENBAR_MAC_CANONICAL"
-            cargo build --release
+            cargo build --release --locked
           )
           rm -rf "$TOKENBAR_WINDOWS/crosscheck/swift-out"
           mkdir -p "$TOKENBAR_WINDOWS/crosscheck/swift-out"
@@ -61,31 +63,56 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.301
+      # Run the clean-checkout artifact contract before any legacy tracked
+      # spike obj/ files can be refreshed by later restores.
+      - name: Phase 10 App artifact evidence (x64)
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "tokenbar-phase10-x64"
+          ./scripts/build-app-artifact.ps1 -Rid win-x64 -OutputRoot $root
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-evidence-win-x64
+          path: |
+            ${{ runner.temp }}/tokenbar-phase10-x64/*/evidence.json
+            ${{ runner.temp }}/tokenbar-phase10-x64/*/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 3
       - uses: actions/download-artifact@v4
         with:
           name: crosscheck-swift-out
           path: crosscheck/swift-out
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 10.0.x
       # Directory.Build.targets owns the only Platform/RID to Rust-target
       # mapping and produces the native source consumed by managed builds.
+      - name: restore locked NuGet graphs
+        run: |
+          dotnet restore src/TokenBar.slnx --locked-mode
+          dotnet restore src/TokenBar.App/TokenBar.App.csproj --locked-mode
+          dotnet restore spike/D3DGraphSpike/D3DGraphSpike.csproj --locked-mode
+          dotnet restore src/TokenBar.CrossCheck/TokenBar.CrossCheck.csproj --locked-mode
+      - name: cargo build native source (x64, locked)
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
       - name: build native DLL (x64 via shared mapping)
-        run: dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-      - name: cargo test (workspace)
-        run: cargo test --workspace --release
+        run: dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:TbNativeCargoLocked=true -p:RestoreLockedMode=true
+      - name: cargo test (workspace, locked)
+        run: cargo test --workspace --release --locked
       - name: build Core.Tests (x64)
-        run: dotnet build src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64
+        run: dotnet build src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64 --no-restore
       - name: test Core.Tests (x64)
-        run: dotnet test src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64 --no-build
+        run: dotnet test src/TokenBar.Core.Tests/TokenBar.Core.Tests.csproj -c Release -p:Platform=x64 --no-build --no-restore
       - name: build WinUI App (x64)
-        run: dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+        run: dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 --no-restore
       - name: build Smoke (x64)
-        run: dotnet build src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -p:Platform=x64
+        run: dotnet build src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -p:Platform=x64 --no-restore
       - name: P/Invoke smoke (all entry points; x64 runtime)
-        run: dotnet run --project src/TokenBar.Smoke -c Release -p:Platform=x64 --no-build
+        run: dotnet run --project src/TokenBar.Smoke -c Release -p:Platform=x64 --no-build --no-restore
         env:
           # Keep credential-bound agent usage and live pricing refreshes out of
           # deterministic CI; their decode paths are covered on dev machines.
@@ -99,12 +126,12 @@ jobs:
           MSYS_NO_PATHCONV=1 tzutil.exe /s "Taipei Standard Time"
           TZ=Asia/Taipei dotnet run \
             --project src/TokenBar.CrossCheck \
-            -c Release -- \
+            -c Release --no-restore -- \
             crosscheck/fixtures \
             crosscheck/csharp-out
           TZ=Asia/Taipei dotnet run \
             --project src/TokenBar.CrossCheck \
-            -c Release -- \
+            -c Release --no-restore -- \
             crosscheck/fixtures \
             crosscheck/csharp-out \
             provider-quota-pace-v3
@@ -196,12 +223,12 @@ jobs:
           $env:TB_SMOKE_MIN_MESSAGES = "3"
           $env:TB_SMOKE_EXPECT_CLIENT = "codex"
           $env:TB_SMOKE_SKIP_NETWORK = "1"
-          dotnet run --project src/TokenBar.Smoke -c Release -p:Platform=x64 --no-build
+          dotnet run --project src/TokenBar.Smoke -c Release -p:Platform=x64 --no-build --no-restore
       # Self-contained smoke bundle (runtime + native dll included): lets a
       # bare Windows verification box run the full entry-point sweep with
       # nothing installed.
       - name: publish smoke bundle (win-x64 self-contained)
-        run: dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-x64 --self-contained -o out/smoke-win-x64
+        run: dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-x64 --self-contained -o out/smoke-win-x64 --no-restore
       # Execute the published file itself, with the same isolated fixture and
       # network skip as the x64 build smoke; this is the published-runtime gate.
       - name: run published smoke bundle (win-x64 runtime)
@@ -262,6 +289,7 @@ jobs:
         with:
           name: smoke-win-x64
           path: out/smoke-win-x64
+          retention-days: 3
 
   # Cross-build/package only. This x64 runner never executes ARM64 binaries;
   # real ARM64 runtime coverage remains a merge gate on the ARM64 VM.
@@ -271,26 +299,41 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.1
           targets: aarch64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           key: arm64
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 10.0.301
+      - name: Phase 10 App artifact evidence (ARM64)
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "tokenbar-phase10-arm64"
+          ./scripts/build-app-artifact.ps1 -Rid win-arm64 -OutputRoot $root
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-evidence-win-arm64
+          path: |
+            ${{ runner.temp }}/tokenbar-phase10-arm64/*/evidence.json
+            ${{ runner.temp }}/tokenbar-phase10-arm64/*/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 3
+      - name: restore locked NuGet graphs (ARM64)
+        run: |
+          dotnet restore src/TokenBar.App/TokenBar.App.csproj --locked-mode
+          dotnet restore src/TokenBar.Smoke/TokenBar.Smoke.csproj --locked-mode
+      - name: cargo build native source (ARM64, locked)
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc
       - name: build native DLL (ARM64 cross-build only)
-        run: dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64
+        run: dotnet msbuild src/TokenBar.Smoke/TokenBar.Smoke.csproj -t:BuildTbNative -p:Configuration=Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64 -p:TbNativeCargoLocked=true -p:RestoreLockedMode=true
       - name: build WinUI App (ARM64 cross-build only)
-        run: dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64
+        run: dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -p:RuntimeIdentifier=win-arm64 --no-restore
       - name: publish Smoke bundle (win-arm64 cross-package validation)
-        run: dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-arm64 --self-contained -o out/smoke-win-arm64
-      - name: publish App bundle (win-arm64 cross-package validation)
-        run: dotnet publish src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=ARM64 -r win-arm64 -o out/app-win-arm64
+        run: dotnet publish src/TokenBar.Smoke/TokenBar.Smoke.csproj -c Release -r win-arm64 --self-contained -o out/smoke-win-arm64 --no-restore
       - uses: actions/upload-artifact@v4
         with:
           name: smoke-win-arm64
           path: out/smoke-win-arm64
-      - uses: actions/upload-artifact@v4
-        with:
-          name: app-win-arm64
-          path: out/app-win-arm64
+          retention-days: 3

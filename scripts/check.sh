@@ -8,14 +8,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo check --workspace
-cargo test --workspace
-cargo build --release
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo build --release --locked
 
 if [[ "${WIN_CHECK:-0}" == "1" ]]; then
-  cargo check --workspace --target x86_64-pc-windows-msvc
+  cargo check --workspace --locked --target x86_64-pc-windows-msvc
 fi
 
-dotnet build src/TokenBar.slnx
+dotnet restore src/TokenBar.slnx --locked-mode
+dotnet build src/TokenBar.slnx --no-restore
 dotnet test src/TokenBar.slnx --no-build
 dotnet run --project src/TokenBar.Smoke --no-build
