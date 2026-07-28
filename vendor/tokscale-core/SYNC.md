@@ -3,19 +3,18 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`4dfed5ffab26e2707a8cd82ee99864520b75892b`](https://github.com/Nanako0129/TokenBar/commit/4dfed5ffab26e2707a8cd82ee99864520b75892b) |
-| Copied on | 2026-07-27 |
+| Copied commit | [`55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218`](https://github.com/Nanako0129/TokenBar/commit/55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218) |
+| Copied on | 2026-07-28 |
 
-`4dfed5ffab26e2707a8cd82ee99864520b75892b` is the final merged Native PR
-#102 commit on `main`. In addition to the Antigravity discovery, format-2 writer
-lifecycle, malformed Copilot Desktop entry, and fixture portability
-corrections, this source retries Codex credential replacement, merges duplicate
-Copilot span endpoints, advances only the Copilot parser identity to 4, and
-makes shipping cache fixtures build fingerprints, seed, and query with the
-scanner-returned path spelling. The post-review merge also preserves valid
-Copilot quota rows when the optional reset field has a non-string type and
-emits DNS/TLS transport categories from typed error sources without exposing
-free-form error text. This is the canonical post-merge M19-B checkpoint.
+`55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218` is the final rebase-merged Native
+PR #111 commit on `main`. It preserves the post-merge M19-B checkpoint and adds
+the issue-107 source-generation-aware filter-parity diagnostic: one Rust-owned
+probe uses a fresh graph and brackets hourly and Agents nil/full reports with
+opaque local-source tokens. Source movement is classified as `sourceChanged`
+instead of a filter mismatch; independently refreshed cost remains diagnostic
+but cannot decide parity. A hermetic vendor fixture covers exact client gates,
+synthetic traffic, duplicate Codebuff roots, unattributed `Main`, cold/warm
+cache, and inherited scanner-root isolation.
 
 The active cache is format 2 at `source-message-cache-v2`; format-1 shards are
 stale and rebuild cold under format 2. The legacy schema-32 monolith
@@ -29,6 +28,30 @@ tracked runtime vendor file is byte-identical to Native except this Windows-only
 fixture at `Fixtures/CrossCheck/provider-quota-pace-v3.json` and the Windows
 cross-check copy are byte-identical to the same Native fixture.
 
+## Verification
+
+The macOS-side downstream gate passed against this exact sync:
+
+- `crates/` is byte-identical to Native `55ca05d3`; `vendor/` is
+  byte-identical after excluding Native-only `vendor/AGENTS.md` and this
+  Windows-only `SYNC.md`; the C header and both provider-v3 fixture copies also
+  match byte-for-byte.
+- `Cargo.lock` is unchanged. The two new Rust fixture/source files pass a
+  focused `rustfmt --check`; the exact shared tree was not reformatted.
+- Focused parity tests pass (`tb_core_ffi` 10/10 and vendor fixture 1/1).
+- `scripts/check.sh` passes with locked dependencies: workspace check, all Rust
+  tests (including 319 FFI and 1,290 vendor unit tests), release build, locked
+  .NET restore, solution build with zero warnings/errors, all 287 Core tests,
+  and the 11-entry P/Invoke smoke.
+- The live smoke observed source movement while local sessions were changing,
+  so both parity reports correctly returned `sourceChanged` and skipped
+  comparison. Credential/network-backed agent usage was intentionally disabled
+  with `TB_SMOKE_SKIP_NETWORK=1`; pricing was cache-only.
+
+This is local macOS-side evidence. Hosted Windows x64 and ARM64 cross-package
+checks remain CI-owned, and this record does not claim real ARM64 runtime
+validation for this sync.
+
 ## Sync procedure
 
 Run from a clean Windows checkout with `TOKENBAR_NATIVE` pointing to a clean
@@ -37,7 +60,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=4dfed5ffab26e2707a8cd82ee99864520b75892b
+source_commit=55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT

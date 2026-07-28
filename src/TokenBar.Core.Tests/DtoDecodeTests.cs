@@ -158,6 +158,60 @@ public class DtoDecodeTests
     }
 
     [Fact]
+    public void FilterParityProbeDecodesStatusesNullableAggregatesAndBoundedSummary()
+    {
+        var payload = TbCore.DecodeEnvelope<FilterParityProbe>(
+            """
+            {"ok":true,"data":{
+              "hourly":{
+                "status":"match",
+                "unfiltered":{"entryCount":1,"input":2,"output":3,"cacheRead":4,
+                  "cacheWrite":5,"reasoning":6,"totalTokens":20,"messageCount":7,
+                  "totalCost":1.0},
+                "full":{"entryCount":1,"input":2,"output":3,"cacheRead":4,
+                  "cacheWrite":5,"reasoning":6,"totalTokens":20,"messageCount":7,
+                  "totalCost":1.5},
+                "delta":{"entryCount":0,"input":0,"output":0,"cacheRead":0,
+                  "cacheWrite":0,"reasoning":0,"totalTokens":0,"messageCount":0,
+                  "totalCost":0.5}
+              },
+              "agents":{"status":"sourceChanged","unfiltered":null,"full":null,"delta":null},
+              "presentClientCount":2
+            }}
+            """);
+
+        Assert.Equal(FilterParityStatus.Match, payload.Hourly.Status);
+        Assert.Equal(FilterParityStatus.SourceChanged, payload.Agents.Status);
+        Assert.Null(payload.Agents.Delta);
+        Assert.Equal(2, payload.PresentClientCount);
+        Assert.Equal(
+            "hourly=MATCH entriesΔ=0 tokensΔ=0 messagesΔ=0 costΔ=0.50; " +
+            "agents=SOURCE_CHANGED / SKIP",
+            payload.SmokeSummary);
+    }
+
+    [Fact]
+    public void FilterParityProbeRejectsUnknownOrNumericStatus()
+    {
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<FilterParityProbe>(
+            """
+            {"ok":true,"data":{
+              "hourly":{"status":"changed","unfiltered":null,"full":null,"delta":null},
+              "agents":{"status":"match","unfiltered":null,"full":null,"delta":null},
+              "presentClientCount":0
+            }}
+            """));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<FilterParityProbe>(
+            """
+            {"ok":true,"data":{
+              "hourly":{"status":0,"unfiltered":null,"full":null,"delta":null},
+              "agents":{"status":"match","unfiltered":null,"full":null,"delta":null},
+              "presentClientCount":0
+            }}
+            """));
+    }
+
+    [Fact]
     public void ModelReportDecodesLowercaseKQuirkAndOptionals()
     {
         var json = """

@@ -24,6 +24,10 @@ public static class TbCore
     {
         RespectRequiredConstructorParameters = true,
         RespectNullableAnnotations = true,
+        Converters =
+        {
+            new JsonStringEnumConverter<FilterParityStatus>(allowIntegerValues: false),
+        },
     };
 
     public static ProbeResult Probe()
@@ -68,6 +72,11 @@ public static class TbCore
     /// <see cref="HourlyReport"/>.</summary>
     public static AgentsReport AgentsReport(string? year = null, IReadOnlyList<string>? clients = null) =>
         Unwrap<AgentsReport>(NativeMethods.tb_agents_report(year, JoinClients(clients)));
+
+    /// <summary>Source-generation-aware nil/full parity diagnostic for the
+    /// hourly and Agents report filters.</summary>
+    public static FilterParityProbe FilterParityProbe() =>
+        Unwrap<FilterParityProbe>(NativeMethods.tb_filter_parity_probe());
 
     private static string? JoinClients(IReadOnlyList<string>? clients) =>
         clients is { Count: > 0 } ? string.Join(',', clients) : null;
