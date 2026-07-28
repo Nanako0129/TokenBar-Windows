@@ -15,9 +15,9 @@ diagnostic only because serializer formatting and line endings differ by host.
 | Legacy `usage-pace.json` and `format.json` | macOS commit `2ed256ee` |
 | Provider quota pace v3 | CORE-X1N Native consumer baseline `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea` |
 
-Run the Swift side from a clean archive or worktree at the exact tested
-provider-v3 merged SHA. Do not use an unrelated dirty macOS checkout as the
-reference.
+Run the Swift side from a clean recursive clone or worktree at the exact tested
+provider-v3 merged SHA, with its submodules initialized. Do not use an
+unrelated dirty macOS checkout as the reference.
 
 Canonical fixture fingerprints:
 
@@ -166,8 +166,10 @@ projection differences.
 
 ## Running
 
-Set `TOKENBAR_MAC_CANONICAL` to a clean archive or worktree at the CORE-X1N
-Native baseline `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea`.
+Set `TOKENBAR_MAC_CANONICAL` to a clean recursive clone or worktree at the
+CORE-X1N Native baseline
+`704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea`. A Git archive is insufficient
+because it does not contain submodule contents.
 
 `Package.swift` links `target/release/libtb_core_ffi.a` by a path relative to
 the canonical macOS repo root. Build the Rust static library first, and run the
@@ -180,7 +182,8 @@ export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-704426e8"
 
 (
   cd "$TOKENBAR_MAC_CANONICAL"
-  cargo build --release
+  git submodule update --init --recursive
+  cargo build --release --locked
 )
 ```
 
