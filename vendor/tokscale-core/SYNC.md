@@ -3,18 +3,14 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218`](https://github.com/Nanako0129/TokenBar/commit/55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218) |
+| Copied commit | [`1d874cdf1c6db97225d4703a25214be75bc33e7b`](https://github.com/Nanako0129/TokenBar/commit/1d874cdf1c6db97225d4703a25214be75bc33e7b) |
 | Copied on | 2026-07-28 |
 
-`55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218` is the final rebase-merged Native
-PR #111 commit on `main`. It preserves the post-merge M19-B checkpoint and adds
-the issue-107 source-generation-aware filter-parity diagnostic: one Rust-owned
-probe uses a fresh graph and brackets hourly and Agents nil/full reports with
-opaque local-source tokens. Source movement is classified as `sourceChanged`
-instead of a filter mismatch; independently refreshed cost remains diagnostic
-but cannot decide parity. A hermetic vendor fixture covers exact client gates,
-synthetic traffic, duplicate Codebuff roots, unattributed `Main`, cold/warm
-cache, and inherited scanner-root isolation.
+`1d874cdf1c6db97225d4703a25214be75bc33e7b` is the final rebase-merged Native
+PR #112 commit on `main`. It preserves the issue-107 filter-parity diagnostic
+and renames the private Grok `ParsedUsage` accessor to `token_breakdown(&self)`
+so Rust 1.96.1 strict Clippy accepts its borrowed receiver. Parsing, cache
+schema, C ABI, and runtime output are unchanged.
 
 The active cache is format 2 at `source-message-cache-v2`; format-1 shards are
 stale and rebuild cold under format 2. The legacy schema-32 monolith
@@ -32,21 +28,21 @@ cross-check copy are byte-identical to the same Native fixture.
 
 The macOS-side downstream gate passed against this exact sync:
 
-- `crates/` is byte-identical to Native `55ca05d3`; `vendor/` is
+- `crates/` is byte-identical to Native `1d874cdf`; `vendor/` is
   byte-identical after excluding Native-only `vendor/AGENTS.md` and this
   Windows-only `SYNC.md`; the C header and both provider-v3 fixture copies also
   match byte-for-byte.
-- `Cargo.lock` is unchanged. The two new Rust fixture/source files pass a
-  focused `rustfmt --check`; the exact shared tree was not reformatted.
-- Focused parity tests pass (`tb_core_ffi` 10/10 and vendor fixture 1/1).
+- `Cargo.lock` is unchanged, `git diff --check` passes, and the exact shared
+  tree was not reformatted.
+- Rust 1.96.1 strict Clippy passes for `tokscale-core`; focused Grok tests pass
+  49/49.
 - `scripts/check.sh` passes with locked dependencies: workspace check, all Rust
   tests (including 319 FFI and 1,290 vendor unit tests), release build, locked
   .NET restore, solution build with zero warnings/errors, all 287 Core tests,
   and the 11-entry P/Invoke smoke.
 - The live smoke observed source movement while local sessions were changing,
   so both parity reports correctly returned `sourceChanged` and skipped
-  comparison. Credential/network-backed agent usage was intentionally disabled
-  with `TB_SMOKE_SKIP_NETWORK=1`; pricing was cache-only.
+  comparison. The agent-usage probe also completed successfully.
 
 This is local macOS-side evidence. Hosted Windows x64 and ARM64 cross-package
 checks remain CI-owned, and this record does not claim real ARM64 runtime
@@ -60,7 +56,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218
+source_commit=1d874cdf1c6db97225d4703a25214be75bc33e7b
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT
