@@ -376,8 +376,9 @@ public sealed class SettingsWindow : Window
                     ?.InformationalVersion ?? "dev",
                 12)));
         about.Children.Add(Hint(
-            "Parsing engine vendored from tokscale by junhoyeo; menu-bar " +
-            "concept from handlecusion's tokcat."));
+            "Shared parsing engine from tokscale-core, originally derived " +
+            "from tokscale by junhoyeo; menu-bar concept from " +
+            "handlecusion's tokcat."));
         panel.Children.Add(Section("About", about));
 
         _scroll.Content = panel;
