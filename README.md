@@ -12,7 +12,7 @@ a native WinUI 3 shell.
 | Layer | Path | Notes |
 |---|---|---|
 | Rust core | `crates/tb_core_ffi` + `vendor/tokscale-core` | Copied from the macOS repo (single sync source — see `vendor/tokscale-core/SYNC.md`). C ABI, JSON envelope, built as `cdylib` for P/Invoke |
-| C ABI contract | `include/ctb.h` | 10 entry points, `{"ok":true,"data":…}` / `{"ok":false,"err":…}` |
+| C ABI contract | `include/ctb.h` | 11 entry points, `{"ok":true,"data":…}` / `{"ok":false,"err":…}` |
 | Interop | `src/TokenBar.Interop` | `net10.0`, platform-neutral — P/Invoke facade + envelope decode |
 | Logic | `src/TokenBar.Core` | `net10.0`, platform-neutral — C# port of the macOS `TokenBarCore` |
 | Shell | `src/TokenBar.App` | WinUI 3, unpackaged. Windows-only build (not in the slnx): `dotnet build src/TokenBar.App/TokenBar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64` |

@@ -121,6 +121,8 @@ Step("tb_agents_report", () =>
            $"claudeOnlyMessages={filtered.TotalMessages}";
 });
 
+Step("tb_filter_parity", () => TbCore.FilterParityProbe().SmokeSummary);
+
 Step("tb_usage_trace", () =>
 {
     var buckets = TbCore.UsageTrace(600);
