@@ -195,7 +195,8 @@ mkdir -p crosscheck/swift-out crosscheck/csharp-out
   TZ=Asia/Taipei swift run crosscheck-harness \
     "$TOKENBAR_WINDOWS/crosscheck/fixtures" \
     "$TOKENBAR_WINDOWS/crosscheck/swift-out" \
-    provider-quota-pace-v3
+    provider-quota-pace-v3 \
+    -AppleLanguages "(en)"
 )
 
 TZ=Asia/Taipei dotnet run \
@@ -224,7 +225,8 @@ mkdir -p crosscheck/swift-out crosscheck/csharp-out
   cd "$TOKENBAR_MAC_CANONICAL"
   TZ=Asia/Taipei swift run crosscheck-harness \
     "$TOKENBAR_WINDOWS/crosscheck/fixtures" \
-    "$TOKENBAR_WINDOWS/crosscheck/swift-out"
+    "$TOKENBAR_WINDOWS/crosscheck/swift-out" \
+    -AppleLanguages "(en)"
 )
 
 TZ=Asia/Taipei dotnet run \
