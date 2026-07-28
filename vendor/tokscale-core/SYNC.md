@@ -3,14 +3,15 @@
 | Field | Value |
 |---|---|
 | Source repo | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) |
-| Copied commit | [`1d874cdf1c6db97225d4703a25214be75bc33e7b`](https://github.com/Nanako0129/TokenBar/commit/1d874cdf1c6db97225d4703a25214be75bc33e7b) |
+| Copied commit | [`729dc3adf21cc31e16ef0b8b742f0244197d7058`](https://github.com/Nanako0129/TokenBar/commit/729dc3adf21cc31e16ef0b8b742f0244197d7058) |
 | Copied on | 2026-07-28 |
 
-`1d874cdf1c6db97225d4703a25214be75bc33e7b` is the final rebase-merged Native
-PR #112 commit on `main`. It preserves the issue-107 filter-parity diagnostic
-and renames the private Grok `ParsedUsage` accessor to `token_breakdown(&self)`
-so Rust 1.96.1 strict Clippy accepts its borrowed receiver. Parsing, cache
-schema, C ABI, and runtime output are unchanged.
+`729dc3adf21cc31e16ef0b8b742f0244197d7058` is the final rebase-merged Native
+PR #113 commit on `main`. It keeps the Copilot Desktop mtime helper import on
+its existing Unix-only test and keeps four Kiro globalStorage fixture helpers
+on their existing macOS-only tests. Windows Rust 1.96.1 strict Clippy therefore
+does not compile unused test declarations. Test bodies, parsing, cache schema,
+C ABI, and runtime output are unchanged.
 
 The active cache is format 2 at `source-message-cache-v2`; format-1 shards are
 stale and rebuild cold under format 2. The legacy schema-32 monolith
@@ -28,14 +29,15 @@ cross-check copy are byte-identical to the same Native fixture.
 
 The macOS-side downstream gate passed against this exact sync:
 
-- `crates/` is byte-identical to Native `1d874cdf`; `vendor/` is
+- `crates/` is byte-identical to Native `729dc3ad`; `vendor/` is
   byte-identical after excluding Native-only `vendor/AGENTS.md` and this
   Windows-only `SYNC.md`; the C header and both provider-v3 fixture copies also
   match byte-for-byte.
 - `Cargo.lock` is unchanged, `git diff --check` passes, and the exact shared
   tree was not reformatted.
-- Rust 1.96.1 strict Clippy passes for `tokscale-core`; focused Grok tests pass
-  49/49.
+- Rust 1.96.1 strict Clippy passes for `tokscale-core`. Before this exact sync,
+  the same cfg repair also passed native Windows x64 strict Clippy with the
+  standalone candidate lock unchanged.
 - `scripts/check.sh` passes with locked dependencies: workspace check, all Rust
   tests (including 319 FFI and 1,290 vendor unit tests), release build, locked
   .NET restore, solution build with zero warnings/errors, all 287 Core tests,
@@ -56,7 +58,7 @@ then update its commit, date, and verification fields before committing:
 
 ```bash
 : "${TOKENBAR_NATIVE:?set TOKENBAR_NATIVE to a clean Native checkout}"
-source_commit=1d874cdf1c6db97225d4703a25214be75bc33e7b
+source_commit=729dc3adf21cc31e16ef0b8b742f0244197d7058
 stage="$(mktemp -d)"
 sync_record="$(mktemp)"
 trap 'rm -rf "$stage"; rm -f "$sync_record"' EXIT
