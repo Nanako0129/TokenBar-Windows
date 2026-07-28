@@ -13,7 +13,7 @@ diagnostic only because serializer formatting and line endings differ by host.
 | Surface | Canonical source |
 |---|---|
 | Legacy `usage-pace.json` and `format.json` | macOS commit `2ed256ee` |
-| Provider quota pace v3 | issue-107 Native baseline `55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218` |
+| Provider quota pace v3 | CORE-X1N Native consumer baseline `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea` |
 
 Run the Swift side from a clean archive or worktree at the exact tested
 provider-v3 merged SHA. Do not use an unrelated dirty macOS checkout as the
@@ -166,8 +166,8 @@ projection differences.
 
 ## Running
 
-Set `TOKENBAR_MAC_CANONICAL` to a clean archive or worktree at the issue-107
-Native baseline `55ca05d3a0a5bf0f02ed20f46bb3e73e65a07218`.
+Set `TOKENBAR_MAC_CANONICAL` to a clean archive or worktree at the CORE-X1N
+Native baseline `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea`.
 
 `Package.swift` links `target/release/libtb_core_ffi.a` by a path relative to
 the canonical macOS repo root. Build the Rust static library first, and run the
@@ -176,7 +176,7 @@ unrelated checkout's `target/` artifact.
 
 ```bash
 export TOKENBAR_WINDOWS="$(pwd)"
-export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-55ca05d3"
+export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-704426e8"
 
 (
   cd "$TOKENBAR_MAC_CANONICAL"

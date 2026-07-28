@@ -72,9 +72,11 @@ Run from a clean Git checkout on Windows with a new, empty output root. The
 command accepts exactly one RID and does not delete an existing directory. It
 requires PowerShell `7.0+` in addition to the locked .NET and Rust toolchains;
 dirty tracked or untracked files are rejected so `gitSha` identifies the exact
-source.
+source. Initialize the pinned shared engine before running the artifact build.
 
 ```powershell
+git submodule update --init --recursive
+
 .\scripts\build-app-artifact.ps1 `
   -Rid win-x64 `
   -OutputRoot "$env:RUNNER_TEMP\tokenbar-phase10-x64"
