@@ -25,7 +25,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$ExpectedSemanticVersion = "0.1.0-preview.1"
+$ExpectedSemanticVersion = "0.1.0"
 $ExpectedAssemblyVersion = "0.1.0.0"
 $ExpectedDotnetVersion = "10.0.301"
 $ExpectedRustVersion = "1.96.1"
