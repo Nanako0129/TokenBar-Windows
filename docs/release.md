@@ -7,16 +7,19 @@
 - [Version and toolchain locks](#version-and-toolchain-locks)
 - [Build command and outputs](#build-command-and-outputs)
 - [Verification evidence](#verification-evidence)
-- [Private startup gate](#private-startup-gate)
+- [Startup gate](#startup-gate)
 - [CI and authority gates](#ci-and-authority-gates)
 - [Phase 11/12 non-goals](#phase-1112-non-goals)
 
 ## 文件目的
 
-這份文件定義 Windows App `0.1.0-preview.1` 的私有、未簽署 release-artifact
-契約。它描述版本來源、鎖定的 dependency/toolchain、產物與 evidence，以及
-哪些檢查必須在獨立的 Windows 主機完成；它不是公開下載頁，也不授權簽署、
-上傳或套用 Velopack。
+這份文件定義 Windows App `v0.1.0` stable、未簽署、portable release-candidate
+transaction 契約。它描述版本來源、鎖定的 dependency/toolchain、產物與
+evidence，以及哪些檢查必須在 Windows 主機完成。`v0.1.0-preview.1` 已作為
+公開的未簽署 prerelease 發布；stable 尚未宣稱發布，也不授權簽署、公開
+publication、tag、assets 或套用 Velopack。
+
+Preview history: [`v0.1.0-preview.1` published prerelease](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0-preview.1).
 
 > **核心原則：** Hosted CI 可以證明結構、版本、PE architecture 與 hash，
 > 但不能把 x64 runner 上的 cross-build 說成 ARM64 runtime 或互動式 WinUI
@@ -24,10 +27,11 @@
 
 ## Release boundary
 
-Phase 10 的產物是 repo-owned PowerShell command 產生的 version/RID-labelled
+Phase 10 的 stable 產物是 repo-owned PowerShell command 產生的 version/RID-labelled
 App ZIP、SHA-256 checksum 與 sanitized JSON evidence。ZIP 保留在 private
-runner/host output root；GitHub Actions 只上傳 evidence 與 checksum，絕不把
-App ZIP、EXE 或 DLL 當成 CI artifact 或 release asset。
+runner/host output root；hosted CI 只上傳 evidence 與 checksum，絕不把
+App ZIP、EXE 或 DLL 當成 CI artifact 或 release asset。Stable public
+publication/tag/assets remain a separate explicit authority gate.
 
 ```mermaid
 flowchart TD
@@ -35,8 +39,8 @@ flowchart TD
     RESTORE --> NATIVE["BuildTbNative + cargo --locked"]
     NATIVE --> PUBLISH["dotnet publish for one RID"]
     PUBLISH --> CHECK["Structure + version + PE + hash checks"]
-    CHECK --> PRIVATE["Private ZIP + checksum + evidence"]
-    PRIVATE --> HOST["Disposable Windows VM startup-smoke"]
+    CHECK --> PRIVATE["Stable unsigned portable ZIP + checksum + evidence"]
+    PRIVATE --> HOST["Windows VM/account startup-smoke"]
     PRIVATE --> CI["Hosted CI evidence only"]
 ```
 
@@ -52,15 +56,18 @@ literal and the props file.
 | Contract item | Locked value | Authority or behavior |
 |---|---|---|
 | Product name | `TokenBar` | `TbProductName`; App assembly/executable and artifact basename derive from this property |
-| Package SemVer | `0.1.0-preview.1` | `TbSemanticVersion`, `Version`, `PackageVersion` |
-| InformationalVersion | `0.1.0-preview.1` | Exact About/sentinel value; source-revision suffix disabled |
-| AssemblyVersion | `0.1.0.0` | Preview and future `0.1.0` stable use the same numeric identity |
+| Package SemVer | `0.1.0` | `TbSemanticVersion`, `Version`, `PackageVersion` |
+| InformationalVersion | `0.1.0` | Exact About/sentinel value; source-revision suffix disabled |
+| AssemblyVersion | `0.1.0.0` | `v0.1.0-preview.1` and stable `v0.1.0` use the same numeric identity |
 | FileVersion | `0.1.0.0` | PE/file metadata |
 | Win32 manifest version | `0.1.0.0` | `src/TokenBar.App/app.manifest`; verifier rejects drift |
 | .NET SDK | `10.0.301` | [`global.json`](../global.json), roll-forward disabled |
 | Rust toolchain | `1.96.1`, minimal profile | [`rust-toolchain.toml`](../rust-toolchain.toml) |
 | NuGet graph | Lock files required | `RestorePackagesWithLockFile=true`; release restore uses `--locked-mode` |
 | Cargo graph | `Cargo.lock` required | Native build uses `cargo ... --locked` |
+
+The published `v0.1.0-preview.1` remains the recorded unsigned prerelease
+history; it is not the stable publication.
 
 The App direct package versions are intentionally exact: Windows App SDK
 `1.8.260710003`, Windows SDK BuildTools `10.0.28000.2526`, H.NotifyIcon.WinUI
@@ -99,8 +106,8 @@ native source/publish byte equality.
 
 | Output | Purpose | Upload policy |
 |---|---|---|
-| `TokenBar-App-0.1.0-preview.1-win-<rid>.zip` | Private unsigned App package | Never uploaded by hosted CI |
-| `TokenBar-App-0.1.0-preview.1-win-<rid>.zip.sha256` | ZIP SHA-256 and filename | Uploaded as sanitized CI evidence |
+| `TokenBar-App-0.1.0-win-<rid>.zip` | Stable unsigned portable App package | Never uploaded by hosted CI |
+| `TokenBar-App-0.1.0-win-<rid>.zip.sha256` | ZIP SHA-256 and filename | Uploaded as sanitized CI evidence |
 | `evidence.json` | Version, RID, toolchain, git SHA, inventory, hashes, gate boundary | Uploaded as sanitized CI evidence |
 | `publish/` | Staging files used for checks and ZIP creation | Private command output only |
 
@@ -121,7 +128,7 @@ below.
 | `rustc.release` | `1.96.1` |
 | `rustc.commitHash` | Concrete rustc commit hash, not `unknown` |
 | `rid` | `win-x64` or `win-arm64` |
-| `semanticVersion` / `informationalVersion` | `0.1.0-preview.1` |
+| `semanticVersion` / `informationalVersion` | `0.1.0` |
 | `assemblyVersion` / `manifestVersion` | `0.1.0.0` |
 | `artifact.sha256` | SHA-256 of the labelled ZIP |
 | `inventory[].path` | Relative path with no drive or profile prefix |
@@ -132,10 +139,10 @@ failures. The command does not fabricate a lock graph when restore inputs are
 unavailable; the generated `packages.lock.json` files must be produced by an
 authorized Windows restore and committed before release CI can pass.
 
-## Private startup gate
+## Startup gate
 
-The bounded probe is a separate host action after the published package has
-passed structure checks:
+The bounded probe is a separate host action after the package has passed
+structure checks:
 
 ```powershell
 TokenBar.App.exe --startup-smoke C:\phase10\sentinel.json
@@ -148,11 +155,21 @@ Missing, invalid or already-existing paths are hard failures. The process sets
 `ExitCode` and routes shutdown through `TrayService.QuitApp` so feed/timer/tray
 and GDI cleanup runs before `Application.Exit`.
 
-The gate runs only in a separately provided disposable Windows VM/account
-snapshot with production credentials absent and outbound network blocked. An
-environment-variable reassignment or a different working directory alone is
-not isolation. Hosted CI does not execute this probe and must not describe its
-evidence as an interactive startup pass.
+The published `v0.1.0-preview.1` x64 and ARM64 startup-smoke runs used the active
+`Nanako` profile with outbound network blocked under explicit approval. This was
+a non-disposable exception for the prerelease, not disposable isolation, and it
+must never be described as isolated. Both runs reached `tray-ready` and exited
+with task result `0`.
+
+For stable, the default gate is a separately provided disposable Windows
+VM/account snapshot with production credentials absent and outbound network
+blocked. An environment-variable reassignment or a different working directory
+alone is not isolation. A non-disposable exception requires separate explicit
+authorization, must be labelled as a non-disposable exception, and must never
+be called isolated. The current `v0.1.0` stable transaction is explicitly
+authorized to use the active `Nanako` profile with outbound blocked under those
+non-disposable terms. Hosted CI does not execute this probe and must not
+describe its evidence as an interactive startup pass.
 
 The M19-B1 historical real-ARM64 result (2026-07-27: 351 Rust tests, 12
 provider-v3 CrossCheck cases, PE checks and synthetic WinUI startup) is recorded
@@ -168,17 +185,18 @@ published-artifact x64/ARM64 gates.
 | Native/App build | Run exact SDK/Rust, `cargo --locked`, `BuildTbNative`, and both RIDs | Preserve `src/Directory.Build.targets` mapping and native verifier |
 | Artifact command | Exercise the repo-owned command in runner temp for x64 and ARM64 | Keep ZIP/EXE/DLL private; upload only evidence/checksums |
 | PE/version/hash | Check inventory, architecture, version mapping and stale-DLL equality | Treat any mismatch as a release blocker |
-| Interactive startup | No hosted claim | Run the bounded probe on the disposable Windows VM/account snapshot |
-| Public release | No CI publication or signing | Requires an explicit later authority decision |
+| Interactive startup | No hosted claim | Run the bounded probe on the default disposable host or an explicitly authorized, labelled non-disposable exception; `v0.1.0` uses the active `Nanako` profile with outbound blocked |
+| Public stable release | No CI publication, signing, tag, or asset upload | Requires a separate explicit authority decision |
 
 ## Phase 11/12 non-goals
 
-Phase 10 does not add Velopack packaging, signing credentials, public App
-uploads, winget/Scoop manifests, general logger or DI rewrites, settings
-migrations, network-suppression seams, or a replacement for the existing native
-build plumbing. Those are Phase 11/12 scope and remain unopened until a later
-authority gate explicitly approves them.
+Phase 10 does not add Velopack packaging, signing credentials, automated
+publication from hosted CI, winget/Scoop manifests, general logger or DI
+rewrites, settings migrations, network-suppression seams, or a replacement for
+the existing native build plumbing. Velopack/signing/installer/updater is the
+next Phase 11 priority; winget/Scoop is Phase 12 and remains unopened until a
+later authority gate explicitly approves it.
 
-The release command is therefore a private, unsigned evidence producer. A
-successful hosted job or historical ARM64 VM result alone is not permission to
-publish a package, attach an App binary, or claim stable-release readiness.
+The release command is therefore a stable unsigned portable evidence producer.
+A successful hosted job or historical ARM64 VM result alone is not permission to
+publish stable artifacts, attach an App binary, or claim stable publication.
