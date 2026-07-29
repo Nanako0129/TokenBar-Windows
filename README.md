@@ -4,10 +4,11 @@ Windows port of [TokenBar](https://github.com/Nanako0129/TokenBar) — the
 menu-bar/tray AI coding-agent token-usage monitor. Same Rust parsing core,
 a native WinUI 3 shell.
 
-> **Status: v0.1.0 stable release candidate.** Phase 10 is the current unsigned
-> portable release transaction; stable publication is not claimed. See the
-> [`release contract`](docs/release.md) and the published
-> [`v0.1.0-preview.1` prerelease](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0-preview.1).
+> **Status: v0.1.0 stable released.** Phase 10 completed the unsigned portable
+> release transaction. Download the
+> [`v0.1.0` stable release](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0),
+> or see the [`release contract`](docs/release.md) and
+> [`v0.1.0-preview.1` prerelease history](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0-preview.1).
 
 ## Architecture
 
@@ -77,8 +78,8 @@ TZ=Asia/Taipei dotnet run \
 ```
 
 CI publishes only short-retention Smoke test-harness artifacts and sanitized
-Phase 10 App evidence/checksums. App ZIP/EXE/DLL files are never uploaded. The
-hosted runners perform structure, version, PE, and hash checks; they do not
+Phase 10 App evidence/checksums. Hosted CI never uploads App ZIP/EXE/DLL files.
+The hosted runners perform structure, version, PE, and hash checks; they do not
 claim an interactive WinUI startup gate.
 
 The M19-B1 real-ARM64 result is historical evidence from a separate Windows
@@ -91,9 +92,10 @@ active `Nanako` profile with outbound blocked under explicit approval; it was a
 non-disposable exception, not disposable isolation. For stable, the default is
 a disposable Windows VM/account with production credentials absent and outbound
 blocked; a non-disposable exception needs separate explicit authorization, must
-be labelled, and must never be called isolated. The current `v0.1.0` stable
-transaction is explicitly authorized to use the active `Nanako` profile with
-outbound blocked under those non-disposable terms.
+be labelled, and must never be called isolated. The published `v0.1.0` stable
+x64/ARM64 startup-smoke used the separately authorized active `Nanako` profile
+with executable-specific outbound blocking under those non-disposable terms;
+both runs reached `tray-ready` and exited with task result `0`.
 
 Prereqs: Rust `1.96.1`, .NET SDK `10.0.301`, PowerShell `7.0+`; on Windows the
 MSVC toolchain.
@@ -125,7 +127,7 @@ debt is tracked separately.
 | 7 | Settings + tray extras | 🔶 feature-complete (macOS parity) — settings store (`%APPDATA%\TokenBar\settings.json`, atomic, unit-tested) with the year filter, chart persistence, manual-refresh spinner; tray: seven modes with the value drawn into the icon (tooltip carries the full string), bars/ring/popsicle gauges (macOS geometry verbatim), cat/parrot animation (HICON-cached, ~0.5% of a core at idle), full context menu with live quota sources; Mica settings window (ten sections, live keys, autostart via HKCU Run honoring StartupApproved); flyout footer gear+Quit; in-flyout Ctrl-shortcut set. Global `RegisterHotKey` dropped: the macOS reference ships no global shortcut, so it's not a parity gap (parked as an optional Windows-only nicety in Phase 9). Verification: icon gallery + live tray screenshots + synthesized input on the x64 box; the non-quota Settings flow passed the 125% DPI interactive gate on 2026-07-17, including live 520→600 DIP flyout resizing, persistence, singleton hide/reopen, autostart restoration, and the 48ms entrance-animation race. The separate 150% pass also passed on 2026-07-17 in an isolated RDP session: both windows reported 144 DPI, 520→600 DIP mapped immediately to 780→900 physical px, and the persisted height survived a process restart. A 33-active-day synthetic fixture supported user-checked 3D hover/orbit/zoom/Fit/Reset, and the Flyout Acrylic was subsequently verified with loaded 3D content in both light and dark themes at 200% DPI |
 | 8 | 3D integration | ✅ 2026-07-17 — product card renders the real contribution grid with macOS-parity colors/lighting (sRGB-correct opaque faces), 4× MSAA, render-on-demand orbit/pan/zoom, persisted `tokenbar.orbit.v1`, Fit/Reset, custom ray-picked tooltip, and a persisted 2D/3D toggle. Real x64 checks include corrected pointer/DPI alignment, 2D↔3D in 6.7–20.1ms, a 241-frame drag trace, idle no-present, the 50-cycle lifecycle gate, and a retained 60-minute soak: 8230 cycles, `created=8230 released=8230 removed=0 errors=0`, 3600.7s elapsed, with private-memory and handle thresholds passing. Fresh review confirmed the lifecycle and cleanup result |
 | 9 | Polish + parity + shared-core sync | ⏸️ **Paused.** Shared-engine consumer migration pins the reviewed public `tokscale-core` commit used by Native; non-quota client tabs remain complete (2026-07-17). **Provider pace v3 reconciliation completed 2026-07-19** against the exact macOS `1e00e7b` tree: Codex, Claude, Grok, Antigravity, and Copilot recurring percentage cards use stable `cardId`, opaque account scope, exact/observed duration, typed lifecycle states, and backend-owned coherent history; Windows adds CNG-backed installation identity, protected DACLs, reparse/file-ID checks, locking, capacity bounds, and atomic replacement. Strict C# decoding, `clientId|cardId` selection retention/migration, shared Dashboard/Settings row semantics, responsive Full layout, Classic/Off suppression, and typed learning/unavailable previews are active. Verification includes 275 .NET tests; the latest Windows x64 `tb_core_ffi` release suite with 300 tests; macOS and Windows x64 workspace/App/synthetic-smoke gates; ARM64 release build, 15 native security/history tests, 12 provider cases, and WinUI startup; Swift↔C# zero-difference checks across 12 provider-v3 and 116 legacy cases; light/dark responsive UI checks at 100%, 150%, and 200% DPI; sanitized production-profile preservation; and fresh focused/end-to-end verifiers. Windows runtime follow-ups resolve provider homes without `HOME`, hide and cache the Claude version probe, and discover/probe every Antigravity language server without visible console windows. Provider compatibility closure on 2026-07-20 adds Windows Antigravity OAuth-client artifact discovery, proves the installed scanner against Antigravity 2.3.1, accepts Grok's unified-billing schema as a separate non-recurring financial cap, and completes sanitized Codex/Grok/Antigravity live gates. Final review fixes unify Antigravity local/remote history scope through verified Google Email and bind the tray last-good gauge to its effective selection. This completes the pace contract only; broader quota-source ordering/visibility and new Agent-limits feature scope remain unopened · backlog: demo mode; optional Windows-only global hotkey to toggle the flyout (no macOS equivalent — needs a key-binding UI) |
-| 10 | v0.1.0 stable portable release transaction | 🔶 Current release-candidate state: unsigned portable `v0.1.0` contract prepared; stable publication/tag/assets are not claimed. See [`docs/release.md`](docs/release.md) and the published [`v0.1.0-preview.1` prerelease](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0-preview.1) history. |
+| 10 | v0.1.0 stable portable release transaction | ✅ 2026-07-29 — [`v0.1.0`](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0) published as the unsigned portable x64/ARM64 stable release from `aa671e0`, with eight checksum/evidence/smoke/package assets and native `tray-ready` startup evidence under the explicitly approved non-disposable active-profile boundary. See [`docs/release.md`](docs/release.md). |
 | 11 | Velopack/signing/installer/updater | ⏭️ Next priority; unopened. |
 | 12 | winget/Scoop | — Unopened. |
 
