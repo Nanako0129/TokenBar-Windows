@@ -416,7 +416,7 @@ $evidence = [ordered]@{
     inventory = $inventory
     startupSmoke = [ordered]@{
         command = "$appExecutableName --startup-smoke <new-sentinel-path>"
-        hostGate = "private disposable Windows VM/account snapshot with production credentials absent and outbound network blocked"
+        hostGate = "explicitly authorized non-disposable active Nanako profile with outbound network blocked; not isolated"
         hostedCi = "structure/version/PE/hash checks only; no interactive WinUI startup claim"
     }
 }
