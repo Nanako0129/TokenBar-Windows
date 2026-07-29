@@ -102,7 +102,7 @@
       "tokenbar.core": {
         "type": "Project",
         "dependencies": {
-          "TokenBar.Interop": "[0.1.0-preview.1, )"
+          "TokenBar.Interop": "[0.1.0, )"
         }
       },
       "tokenbar.interop": {
