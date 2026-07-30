@@ -67,7 +67,7 @@ public sealed class SettingsWindow : Window
     {
         _quota = quota;
         _graph = graph;
-        Title = "TokenBar Settings";
+        Title = $"{ProductIdentity.Name} Settings";
         SystemBackdrop = new MicaBackdrop();
         var root = new Grid();
         root.ColumnDefinitions.Add(new ColumnDefinition

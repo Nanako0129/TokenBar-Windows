@@ -20,6 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\TokenBar.App\ProductIdentity.cs" Link="ProductIdentity.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\TokenBar.Core\TokenBar.Core.csproj" />
     <ProjectReference Include="..\TokenBar.Interop\TokenBar.Interop.csproj" />
   </ItemGroup>

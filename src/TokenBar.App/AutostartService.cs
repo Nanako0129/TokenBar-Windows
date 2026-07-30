@@ -15,7 +15,7 @@ internal static class AutostartService
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string ApprovedKey =
         @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
-    private const string ValueName = "TokenBar";
+    private static readonly string ValueName = ProductIdentity.Name;
 
     public static bool IsEnabled
     {
