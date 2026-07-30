@@ -15,10 +15,10 @@
         <StackPanel Grid.Row="0" Spacing="6">
             <Grid>
                 <TextBlock
+                    x:Name="ProductTitle"
                     FontSize="15"
                     FontWeight="SemiBold"
-                    VerticalAlignment="Center"
-                    Text="TokenBar" />
+                    VerticalAlignment="Center" />
                 <StackPanel
                     Orientation="Horizontal"
                     Spacing="6"

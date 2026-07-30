@@ -3,7 +3,8 @@
        numeric assembly/file version intentionally remains 0.1.0.0 across the
        v0.1.0-preview.1 prerelease and the v0.1.0 stable package. -->
   <PropertyGroup>
-    <TbProductName>TokenBar</TbProductName>
+    <TbProductName>Syrtis</TbProductName>
+    <Product>$(TbProductName)</Product>
     <TbSemanticVersion>0.1.0</TbSemanticVersion>
     <TbAssemblyVersion>0.1.0.0</TbAssemblyVersion>
     <Version>$(TbSemanticVersion)</Version>

@@ -35,7 +35,7 @@ public sealed class TrayService : IDisposable
     {
         _icon = new TaskbarIcon
         {
-            ToolTipText = "TokenBar",
+            ToolTipText = ProductIdentity.Name,
         };
         _flyout = flyout;
         _icon.LeftClickCommand = new RelayCommand(flyout.ToggleFlyout);
@@ -104,7 +104,7 @@ public sealed class TrayService : IDisposable
         var menu = new Microsoft.UI.Xaml.Controls.MenuFlyout();
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
         {
-            Text = "Open TokenBar",
+            Text = $"Open {ProductIdentity.Name}",
             Command = new RelayCommand(_flyout.ShowFlyout),
         });
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
@@ -202,12 +202,12 @@ public sealed class TrayService : IDisposable
     {
         if (_feed.VisibleTotals is not { } totals)
         {
-            return "TokenBar — loading…";
+            return $"{ProductIdentity.Name} — loading…";
         }
 
         var lines = new List<string>
         {
-            "TokenBar",
+            ProductIdentity.Name,
             $"Today {Format.CompactTokens(totals.TodayTokens)} · {Format.Usd(totals.TodayCost)}",
             $"All time {Format.CompactTokens(totals.TotalTokens)} · {Format.Usd(totals.TotalCost)}",
         };
