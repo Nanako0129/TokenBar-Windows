@@ -15,6 +15,7 @@ public partial class App : Application
     private bool _startupSmokeRequested;
     private string? _startupSmokePath;
     private string? _startupSmokeError;
+    private int _updateCheckStarted;
 
     public App()
     {
@@ -90,6 +91,8 @@ public partial class App : Application
                 QueueStartupSmoke();
             }
 
+            StartUpdateCheckOnce();
+
             // Dev-only 3D panel (Phase 8 Gate 0). --graph3d mounts and shows
             // it for manual inspection; --soak3d runs the device-lifecycle
             // soak (50 cycles, or --soak3d-minutes duration mode) and exits
@@ -110,6 +113,161 @@ public partial class App : Application
             DevLog.Write($"launch FAILED: {ex}");
             throw;
         }
+    }
+
+    private void StartUpdateCheckOnce()
+    {
+        if (Interlocked.Exchange(ref _updateCheckStarted, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _ = Task.Run(CheckForUpdatesOnceAsync);
+        }
+        catch (Exception ex)
+        {
+            LogUpdateFailure("update-check", ex);
+        }
+    }
+
+    private async Task CheckForUpdatesOnceAsync()
+    {
+        try
+        {
+            var flow = new UpdateFlow();
+            var candidate = await flow.CheckForUpdatesAsync().ConfigureAwait(false);
+            if (candidate is null)
+            {
+                DevLog.Write("update-check: none");
+                return;
+            }
+
+            if (!QueueUpdateUi(() => PublishUpdate(flow, candidate)))
+            {
+                throw new InvalidOperationException();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogUpdateFailure("update-check", ex);
+        }
+    }
+
+    private void PublishUpdate(UpdateFlow flow, UpdateCandidate candidate)
+    {
+        try
+        {
+            var tray = _tray;
+            if (tray is null || !tray.CanHandoff)
+            {
+                return;
+            }
+
+            if (tray.PublishUpdate(
+                candidate.Version,
+                () => StartUpdateDownload(flow, candidate)))
+            {
+                DevLog.Write($"update-available: v{candidate.Version}");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogUpdateFailure("update-check", ex);
+        }
+    }
+
+    private void StartUpdateDownload(UpdateFlow flow, UpdateCandidate candidate)
+    {
+        try
+        {
+            _ = Task.Run(() => DownloadUpdateAsync(flow, candidate));
+        }
+        catch (Exception ex)
+        {
+            RestoreUpdateAction("update-download");
+            LogUpdateFailure("update-download", ex);
+        }
+    }
+
+    private async Task DownloadUpdateAsync(
+        UpdateFlow flow,
+        UpdateCandidate candidate)
+    {
+        DevLog.Write($"update-download: start v{candidate.Version}");
+        try
+        {
+            await flow.DownloadAndVerifyAsync(candidate).ConfigureAwait(false);
+            DevLog.Write($"update-download: verified v{candidate.Version}");
+            if (!QueueUpdateUi(() => HandoffUpdate(flow, candidate)))
+            {
+                throw new InvalidOperationException();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogUpdateFailure("update-download", ex);
+            _ = QueueUpdateUi(() => RestoreUpdateAction("update-download"));
+        }
+    }
+
+    private void HandoffUpdate(UpdateFlow flow, UpdateCandidate candidate)
+    {
+        var tray = _tray;
+        if (tray is null || !tray.CanHandoff)
+        {
+            return;
+        }
+
+        try
+        {
+            var quit = TrayService.QuitApp
+                ?? throw new InvalidOperationException();
+            DevLog.Write($"update-handoff: start v{candidate.Version}");
+            if (flow.TryHandoff(
+                candidate,
+                () => tray.CanHandoff,
+                () =>
+                {
+                    tray.CompleteUpdateAction();
+                    quit();
+                }))
+            {
+                DevLog.Write($"update-handoff: started v{candidate.Version}");
+            }
+        }
+        catch (Exception ex)
+        {
+            RestoreUpdateAction("update-handoff");
+            LogUpdateFailure("update-handoff", ex);
+        }
+    }
+
+    private void RestoreUpdateAction(string stage)
+    {
+        try
+        {
+            _tray?.RestoreUpdateAction();
+        }
+        catch (Exception ex)
+        {
+            LogUpdateFailure(stage, ex);
+        }
+    }
+
+    private bool QueueUpdateUi(Action action) =>
+        _flyout?.DispatcherQueue.TryEnqueue(() => action()) == true;
+
+    private static void LogUpdateFailure(string stage, Exception exception)
+    {
+        var type = exception.GetType().Name;
+        if (type.Length > 64)
+        {
+            type = type[..64];
+        }
+
+        DevLog.Write($"{stage}: failed {type}");
     }
 
     private static (bool Requested, string? Path, string? Error)

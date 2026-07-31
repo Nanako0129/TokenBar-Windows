@@ -27,6 +27,8 @@ public sealed class TrayService : IDisposable
     private readonly TrayFeed _feed;
     private readonly TrayAnimator _animator;
     private readonly Action<string> _onStoreChanged;
+    private readonly PendingUpdateAction _pendingUpdate = new();
+    private PendingUpdateAction.PendingAction? _activeUpdate;
     private string _iconSignature = "";
     private nint _hicon;
     private bool _disposed;
@@ -39,6 +41,13 @@ public sealed class TrayService : IDisposable
         };
         _flyout = flyout;
         _icon.LeftClickCommand = new RelayCommand(flyout.ToggleFlyout);
+        _icon.TrayIcon.MessageWindow.MouseEventReceived += (_, eventArgs) =>
+        {
+            if (eventArgs.MouseEvent == MouseEvent.BalloonToolTipClicked)
+            {
+                InvokePendingUpdate();
+            }
+        };
         _icon.NoLeftClickDelay = true;
         // NOT SecondWindow: that mode parks a transparent helper window over
         // the desktop, which swallowed hover/wheel input meant for the flyout.
@@ -89,6 +98,95 @@ public sealed class TrayService : IDisposable
     public void ShowSettings() => SettingsWindow.Present(
         () => _feed.Quota, () => _feed.Graph);
 
+    internal bool CanHandoff => !Volatile.Read(ref _disposed);
+
+    internal bool PublishUpdate(string version, Action action)
+    {
+        if (_disposed || !_pendingUpdate.Publish(version, action))
+        {
+            return false;
+        }
+
+        try
+        {
+            RebuildMenu();
+            try
+            {
+                _icon.ShowNotification(
+                    title: ProductIdentity.Name,
+                    message: $"Update to v{version}",
+                    icon: NotificationIcon.Info,
+                    sound: false,
+                    respectQuietTime: true);
+            }
+            catch (Exception ex)
+            {
+                var type = ex.GetType().Name;
+                DevLog.Write(
+                    $"update-notification: failed {type[..Math.Min(type.Length, 64)]}");
+            }
+
+            return true;
+        }
+        catch
+        {
+            _pendingUpdate.Clear();
+            RebuildMenu();
+            throw;
+        }
+    }
+
+    internal void RestoreUpdateAction()
+    {
+        if (_disposed || _activeUpdate is not { } active)
+        {
+            return;
+        }
+
+        if (_pendingUpdate.Restore(active))
+        {
+            _activeUpdate = null;
+            RebuildMenu();
+        }
+    }
+
+    internal void CompleteUpdateAction()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _activeUpdate = null;
+        _pendingUpdate.Clear();
+    }
+
+    private void InvokePendingUpdate()
+    {
+        if (_disposed || _pendingUpdate.Take() is not { } pending)
+        {
+            return;
+        }
+
+        _activeUpdate = pending;
+        RebuildMenu();
+        try
+        {
+            if (!pending.TryInvoke())
+            {
+                _activeUpdate = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            _ = _pendingUpdate.Restore(pending);
+            _activeUpdate = null;
+            RebuildMenu();
+            var type = ex.GetType().Name;
+            DevLog.Write($"update-download: failed {type[..Math.Min(type.Length, 64)]}");
+        }
+    }
+
     /// <summary>The full context menu (macOS splits this between the
     /// status-item right-click quota menu and the settings panel; Windows
     /// keeps one battery-style menu): Open · Menu bar shows · Quota source ·
@@ -107,6 +205,14 @@ public sealed class TrayService : IDisposable
             Text = $"Open {ProductIdentity.Name}",
             Command = new RelayCommand(_flyout.ShowFlyout),
         });
+        if (_pendingUpdate.Peek() is { } updateVersion)
+        {
+            menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
+            {
+                Text = $"Update to v{updateVersion}",
+                Command = new RelayCommand(InvokePendingUpdate),
+            });
+        }
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
 
         // Menu bar shows — the seven TrayModes as a radio group.
@@ -333,6 +439,8 @@ public sealed class TrayService : IDisposable
         }
 
         _disposed = true;
+        _pendingUpdate.Dispose();
+        _activeUpdate = null;
         AppSettings.Store.Changed -= _onStoreChanged;
         _feed.Dispose(); // stop polling before the icon it feeds goes away
         _animator.Stop();

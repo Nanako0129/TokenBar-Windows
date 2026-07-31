@@ -11,6 +11,7 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Velopack" Version="1.2.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
   </ItemGroup>
@@ -20,7 +21,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\TokenBar.App\PendingUpdateAction.cs" Link="PendingUpdateAction.cs" />
     <Compile Include="..\TokenBar.App\ProductIdentity.cs" Link="ProductIdentity.cs" />
+    <Compile Include="..\TokenBar.App\UpdateFlow.cs" Link="UpdateFlow.cs" />
   </ItemGroup>
 
   <ItemGroup>

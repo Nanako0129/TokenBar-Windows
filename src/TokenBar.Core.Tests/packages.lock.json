@@ -18,6 +18,12 @@
           "Microsoft.TestPlatform.TestHost": "17.14.1"
         }
       },
+      "Velopack": {
+        "type": "Direct",
+        "requested": "[1.2.0, )",
+        "resolved": "1.2.0",
+        "contentHash": "Rz67gJL619fSBS6omaSINUxyDuwhIxkm5mmubf7uLd5Qgi6LLKaKCha+QFP6n+Bw/UjA0vutnH4JQfYzn6ANtw=="
+      },
       "xunit": {
         "type": "Direct",
         "requested": "[2.9.3, )",
@@ -102,7 +108,7 @@
       "tokenbar.core": {
         "type": "Project",
         "dependencies": {
-          "TokenBar.Interop": "[0.1.0, )"
+          "TokenBar.Interop": "[0.2.0, )"
         }
       },
       "tokenbar.interop": {
