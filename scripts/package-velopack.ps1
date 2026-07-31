@@ -125,6 +125,7 @@ function Assert-VelopackPackage {
     param(
         [Parameter(Mandatory = $true)][string]$PackagePath,
         [Parameter(Mandatory = $true)][string]$PackId,
+        [Parameter(Mandatory = $true)][string]$ProductName,
         [Parameter(Mandatory = $true)][string]$SemanticVersion,
         [Parameter(Mandatory = $true)][string]$MainExe,
         [Parameter(Mandatory = $true)][string]$Rid,
@@ -154,6 +155,7 @@ function Assert-VelopackPackage {
 
         $expected = [ordered]@{
             id = $PackId
+            title = $ProductName
             version = $SemanticVersion
             mainExe = $MainExe
             machineArchitecture = $MachineArchitecture
@@ -240,6 +242,7 @@ finally {
 $packageName = "{0}-{1}-{2}-full.nupkg" -f $packId, $packProperties.SemanticVersion, $Rid
 $packagePath = Join-Path $releasesRoot $packageName
 Assert-VelopackPackage -PackagePath $packagePath -PackId $packId `
+    -ProductName $packProperties.ProductName `
     -SemanticVersion $packProperties.SemanticVersion -MainExe $appExecutableName `
     -Rid $Rid -MachineArchitecture $machineArchitecture
 
