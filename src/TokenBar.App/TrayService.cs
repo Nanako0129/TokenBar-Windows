@@ -110,12 +110,22 @@ public sealed class TrayService : IDisposable
         try
         {
             RebuildMenu();
-            _icon.ShowNotification(
-                title: ProductIdentity.Name,
-                message: $"Update to v{version}",
-                icon: NotificationIcon.Info,
-                sound: false,
-                respectQuietTime: true);
+            try
+            {
+                _icon.ShowNotification(
+                    title: ProductIdentity.Name,
+                    message: $"Update to v{version}",
+                    icon: NotificationIcon.Info,
+                    sound: false,
+                    respectQuietTime: true);
+            }
+            catch (Exception ex)
+            {
+                var type = ex.GetType().Name;
+                DevLog.Write(
+                    $"update-notification: failed {type[..Math.Min(type.Length, 64)]}");
+            }
+
             return true;
         }
         catch
