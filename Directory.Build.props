@@ -1,12 +1,16 @@
 <Project>
-  <!-- Phase 10: one source of truth for product, package, and assembly identity. The
-       numeric assembly/file version intentionally remains 0.1.0.0 across the
-       v0.1.0-preview.1 prerelease and the v0.1.0 stable package. -->
+  <!-- One source of truth for product, package, and assembly identity. Phase 11
+       moves to 0.2.0 for the first installed (Velopack) release; v0.1.0 was the
+       portable TokenBar package and stays where it is. Velopack compares
+       releases by SemVer, so once an installed release ships this only ever
+       moves forward. Keep the numeric version in src/TokenBar.App/app.manifest
+       and the version contract in scripts/build-app-artifact.ps1 in step with
+       these two properties; the packaging command rejects any drift. -->
   <PropertyGroup>
     <TbProductName>Syrtis</TbProductName>
     <Product>$(TbProductName)</Product>
-    <TbSemanticVersion>0.1.0</TbSemanticVersion>
-    <TbAssemblyVersion>0.1.0.0</TbAssemblyVersion>
+    <TbSemanticVersion>0.2.0</TbSemanticVersion>
+    <TbAssemblyVersion>0.2.0.0</TbAssemblyVersion>
     <Version>$(TbSemanticVersion)</Version>
     <PackageVersion>$(TbSemanticVersion)</PackageVersion>
     <InformationalVersion>$(TbSemanticVersion)</InformationalVersion>
