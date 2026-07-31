@@ -18,12 +18,20 @@
     <AssemblyName>$(TbProductName).App</AssemblyName>
     <RootNamespace>TokenBar.App</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Phase 11: Program.cs replaces the generated entry point so Velopack's
+         install/update/uninstall hooks run before any WinUI initialisation.
+         The XAML compiler guards its generated Program with
+         "#if !DISABLE_XAML_GENERATED_MAIN"; nothing in the WindowsAppSDK
+         targets reads an MSBuild property for this, so the symbol itself must
+         be defined. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260710003" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" />
     <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
+    <PackageReference Include="Velopack" Version="1.2.0" />
     <!-- Phase 8 Gate 0: 3D contribution graph on D3D11, mirroring the Phase 2
          spike's Vortice stack. DXGI is explicit (composition swapchain +
          IDXGIFactory2.CreateSwapChainForComposition live here). -->
