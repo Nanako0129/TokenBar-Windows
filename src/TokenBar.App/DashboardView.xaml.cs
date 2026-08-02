@@ -836,10 +836,16 @@ public sealed partial class DashboardView : UserControl
                         Width = barWidth + gap,
                         Height = height,
                         Fill = new SolidColorBrush(Colors.Transparent),
+                        Stroke = new SolidColorBrush(Colors.Transparent),
+                        StrokeThickness = 2,
                     };
                     Canvas.SetLeft(overlay, x - gap / 2);
                     Canvas.SetTop(overlay, 0);
                     var capturedBar = bar;
+                    AttachHoverOutline(overlay, hovered =>
+                        overlay.Stroke = hovered
+                            ? HoverOutlineBrush()
+                            : new SolidColorBrush(Colors.Transparent));
                     HoverTip.AttachRich(overlay, () => DayTip(capturedBar));
                     canvas.Children.Add(overlay);
                 }
@@ -1073,13 +1079,39 @@ public sealed partial class DashboardView : UserControl
             trailing.Children.Add(costText);
             block.Children.Add(Ui.Row(name, trailing));
             block.Children.Add(TokenKindBar(entry));
+            var row = new Grid();
+            row.Children.Add(block);
+            var outline = new Border
+            {
+                BorderBrush = new SolidColorBrush(Colors.Transparent),
+                BorderThickness = new Thickness(2),
+                IsHitTestVisible = false,
+            };
+            row.Children.Add(outline);
             var captured = entry;
-            HoverTip.AttachRich(block, () => ModelTip(captured, colors));
-            panel.Children.Add(block);
+            AttachHoverOutline(row, hovered =>
+                outline.BorderBrush = hovered
+                    ? HoverOutlineBrush()
+                    : new SolidColorBrush(Colors.Transparent));
+            HoverTip.AttachRich(row, () => ModelTip(captured, colors));
+            panel.Children.Add(row);
         }
 
         return panel;
     }
+
+    // Keep the outline inside the target's arranged bounds so hover feedback
+    // cannot move chart bars or model rows while the tooltip follows the pointer.
+    private static void AttachHoverOutline(
+        FrameworkElement target, Action<bool> setVisible)
+    {
+        target.PointerEntered += (_, _) => setVisible(true);
+        target.PointerExited += (_, _) => setVisible(false);
+        target.Unloaded += (_, _) => setVisible(false);
+    }
+
+    private Brush HoverOutlineBrush() =>
+        (Brush)Application.Current.Resources["AccentFillColorDefaultBrush"];
 
     // ── Daily lens ───────────────────────────────────────────────────────
 
