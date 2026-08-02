@@ -73,4 +73,21 @@
           OverwriteReadOnlyFiles="true" />
   </Target>
 
+  <!-- Phase 11 S5: WindowsAppSDK 1.8's self-contained payload carries the
+       Windows AI runtime. onnxruntime.dll and DirectML.dll are 38.5 MB
+       uncompressed between them and this app has no call site for either; a
+       repository-wide search for AI, ONNX, DirectML, WinML or Phi Silica finds
+       nothing. The umbrella package cannot be dropped, because
+       H.NotifyIcon.WinUI depends on it, and ExcludeAssets on the .AI and .ML
+       sub-packages does not help, because the binaries arrive through the
+       self-contained payload rather than those packages' own assets. The SDK
+       adds the payload as None items, so drop the two by name after it does. -->
+  <Target Name="TbTrimUnusedWindowsAppSdkPayload"
+          AfterTargets="AddMicrosoftWindowsAppSDKPayloadFilesFromMsix;AddMicrosoftWindowsAppSDKPayloadFilesFromComponents">
+    <ItemGroup>
+      <None Remove="@(None)"
+            Condition="'%(Filename)%(Extension)' == 'onnxruntime.dll' or '%(Filename)%(Extension)' == 'DirectML.dll'" />
+    </ItemGroup>
+  </Target>
+
 </Project>
