@@ -1172,6 +1172,15 @@ public sealed partial class DashboardView : UserControl
     private static void AttachHoverOutline(
         FrameworkElement target, Action<bool> setVisible)
     {
+        // A panel with no Background is hit-tested only where its children are,
+        // so the gap between a row's left and right columns would fire
+        // PointerExited while the pointer is still inside the lit row. Every
+        // hover target routes through here, so one guard covers them all.
+        if (target is Panel panel && panel.Background is null)
+        {
+            panel.Background = new SolidColorBrush(Colors.Transparent);
+        }
+
         target.PointerEntered += (_, _) => setVisible(true);
         target.PointerExited += (_, _) => setVisible(false);
         target.Unloaded += (_, _) => setVisible(false);
@@ -1586,7 +1595,11 @@ public sealed partial class DashboardView : UserControl
     {
         long[] values =
             [entry.Input, entry.Output, entry.CacheRead, entry.CacheWrite, entry.Reasoning];
-        var total = Math.Max(1, values.Sum());
+        // Same saturating aggregate TokenBreakdown.Total uses: a corrupt lane
+        // clamped to long.MaxValue must not throw out of a tooltip, and
+        // Enumerable.Sum over long is checked.
+        var total = Math.Max(
+            1, values.Aggregate(0L, (running, v) => running.SaturatingAdd(v)));
         var panel = new StackPanel { Spacing = 5, MinWidth = 200 };
         var head = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
         head.Children.Add(Ui.Disc(colors.Color(entry.Provider, entry.Model), 7));
