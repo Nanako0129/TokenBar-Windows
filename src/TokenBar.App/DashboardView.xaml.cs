@@ -828,6 +828,21 @@ public sealed partial class DashboardView : UserControl
                 }
                 else
                 {
+                    var outline = new Rectangle
+                    {
+                        Width = barWidth,
+                        Height = height - y,
+                        Fill = new SolidColorBrush(Colors.Transparent),
+                        Stroke = new SolidColorBrush(Colors.Transparent),
+                        StrokeThickness = 1,
+                        RadiusX = 1,
+                        RadiusY = 1,
+                        IsHitTestVisible = false,
+                    };
+                    Canvas.SetLeft(outline, x);
+                    Canvas.SetTop(outline, y);
+                    canvas.Children.Add(outline);
+
                     // Full-height hover column: ONE tooltip per day listing
                     // every segment with its color dot (the macOS layout),
                     // instead of sliver-sized per-segment targets.
@@ -843,7 +858,7 @@ public sealed partial class DashboardView : UserControl
                     Canvas.SetTop(overlay, 0);
                     var capturedBar = bar;
                     AttachHoverOutline(overlay, hovered =>
-                        overlay.Stroke = hovered
+                        outline.Stroke = hovered
                             ? HoverOutlineBrush()
                             : new SolidColorBrush(Colors.Transparent));
                     HoverTip.AttachRich(overlay, () => DayTip(capturedBar));
@@ -1067,7 +1082,8 @@ public sealed partial class DashboardView : UserControl
         {
             var block = new StackPanel { Spacing = 3 };
             var name = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            name.Children.Add(Ui.Disc(colors.Color(entry.Provider, entry.Model)));
+            var (discHost, discGlow) = GlowingDisc(colors.Color(entry.Provider, entry.Model));
+            name.Children.Add(discHost);
             name.Children.Add(Ui.Text(entry.Model, 11));
             // Right column, macOS style: tokens over cost.
             var trailing = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
@@ -1078,30 +1094,81 @@ public sealed partial class DashboardView : UserControl
             trailing.Children.Add(tokensText);
             trailing.Children.Add(costText);
             block.Children.Add(Ui.Row(name, trailing));
-            block.Children.Add(TokenKindBar(entry));
-            var row = new Grid();
-            row.Children.Add(block);
-            var outline = new Border
+            var tokenBar = TokenKindBar(entry);
+            var barHost = new Grid { Height = 4 };
+            // White alpha brightens each segment; the accent edge reads as a halo.
+            var barGlow = new Border
             {
+                Background = new SolidColorBrush(HoverGlowFill),
                 BorderBrush = new SolidColorBrush(Colors.Transparent),
-                BorderThickness = new Thickness(2),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(1),
                 IsHitTestVisible = false,
+                Opacity = 0,
+                RenderTransform = new ScaleTransform { ScaleX = 1, ScaleY = 1.75 },
+                RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
             };
-            row.Children.Add(outline);
+            barHost.Children.Add(tokenBar);
+            barHost.Children.Add(barGlow);
+            block.Children.Add(barHost);
             var captured = entry;
-            AttachHoverOutline(row, hovered =>
-                outline.BorderBrush = hovered
-                    ? HoverOutlineBrush()
-                    : new SolidColorBrush(Colors.Transparent));
-            HoverTip.AttachRich(row, () => ModelTip(captured, colors));
-            panel.Children.Add(row);
+            // One row target covers the disc and bar so their hover state cannot drift.
+            AttachHoverOutline(block, hovered =>
+            {
+                if (hovered)
+                {
+                    var accent = HoverOutlineBrush();
+                    barGlow.BorderBrush = accent;
+                    discGlow.Stroke = accent;
+                }
+
+                barGlow.Opacity = hovered ? 1 : 0;
+                discGlow.Opacity = hovered ? 1 : 0;
+            });
+            HoverTip.AttachRich(block, () => ModelTip(captured, colors));
+            panel.Children.Add(block);
         }
 
         return panel;
     }
 
-    // Keep the outline inside the target's arranged bounds so hover feedback
-    // cannot move chart bars or model rows while the tooltip follows the pointer.
+    // Hover brightening for the model bar and its disc. Tuned down from the
+    // first attempt, which read as washed-out rather than lit; white over a
+    // saturated fill loses colour faster than it gains brightness.
+    private static readonly Color HoverGlowFill = Color.FromArgb(48, 255, 255, 255);
+
+    /// <summary>A provider disc plus its hover glow. The fixed host keeps the
+    /// disc's arranged size while the glow scales out, so lighting one up never
+    /// moves the row. Used by the Models lens and by the per-model rows inside
+    /// an expanded Daily entry, which must light up the same way.</summary>
+    private static (Grid Host, Ellipse Glow) GlowingDisc(string hex, double size = 8)
+    {
+        var disc = Ui.Disc(hex, size);
+        var glow = new Ellipse
+        {
+            Width = size,
+            Height = size,
+            Fill = new SolidColorBrush(HoverGlowFill),
+            Stroke = new SolidColorBrush(Colors.Transparent),
+            StrokeThickness = 1,
+            IsHitTestVisible = false,
+            Opacity = 0,
+            RenderTransform = new ScaleTransform { ScaleX = 1.35, ScaleY = 1.35 },
+            RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
+        };
+        var host = new Grid
+        {
+            Width = size,
+            Height = size,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        host.Children.Add(disc);
+        host.Children.Add(glow);
+        return (host, glow);
+    }
+
+    // Keep hover state attached to the target; visual changes do not alter
+    // measured or arranged bounds while the tooltip follows the pointer.
     private static void AttachHoverOutline(
         FrameworkElement target, Action<bool> setVisible)
     {
@@ -1164,12 +1231,45 @@ public sealed partial class DashboardView : UserControl
                         Spacing = 6,
                         Margin = new Thickness(12, 0, 0, 0),
                     };
-                    name.Children.Add(Ui.Disc(colors.Color(client.ProviderId, client.ModelId), 6));
+                    var (subDiscHost, subDiscGlow) =
+                        GlowingDisc(colors.Color(client.ProviderId, client.ModelId), 6);
+                    name.Children.Add(subDiscHost);
                     name.Children.Add(Ui.Text(
                         $"{client.ModelId} · {ClientRegistry.ShortName(client.Client)}", 10, 0.85));
-                    block.Children.Add(Ui.Row(
+                    var row = Ui.Row(
                         name,
-                        Ui.Text($"{Format.CompactTokens(client.Tokens.Total)} · {Format.Usd(client.Cost)}", 10, 0.7)));
+                        Ui.Text($"{Format.CompactTokens(client.Tokens.Total)} · {Format.Usd(client.Cost)}", 10, 0.7));
+                    var capturedClient = client;
+                    // Same treatment as the Models lens: the disc lights up with
+                    // the card, so the row the card describes is unambiguous.
+                    // Highlight the sub-row itself, not the day card that
+                    // encloses it: the card the tooltip describes is this model,
+                    // and lighting the whole day would point at the wrong thing.
+                    var rowGlow = new Border
+                    {
+                        BorderBrush = new SolidColorBrush(Colors.Transparent),
+                        BorderThickness = new Thickness(1),
+                        CornerRadius = new CornerRadius(3),
+                        IsHitTestVisible = false,
+                        Opacity = 0,
+                    };
+                    var rowHost = new Grid();
+                    rowHost.Children.Add(row);
+                    rowHost.Children.Add(rowGlow);
+                    AttachHoverOutline(rowHost, hovered =>
+                    {
+                        if (hovered)
+                        {
+                            var accent = HoverOutlineBrush();
+                            subDiscGlow.Stroke = accent;
+                            rowGlow.BorderBrush = accent;
+                        }
+
+                        subDiscGlow.Opacity = hovered ? 1 : 0;
+                        rowGlow.Opacity = hovered ? 0.55 : 0;
+                    });
+                    HoverTip.AttachRich(rowHost, () => ModelTip(capturedClient, colors));
+                    block.Children.Add(rowHost);
                 }
             }
 
@@ -1186,6 +1286,7 @@ public sealed partial class DashboardView : UserControl
                 _expandedDay = _expandedDay == date ? null : date;
                 RenderContent(animated: false);
             };
+
             panel.Children.Add(card);
         }
 
@@ -1466,7 +1567,22 @@ public sealed partial class DashboardView : UserControl
     /// <summary>Model-row tooltip: header disc + name, source line, totals,
     /// then per-kind colored rows with share percentages — the macOS
     /// ModelBreakdownCard hover.</summary>
-    private static UIElement ModelTip(ModelReportEntry entry, ModelColorMap colors)
+    private static UIElement ModelTip(ContributionClient entry, ModelColorMap colors) =>
+        ModelTip(new ModelReportEntry(
+            entry.Client,
+            entry.ModelId,
+            entry.ProviderId,
+            entry.Tokens.Input,
+            entry.Tokens.Output,
+            entry.Tokens.CacheRead,
+            entry.Tokens.CacheWrite,
+            entry.Tokens.Reasoning,
+            entry.Tokens.Total,
+            entry.Messages,
+            entry.Cost), colors, includeZeroKinds: true);
+
+    private static UIElement ModelTip(
+        ModelReportEntry entry, ModelColorMap colors, bool includeZeroKinds = false)
     {
         long[] values =
             [entry.Input, entry.Output, entry.CacheRead, entry.CacheWrite, entry.Reasoning];
@@ -1491,7 +1607,7 @@ public sealed partial class DashboardView : UserControl
         ];
         for (var i = 0; i < values.Length; i++)
         {
-            if (values[i] > 0)
+            if (includeZeroKinds || values[i] > 0)
             {
                 panel.Children.Add(TipRow(
                     TipLabel(kinds[i].Color, kinds[i].Label, square: true),
