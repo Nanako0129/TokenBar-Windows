@@ -32,6 +32,11 @@ public sealed class TrayService : IDisposable
     private string _iconSignature = "";
     private nint _hicon;
     private bool _disposed;
+    private readonly DispatcherQueue _dispatcher;
+    private TrayForceCreateEpisode? _creationEpisode;
+    private DispatcherQueueTimer? _retryTimer;
+    private TaskCompletionSource<bool>? _readyTcs;
+    private bool _trayCreationFailed;
 
     public TrayService(FlyoutWindow flyout)
     {
@@ -53,9 +58,9 @@ public sealed class TrayService : IDisposable
         // the desktop, which swallowed hover/wheel input meant for the flyout.
         _icon.ContextMenuMode = ContextMenuMode.PopupMenu;
 
-        var dispatcher = DispatcherQueue.GetForCurrentThread();
-        _feed = new TrayFeed(dispatcher);
-        _animator = new TrayAnimator(dispatcher, () => _feed.TokensPerMin, ApplyCachedIcon);
+        _dispatcher = DispatcherQueue.GetForCurrentThread();
+        _feed = new TrayFeed(_dispatcher);
+        _animator = new TrayAnimator(_dispatcher, () => _feed.TokensPerMin, ApplyCachedIcon);
         OpenSettings = ShowSettings;
         _feed.Changed += () =>
         {
@@ -69,7 +74,7 @@ public sealed class TrayService : IDisposable
                 // Changed fires on the writing thread; today's writers are
                 // all UI-thread, but the XAML objects here must never bet
                 // on that staying true.
-                _ = dispatcher.TryEnqueue(() =>
+                _ = _dispatcher.TryEnqueue(() =>
                 {
                     UpdateIcon();
                     RebuildMenu();
@@ -86,7 +91,36 @@ public sealed class TrayService : IDisposable
 
         UpdateIcon();
         RebuildMenu();
-        _icon.ForceCreate();
+        // Soft first attempt without Sleep; schedule timer ticks if needed.
+        BeginCreationEpisode();
+    }
+
+    /// <summary>True when H.NotifyIcon reports the shell icon was created.</summary>
+    internal bool IsTrayIconCreated => _icon.IsCreated;
+
+    /// <summary>
+    /// Hard tray-ready gate for --startup-smoke: awaits a fresh creation
+    /// episode with a bounded timeout (timer ticks; no UI-thread blocking wait).
+    /// </summary>
+    internal Task AssertTrayReadyAsync(
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (IsTrayIconCreated)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (_trayCreationFailed)
+        {
+            return Task.FromException(new InvalidOperationException(
+                "tray icon creation already exhausted without success."));
+        }
+
+        var budget = timeout
+            ?? TimeSpan.FromMilliseconds(TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds);
+        BeginCreationEpisode();
+        return WaitForTrayReadyAsync(budget, cancellationToken);
     }
 
     private readonly FlyoutWindow _flyout;
@@ -386,6 +420,7 @@ public sealed class TrayService : IDisposable
     {
         var hicon = bmp.GetHicon();
         _icon.Icon = System.Drawing.Icon.FromHandle(hicon);
+        EnsureIconCreated();
         if (_hicon != 0)
         {
             _ = DestroyIcon(_hicon);
@@ -400,10 +435,176 @@ public sealed class TrayService : IDisposable
     private void ApplyCachedIcon(System.Drawing.Icon icon)
     {
         _icon.Icon = icon;
+        EnsureIconCreated();
         if (_hicon != 0)
         {
             _ = DestroyIcon(_hicon);
             _hicon = 0;
+        }
+    }
+
+    private void EnsureIconCreated()
+    {
+        if (_icon.IsCreated || _trayCreationFailed)
+        {
+            return;
+        }
+
+        BeginCreationEpisode();
+    }
+
+    /// <summary>
+    /// Starts a new per-episode ForceCreate budget if none is running. One
+    /// attempt runs immediately; further attempts ride DispatcherQueueTimer
+    /// ticks (no blocking sleep on the UI thread).
+    /// </summary>
+    private void BeginCreationEpisode()
+    {
+        if (_disposed || _icon.IsCreated || _trayCreationFailed)
+        {
+            return;
+        }
+
+        if (_creationEpisode is not null && !_creationEpisode.IsExhausted)
+        {
+            return; // episode already in flight
+        }
+
+        _creationEpisode = new TrayForceCreateEpisode();
+        _readyTcs ??= new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        ProcessCreationTick();
+    }
+
+    private void ProcessCreationTick()
+    {
+        if (_disposed || _icon.IsCreated)
+        {
+            CompleteReady(success: _icon.IsCreated);
+            StopRetryTimer();
+            return;
+        }
+
+        var episode = _creationEpisode
+            ?? throw new InvalidOperationException("creation episode missing");
+        TrayForceCreateTickResult result;
+        try
+        {
+            result = episode.Tick(() =>
+            {
+                _icon.ForceCreate();
+                return _icon.IsCreated;
+            });
+        }
+        catch (Exception ex)
+        {
+            // Non-retryable: fail closed visibly.
+            DevLog.Write($"ForceCreate hard failure: {ex}");
+            FailTrayCreation(ex.Message);
+            throw;
+        }
+
+        switch (result)
+        {
+            case TrayForceCreateTickResult.Success:
+                CompleteReady(success: true);
+                StopRetryTimer();
+                return;
+            case TrayForceCreateTickResult.Exhausted:
+                FailTrayCreation(
+                    $"tray icon not ready after {episode.Attempts} ForceCreate attempts");
+                return;
+            case TrayForceCreateTickResult.Continue:
+                ScheduleRetryTick(
+                    TrayForceCreatePolicy.DelayMilliseconds(episode.Attempts));
+                return;
+            default:
+                throw new InvalidOperationException($"unknown tick result {result}");
+        }
+    }
+
+    private void ScheduleRetryTick(int delayMs)
+    {
+        StopRetryTimer();
+        _retryTimer = _dispatcher.CreateTimer();
+        _retryTimer.IsRepeating = false;
+        _retryTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(delayMs, 1));
+        _retryTimer.Tick += (_, _) =>
+        {
+            StopRetryTimer();
+            if (!_disposed)
+            {
+                ProcessCreationTick();
+            }
+        };
+        _retryTimer.Start();
+    }
+
+    private void StopRetryTimer()
+    {
+        if (_retryTimer is null)
+        {
+            return;
+        }
+
+        _retryTimer.Stop();
+        _retryTimer = null;
+    }
+
+    private void CompleteReady(bool success)
+    {
+        if (success)
+        {
+            _trayCreationFailed = false;
+            _creationEpisode = null;
+            _readyTcs?.TrySetResult(true);
+            _readyTcs = null;
+        }
+    }
+
+    private void FailTrayCreation(string message)
+    {
+        _trayCreationFailed = true;
+        _creationEpisode = null;
+        StopRetryTimer();
+        DevLog.Write($"tray creation FAILED: {message}");
+        _readyTcs?.TrySetException(new InvalidOperationException(message));
+        _readyTcs = null;
+
+        // Normal launch must not leave an invisible tray-less process.
+        // Startup-smoke path also exits via QuitApp after assert failure.
+        try
+        {
+            Environment.ExitCode = 1;
+            QuitApp?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            DevLog.Write($"tray fail-exit threw: {ex.Message}");
+            Microsoft.UI.Xaml.Application.Current?.Exit();
+        }
+    }
+
+    private async Task WaitForTrayReadyAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        if (IsTrayIconCreated)
+        {
+            return;
+        }
+
+        var tcs = _readyTcs
+            ?? throw new InvalidOperationException("tray creation episode was not started");
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        linked.CancelAfter(timeout);
+        await using var reg = linked.Token.Register(
+            () => tcs.TrySetException(new TimeoutException(
+                $"tray icon not ready within {timeout.TotalMilliseconds:0} ms")));
+        _ = await tcs.Task.ConfigureAwait(true);
+        if (!IsTrayIconCreated)
+        {
+            throw new InvalidOperationException("tray icon creation finished without ready state");
         }
     }
 
@@ -439,6 +640,10 @@ public sealed class TrayService : IDisposable
         }
 
         _disposed = true;
+        StopRetryTimer();
+        _creationEpisode = null;
+        _readyTcs?.TrySetCanceled();
+        _readyTcs = null;
         _pendingUpdate.Dispose();
         _activeUpdate = null;
         AppSettings.Store.Changed -= _onStoreChanged;

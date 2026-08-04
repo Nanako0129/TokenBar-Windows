@@ -23,6 +23,7 @@
   <ItemGroup>
     <Compile Include="..\TokenBar.App\PendingUpdateAction.cs" Link="PendingUpdateAction.cs" />
     <Compile Include="..\TokenBar.App\ProductIdentity.cs" Link="ProductIdentity.cs" />
+    <Compile Include="..\TokenBar.App\TrayForceCreatePolicy.cs" Link="TrayForceCreatePolicy.cs" />
     <Compile Include="..\TokenBar.App\UpdateFlow.cs" Link="UpdateFlow.cs" />
   </ItemGroup>
 

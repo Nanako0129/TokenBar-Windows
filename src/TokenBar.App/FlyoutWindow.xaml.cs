@@ -88,7 +88,18 @@ public sealed partial class FlyoutWindow : Window
 
         ApplyPopupChrome();
 
-        AppWindow.IsShownInSwitchers = false;
+        try
+        {
+            AppWindow.IsShownInSwitchers = false;
+        }
+        catch (NotImplementedException ex)
+        {
+            // WinUI 3 unpackaged (WindowsPackageType=None): SetShownInSwitchers
+            // is not implemented. Catch only that known platform gap.
+            // Fallback: when the setter is unavailable the flyout may remain
+            // visible in Alt+Tab; visible-but-working is accepted over crashing.
+            DevLog.Write($"IsShownInSwitchers ignored: {ex.Message}");
+        }
         AppWindow.Closing += (_, e) =>
         {
             // Tray-resident: closing the window means hiding it.

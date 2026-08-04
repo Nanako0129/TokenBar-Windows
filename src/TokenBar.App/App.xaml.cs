@@ -314,14 +314,15 @@ public partial class App : Application
             return;
         }
 
-        if (!_flyout.DispatcherQueue.TryEnqueue(() =>
-            CompleteStartupSmoke(_startupSmokePath, _startupSmokeError)))
+        if (!_flyout.DispatcherQueue.TryEnqueue(async () =>
+            await CompleteStartupSmokeAsync(_startupSmokePath, _startupSmokeError)
+                .ConfigureAwait(true)))
         {
             FailStartupSmoke("DispatcherQueue rejected the startup probe");
         }
     }
 
-    private void CompleteStartupSmoke(string? path, string? parseError)
+    private async Task CompleteStartupSmokeAsync(string? path, string? parseError)
     {
         try
         {
@@ -335,6 +336,12 @@ public partial class App : Application
                 throw new InvalidOperationException(
                     "--startup-smoke sentinel path is missing");
             }
+
+            // Hard gate: await per-episode ForceCreate ticks with bounded timeout.
+            await _tray!.AssertTrayReadyAsync(
+                TimeSpan.FromMilliseconds(
+                    TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds))
+                .ConfigureAwait(true);
 
             WriteStartupSmokeSentinel(path);
             Environment.ExitCode = 0;
