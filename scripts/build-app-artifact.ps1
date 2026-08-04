@@ -29,10 +29,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "lib\RuntimeConfig.ps1")
+
 $ExpectedSemanticVersion = "0.2.1"
 $ExpectedAssemblyVersion = "0.2.1.0"
-$ExpectedDotnetVersion = "10.0.204"
-$ExpectedRustVersion = "1.94.0-nightly"
+$ExpectedDotnetVersion = "10.0.301"
+$ExpectedRustVersion = "1.96.1"
 
 function Get-RepoProperty {
     param(
@@ -248,13 +250,13 @@ try {
         throw "rustc toolchain drifted: expected release $ExpectedRustVersion with a concrete commit hash."
     }
 
-    # $gitStatus = @(& git status --porcelain=v1 --untracked-files=all | Where-Object { $_ -notmatch '\.agents' -and $_ -notmatch 'ORIGINAL_REQUEST\.md' -and $_ -notmatch 'global\.json' -and $_ -notmatch 'build-app-artifact\.ps1' })
-    # if ($LASTEXITCODE -ne 0) {
-    #     throw "Unable to inspect git checkout state."
-    # }
-    # if ($gitStatus.Count -ne 0) {
-    #     throw "Artifact builds require a clean git checkout so gitSha identifies the exact source."
-    # }
+    $gitStatus = @(& git status --porcelain=v1 --untracked-files=all)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to inspect git checkout state."
+    }
+    if ($gitStatus.Count -ne 0) {
+        throw "Artifact builds require a clean git checkout so gitSha identifies the exact source."
+    }
 
     $gitSha = ((& git rev-parse --verify HEAD) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $gitSha -notmatch '^[0-9a-fA-F]{40}$') {
@@ -276,11 +278,11 @@ try {
         }
     }
     Invoke-Captured -Command "dotnet" -Arguments @(
-        "restore", $appProject, "-p:Platform=$platform", "-p:RuntimeIdentifier=$Rid"
-    ) -FailureMessage "App restore failed"
+        "restore", $appProject, "--locked-mode"
+    ) -FailureMessage "Locked App restore failed"
     Invoke-Captured -Command "dotnet" -Arguments @(
-        "restore", $smokeProject, "-p:Platform=$platform", "-p:RuntimeIdentifier=$Rid"
-    ) -FailureMessage "Smoke restore failed"
+        "restore", $smokeProject, "--locked-mode"
+    ) -FailureMessage "Locked Smoke restore failed"
 
     # Keep the existing repository-owned Platform/RID mapping and verifier in
     # the build path. TbNativeCargoLocked makes that target's own Cargo
@@ -320,6 +322,36 @@ if (-not (Test-Path -LiteralPath $priPath -PathType Leaf)) {
 $xbfFiles = @(Get-ChildItem -LiteralPath $publishRoot -Recurse -File -Filter "*.xbf")
 if ($xbfFiles.Count -eq 0) {
     throw "Published WinUI resources contain no XBF files."
+}
+
+$muiFiles = @(Get-ChildItem -LiteralPath $publishRoot -Recurse -File -Filter "*.mui")
+if ($muiFiles.Count -eq 0) {
+    throw "Published output must retain .mui locale files; found zero."
+}
+
+# Deployment-mode structural checks (Lite must not ship a self-contained runtime).
+$coreClr = Join-Path $publishRoot "coreclr.dll"
+$liteFrameworkFamily = $null
+$liteVelopackFramework = $null
+if ($DeploymentMode -eq "Lite") {
+    if (Test-Path -LiteralPath $coreClr -PathType Leaf) {
+        throw "Lite publish must not include bundled runtime coreclr.dll."
+    }
+    # Framework-dependent apphost still carries hostfxr/hostpolicy; coreclr must come
+    # from the machine-installed shared framework.
+    $runtimeConfigName = "{0}.runtimeconfig.json" -f $appAssemblyName
+    $runtimeConfigPath = Join-Path $publishRoot $runtimeConfigName
+    if (-not (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf)) {
+        throw "Lite publish is missing runtimeconfig.json: $runtimeConfigName"
+    }
+    $liteFrameworkFamily = Get-RuntimeConfigFrameworkFamily -Path $runtimeConfigPath
+    $liteVelopackFramework = Get-VelopackFrameworkSpecFromFamily -Family $liteFrameworkFamily -Rid $Rid
+}
+else {
+    # Full self-contained ships the runtime; coreclr is the strong signal.
+    if (-not (Test-Path -LiteralPath $coreClr -PathType Leaf)) {
+        throw "Full self-contained publish is missing coreclr.dll."
+    }
 }
 
 $assetCounts = [ordered]@{
@@ -401,6 +433,9 @@ $evidence = [ordered]@{
     informationalVersion = $ExpectedSemanticVersion
     manifestVersion = $manifestVersion
     deploymentMode = $DeploymentMode
+    muiCount = [int]$muiFiles.Count
+    liteFrameworkFamily = $liteFrameworkFamily
+    liteVelopackFramework = $liteVelopackFramework
     rid = $Rid
     platform = $platform
     expectedPeMachine = ("0x{0:X4}" -f $expectedMachine)

@@ -5,13 +5,12 @@
       "tokenbar.core": {
         "type": "Project",
         "dependencies": {
-          "TokenBar.Interop": "[0.2.1, )"
+          "TokenBar.Interop": "[0.1.0, )"
         }
       },
       "tokenbar.interop": {
         "type": "Project"
       }
-    },
-    "net10.0/win-x64": {}
+    }
   }
 }
