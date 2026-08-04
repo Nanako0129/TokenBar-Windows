@@ -315,6 +315,91 @@ if ($xbfFiles.Count -eq 0) {
     throw "Published WinUI resources contain no XBF files."
 }
 
+$muiFiles = @(Get-ChildItem -LiteralPath $publishRoot -Recurse -File -Filter "*.mui")
+if ($muiFiles.Count -eq 0) {
+    throw "Published output must retain .mui locale files; found zero."
+}
+
+# Required locale tags (checked-in manifest). Compare case-insensitively; reject
+# duplicate entries after case normalization; fail with exact missing locale names.
+$muiManifestPath = Join-Path $repoRoot "scripts\required-mui-locales.txt"
+if (-not (Test-Path -LiteralPath $muiManifestPath -PathType Leaf)) {
+    throw "Missing required MUI locale manifest: scripts/required-mui-locales.txt"
+}
+$rawLocales = @(
+    Get-Content -LiteralPath $muiManifestPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith("#") }
+)
+if ($rawLocales.Count -lt 1) {
+    throw "MUI locale manifest is empty."
+}
+$requiredLocales = [System.Collections.Generic.List[string]]::new()
+$seenLocaleKeys = @{}
+foreach ($locale in $rawLocales) {
+    $key = $locale.ToLowerInvariant()
+    if ($seenLocaleKeys.ContainsKey($key)) {
+        throw "Duplicate MUI locale entry after case normalization: $locale"
+    }
+    $seenLocaleKeys[$key] = $true
+    [void]$requiredLocales.Add($locale)
+}
+$missingLocales = [System.Collections.Generic.List[string]]::new()
+foreach ($locale in $requiredLocales) {
+    $matched = $false
+    foreach ($mui in $muiFiles) {
+        $rel = Get-RelativePath -Root $publishRoot -Path $mui.FullName
+        if ($rel -match "(?i)(^|[/\\])$([regex]::Escape($locale))([/\\]|$)") {
+            $matched = $true
+            break
+        }
+    }
+    if (-not $matched) {
+        [void]$missingLocales.Add($locale)
+    }
+}
+if ($missingLocales.Count -gt 0) {
+    throw ("Required MUI locale(s) missing from publish: {0}" -f ($missingLocales -join ", "))
+}
+
+# Forbidden payload / diagnostics / unused SDK binaries (must be absent from installer payload).
+$forbiddenExact = @(
+    "onnxruntime.dll",
+    "onnxruntime_providers_shared.dll",
+    "DirectML.dll",
+    "Microsoft.Windows.Widgets.dll",
+    "Microsoft.Windows.Widgets.Projection.dll",
+    "Microsoft.Windows.Widgets.winmd",
+    "WinUIEdit.dll",
+    "mscordaccore.dll",
+    "mscordbi.dll"
+)
+$publishFiles = @(Get-ChildItem -LiteralPath $publishRoot -Recurse -File)
+$pdbCount = @($publishFiles | Where-Object { $_.Extension -eq ".pdb" }).Count
+if ($pdbCount -ne 0) {
+    throw "Published output must contain zero PDB files; found $pdbCount."
+}
+foreach ($name in $forbiddenExact) {
+    $hits = @($publishFiles | Where-Object {
+            [string]::Equals($_.Name, $name, [StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($hits.Count -gt 0) {
+        throw "Forbidden file present in publish: $name"
+    }
+}
+$prefixForbidden = @(
+    @{ Prefix = "mscordaccore_"; Label = "mscordaccore_*" },
+    @{ Prefix = "Microsoft.DiaSymReader.Native"; Label = "Microsoft.DiaSymReader.Native*" }
+)
+foreach ($rule in $prefixForbidden) {
+    $hits = @($publishFiles | Where-Object {
+            $_.Name.StartsWith($rule.Prefix, [StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($hits.Count -gt 0) {
+        throw "Forbidden file present in publish: $($rule.Label)"
+    }
+}
+
 $assetCounts = [ordered]@{
     "Assets/anim-cat2" = 5
     "Assets/anim-cat2-light" = 5
@@ -384,6 +469,106 @@ $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerIn
 $hashName = "$zipName.sha256"
 $hashPath = Join-Path $artifactRoot $hashName
 Set-Content -LiteralPath $hashPath -Value "$zipHash  $zipName" -Encoding ascii -NoNewline
+$zipBytes = [int64](Get-Item -LiteralPath $zipPath).Length
+
+# Tight Full publish-zip budgets (bytes). Measured baselines + ~5% tolerance.
+# A budget increase requires an explicit source edit and explanation.
+# Placeholder zeros are replaced after clean measured publish on this branch.
+$fullPublishZipBudgetByRid = @{
+    "win-x64"   = [int64]95000000   # provisional; tighten after measurement
+    "win-arm64" = [int64]95000000
+}
+if (-not $fullPublishZipBudgetByRid.ContainsKey($Rid)) {
+    throw "No publish-zip size budget configured for RID $Rid."
+}
+$maxZipBytes = [int64]$fullPublishZipBudgetByRid[$Rid]
+if ($zipBytes -gt $maxZipBytes) {
+    $over = $zipBytes - $maxZipBytes
+    $measuredMiB = [math]::Round($zipBytes / 1MB, 3)
+    $budgetMiB = [math]::Round($maxZipBytes / 1MB, 3)
+    $overMiB = [math]::Round($over / 1MB, 3)
+    throw ("Publish zip exceeds size budget for {0}: measured={1} bytes ({2} MiB), budget={3} bytes ({4} MiB), over by {5} bytes ({6} MiB)." -f `
+        $Rid, $zipBytes, $measuredMiB, $maxZipBytes, $budgetMiB, $over, $overMiB)
+}
+
+# Separate version/RID-bound symbols/support artifact (NOT part of Setup.exe/nupkg).
+# Collect PDBs and DAC/DBI diagnostics from intermediate build output so crash dumps
+# remain analyzable even though the installer payload is strip-clean.
+$symbolsStaging = Join-Path $artifactRoot "symbols-staging"
+if (Test-Path -LiteralPath $symbolsStaging) {
+    Remove-Item -LiteralPath $symbolsStaging -Recurse -Force
+}
+New-Item -ItemType Directory -Path $symbolsStaging | Out-Null
+$symbolsPatterns = @("*.pdb", "mscordaccore.dll", "mscordbi.dll", "mscordaccore_*.dll", "Microsoft.DiaSymReader.Native*.dll")
+$searchRoots = @(
+    (Join-Path $repoRoot ("src\TokenBar.App\bin\{0}\Release" -f $platform)),
+    (Join-Path $repoRoot ("src\TokenBar.App\obj\{0}\Release" -f $platform)),
+    $publishRoot
+)
+$copiedSymbolNames = @{}
+foreach ($root in $searchRoots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    foreach ($pat in $symbolsPatterns) {
+        Get-ChildItem -LiteralPath $root -Recurse -File -Filter $pat -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $destName = $_.Name
+                if ($copiedSymbolNames.ContainsKey($destName.ToLowerInvariant())) { return }
+                Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $symbolsStaging $destName) -Force
+                $copiedSymbolNames[$destName.ToLowerInvariant()] = $true
+            }
+    }
+}
+$symbolFiles = @(Get-ChildItem -LiteralPath $symbolsStaging -File | Sort-Object Name)
+$symbolInventory = @(
+    $symbolFiles | ForEach-Object {
+        [pscustomobject]@{
+            path = $_.Name
+            bytes = [int64]$_.Length
+            sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+)
+$symbolsMeta = [ordered]@{
+    schema = "tokenbar-symbols-support.v1"
+    productName = $versionContract.ProductName
+    semanticVersion = $versionContract.SemanticVersion
+    gitSha = $gitSha.ToLowerInvariant()
+    rid = $Rid
+    platform = $platform
+    note = "Support/diagnostics archive for matching crash dumps. Not installed by Setup.exe or nupkg. Release operators archive this alongside the release transaction; PR CI uploads only sanitized hash metadata."
+    files = $symbolInventory
+}
+$symbolsMetaPath = Join-Path $symbolsStaging "SYMBOLS-MANIFEST.json"
+($symbolsMeta | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $symbolsMetaPath -Encoding utf8
+$symbolsZipName = "{0}-Symbols-{1}-{2}.zip" -f $versionContract.ProductName, $versionContract.SemanticVersion, $Rid
+$symbolsZipPath = Join-Path $artifactRoot $symbolsZipName
+if (Test-Path -LiteralPath $symbolsZipPath) {
+    throw "Symbols archive already exists: $symbolsZipName"
+}
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $symbolsStaging,
+    $symbolsZipPath,
+    [System.IO.Compression.CompressionLevel]::Optimal,
+    $false)
+$symbolsZipHash = (Get-FileHash -LiteralPath $symbolsZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$symbolsZipBytes = [int64](Get-Item -LiteralPath $symbolsZipPath).Length
+Set-Content -LiteralPath (Join-Path $artifactRoot "$symbolsZipName.sha256") -Value "$symbolsZipHash  $symbolsZipName" -Encoding ascii -NoNewline
+# Drop staging tree; keep only the zip + sha256 next to the app artifact.
+Remove-Item -LiteralPath $symbolsStaging -Recurse -Force
+# Sanitized symbols evidence (hashes/sizes only) for PR CI upload surfaces.
+$symbolsEvidence = [ordered]@{
+    schema = "tokenbar-symbols-evidence.v1"
+    productName = $versionContract.ProductName
+    semanticVersion = $versionContract.SemanticVersion
+    gitSha = $gitSha.ToLowerInvariant()
+    rid = $Rid
+    archive = $symbolsZipName
+    archiveSha256 = $symbolsZipHash
+    archiveBytes = $symbolsZipBytes
+    fileCount = [int]$symbolInventory.Count
+    files = $symbolInventory
+}
+($symbolsEvidence | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $artifactRoot "symbols-evidence.json") -Encoding utf8
 
 $evidence = [ordered]@{
     schema = "phase10-app-evidence.v1"
@@ -393,6 +578,15 @@ $evidence = [ordered]@{
     assemblyVersion = $versionContract.AssemblyVersion
     informationalVersion = $ExpectedSemanticVersion
     manifestVersion = $manifestVersion
+    muiCount = [int]$muiFiles.Count
+    requiredMuiLocales = [int]$requiredLocales.Count
+    pdbCount = [int]$pdbCount
+    forbiddenAbsent = $true
+    maxZipBytesBudget = [int64]$maxZipBytes
+    zipBytes = [int64]$zipBytes
+    symbolsArchive = $symbolsZipName
+    symbolsArchiveSha256 = $symbolsZipHash
+    symbolsArchiveBytes = [int64]$symbolsZipBytes
     rid = $Rid
     platform = $platform
     expectedPeMachine = ("0x{0:X4}" -f $expectedMachine)
@@ -430,4 +624,4 @@ $evidencePath = Join-Path $artifactRoot $evidenceName
 Set-Content -LiteralPath $evidencePath -Value $evidenceJson -Encoding utf8
 
 Write-Output "Phase 10 App artifact verified: $zipName"
-Write-Output "Evidence: $evidenceName; checksum: $hashName"
+Write-Output "Evidence: $evidenceName; checksum: $hashName; symbols: $symbolsZipName"
