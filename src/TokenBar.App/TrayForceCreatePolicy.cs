@@ -2,7 +2,8 @@ namespace TokenBar.App;
 
 /// <summary>
 /// Pure policy + injectable per-episode ForceCreate state machine.
-/// Free of WinUI types so unit tests can inject attempt functions without a tray.
+/// Free of WinUI types so unit tests can inject attempt and delay functions
+/// without constructing a tray.
 /// </summary>
 internal static class TrayForceCreatePolicy
 {
@@ -45,21 +46,31 @@ internal enum TrayForceCreateTickResult
 }
 
 /// <summary>
-/// Per-episode attempt accounting. Call <see cref="Tick"/> once per timer/async
-/// delay. Does not sleep — the host schedules the next tick.
+/// Per-episode attempt accounting. Call <see cref="Tick"/> once per timer tick.
+/// The attempt and delay policy are injected; this type never sleeps or owns a
+/// timer, so production can schedule with DispatcherQueueTimer and tests can
+/// drive the exact state machine deterministically.
 /// </summary>
 internal sealed class TrayForceCreateEpisode
 {
+    private readonly Func<bool> _attempt;
+    private readonly Func<int, int> _delayMilliseconds;
     private readonly int _maxAttempts;
 
     public TrayForceCreateEpisode(
+        Func<bool> attempt,
+        Func<int, int>? delayMilliseconds = null,
         int maxAttempts = TrayForceCreatePolicy.MaxAttemptsPerEpisode)
     {
+        ArgumentNullException.ThrowIfNull(attempt);
         if (maxAttempts < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(maxAttempts));
         }
 
+        _attempt = attempt;
+        _delayMilliseconds = delayMilliseconds
+            ?? TrayForceCreatePolicy.DelayMilliseconds;
         _maxAttempts = maxAttempts;
     }
 
@@ -68,25 +79,31 @@ internal sealed class TrayForceCreateEpisode
     public bool IsExhausted => Attempts >= _maxAttempts;
 
     /// <summary>
-    /// Runs one ForceCreate attempt. Propagates non-retryable exceptions.
-    /// Soft-retryable failures return Continue or Exhausted.
+    /// Delay for the next host-scheduled tick after <see cref="Tick"/> returns
+    /// <see cref="TrayForceCreateTickResult.Continue"/>. Zero in all terminal
+    /// states.
     /// </summary>
-    /// <param name="attempt">
-    /// Returns true when the icon is created after the attempt.
-    /// </param>
-    public TrayForceCreateTickResult Tick(Func<bool> attempt)
+    public int NextDelayMilliseconds { get; private set; }
+
+    /// <summary>
+    /// Runs exactly one ForceCreate attempt. Propagates non-retryable attempt
+    /// exceptions and invalid delay-policy output. Soft failures return
+    /// Continue or Exhausted.
+    /// </summary>
+    public TrayForceCreateTickResult Tick()
     {
-        ArgumentNullException.ThrowIfNull(attempt);
         if (IsExhausted)
         {
+            NextDelayMilliseconds = 0;
             return TrayForceCreateTickResult.Exhausted;
         }
 
         Attempts++;
         try
         {
-            if (attempt())
+            if (_attempt())
             {
+                NextDelayMilliseconds = 0;
                 return TrayForceCreateTickResult.Success;
             }
         }
@@ -95,8 +112,20 @@ internal sealed class TrayForceCreateEpisode
             // Soft miss — budget continues.
         }
 
-        return Attempts >= _maxAttempts
-            ? TrayForceCreateTickResult.Exhausted
-            : TrayForceCreateTickResult.Continue;
+        if (Attempts >= _maxAttempts)
+        {
+            NextDelayMilliseconds = 0;
+            return TrayForceCreateTickResult.Exhausted;
+        }
+
+        var delay = _delayMilliseconds(Attempts);
+        if (delay < 1)
+        {
+            throw new InvalidOperationException(
+                $"ForceCreate retry delay must be positive after attempt {Attempts}.");
+        }
+
+        NextDelayMilliseconds = delay;
+        return TrayForceCreateTickResult.Continue;
     }
 }
