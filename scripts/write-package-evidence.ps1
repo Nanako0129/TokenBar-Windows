@@ -20,23 +20,28 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-function Get-NuspecElement {
+function Get-NuspecElements {
     param(
         [Parameter(Mandatory = $true)][xml]$Document,
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $false)][switch]$Optional
+        [Parameter(Mandatory = $true)][string]$Name
     )
 
     $path = "/*[local-name()='package']/*[local-name()='metadata']/*[local-name()='{0}']" -f $Name
-    $nodes = @($Document.SelectNodes($path))
-    if ($nodes.Count -eq 0 -and $Optional) {
-        return $null
-    }
-    if ($nodes.Count -ne 1) {
-        throw "Velopack nuspec must contain exactly one '$Name' element; found $($nodes.Count)."
+    return @($Document.SelectNodes($path))
+}
+
+function Get-RequiredNuspecValue {
+    param(
+        [Parameter(Mandatory = $true)][xml]$Document,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $nodes = @(Get-NuspecElements -Document $Document -Name $Name)
+    if ($nodes.Count -ne 1 -or [string]::IsNullOrWhiteSpace($nodes[0].InnerText)) {
+        throw "Velopack nuspec must contain exactly one non-empty '$Name' element."
     }
 
-    return $nodes[0]
+    return $nodes[0].InnerText.Trim()
 }
 
 if (-not (Test-Path -LiteralPath $ReleasesRoot -PathType Container)) {
@@ -80,10 +85,10 @@ if ($setupEntries.Count -ne 1) {
 
 $nupkg = $nupkgEntries[0]
 $setup = $setupEntries[0]
-if ($nupkg.name -notlike "*-$channel-full.nupkg") {
+if ($nupkg.name -cnotlike "*-$channel-full.nupkg") {
     throw "Nupkg name does not embed expected channel '$channel': $($nupkg.name)"
 }
-if ($setup.name -notlike "*-$channel-Setup.exe") {
+if ($setup.name -cnotlike "*-$channel-Setup.exe") {
     throw "Setup name does not embed expected channel '$channel': $($setup.name)"
 }
 
@@ -113,8 +118,8 @@ try {
     $reader.Dispose()
     $reader = $null
 
-    $nuspecChannel = (Get-NuspecElement -Document $document -Name "channel").InnerText.Trim()
-    $nuspecArchitecture = (Get-NuspecElement -Document $document -Name "machineArchitecture").InnerText.Trim()
+    $nuspecChannel = Get-RequiredNuspecValue -Document $document -Name "channel"
+    $nuspecArchitecture = Get-RequiredNuspecValue -Document $document -Name "machineArchitecture"
     if ($nuspecChannel -cne $channel) {
         throw "Nuspec channel mismatch: expected '$channel', got '$nuspecChannel'."
     }
@@ -122,12 +127,16 @@ try {
         throw "Nuspec architecture mismatch: expected '$architecture', got '$nuspecArchitecture'."
     }
 
-    $runtimeNode = Get-NuspecElement -Document $document -Name "runtimeDependencies" -Optional
-    $runtimeDependency = if ($null -eq $runtimeNode) { "" } else { $runtimeNode.InnerText.Trim() }
+    $runtimeNodes = @(Get-NuspecElements -Document $document -Name "runtimeDependencies")
     if ($DeploymentMode -eq "Lite") {
         if ($ExpectedFramework -cne $requiredLiteFramework) {
             throw "Lite framework must be '$requiredLiteFramework' (runtime family), got '$ExpectedFramework'."
         }
+        if ($runtimeNodes.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace($runtimeNodes[0].InnerText)) {
+            throw "Lite package must contain exactly one non-empty runtimeDependencies element."
+        }
+        $runtimeDependency = $runtimeNodes[0].InnerText.Trim()
         if ($runtimeDependency -cne $requiredLiteFramework) {
             throw "Lite runtime dependency mismatch: expected '$requiredLiteFramework', got '$runtimeDependency'."
         }
@@ -136,9 +145,10 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($ExpectedFramework)) {
             throw "Full package evidence must not be given a Lite framework prerequisite."
         }
-        if (-not [string]::IsNullOrWhiteSpace($runtimeDependency)) {
-            throw "Full package must not contain runtimeDependencies; got '$runtimeDependency'."
+        if ($runtimeNodes.Count -ne 0) {
+            throw "Full package must omit runtimeDependencies entirely; found $($runtimeNodes.Count) element(s)."
         }
+        $runtimeDependency = ""
     }
 }
 finally {
