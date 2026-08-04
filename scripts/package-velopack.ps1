@@ -17,7 +17,11 @@ param(
     [string]$Rid,
 
     [Parameter(Mandatory = $true)]
-    [string]$OutputRoot
+    [string]$OutputRoot,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Full", "Lite")]
+    [string]$DeploymentMode = "Full"
 )
 
 $ErrorActionPreference = "Stop"
@@ -129,7 +133,9 @@ function Assert-VelopackPackage {
         [Parameter(Mandatory = $true)][string]$SemanticVersion,
         [Parameter(Mandatory = $true)][string]$MainExe,
         [Parameter(Mandatory = $true)][string]$Rid,
-        [Parameter(Mandatory = $true)][string]$MachineArchitecture
+        [Parameter(Mandatory = $true)][string]$MachineArchitecture,
+        [Parameter(Mandatory = $true)][string]$Channel,
+        [Parameter(Mandatory = $true)][string]$DeploymentMode
     )
 
     if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) {
@@ -159,12 +165,20 @@ function Assert-VelopackPackage {
             version = $SemanticVersion
             mainExe = $MainExe
             machineArchitecture = $MachineArchitecture
-            channel = $Rid
+            channel = $Channel
         }
         foreach ($item in $expected.GetEnumerator()) {
             $actual = Get-NuspecValue -Document $document -Name $item.Key
             if ($actual -cne [string]$item.Value) {
                 throw "Velopack nuspec '$($item.Key)' mismatch: expected '$($item.Value)', got '$actual'."
+            }
+        }
+
+        if ($DeploymentMode -eq "Lite") {
+            $expectedRuntimeDep = if ($Rid -eq "win-x64") { "net10-x64-desktop" } else { "net10-arm64-desktop" }
+            $runtimeDeps = Get-NuspecValue -Document $document -Name "runtimeDependencies"
+            if ($runtimeDeps -notmatch [regex]::Escape($expectedRuntimeDep)) {
+                throw "Velopack nuspec 'runtimeDependencies' mismatch: expected to contain '$expectedRuntimeDep', got '$runtimeDeps'."
             }
         }
 
@@ -198,6 +212,8 @@ $packId = "Nyanako.TokenBar"
 $appExecutableName = "{0}.App.exe" -f $packProperties.ProductName
 $machineArchitecture = if ($Rid -eq "win-x64") { "x64" } else { "arm64" }
 
+$channel = if ($DeploymentMode -eq "Lite") { "$Rid-lite" } else { $Rid }
+
 # Keep build artifacts separate from channel-scoped release files so the
 # publish directory passed to vpk remains the one verified by the build step.
 $buildOutputRoot = Join-Path $outputRootResolved "app-artifact"
@@ -206,7 +222,7 @@ $buildOutputRoot = Join-Path $outputRootResolved "app-artifact"
 # set. Splatting an argument array at a script also binds "-Rid" positionally
 # instead of as a parameter name. This script throws on failure and
 # $ErrorActionPreference is Stop, so a failure propagates on its own.
-& $buildScript -Rid $Rid -OutputRoot $buildOutputRoot
+& $buildScript -Rid $Rid -OutputRoot $buildOutputRoot -DeploymentMode $DeploymentMode
 
 $artifactName = "{0}-App-{1}-{2}" -f $packProperties.ProductName, $packProperties.SemanticVersion, $Rid
 $publishRoot = Join-Path $buildOutputRoot (Join-Path $artifactName "publish")
@@ -223,7 +239,7 @@ try {
         "tool", "restore"
     ) -FailureMessage "Local .NET tool restore failed"
 
-    Invoke-Captured -Command "dotnet" -Arguments @(
+    $vpkArgs = @(
         "vpk", "pack",
         "--packId", $packId,
         "--packVersion", $packProperties.SemanticVersion,
@@ -231,20 +247,27 @@ try {
         "--mainExe", $appExecutableName,
         "--packTitle", $packProperties.ProductName,
         "--runtime", $Rid,
-        "--channel", $Rid,
+        "--channel", $channel,
         "--outputDir", $releasesRoot
-    ) -FailureMessage "Velopack pack failed"
+    )
+    if ($DeploymentMode -eq "Lite") {
+        $frameworkSpec = if ($Rid -eq "win-x64") { "net10-x64-desktop" } else { "net10-arm64-desktop" }
+        $vpkArgs += @("--framework", $frameworkSpec)
+    }
+
+    Invoke-Captured -Command "dotnet" -Arguments $vpkArgs -FailureMessage "Velopack pack failed"
 }
 finally {
     Pop-Location
 }
 
-$packageName = "{0}-{1}-{2}-full.nupkg" -f $packId, $packProperties.SemanticVersion, $Rid
+$packageName = "{0}-{1}-{2}-full.nupkg" -f $packId, $packProperties.SemanticVersion, $channel
 $packagePath = Join-Path $releasesRoot $packageName
 Assert-VelopackPackage -PackagePath $packagePath -PackId $packId `
     -ProductName $packProperties.ProductName `
     -SemanticVersion $packProperties.SemanticVersion -MainExe $appExecutableName `
-    -Rid $Rid -MachineArchitecture $machineArchitecture
+    -Rid $Rid -MachineArchitecture $machineArchitecture `
+    -Channel $channel -DeploymentMode $DeploymentMode
 
 $releaseFiles = @(Get-ChildItem -LiteralPath $releasesRoot -File | Sort-Object Name)
 Write-Output "Phase 11 Velopack package verified: $packageName"

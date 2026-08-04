@@ -19,7 +19,11 @@ param(
 
     [Parameter(Mandatory = $true)]
     [Alias("EvidenceRoot")]
-    [string]$OutputRoot
+    [string]$OutputRoot,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Full", "Lite")]
+    [string]$DeploymentMode = "Full"
 )
 
 $ErrorActionPreference = "Stop"
@@ -287,8 +291,11 @@ try {
         "-p:TbNativeCargoLocked=true", "-p:RestoreLockedMode=true"
     ) -FailureMessage "BuildTbNative failed"
 
+    $selfContainedArg = if ($DeploymentMode -eq "Lite") { "--no-self-contained" } else { "--self-contained" }
+    $selfContainedProp = if ($DeploymentMode -eq "Lite") { "-p:SelfContained=false" } else { "-p:SelfContained=true" }
+
     Invoke-Captured -Command "dotnet" -Arguments @(
-        "publish", $appProject, "-c", "Release", "-r", $Rid, "--self-contained",
+        "publish", $appProject, "-c", "Release", "-r", $Rid, $selfContainedArg, $selfContainedProp,
         "-p:Platform=$platform", "-p:RuntimeIdentifier=$Rid", "--no-restore",
         "-o", $publishRoot
     ) -FailureMessage "Locked App publish failed"
@@ -393,6 +400,7 @@ $evidence = [ordered]@{
     assemblyVersion = $versionContract.AssemblyVersion
     informationalVersion = $ExpectedSemanticVersion
     manifestVersion = $manifestVersion
+    deploymentMode = $DeploymentMode
     rid = $Rid
     platform = $platform
     expectedPeMachine = ("0x{0:X4}" -f $expectedMachine)
