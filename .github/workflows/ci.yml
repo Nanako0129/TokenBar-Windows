@@ -381,40 +381,81 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.301
-      - name: App artifact (${{ matrix.mode }} / ${{ matrix.rid }})
+      - name: RuntimeConfig unit test
+        shell: pwsh
+        run: pwsh -File ./scripts/tests/test-runtimeconfig-framework.ps1
+      - name: Velopack package (${{ matrix.mode }} / ${{ matrix.rid }})
         shell: pwsh
         run: |
-          $root = Join-Path $env:RUNNER_TEMP "tb-artifact-${{ matrix.mode }}-${{ matrix.rid }}"
-          ./scripts/build-app-artifact.ps1 -Rid ${{ matrix.rid }} -OutputRoot $root -DeploymentMode ${{ matrix.mode }}
-          $evidence = Get-ChildItem -LiteralPath $root -Recurse -Filter evidence.json | Select-Object -First 1
-          if ($null -eq $evidence) { throw "evidence.json missing" }
-          $doc = Get-Content -LiteralPath $evidence.FullName -Raw | ConvertFrom-Json
+          # package-velopack builds the verified App artifact then packs it.
+          $root = Join-Path $env:RUNNER_TEMP "tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}"
+          ./scripts/package-velopack.ps1 -Rid ${{ matrix.rid }} -OutputRoot $root -DeploymentMode ${{ matrix.mode }}
+
+          $artifactEvidence = Get-ChildItem -LiteralPath (Join-Path $root "app-artifact") -Recurse -Filter evidence.json |
+            Select-Object -First 1
+          if ($null -eq $artifactEvidence) { throw "app evidence.json missing under package root" }
+          $doc = Get-Content -LiteralPath $artifactEvidence.FullName -Raw | ConvertFrom-Json
           if ($doc.deploymentMode -cne "${{ matrix.mode }}") {
             throw "evidence.deploymentMode mismatch: $($doc.deploymentMode)"
           }
-          if ([int]$doc.muiCount -le 0) {
-            throw "evidence.muiCount must be > 0"
+          if ([int]$doc.pdbCount -ne 0) { throw "pdbCount must be 0" }
+          if ($doc.forbiddenAbsent -ne $true) { throw "forbiddenAbsent must be true" }
+          if ([int]$doc.requiredMuiLocales -lt 1) { throw "requiredMuiLocales missing" }
+          if ([int]$doc.muiCount -lt [int]$doc.requiredMuiLocales) {
+            throw "muiCount $($doc.muiCount) < requiredMuiLocales $($doc.requiredMuiLocales)"
           }
+
+          $expectedFramework = ""
           if ("${{ matrix.mode }}" -eq "Lite") {
             if ([string]::IsNullOrWhiteSpace([string]$doc.liteVelopackFramework)) {
               throw "Lite evidence missing liteVelopackFramework"
             }
-            if ($doc.liteFrameworkFamily -notin @("desktop", "runtime")) {
+            if ($doc.liteFrameworkFamily -cne "runtime" -and $doc.liteFrameworkFamily -cne "desktop") {
               throw "Lite evidence has invalid liteFrameworkFamily"
             }
+            $expectedFramework = [string]$doc.liteVelopackFramework
           }
-      - name: Velopack package (${{ matrix.mode }} / ${{ matrix.rid }})
-        if: matrix.mode == 'Lite'
-        shell: pwsh
-        run: |
-          $root = Join-Path $env:RUNNER_TEMP "tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}"
-          ./scripts/package-velopack.ps1 -Rid ${{ matrix.rid }} -OutputRoot $root -DeploymentMode Lite
+
+          $releases = Join-Path $root "releases"
+          $pkgEvidence = Join-Path $root "package-evidence.json"
+          $args = @{
+            ReleasesRoot = $releases
+            OutputJson = $pkgEvidence
+            DeploymentMode = "${{ matrix.mode }}"
+            Rid = "${{ matrix.rid }}"
+          }
+          if ($expectedFramework) { $args.ExpectedFramework = $expectedFramework }
+          ./scripts/write-package-evidence.ps1 @args
+
+          $pkg = Get-Content -LiteralPath $pkgEvidence -Raw | ConvertFrom-Json
+          if ($pkg.channel -cne $doc.rid -and "${{ matrix.mode }}" -eq "Full") {
+            # Full channel equals RID
+            if ($pkg.channel -cne "${{ matrix.rid }}") {
+              throw "Full package channel mismatch: $($pkg.channel)"
+            }
+          }
+          if ("${{ matrix.mode }}" -eq "Lite") {
+            if ($pkg.channel -cne "${{ matrix.rid }}-lite") {
+              throw "Lite package channel mismatch: $($pkg.channel)"
+            }
+            if ($pkg.nupkgName -notlike "*-${{ matrix.rid }}-lite-full.nupkg") {
+              throw "Lite nupkg filename mismatch: $($pkg.nupkgName)"
+            }
+          } else {
+            if ($pkg.nupkgName -notlike "*-${{ matrix.rid }}-full.nupkg") {
+              throw "Full nupkg filename mismatch: $($pkg.nupkgName)"
+            }
+            if ($null -ne $pkg.expectedFramework -and "$($pkg.expectedFramework)" -ne "") {
+              throw "Full package must not carry Lite framework prerequisite"
+            }
+          }
       - uses: actions/upload-artifact@v4
         with:
+          # Sanitized evidence only — never Setup.exe / nupkg / App ZIP bytes.
           name: app-evidence-${{ matrix.rid }}-${{ matrix.mode }}
           path: |
-            ${{ runner.temp }}/tb-artifact-${{ matrix.mode }}-${{ matrix.rid }}/*/evidence.json
-            ${{ runner.temp }}/tb-artifact-${{ matrix.mode }}-${{ matrix.rid }}/*/*.zip.sha256
-            ${{ runner.temp }}/tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}/releases/**
-          if-no-files-found: warn
+            ${{ runner.temp }}/tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}/app-artifact/*/evidence.json
+            ${{ runner.temp }}/tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}/app-artifact/*/*.zip.sha256
+            ${{ runner.temp }}/tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}/package-evidence.json
+          if-no-files-found: error
           retention-days: 3

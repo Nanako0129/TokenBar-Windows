@@ -329,6 +329,71 @@ if ($muiFiles.Count -eq 0) {
     throw "Published output must retain .mui locale files; found zero."
 }
 
+# Required locale tags (checked-in manifest) — fail if any is missing.
+$muiManifestPath = Join-Path $repoRoot "scripts\required-mui-locales.txt"
+if (-not (Test-Path -LiteralPath $muiManifestPath -PathType Leaf)) {
+    throw "Missing required MUI locale manifest: scripts/required-mui-locales.txt"
+}
+$requiredLocales = @(
+    Get-Content -LiteralPath $muiManifestPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith("#") }
+)
+if ($requiredLocales.Count -lt 1) {
+    throw "MUI locale manifest is empty."
+}
+foreach ($locale in $requiredLocales) {
+    $matched = $false
+    foreach ($mui in $muiFiles) {
+        $rel = Get-RelativePath -Root $publishRoot -Path $mui.FullName
+        if ($rel -match "(?i)(^|[/\\])$([regex]::Escape($locale))([/\\]|$)") {
+            $matched = $true
+            break
+        }
+    }
+    if (-not $matched) {
+        throw "Required MUI locale missing from publish: $locale"
+    }
+}
+
+# Forbidden payload / diagnostics / unused SDK binaries (must be absent).
+$forbiddenExact = @(
+    "onnxruntime.dll",
+    "onnxruntime_providers_shared.dll",
+    "DirectML.dll",
+    "Microsoft.Windows.Widgets.dll",
+    "Microsoft.Windows.Widgets.Projection.dll",
+    "Microsoft.Windows.Widgets.winmd",
+    "WinUIEdit.dll",
+    "mscordaccore.dll",
+    "mscordbi.dll"
+)
+$publishFiles = @(Get-ChildItem -LiteralPath $publishRoot -Recurse -File)
+$pdbCount = @($publishFiles | Where-Object { $_.Extension -eq ".pdb" }).Count
+if ($pdbCount -ne 0) {
+    throw "Published output must contain zero PDB files; found $pdbCount."
+}
+foreach ($name in $forbiddenExact) {
+    $hits = @($publishFiles | Where-Object {
+            [string]::Equals($_.Name, $name, [StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($hits.Count -gt 0) {
+        throw "Forbidden file present in publish: $name"
+    }
+}
+$prefixForbidden = @(
+    @{ Prefix = "mscordaccore_"; Label = "mscordaccore_*" },
+    @{ Prefix = "Microsoft.DiaSymReader.Native"; Label = "Microsoft.DiaSymReader.Native*" }
+)
+foreach ($rule in $prefixForbidden) {
+    $hits = @($publishFiles | Where-Object {
+            $_.Name.StartsWith($rule.Prefix, [StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($hits.Count -gt 0) {
+        throw "Forbidden file present in publish: $($rule.Label)"
+    }
+}
+
 # Deployment-mode structural checks (Lite must not ship a self-contained runtime).
 $coreClr = Join-Path $publishRoot "coreclr.dll"
 $liteFrameworkFamily = $null
@@ -352,6 +417,14 @@ else {
     if (-not (Test-Path -LiteralPath $coreClr -PathType Leaf)) {
         throw "Full self-contained publish is missing coreclr.dll."
     }
+}
+
+# Size regression budgets (bytes) for the labelled publish zip — intentional Full
+# shrink via payload strip is allowed well below these ceilings.
+$maxZipBytes = if ($DeploymentMode -eq "Lite") {
+    55MB
+} else {
+    100MB
 }
 
 $assetCounts = [ordered]@{
@@ -423,6 +496,10 @@ $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerIn
 $hashName = "$zipName.sha256"
 $hashPath = Join-Path $artifactRoot $hashName
 Set-Content -LiteralPath $hashPath -Value "$zipHash  $zipName" -Encoding ascii -NoNewline
+$zipBytes = [int64](Get-Item -LiteralPath $zipPath).Length
+if ($zipBytes -gt $maxZipBytes) {
+    throw "Publish zip exceeds regression budget for ${DeploymentMode}: $zipBytes > $maxZipBytes bytes."
+}
 
 $evidence = [ordered]@{
     schema = "phase10-app-evidence.v1"
@@ -434,6 +511,10 @@ $evidence = [ordered]@{
     manifestVersion = $manifestVersion
     deploymentMode = $DeploymentMode
     muiCount = [int]$muiFiles.Count
+    requiredMuiLocales = [int]$requiredLocales.Count
+    pdbCount = [int]$pdbCount
+    forbiddenAbsent = $true
+    maxZipBytesBudget = [int64]$maxZipBytes
     liteFrameworkFamily = $liteFrameworkFamily
     liteVelopackFramework = $liteVelopackFramework
     rid = $Rid

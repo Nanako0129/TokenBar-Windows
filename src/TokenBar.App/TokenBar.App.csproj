@@ -117,7 +117,10 @@
 
       <!-- Unused SDK DLLs (mirror of payload target, for publish-only paths) -->
       <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
-                             Condition="'%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.dll' or
+                             Condition="'%(Filename)%(Extension)' == 'onnxruntime.dll' or
+                                        '%(Filename)%(Extension)' == 'onnxruntime_providers_shared.dll' or
+                                        '%(Filename)%(Extension)' == 'DirectML.dll' or
+                                        '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.dll' or
                                         '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.Projection.dll' or
                                         '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.winmd' or
                                         '%(Filename)%(Extension)' == 'WinUIEdit.dll' or

@@ -15,6 +15,18 @@ internal class UpdateFlow
     private const int MaxNuspecBytes = 65_536;
     private const long MaxCompressionRatio = 100;
 
+    /// <summary>
+    /// Exact Velopack channels accepted for installed products. Full and Lite
+    /// share architecture mapping; any other string fails closed.
+    /// </summary>
+    internal static readonly HashSet<string> AcceptedChannels = new(StringComparer.Ordinal)
+    {
+        "win-x64",
+        "win-x64-lite",
+        "win-arm64",
+        "win-arm64-lite",
+    };
+
     private readonly ManagedUpdateManager _manager;
     private int _downloadActive;
 
@@ -170,13 +182,9 @@ internal class UpdateFlow
 
         var version = _manager.CurrentVersion
             ?? throw new InvalidOperationException("Installed version is missing.");
-        var channel = _manager.InstalledChannel;
-        var architecture = channel switch
-        {
-            "win-x64" => "x64",
-            "win-arm64" => "arm64",
-            _ => throw new InvalidOperationException("Installed channel is invalid."),
-        };
+        var channel = _manager.InstalledChannel
+            ?? throw new InvalidOperationException("Installed channel is missing.");
+        var architecture = MapChannelToArchitecture(channel);
         var packagesDirectory = _manager.PackagesDirectory;
         if (string.IsNullOrWhiteSpace(packagesDirectory))
         {
@@ -184,6 +192,23 @@ internal class UpdateFlow
         }
 
         return new Installation(version, channel, architecture, packagesDirectory);
+    }
+
+    /// <summary>
+    /// Maps an installed Velopack channel to PE architecture. Fail-closed for
+    /// near-miss and unknown channels (including null/empty).
+    /// </summary>
+    internal static string MapChannelToArchitecture(string? channel)
+    {
+        if (channel is null
+            || !AcceptedChannels.Contains(channel))
+        {
+            throw new InvalidOperationException("Installed channel is invalid.");
+        }
+
+        return channel.StartsWith("win-arm64", StringComparison.Ordinal)
+            ? "arm64"
+            : "x64";
     }
 
     private static bool IsSha256(string? value) =>

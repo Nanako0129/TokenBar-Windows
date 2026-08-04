@@ -29,7 +29,9 @@ public class UpdateFlowTests : IDisposable
 
     [Theory]
     [InlineData("win-x64", "x64")]
+    [InlineData("win-x64-lite", "x64")]
     [InlineData("win-arm64", "arm64")]
+    [InlineData("win-arm64-lite", "arm64")]
     public async Task GithubSourceIsFixedStableUnauthenticatedAndDownloadsOnlyAfterClick(
         string channel,
         string architecture)
@@ -42,6 +44,9 @@ public class UpdateFlowTests : IDisposable
         Assert.Equal("0.3.0", candidate.Version);
         Assert.Equal(channel, candidate.Channel);
         Assert.Equal(architecture, candidate.Architecture);
+        Assert.Equal(
+            $"{UpdateFlow.PackageId}-0.3.0-{channel}-full.nupkg",
+            candidate.Target.FileName);
         Assert.Equal(1, fixture.Downloader.DownloadStringCalls);
         Assert.Equal(1, fixture.Downloader.DownloadBytesCalls);
         Assert.Equal(0, fixture.Downloader.DownloadFileCalls);
@@ -61,6 +66,88 @@ public class UpdateFlowTests : IDisposable
 
         Assert.Equal(1, fixture.Downloader.DownloadFileCalls);
         Assert.True(File.Exists(candidate.PackagePath));
+        Assert.EndsWith(
+            $"{UpdateFlow.PackageId}-0.3.0-{channel}-full.nupkg",
+            candidate.PackagePath,
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("win-x64-lite", "x64")]
+    [InlineData("win-arm64-lite", "arm64")]
+    public async Task LiteChannel_CheckFilenameNuspecChecksumDownloadAndHandoff(
+        string channel,
+        string architecture)
+    {
+        var fixture = CreateFixture(channel);
+        var flow = new RecordingUpdateFlow(fixture.Downloader, fixture.Locator);
+
+        var candidate = await flow.CheckForUpdatesAsync();
+
+        Assert.NotNull(candidate);
+        Assert.Equal(channel, candidate.Channel);
+        Assert.Equal(architecture, candidate.Architecture);
+        Assert.Equal(
+            $"{UpdateFlow.PackageId}-0.3.0-{channel}-full.nupkg",
+            candidate.Target.FileName);
+
+        await flow.DownloadAndVerifyAsync(candidate);
+
+        Assert.True(File.Exists(candidate.PackagePath));
+        Assert.Equal(1, fixture.Downloader.DownloadFileCalls);
+
+        // Re-open package to prove nuspec channel survived checksum path.
+        using (var archive = ZipFile.OpenRead(candidate.PackagePath))
+        {
+            var nuspec = Assert.Single(
+                archive.Entries.Where(e =>
+                    e.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase)));
+            using var reader = new StreamReader(nuspec.Open());
+            var text = await reader.ReadToEndAsync();
+            Assert.Contains($"<channel>{channel}</channel>", text, StringComparison.Ordinal);
+            Assert.Contains(
+                $"<machineArchitecture>{architecture}</machineArchitecture>",
+                text,
+                StringComparison.Ordinal);
+        }
+
+        var events = new List<string>();
+        flow.Events = events;
+        var handedOff = flow.TryHandoff(candidate, () => true, () => events.Add("quit"));
+
+        Assert.True(handedOff);
+        Assert.Equal(["handoff", "quit"], events);
+        Assert.Equal(1, flow.HandoffCalls);
+        Assert.Same(candidate.Target, flow.HandoffTarget);
+    }
+
+    [Theory]
+    [InlineData("win-x64")]
+    [InlineData("win-x64-lite")]
+    [InlineData("win-arm64")]
+    [InlineData("win-arm64-lite")]
+    public void MapChannelToArchitecture_AcceptsExactChannels(string channel)
+    {
+        var arch = UpdateFlow.MapChannelToArchitecture(channel);
+        Assert.Equal(
+            channel.StartsWith("win-arm64", StringComparison.Ordinal) ? "arm64" : "x64",
+            arch);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("win")]
+    [InlineData("win-x64-full")]
+    [InlineData("win-x64lite")]
+    [InlineData("win-x64-Lite")]
+    [InlineData("win-arm64-full")]
+    [InlineData("linux-x64")]
+    [InlineData("win-x86")]
+    public void MapChannelToArchitecture_FailClosedOnNearMiss(string? channel)
+    {
+        Assert.Throws<InvalidOperationException>(
+            () => UpdateFlow.MapChannelToArchitecture(channel));
     }
 
     [Theory]
@@ -124,6 +211,9 @@ public class UpdateFlowTests : IDisposable
     [InlineData("Other.Package", "win-x64")]
     [InlineData("Nyanako.TokenBar", "win")]
     [InlineData("Nyanako.TokenBar", "linux-x64")]
+    [InlineData("Nyanako.TokenBar", "win-x64-full")]
+    [InlineData("Nyanako.TokenBar", "win-x64lite")]
+    [InlineData("Nyanako.TokenBar", "win-arm64-full")]
     public async Task RejectsInvalidInstalledIdentityOrChannelBeforeNetwork(
         string appId,
         string channel)
@@ -490,7 +580,19 @@ public class UpdateFlowTests : IDisposable
             Directory.CreateDirectory(packagesDirectory);
         }
 
-        var architecture = channel == "win-arm64" ? "arm64" : "x64";
+        // Production mapping: fail-closed except the four accepted channels.
+        // For invalid-channel tests we still need a package architecture token;
+        // MapChannelToArchitecture is exercised separately.
+        string architecture;
+        try
+        {
+            architecture = UpdateFlow.MapChannelToArchitecture(channel);
+        }
+        catch (InvalidOperationException)
+        {
+            architecture = channel.Contains("arm64", StringComparison.Ordinal) ? "arm64" : "x64";
+        }
+
         packageBytes ??= CreateValidPackage(channel, architecture);
         var target = CreateTarget(packageBytes, channel);
         mutateTarget?.Invoke(target);
