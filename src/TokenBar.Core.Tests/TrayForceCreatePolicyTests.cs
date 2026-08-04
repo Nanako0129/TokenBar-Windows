@@ -33,45 +33,84 @@ public sealed class TrayForceCreatePolicyTests
     public void Episode_stops_immediately_on_success()
     {
         var calls = 0;
+        var delayCalls = 0;
         var episode = new TrayForceCreateEpisode(maxAttempts: 5);
-        var result = episode.Tick(() =>
-        {
-            calls++;
-            return true;
-        });
+        var result = episode.Tick(
+            () =>
+            {
+                calls++;
+                return true;
+            },
+            attempt =>
+            {
+                delayCalls++;
+                return attempt * 10;
+            });
 
         Assert.Equal(TrayForceCreateTickResult.Success, result);
         Assert.Equal(1, calls);
+        Assert.Equal(0, delayCalls);
+        Assert.Equal(0, episode.NextDelayMilliseconds);
         Assert.Equal(1, episode.Attempts);
     }
 
     [Fact]
-    public void Episode_soft_failures_consume_budget_then_exhaust()
+    public void Episode_soft_failures_use_injected_delay_then_exhaust()
     {
         var calls = 0;
+        var delayAttempts = new List<int>();
         var episode = new TrayForceCreateEpisode(maxAttempts: 3);
-        TrayForceCreateTickResult last = TrayForceCreateTickResult.Continue;
-        for (var i = 0; i < 3; i++)
-        {
-            last = episode.Tick(() =>
+
+        TrayForceCreateTickResult Tick() => episode.Tick(
+            () =>
             {
                 calls++;
                 throw new InvalidOperationException("shell not ready");
+            },
+            attempt =>
+            {
+                delayAttempts.Add(attempt);
+                return attempt * 17;
             });
-        }
+
+        Assert.Equal(TrayForceCreateTickResult.Continue, Tick());
+        Assert.Equal(17, episode.NextDelayMilliseconds);
+        Assert.Equal(TrayForceCreateTickResult.Continue, Tick());
+        Assert.Equal(34, episode.NextDelayMilliseconds);
+        Assert.Equal(TrayForceCreateTickResult.Exhausted, Tick());
+        Assert.Equal(0, episode.NextDelayMilliseconds);
 
         Assert.Equal(3, calls);
-        Assert.Equal(TrayForceCreateTickResult.Exhausted, last);
+        Assert.Equal([1, 2], delayAttempts);
         Assert.True(episode.IsExhausted);
 
-        // Further ticks stay exhausted without calling attempt.
-        var after = episode.Tick(() =>
-        {
-            calls++;
-            return true;
-        });
+        // Further ticks stay exhausted without invoking attempt or delay.
+        var after = episode.Tick(
+            () =>
+            {
+                calls++;
+                return true;
+            },
+            attempt =>
+            {
+                delayAttempts.Add(attempt);
+                return 1;
+            });
         Assert.Equal(TrayForceCreateTickResult.Exhausted, after);
         Assert.Equal(3, calls);
+        Assert.Equal([1, 2], delayAttempts);
+    }
+
+    [Fact]
+    public void Episode_rejects_non_positive_injected_delay()
+    {
+        var episode = new TrayForceCreateEpisode(maxAttempts: 2);
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            episode.Tick(() => false, _ => 0));
+
+        Assert.Contains("delay must be positive", error.Message, StringComparison.Ordinal);
+        Assert.Equal(1, episode.Attempts);
     }
 
     [Fact]
