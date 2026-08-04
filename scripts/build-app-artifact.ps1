@@ -19,13 +19,18 @@ param(
 
     [Parameter(Mandatory = $true)]
     [Alias("EvidenceRoot")]
-    [string]$OutputRoot
+    [string]$OutputRoot,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Full", "Lite")]
+    [string]$DeploymentMode = "Full"
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "lib\MuiGuard.ps1")
+. (Join-Path $PSScriptRoot "lib\RuntimeConfig.ps1")
 
 $ExpectedSemanticVersion = "0.2.1"
 $ExpectedAssemblyVersion = "0.2.1.0"
@@ -289,8 +294,11 @@ try {
         "-p:TbNativeCargoLocked=true", "-p:RestoreLockedMode=true"
     ) -FailureMessage "BuildTbNative failed"
 
+    $selfContainedArg = if ($DeploymentMode -eq "Lite") { "--no-self-contained" } else { "--self-contained" }
+    $selfContainedProp = if ($DeploymentMode -eq "Lite") { "-p:SelfContained=false" } else { "-p:SelfContained=true" }
+
     Invoke-Captured -Command "dotnet" -Arguments @(
-        "publish", $appProject, "-c", "Release", "-r", $Rid, "--self-contained",
+        "publish", $appProject, "-c", "Release", "-r", $Rid, $selfContainedArg, $selfContainedProp,
         "-p:Platform=$platform", "-p:RuntimeIdentifier=$Rid", "--no-restore",
         "-o", $publishRoot
     ) -FailureMessage "Locked App publish failed"
@@ -394,6 +402,28 @@ foreach ($rule in $prefixForbidden) {
     }
 }
 
+# Deployment-mode structural checks (Lite must not ship a self-contained runtime).
+$coreClr = Join-Path $publishRoot "coreclr.dll"
+$liteFrameworkFamily = $null
+$liteVelopackFramework = $null
+if ($DeploymentMode -eq "Lite") {
+    if (Test-Path -LiteralPath $coreClr -PathType Leaf) {
+        throw "Lite publish must not include bundled runtime coreclr.dll."
+    }
+    $runtimeConfigName = "{0}.runtimeconfig.json" -f $appAssemblyName
+    $runtimeConfigPath = Join-Path $publishRoot $runtimeConfigName
+    if (-not (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf)) {
+        throw "Lite publish is missing runtimeconfig.json: $runtimeConfigName"
+    }
+    $liteFrameworkFamily = Get-RuntimeConfigFrameworkFamily -Path $runtimeConfigPath
+    $liteVelopackFramework = Get-VelopackFrameworkSpecFromFamily -Family $liteFrameworkFamily -Rid $Rid
+}
+else {
+    if (-not (Test-Path -LiteralPath $coreClr -PathType Leaf)) {
+        throw "Full self-contained publish is missing coreclr.dll."
+    }
+}
+
 $assetCounts = [ordered]@{
     "Assets/anim-cat2" = 5
     "Assets/anim-cat2-light" = 5
@@ -494,24 +524,27 @@ $hashPath = Join-Path $artifactRoot $hashName
 Set-Content -LiteralPath $hashPath -Value "$zipHash  $zipName" -Encoding ascii -NoNewline
 $zipBytes = [int64](Get-Item -LiteralPath $zipPath).Length
 
-# Tight Full publish-zip budgets (bytes). Measured baselines + ~5% tolerance.
+# Mode+RID publish-zip budgets (bytes). Full values are post-strip measured baselines
+# (+ ~5%). Lite provisional until later measured commits refine them.
 # A budget increase requires an explicit source edit and explanation.
-# Placeholder zeros are replaced after clean measured publish on this branch.
-$fullPublishZipBudgetByRid = @{
-    "win-x64"   = [int64]78691000   # measured 74943809 (2026-08-05 clean Full) + ~5%
-    "win-arm64" = [int64]74928327   # measured 71360311 (fork hosted Full arm64-cross 2026-08-05) + ~5%
+$publishZipBudgetByModeRid = @{
+    "Full|win-x64"   = [int64]78691000   # measured 74943809 (2026-08-05 clean Full) + ~5%
+    "Full|win-arm64" = [int64]74928327   # measured 71360311 (fork hosted Full arm64-cross 2026-08-05) + ~5%
+    "Lite|win-x64"   = [int64](55MB)     # provisional; refined by later measure commits
+    "Lite|win-arm64" = [int64](55MB)
 }
-if (-not $fullPublishZipBudgetByRid.ContainsKey($Rid)) {
-    throw "No publish-zip size budget configured for RID $Rid."
+$budgetKey = "{0}|{1}" -f $DeploymentMode, $Rid
+if (-not $publishZipBudgetByModeRid.ContainsKey($budgetKey)) {
+    throw "No publish-zip size budget configured for $budgetKey."
 }
-$maxZipBytes = [int64]$fullPublishZipBudgetByRid[$Rid]
+$maxZipBytes = [int64]$publishZipBudgetByModeRid[$budgetKey]
 if ($zipBytes -gt $maxZipBytes) {
     $over = $zipBytes - $maxZipBytes
     $measuredMiB = [math]::Round($zipBytes / 1MB, 3)
     $budgetMiB = [math]::Round($maxZipBytes / 1MB, 3)
     $overMiB = [math]::Round($over / 1MB, 3)
-    throw ("Publish zip exceeds size budget for {0}: measured={1} bytes ({2} MiB), budget={3} bytes ({4} MiB), over by {5} bytes ({6} MiB)." -f `
-        $Rid, $zipBytes, $measuredMiB, $maxZipBytes, $budgetMiB, $over, $overMiB)
+    throw ("Publish zip exceeds size budget for {0}/{1}: measured={2} bytes ({3} MiB), budget={4} bytes ({5} MiB), over by {6} bytes ({7} MiB)." -f `
+        $DeploymentMode, $Rid, $zipBytes, $measuredMiB, $maxZipBytes, $budgetMiB, $over, $overMiB)
 }
 
 # Separate version/RID-bound symbols/support artifact (NOT part of Setup.exe/nupkg).
@@ -782,6 +815,7 @@ $symbolsEvidence = [ordered]@{
 }
 ($symbolsEvidence | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $artifactRoot "symbols-evidence.json") -Encoding utf8
 
+
 $evidence = [ordered]@{
     schema = "phase10-app-evidence.v1"
     status = "structure-version-pe-hash"
@@ -790,6 +824,9 @@ $evidence = [ordered]@{
     assemblyVersion = $versionContract.AssemblyVersion
     informationalVersion = $ExpectedSemanticVersion
     manifestVersion = $manifestVersion
+    deploymentMode = $DeploymentMode
+    liteFrameworkFamily = $liteFrameworkFamily
+    liteVelopackFramework = $liteVelopackFramework
     muiCount = [int]$muiFiles.Count
     requiredMuiLocales = [int]$requiredLocales.Count
     pdbCount = [int]$pdbCount

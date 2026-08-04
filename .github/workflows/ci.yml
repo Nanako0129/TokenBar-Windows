@@ -79,17 +79,19 @@ jobs:
       - name: required-desktop-MUI guard unit test
         shell: pwsh
         run: pwsh -File ./scripts/tests/test-required-mui-guard.ps1
+      # Full x64 artifact (also covered by deployment-matrix). Kept here so the
+      # primary build job still fails closed on the release contract early.
       # Run the clean-checkout artifact contract before any legacy tracked
       # spike obj/ files can be refreshed by later restores.
-      - name: Phase 10 App artifact evidence (x64)
+      - name: Phase 10 App artifact evidence (x64 Full)
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "tokenbar-phase10-x64"
-          ./scripts/build-app-artifact.ps1 -Rid win-x64 -OutputRoot $root
+          ./scripts/build-app-artifact.ps1 -Rid win-x64 -OutputRoot $root -DeploymentMode Full
       - uses: actions/upload-artifact@v4
         with:
           # Sanitized evidence only — never Setup.exe / nupkg / symbols ZIP binaries.
-          name: app-evidence-win-x64
+          name: app-evidence-win-x64-full
           path: |
             ${{ runner.temp }}/tokenbar-phase10-x64/*/evidence.json
             ${{ runner.temp }}/tokenbar-phase10-x64/*/symbols-evidence.json
@@ -320,15 +322,15 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.301
-      - name: Phase 10 App artifact evidence (ARM64)
+      - name: Phase 10 App artifact evidence (ARM64 Full)
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "tokenbar-phase10-arm64"
-          ./scripts/build-app-artifact.ps1 -Rid win-arm64 -OutputRoot $root
+          ./scripts/build-app-artifact.ps1 -Rid win-arm64 -OutputRoot $root -DeploymentMode Full
       - uses: actions/upload-artifact@v4
         with:
           # Sanitized evidence only — never Setup.exe / nupkg / symbols ZIP binaries.
-          name: app-evidence-win-arm64
+          name: app-evidence-win-arm64-full
           path: |
             ${{ runner.temp }}/tokenbar-phase10-arm64/*/evidence.json
             ${{ runner.temp }}/tokenbar-phase10-arm64/*/symbols-evidence.json
@@ -351,4 +353,118 @@ jobs:
         with:
           name: smoke-win-arm64
           path: out/smoke-win-arm64
+          retention-days: 3
+
+  # Full/Lite × win-x64/win-arm64 packaging matrix. Lite asserts are enforced
+  # by build-app-artifact.ps1 + package-velopack.ps1 (no bundled coreclr,
+  # runtimeconfig-derived framework, channel, nuspec runtimeDependencies, PE).
+  deployment-matrix:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            mode: Full
+            rust_target: x86_64-pc-windows-msvc
+          - rid: win-x64
+            mode: Lite
+            rust_target: x86_64-pc-windows-msvc
+          - rid: win-arm64
+            mode: Full
+            rust_target: aarch64-pc-windows-msvc
+          - rid: win-arm64
+            mode: Lite
+            rust_target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deploy-${{ matrix.rid }}-${{ matrix.mode }}
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.301
+      - name: RuntimeConfig unit test
+        shell: pwsh
+        run: pwsh -File ./scripts/tests/test-runtimeconfig-framework.ps1
+      - name: Velopack package (${{ matrix.mode }} / ${{ matrix.rid }})
+        shell: pwsh
+        run: |
+          # package-velopack builds the verified App artifact then packs it.
+          $root = Join-Path $env:RUNNER_TEMP "tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}"
+          ./scripts/package-velopack.ps1 -Rid ${{ matrix.rid }} -OutputRoot $root -DeploymentMode ${{ matrix.mode }}
+
+          $artifactEvidence = Get-ChildItem -LiteralPath (Join-Path $root "app-artifact") -Recurse -Filter evidence.json |
+            Select-Object -First 1
+          if ($null -eq $artifactEvidence) { throw "app evidence.json missing under package root" }
+          $doc = Get-Content -LiteralPath $artifactEvidence.FullName -Raw | ConvertFrom-Json
+          if ($doc.deploymentMode -cne "${{ matrix.mode }}") {
+            throw "evidence.deploymentMode mismatch: $($doc.deploymentMode)"
+          }
+          if ([int]$doc.pdbCount -ne 0) { throw "pdbCount must be 0" }
+          if ($doc.forbiddenAbsent -ne $true) { throw "forbiddenAbsent must be true" }
+          if ([int]$doc.requiredMuiLocales -lt 1) { throw "requiredMuiLocales missing" }
+          if ([int]$doc.muiCount -lt [int]$doc.requiredMuiLocales) {
+            throw "muiCount $($doc.muiCount) < requiredMuiLocales $($doc.requiredMuiLocales)"
+          }
+
+          $expectedFramework = ""
+          if ("${{ matrix.mode }}" -eq "Lite") {
+            if ([string]::IsNullOrWhiteSpace([string]$doc.liteVelopackFramework)) {
+              throw "Lite evidence missing liteVelopackFramework"
+            }
+            if ($doc.liteFrameworkFamily -cne "runtime" -and $doc.liteFrameworkFamily -cne "desktop") {
+              throw "Lite evidence has invalid liteFrameworkFamily"
+            }
+            $expectedFramework = [string]$doc.liteVelopackFramework
+          }
+
+          $releases = Join-Path $root "releases"
+          $pkgEvidence = Join-Path $root "package-evidence.json"
+          $args = @{
+            ReleasesRoot = $releases
+            OutputJson = $pkgEvidence
+            DeploymentMode = "${{ matrix.mode }}"
+            Rid = "${{ matrix.rid }}"
+          }
+          if ($expectedFramework) { $args.ExpectedFramework = $expectedFramework }
+          ./scripts/write-package-evidence.ps1 @args
+
+          $pkg = Get-Content -LiteralPath $pkgEvidence -Raw | ConvertFrom-Json
+          if ($pkg.channel -cne $doc.rid -and "${{ matrix.mode }}" -eq "Full") {
+            # Full channel equals RID
+            if ($pkg.channel -cne "${{ matrix.rid }}") {
+              throw "Full package channel mismatch: $($pkg.channel)"
+            }
+          }
+          if ("${{ matrix.mode }}" -eq "Lite") {
+            if ($pkg.channel -cne "${{ matrix.rid }}-lite") {
+              throw "Lite package channel mismatch: $($pkg.channel)"
+            }
+            if ($pkg.nupkgName -notlike "*-${{ matrix.rid }}-lite-full.nupkg") {
+              throw "Lite nupkg filename mismatch: $($pkg.nupkgName)"
+            }
+          } else {
+            if ($pkg.nupkgName -notlike "*-${{ matrix.rid }}-full.nupkg") {
+              throw "Full nupkg filename mismatch: $($pkg.nupkgName)"
+            }
+            if ($null -ne $pkg.expectedFramework -and "$($pkg.expectedFramework)" -ne "") {
+              throw "Full package must not carry Lite framework prerequisite"
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          # Sanitized evidence only — never Setup.exe / nupkg / App ZIP bytes.
+          name: app-evidence-${{ matrix.rid }}-${{ matrix.mode }}
+          path: |
+            ${{ runner.temp }}/tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}/app-artifact/*/evidence.json
+            ${{ runner.temp }}/tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}/app-artifact/*/*.zip.sha256
+            ${{ runner.temp }}/tb-vpk-${{ matrix.mode }}-${{ matrix.rid }}/package-evidence.json
+          if-no-files-found: error
           retention-days: 3
