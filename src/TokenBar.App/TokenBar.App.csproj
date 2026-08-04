@@ -25,6 +25,8 @@
          targets reads an MSBuild property for this, so the symbol itself must
          be defined. -->
     <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <!-- R1: Restrict .NET satellite resource assembly generation to English -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>
@@ -73,21 +75,85 @@
           OverwriteReadOnlyFiles="true" />
   </Target>
 
-  <!-- Phase 11 S5: WindowsAppSDK 1.8's self-contained payload carries the
-       Windows AI runtime. onnxruntime.dll and DirectML.dll are 38.5 MB
-       uncompressed between them and this app has no call site for either; a
-       repository-wide search for AI, ONNX, DirectML, WinML or Phi Silica finds
-       nothing. The umbrella package cannot be dropped, because
-       H.NotifyIcon.WinUI depends on it, and ExcludeAssets on the .AI and .ML
-       sub-packages does not help, because the binaries arrive through the
-       self-contained payload rather than those packages' own assets. The SDK
-       adds the payload as None items, so drop the two by name after it does. -->
+   <!-- Phase 11 S5: WindowsAppSDK 1.8's self-contained payload carries binaries
+       this app never calls. The umbrella package cannot be dropped because
+       H.NotifyIcon.WinUI depends on it, and ExcludeAssets on sub-packages does
+       not help because the binaries arrive through the self-contained payload.
+       The SDK adds the payload as None items, so drop them by name after it does.
+
+       Stripped binaries and justification (confirmed by repository-wide search):
+         onnxruntime.dll + DirectML.dll      (38.5 MB) — no AI/ONNX/WinML usage
+         Microsoft.Windows.Widgets.*         ( 2.5 MB) — no Widget API usage
+         WinUIEdit.dll                       ( 3.3 MB) — no TextBox/RichEditBox
+         Microsoft.DiaSymReader.Native.*.dll ( 2.1 MB) — debug symbol reader only -->
   <Target Name="TbTrimUnusedWindowsAppSdkPayload"
           AfterTargets="AddMicrosoftWindowsAppSDKPayloadFilesFromMsix;AddMicrosoftWindowsAppSDKPayloadFilesFromComponents">
     <ItemGroup>
       <None Remove="@(None)"
-            Condition="'%(Filename)%(Extension)' == 'onnxruntime.dll' or '%(Filename)%(Extension)' == 'DirectML.dll'" />
+            Condition="'%(Filename)%(Extension)' == 'onnxruntime.dll' or
+                       '%(Filename)%(Extension)' == 'onnxruntime_providers_shared.dll' or
+                       '%(Filename)%(Extension)' == 'DirectML.dll' or
+                       '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.dll' or
+                       '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.Projection.dll' or
+                       '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.winmd' or
+                       '%(Filename)%(Extension)' == 'WinUIEdit.dll' or
+                       $([System.String]::Copy('%(Filename)').StartsWith('Microsoft.DiaSymReader.Native'))" />
+
+      <!-- R1: Remove non-English .mui localized resources injected by WindowsAppSDK.
+           Only .mui files are stripped here; root-level .pri files (Microsoft.UI.pri,
+           Microsoft.UI.Xaml.Controls.pri, etc.) are required by the XAML resource
+           loader and must NOT be removed. -->
+      <None Remove="@(None)"
+            Condition="$([System.String]::Copy('%(Identity)').EndsWith('.mui')) and
+                       !$([System.String]::Copy('%(Identity)').Contains('\en-us\')) and
+                       !$([System.String]::Copy('%(Identity)').Contains('/en-us/')) and
+                       !$([System.String]::Copy('%(Identity)').Contains('\en-GB\')) and
+                       !$([System.String]::Copy('%(Identity)').Contains('/en-GB/'))" />
     </ItemGroup>
   </Target>
 
+  <!-- Ensure the same files plus PDBs and diagnostics DLLs are stripped from
+       the publish manifest. Belt-and-suspenders with the payload target above,
+       plus files that arrive through the publish pipeline only. -->
+  <Target Name="TbTrimUnusedPublishPayload"
+          AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <!-- Non-English .mui locale files (root-level .pri files are preserved) -->
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="$([System.String]::Copy('%(Identity)').EndsWith('.mui')) and
+                                        !$([System.String]::Copy('%(Identity)').Contains('\en-us\')) and
+                                        !$([System.String]::Copy('%(Identity)').Contains('/en-us/')) and
+                                        !$([System.String]::Copy('%(Identity)').Contains('\en-GB\')) and
+                                        !$([System.String]::Copy('%(Identity)').Contains('/en-GB/'))" />
+
+      <!-- PDB files should never ship in the installer -->
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(Extension)' == '.pdb'" />
+
+      <!-- Unused SDK DLLs (mirror of payload target, for publish-only paths) -->
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.dll' or
+                                        '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.Projection.dll' or
+                                        '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.winmd' or
+                                        '%(Filename)%(Extension)' == 'WinUIEdit.dll' or
+                                        $([System.String]::Copy('%(Filename)').StartsWith('Microsoft.DiaSymReader.Native'))" />
+
+      <!-- .NET diagnostics DLLs (crash-dump analysis tools, not needed at runtime;
+           clrjit is required and is NOT stripped) -->
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(Filename)%(Extension)' == 'mscordaccore.dll' or
+                                        '%(Filename)%(Extension)' == 'mscordbi.dll' or
+                                        '%(Filename)%(Extension)' == 'onnxruntime_providers_shared.dll' or
+                                        $([System.String]::Copy('%(Filename)').StartsWith('mscordaccore_'))" />
+
+      <!-- ONNX workload configuration files (unused without onnxruntime) -->
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="$([System.String]::Copy('%(Filename)').StartsWith('workloads')) and '%(Extension)' == '.json'" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Clean up empty culture resource subdirectories after publish -->
+  <Target Name="TbCleanEmptyCultureDirectories" AfterTargets="Publish">
+    <Exec Command="pwsh -NoProfile -Command &quot;Get-ChildItem -Path '$(PublishDir)' -Directory | Where-Object { (Get-ChildItem -Path $_.FullName -Recurse -File).Count -eq 0 } | Remove-Item -Recurse -Force&quot;" />
+  </Target>
 </Project>

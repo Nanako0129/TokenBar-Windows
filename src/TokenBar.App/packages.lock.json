@@ -226,7 +226,7 @@
       "tokenbar.core": {
         "type": "Project",
         "dependencies": {
-          "TokenBar.Interop": "[0.2.0, )"
+          "TokenBar.Interop": "[0.2.1, )"
         }
       },
       "tokenbar.interop": {

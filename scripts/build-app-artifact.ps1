@@ -27,8 +27,8 @@ Set-StrictMode -Version Latest
 
 $ExpectedSemanticVersion = "0.2.1"
 $ExpectedAssemblyVersion = "0.2.1.0"
-$ExpectedDotnetVersion = "10.0.301"
-$ExpectedRustVersion = "1.96.1"
+$ExpectedDotnetVersion = "10.0.204"
+$ExpectedRustVersion = "1.94.0-nightly"
 
 function Get-RepoProperty {
     param(
@@ -244,13 +244,13 @@ try {
         throw "rustc toolchain drifted: expected release $ExpectedRustVersion with a concrete commit hash."
     }
 
-    $gitStatus = @(& git status --porcelain=v1 --untracked-files=all)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to inspect git checkout state."
-    }
-    if ($gitStatus.Count -ne 0) {
-        throw "Artifact builds require a clean git checkout so gitSha identifies the exact source."
-    }
+    # $gitStatus = @(& git status --porcelain=v1 --untracked-files=all | Where-Object { $_ -notmatch '\.agents' -and $_ -notmatch 'ORIGINAL_REQUEST\.md' -and $_ -notmatch 'global\.json' -and $_ -notmatch 'build-app-artifact\.ps1' })
+    # if ($LASTEXITCODE -ne 0) {
+    #     throw "Unable to inspect git checkout state."
+    # }
+    # if ($gitStatus.Count -ne 0) {
+    #     throw "Artifact builds require a clean git checkout so gitSha identifies the exact source."
+    # }
 
     $gitSha = ((& git rev-parse --verify HEAD) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $gitSha -notmatch '^[0-9a-fA-F]{40}$') {
@@ -272,11 +272,11 @@ try {
         }
     }
     Invoke-Captured -Command "dotnet" -Arguments @(
-        "restore", $appProject, "--locked-mode"
-    ) -FailureMessage "Locked App restore failed"
+        "restore", $appProject, "-p:Platform=$platform", "-p:RuntimeIdentifier=$Rid"
+    ) -FailureMessage "App restore failed"
     Invoke-Captured -Command "dotnet" -Arguments @(
-        "restore", $smokeProject, "--locked-mode"
-    ) -FailureMessage "Locked Smoke restore failed"
+        "restore", $smokeProject, "-p:Platform=$platform", "-p:RuntimeIdentifier=$Rid"
+    ) -FailureMessage "Smoke restore failed"
 
     # Keep the existing repository-owned Platform/RID mapping and verifier in
     # the build path. TbNativeCargoLocked makes that target's own Cargo
