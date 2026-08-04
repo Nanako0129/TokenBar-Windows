@@ -336,6 +336,10 @@ public partial class App : Application
                     "--startup-smoke sentinel path is missing");
             }
 
+            // Hard gate: soft ForceCreate retries during construction are not
+            // enough for the probe — the shell icon must actually be ready.
+            _tray!.AssertTrayReady();
+
             WriteStartupSmokeSentinel(path);
             Environment.ExitCode = 0;
             DevLog.Write("startup-smoke: success stage=tray-ready");

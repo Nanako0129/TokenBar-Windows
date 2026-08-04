@@ -92,8 +92,10 @@ public sealed partial class FlyoutWindow : Window
         {
             AppWindow.IsShownInSwitchers = false;
         }
-        catch (Exception ex)
+        catch (NotImplementedException ex)
         {
+            // WinUI 3 unpackaged (WindowsPackageType=None): SetShownInSwitchers
+            // is not implemented. Catch only that known platform gap.
             DevLog.Write($"IsShownInSwitchers ignored: {ex.Message}");
         }
         AppWindow.Closing += (_, e) =>

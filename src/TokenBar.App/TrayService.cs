@@ -32,6 +32,7 @@ public sealed class TrayService : IDisposable
     private string _iconSignature = "";
     private nint _hicon;
     private bool _disposed;
+    private int _forceCreateAttempts;
 
     public TrayService(FlyoutWindow flyout)
     {
@@ -86,13 +87,30 @@ public sealed class TrayService : IDisposable
 
         UpdateIcon();
         RebuildMenu();
-        try
+        // Soft first attempt: shell may not be ready during early process init.
+        // Startup-smoke and later icon ticks hard-assert / retry with bounds.
+        _ = TryForceCreateBounded(logSoftFailures: true);
+    }
+
+    /// <summary>True when H.NotifyIcon reports the shell icon was created.</summary>
+    internal bool IsTrayIconCreated => _icon.IsCreated;
+
+    /// <summary>
+    /// Hard tray-ready gate for --startup-smoke: fail closed if the icon never
+    /// becomes ready within the bounded retry budget.
+    /// </summary>
+    internal void AssertTrayReady()
+    {
+        if (IsTrayIconCreated)
         {
-            _icon.ForceCreate();
+            return;
         }
-        catch (Exception ex)
+
+        if (!TryForceCreateBounded(logSoftFailures: false))
         {
-            DevLog.Write($"_icon.ForceCreate warning: {ex.Message}");
+            throw new InvalidOperationException(
+                $"tray icon not ready after {TrayForceCreatePolicy.MaxAttempts} ForceCreate attempts " +
+                $"(last attempt count={_forceCreateAttempts}).");
         }
     }
 
@@ -418,17 +436,61 @@ public sealed class TrayService : IDisposable
 
     private void EnsureIconCreated()
     {
-        if (!_icon.IsCreated)
+        if (_icon.IsCreated)
         {
+            return;
+        }
+
+        _ = TryForceCreateBounded(logSoftFailures: true);
+    }
+
+    /// <summary>
+    /// Attempts ForceCreate up to <see cref="TrayForceCreatePolicy.MaxAttempts"/> times.
+    /// Only soft-retryable shell exceptions are swallowed; every other exception
+    /// fails closed immediately.
+    /// </summary>
+    private bool TryForceCreateBounded(bool logSoftFailures)
+    {
+        if (_icon.IsCreated)
+        {
+            return true;
+        }
+
+        while (_forceCreateAttempts < TrayForceCreatePolicy.MaxAttempts)
+        {
+            _forceCreateAttempts++;
             try
             {
                 _icon.ForceCreate();
+                if (_icon.IsCreated)
+                {
+                    return true;
+                }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (TrayForceCreatePolicy.IsSoftRetryable(ex))
             {
-                DevLog.Write($"EnsureIconCreated warning: {ex.Message}");
+                // Documented H.NotifyIcon path when the notification area is
+                // unavailable or still initializing.
+                if (logSoftFailures)
+                {
+                    DevLog.Write(
+                        $"ForceCreate attempt {_forceCreateAttempts}/{TrayForceCreatePolicy.MaxAttempts}: {ex.Message}");
+                }
+            }
+
+            if (_icon.IsCreated)
+            {
+                return true;
+            }
+
+            // Small backoff so the shell can finish bringing up the tray.
+            if (_forceCreateAttempts < TrayForceCreatePolicy.MaxAttempts)
+            {
+                Thread.Sleep(TrayForceCreatePolicy.BackoffMilliseconds(_forceCreateAttempts));
             }
         }
+
+        return _icon.IsCreated;
     }
 
     /// <summary>Taskbar theme; missing value = dark (the Windows default).</summary>
