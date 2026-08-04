@@ -44,11 +44,35 @@ function Get-RequiredNuspecValue {
     return $nodes[0].InnerText.Trim()
 }
 
+function Get-ExpectedSemanticVersion {
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $propsPath = Join-Path $repoRoot "Directory.Build.props"
+    if (-not (Test-Path -LiteralPath $propsPath -PathType Leaf)) {
+        throw "Version contract is missing: $propsPath"
+    }
+
+    try {
+        $document = [xml](Get-Content -LiteralPath $propsPath -Raw)
+    }
+    catch {
+        throw "Directory.Build.props is not valid XML: $($_.Exception.Message)"
+    }
+
+    $path = "/*[local-name()='Project']/*[local-name()='PropertyGroup']/*[local-name()='TbSemanticVersion']"
+    $nodes = @($document.SelectNodes($path))
+    if ($nodes.Count -ne 1 -or [string]::IsNullOrWhiteSpace($nodes[0].InnerText)) {
+        throw "Directory.Build.props must contain exactly one non-empty TbSemanticVersion."
+    }
+
+    return $nodes[0].InnerText.Trim()
+}
+
 if (-not (Test-Path -LiteralPath $ReleasesRoot -PathType Container)) {
     throw "Releases root missing: $ReleasesRoot"
 }
 
 $expectedPackageId = "Nyanako.TokenBar"
+$expectedVersion = Get-ExpectedSemanticVersion
 $channel = if ($DeploymentMode -eq "Lite") { "$Rid-lite" } else { $Rid }
 $architecture = if ($Rid -eq "win-x64") { "x64" } else { "arm64" }
 $requiredLiteFramework = if ($Rid -eq "win-x64") {
@@ -119,6 +143,9 @@ try {
     if ($nuspecPackageId -cne $expectedPackageId) {
         throw "Nuspec package id mismatch: expected '$expectedPackageId', got '$nuspecPackageId'."
     }
+    if ($nuspecVersion -cne $expectedVersion) {
+        throw "Nuspec version mismatch: expected '$expectedVersion', got '$nuspecVersion'."
+    }
     if ($nuspecChannel -cne $channel) {
         throw "Nuspec channel mismatch: expected '$channel', got '$nuspecChannel'."
     }
@@ -126,7 +153,7 @@ try {
         throw "Nuspec architecture mismatch: expected '$architecture', got '$nuspecArchitecture'."
     }
 
-    $expectedNupkgName = "$expectedPackageId-$nuspecVersion-$channel-full.nupkg"
+    $expectedNupkgName = "$expectedPackageId-$expectedVersion-$channel-full.nupkg"
     $expectedSetupName = "$expectedPackageId-$channel-Setup.exe"
     if ($nupkg.name -cne $expectedNupkgName) {
         throw "Nupkg name mismatch: expected '$expectedNupkgName', got '$($nupkg.name)'."
