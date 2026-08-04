@@ -46,31 +46,23 @@ internal enum TrayForceCreateTickResult
 }
 
 /// <summary>
-/// Per-episode attempt accounting. Call <see cref="Tick"/> once per timer tick.
-/// The attempt and delay policy are injected; this type never sleeps or owns a
-/// timer, so production can schedule with DispatcherQueueTimer and tests can
-/// drive the exact state machine deterministically.
+/// Per-episode attempt accounting. Call <see cref="Tick(Func{bool})"/> once per
+/// timer tick. This type never sleeps or owns a timer; production schedules the
+/// next tick with DispatcherQueueTimer and tests inject both attempt and delay
+/// functions deterministically.
 /// </summary>
 internal sealed class TrayForceCreateEpisode
 {
-    private readonly Func<bool> _attempt;
-    private readonly Func<int, int> _delayMilliseconds;
     private readonly int _maxAttempts;
 
     public TrayForceCreateEpisode(
-        Func<bool> attempt,
-        Func<int, int>? delayMilliseconds = null,
         int maxAttempts = TrayForceCreatePolicy.MaxAttemptsPerEpisode)
     {
-        ArgumentNullException.ThrowIfNull(attempt);
         if (maxAttempts < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(maxAttempts));
         }
 
-        _attempt = attempt;
-        _delayMilliseconds = delayMilliseconds
-            ?? TrayForceCreatePolicy.DelayMilliseconds;
         _maxAttempts = maxAttempts;
     }
 
@@ -79,19 +71,29 @@ internal sealed class TrayForceCreateEpisode
     public bool IsExhausted => Attempts >= _maxAttempts;
 
     /// <summary>
-    /// Delay for the next host-scheduled tick after <see cref="Tick"/> returns
-    /// <see cref="TrayForceCreateTickResult.Continue"/>. Zero in all terminal
-    /// states.
+    /// Delay computed for the next host-scheduled tick after a Continue result.
+    /// Zero in terminal states.
     /// </summary>
     public int NextDelayMilliseconds { get; private set; }
 
     /// <summary>
+    /// Runs one attempt using the production delay policy.
+    /// </summary>
+    public TrayForceCreateTickResult Tick(Func<bool> attempt) =>
+        Tick(attempt, TrayForceCreatePolicy.DelayMilliseconds);
+
+    /// <summary>
     /// Runs exactly one ForceCreate attempt. Propagates non-retryable attempt
     /// exceptions and invalid delay-policy output. Soft failures return
-    /// Continue or Exhausted.
+    /// Continue or Exhausted. The injected delay function is called only when
+    /// another tick is actually required.
     /// </summary>
-    public TrayForceCreateTickResult Tick()
+    public TrayForceCreateTickResult Tick(
+        Func<bool> attempt,
+        Func<int, int> delayMilliseconds)
     {
+        ArgumentNullException.ThrowIfNull(attempt);
+        ArgumentNullException.ThrowIfNull(delayMilliseconds);
         if (IsExhausted)
         {
             NextDelayMilliseconds = 0;
@@ -101,7 +103,7 @@ internal sealed class TrayForceCreateEpisode
         Attempts++;
         try
         {
-            if (_attempt())
+            if (attempt())
             {
                 NextDelayMilliseconds = 0;
                 return TrayForceCreateTickResult.Success;
@@ -118,7 +120,7 @@ internal sealed class TrayForceCreateEpisode
             return TrayForceCreateTickResult.Exhausted;
         }
 
-        var delay = _delayMilliseconds(Attempts);
+        var delay = delayMilliseconds(Attempts);
         if (delay < 1)
         {
             throw new InvalidOperationException(
