@@ -86,7 +86,14 @@ public sealed class TrayService : IDisposable
 
         UpdateIcon();
         RebuildMenu();
-        _icon.ForceCreate();
+        try
+        {
+            _icon.ForceCreate();
+        }
+        catch (Exception ex)
+        {
+            DevLog.Write($"_icon.ForceCreate warning: {ex.Message}");
+        }
     }
 
     private readonly FlyoutWindow _flyout;
@@ -386,6 +393,7 @@ public sealed class TrayService : IDisposable
     {
         var hicon = bmp.GetHicon();
         _icon.Icon = System.Drawing.Icon.FromHandle(hicon);
+        EnsureIconCreated();
         if (_hicon != 0)
         {
             _ = DestroyIcon(_hicon);
@@ -400,10 +408,26 @@ public sealed class TrayService : IDisposable
     private void ApplyCachedIcon(System.Drawing.Icon icon)
     {
         _icon.Icon = icon;
+        EnsureIconCreated();
         if (_hicon != 0)
         {
             _ = DestroyIcon(_hicon);
             _hicon = 0;
+        }
+    }
+
+    private void EnsureIconCreated()
+    {
+        if (!_icon.IsCreated)
+        {
+            try
+            {
+                _icon.ForceCreate();
+            }
+            catch (Exception ex)
+            {
+                DevLog.Write($"EnsureIconCreated warning: {ex.Message}");
+            }
         }
     }
 

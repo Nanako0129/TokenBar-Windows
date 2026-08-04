@@ -88,7 +88,14 @@ public sealed partial class FlyoutWindow : Window
 
         ApplyPopupChrome();
 
-        AppWindow.IsShownInSwitchers = false;
+        try
+        {
+            AppWindow.IsShownInSwitchers = false;
+        }
+        catch (Exception ex)
+        {
+            DevLog.Write($"IsShownInSwitchers ignored: {ex.Message}");
+        }
         AppWindow.Closing += (_, e) =>
         {
             // Tray-resident: closing the window means hiding it.
