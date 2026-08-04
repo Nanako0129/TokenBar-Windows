@@ -27,6 +27,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "lib\RuntimeConfig.ps1")
+
 function Get-RepoProperty {
     param(
         [Parameter(Mandatory = $true)]
@@ -125,6 +127,18 @@ function Get-NuspecValue {
     return $node.InnerText.Trim()
 }
 
+function Get-VelopackFrameworkSpec {
+    param(
+        [Parameter(Mandatory = $true)][string]$PublishRoot,
+        [Parameter(Mandatory = $true)][string]$AppAssemblyName,
+        [Parameter(Mandatory = $true)][string]$Rid
+    )
+
+    $runtimeConfigPath = Join-Path $PublishRoot ("{0}.runtimeconfig.json" -f $AppAssemblyName)
+    $family = Get-RuntimeConfigFrameworkFamily -Path $runtimeConfigPath
+    return Get-VelopackFrameworkSpecFromFamily -Family $family -Rid $Rid
+}
+
 function Assert-VelopackPackage {
     param(
         [Parameter(Mandatory = $true)][string]$PackagePath,
@@ -135,7 +149,8 @@ function Assert-VelopackPackage {
         [Parameter(Mandatory = $true)][string]$Rid,
         [Parameter(Mandatory = $true)][string]$MachineArchitecture,
         [Parameter(Mandatory = $true)][string]$Channel,
-        [Parameter(Mandatory = $true)][string]$DeploymentMode
+        [Parameter(Mandatory = $true)][string]$DeploymentMode,
+        [Parameter(Mandatory = $false)][string]$ExpectedRuntimeDependency = ""
     )
 
     if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) {
@@ -175,10 +190,12 @@ function Assert-VelopackPackage {
         }
 
         if ($DeploymentMode -eq "Lite") {
-            $expectedRuntimeDep = if ($Rid -eq "win-x64") { "net10-x64-desktop" } else { "net10-arm64-desktop" }
+            if ([string]::IsNullOrWhiteSpace($ExpectedRuntimeDependency)) {
+                throw "Lite package validation requires ExpectedRuntimeDependency from runtimeconfig.json."
+            }
             $runtimeDeps = Get-NuspecValue -Document $document -Name "runtimeDependencies"
-            if ($runtimeDeps -notmatch [regex]::Escape($expectedRuntimeDep)) {
-                throw "Velopack nuspec 'runtimeDependencies' mismatch: expected to contain '$expectedRuntimeDep', got '$runtimeDeps'."
+            if ($runtimeDeps -notmatch [regex]::Escape($ExpectedRuntimeDependency)) {
+                throw "Velopack nuspec 'runtimeDependencies' mismatch: expected to contain '$ExpectedRuntimeDependency', got '$runtimeDeps'."
             }
         }
 
@@ -230,6 +247,16 @@ if (-not (Test-Path -LiteralPath $publishRoot -PathType Container)) {
     throw "Verified publish directory is missing: $publishRoot"
 }
 
+$appAssemblyName = "{0}.App" -f $packProperties.ProductName
+$frameworkSpec = $null
+if ($DeploymentMode -eq "Lite") {
+    $frameworkSpec = Get-VelopackFrameworkSpec `
+        -PublishRoot $publishRoot `
+        -AppAssemblyName $appAssemblyName `
+        -Rid $Rid
+    Write-Output "Lite Velopack framework from runtimeconfig.json: $frameworkSpec"
+}
+
 $releasesRoot = Join-Path $outputRootResolved "releases"
 New-Item -ItemType Directory -Path $releasesRoot -Force | Out-Null
 
@@ -251,7 +278,6 @@ try {
         "--outputDir", $releasesRoot
     )
     if ($DeploymentMode -eq "Lite") {
-        $frameworkSpec = if ($Rid -eq "win-x64") { "net10-x64-desktop" } else { "net10-arm64-desktop" }
         $vpkArgs += @("--framework", $frameworkSpec)
     }
 
@@ -267,7 +293,8 @@ Assert-VelopackPackage -PackagePath $packagePath -PackId $packId `
     -ProductName $packProperties.ProductName `
     -SemanticVersion $packProperties.SemanticVersion -MainExe $appExecutableName `
     -Rid $Rid -MachineArchitecture $machineArchitecture `
-    -Channel $channel -DeploymentMode $DeploymentMode
+    -Channel $channel -DeploymentMode $DeploymentMode `
+    -ExpectedRuntimeDependency $(if ($null -ne $frameworkSpec) { $frameworkSpec } else { "" })
 
 $releaseFiles = @(Get-ChildItem -LiteralPath $releasesRoot -File | Sort-Object Name)
 Write-Output "Phase 11 Velopack package verified: $packageName"
