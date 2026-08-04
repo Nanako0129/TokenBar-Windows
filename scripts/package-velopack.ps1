@@ -110,21 +110,45 @@ function Assert-NewOutputRoot {
     return $resolved
 }
 
-function Get-NuspecValue {
+function Get-NuspecNodes {
     param(
-        [Parameter(Mandatory = $true)]
-        [xml]$Document,
-        [Parameter(Mandatory = $true)]
-        [string]$Name
+        [Parameter(Mandatory = $true)][xml]$Document,
+        [Parameter(Mandatory = $true)][string]$Name
     )
 
     $path = "/*[local-name()='package']/*[local-name()='metadata']/*[local-name()='{0}']" -f $Name
-    $node = $Document.SelectSingleNode($path)
-    if ($null -eq $node -or [string]::IsNullOrWhiteSpace($node.InnerText)) {
-        throw "Velopack nuspec metadata is missing '$Name'."
+    return @($Document.SelectNodes($path))
+}
+
+function Get-NuspecValue {
+    param(
+        [Parameter(Mandatory = $true)][xml]$Document,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $nodes = @(Get-NuspecNodes -Document $Document -Name $Name)
+    if ($nodes.Count -ne 1 -or [string]::IsNullOrWhiteSpace($nodes[0].InnerText)) {
+        throw "Velopack nuspec metadata must contain exactly one non-empty '$Name' element."
     }
 
-    return $node.InnerText.Trim()
+    return $nodes[0].InnerText.Trim()
+}
+
+function Get-NuspecOptionalValue {
+    param(
+        [Parameter(Mandatory = $true)][xml]$Document,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $nodes = @(Get-NuspecNodes -Document $Document -Name $Name)
+    if ($nodes.Count -eq 0) {
+        return ""
+    }
+    if ($nodes.Count -ne 1) {
+        throw "Velopack nuspec metadata contains duplicate '$Name' elements."
+    }
+
+    return $nodes[0].InnerText.Trim()
 }
 
 function Get-VelopackFrameworkSpec {
@@ -146,7 +170,6 @@ function Assert-VelopackPackage {
         [Parameter(Mandatory = $true)][string]$ProductName,
         [Parameter(Mandatory = $true)][string]$SemanticVersion,
         [Parameter(Mandatory = $true)][string]$MainExe,
-        [Parameter(Mandatory = $true)][string]$Rid,
         [Parameter(Mandatory = $true)][string]$MachineArchitecture,
         [Parameter(Mandatory = $true)][string]$Channel,
         [Parameter(Mandatory = $true)][string]$DeploymentMode,
@@ -189,13 +212,21 @@ function Assert-VelopackPackage {
             }
         }
 
+        $runtimeDependency = Get-NuspecOptionalValue -Document $document -Name "runtimeDependencies"
         if ($DeploymentMode -eq "Lite") {
             if ([string]::IsNullOrWhiteSpace($ExpectedRuntimeDependency)) {
                 throw "Lite package validation requires ExpectedRuntimeDependency from runtimeconfig.json."
             }
-            $runtimeDeps = Get-NuspecValue -Document $document -Name "runtimeDependencies"
-            if ($runtimeDeps -notmatch [regex]::Escape($ExpectedRuntimeDependency)) {
-                throw "Velopack nuspec 'runtimeDependencies' mismatch: expected to contain '$ExpectedRuntimeDependency', got '$runtimeDeps'."
+            if ($runtimeDependency -cne $ExpectedRuntimeDependency) {
+                throw "Velopack nuspec 'runtimeDependencies' mismatch: expected '$ExpectedRuntimeDependency', got '$runtimeDependency'."
+            }
+        }
+        else {
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedRuntimeDependency)) {
+                throw "Full package validation must not receive a Lite runtime prerequisite."
+            }
+            if (-not [string]::IsNullOrWhiteSpace($runtimeDependency)) {
+                throw "Full package must not contain runtimeDependencies; got '$runtimeDependency'."
             }
         }
 
@@ -228,7 +259,11 @@ $packProperties = Read-PackProperties -Path $propsPath
 $packId = "Nyanako.TokenBar"
 $appExecutableName = "{0}.App.exe" -f $packProperties.ProductName
 $machineArchitecture = if ($Rid -eq "win-x64") { "x64" } else { "arm64" }
-
+$requiredLiteFramework = if ($Rid -eq "win-x64") {
+    "net10-x64-runtime"
+} else {
+    "net10-arm64-runtime"
+}
 $channel = if ($DeploymentMode -eq "Lite") { "$Rid-lite" } else { $Rid }
 
 # Keep build artifacts separate from channel-scoped release files so the
@@ -248,12 +283,15 @@ if (-not (Test-Path -LiteralPath $publishRoot -PathType Container)) {
 }
 
 $appAssemblyName = "{0}.App" -f $packProperties.ProductName
-$frameworkSpec = $null
+$frameworkSpec = ""
 if ($DeploymentMode -eq "Lite") {
     $frameworkSpec = Get-VelopackFrameworkSpec `
         -PublishRoot $publishRoot `
         -AppAssemblyName $appAssemblyName `
         -Rid $Rid
+    if ($frameworkSpec -cne $requiredLiteFramework) {
+        throw "Lite runtimeconfig must resolve to '$requiredLiteFramework', got '$frameworkSpec'."
+    }
     Write-Output "Lite Velopack framework from runtimeconfig.json: $frameworkSpec"
 }
 
@@ -292,9 +330,8 @@ $packagePath = Join-Path $releasesRoot $packageName
 Assert-VelopackPackage -PackagePath $packagePath -PackId $packId `
     -ProductName $packProperties.ProductName `
     -SemanticVersion $packProperties.SemanticVersion -MainExe $appExecutableName `
-    -Rid $Rid -MachineArchitecture $machineArchitecture `
-    -Channel $channel -DeploymentMode $DeploymentMode `
-    -ExpectedRuntimeDependency $(if ($null -ne $frameworkSpec) { $frameworkSpec } else { "" })
+    -MachineArchitecture $machineArchitecture -Channel $channel `
+    -DeploymentMode $DeploymentMode -ExpectedRuntimeDependency $frameworkSpec
 
 $releaseFiles = @(Get-ChildItem -LiteralPath $releasesRoot -File | Sort-Object Name)
 Write-Output "Phase 11 Velopack package verified: $packageName"
