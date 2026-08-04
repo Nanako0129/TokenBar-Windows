@@ -48,6 +48,7 @@ if (-not (Test-Path -LiteralPath $ReleasesRoot -PathType Container)) {
     throw "Releases root missing: $ReleasesRoot"
 }
 
+$expectedPackageId = "Nyanako.TokenBar"
 $channel = if ($DeploymentMode -eq "Lite") { "$Rid-lite" } else { $Rid }
 $architecture = if ($Rid -eq "win-x64") { "x64" } else { "arm64" }
 $requiredLiteFramework = if ($Rid -eq "win-x64") {
@@ -85,13 +86,6 @@ if ($setupEntries.Count -ne 1) {
 
 $nupkg = $nupkgEntries[0]
 $setup = $setupEntries[0]
-if ($nupkg.name -cnotlike "*-$channel-full.nupkg") {
-    throw "Nupkg name does not embed expected channel '$channel': $($nupkg.name)"
-}
-if ($setup.name -cnotlike "*-$channel-Setup.exe") {
-    throw "Setup name does not embed expected channel '$channel': $($setup.name)"
-}
-
 $maxPackageBytes = if ($DeploymentMode -eq "Lite") { 60MB } else { 110MB }
 $maxSetupBytes = if ($DeploymentMode -eq "Lite") { 75MB } else { 125MB }
 if ([int64]$nupkg.bytes -gt $maxPackageBytes) {
@@ -118,13 +112,27 @@ try {
     $reader.Dispose()
     $reader = $null
 
+    $nuspecPackageId = Get-RequiredNuspecValue -Document $document -Name "id"
+    $nuspecVersion = Get-RequiredNuspecValue -Document $document -Name "version"
     $nuspecChannel = Get-RequiredNuspecValue -Document $document -Name "channel"
     $nuspecArchitecture = Get-RequiredNuspecValue -Document $document -Name "machineArchitecture"
+    if ($nuspecPackageId -cne $expectedPackageId) {
+        throw "Nuspec package id mismatch: expected '$expectedPackageId', got '$nuspecPackageId'."
+    }
     if ($nuspecChannel -cne $channel) {
         throw "Nuspec channel mismatch: expected '$channel', got '$nuspecChannel'."
     }
     if ($nuspecArchitecture -cne $architecture) {
         throw "Nuspec architecture mismatch: expected '$architecture', got '$nuspecArchitecture'."
+    }
+
+    $expectedNupkgName = "$expectedPackageId-$nuspecVersion-$channel-full.nupkg"
+    $expectedSetupName = "$expectedPackageId-$channel-Setup.exe"
+    if ($nupkg.name -cne $expectedNupkgName) {
+        throw "Nupkg name mismatch: expected '$expectedNupkgName', got '$($nupkg.name)'."
+    }
+    if ($setup.name -cne $expectedSetupName) {
+        throw "Setup name mismatch: expected '$expectedSetupName', got '$($setup.name)'."
     }
 
     $runtimeNodes = @(Get-NuspecElements -Document $document -Name "runtimeDependencies")
@@ -163,6 +171,8 @@ finally {
 $evidence = [ordered]@{
     schema = "phase11-package-evidence.v2"
     deploymentMode = $DeploymentMode
+    packageId = $nuspecPackageId
+    version = $nuspecVersion
     rid = $Rid
     architecture = $architecture
     channel = $channel
