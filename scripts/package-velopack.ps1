@@ -134,23 +134,6 @@ function Get-NuspecValue {
     return $nodes[0].InnerText.Trim()
 }
 
-function Get-NuspecOptionalValue {
-    param(
-        [Parameter(Mandatory = $true)][xml]$Document,
-        [Parameter(Mandatory = $true)][string]$Name
-    )
-
-    $nodes = @(Get-NuspecNodes -Document $Document -Name $Name)
-    if ($nodes.Count -eq 0) {
-        return ""
-    }
-    if ($nodes.Count -ne 1) {
-        throw "Velopack nuspec metadata contains duplicate '$Name' elements."
-    }
-
-    return $nodes[0].InnerText.Trim()
-}
-
 function Get-VelopackFrameworkSpec {
     param(
         [Parameter(Mandatory = $true)][string]$PublishRoot,
@@ -212,11 +195,16 @@ function Assert-VelopackPackage {
             }
         }
 
-        $runtimeDependency = Get-NuspecOptionalValue -Document $document -Name "runtimeDependencies"
+        $runtimeNodes = @(Get-NuspecNodes -Document $document -Name "runtimeDependencies")
         if ($DeploymentMode -eq "Lite") {
             if ([string]::IsNullOrWhiteSpace($ExpectedRuntimeDependency)) {
                 throw "Lite package validation requires ExpectedRuntimeDependency from runtimeconfig.json."
             }
+            if ($runtimeNodes.Count -ne 1 -or
+                [string]::IsNullOrWhiteSpace($runtimeNodes[0].InnerText)) {
+                throw "Lite package must contain exactly one non-empty runtimeDependencies element."
+            }
+            $runtimeDependency = $runtimeNodes[0].InnerText.Trim()
             if ($runtimeDependency -cne $ExpectedRuntimeDependency) {
                 throw "Velopack nuspec 'runtimeDependencies' mismatch: expected '$ExpectedRuntimeDependency', got '$runtimeDependency'."
             }
@@ -225,8 +213,8 @@ function Assert-VelopackPackage {
             if (-not [string]::IsNullOrWhiteSpace($ExpectedRuntimeDependency)) {
                 throw "Full package validation must not receive a Lite runtime prerequisite."
             }
-            if (-not [string]::IsNullOrWhiteSpace($runtimeDependency)) {
-                throw "Full package must not contain runtimeDependencies; got '$runtimeDependency'."
+            if ($runtimeNodes.Count -ne 0) {
+                throw "Full package must omit runtimeDependencies entirely; found $($runtimeNodes.Count) element(s)."
             }
         }
 
