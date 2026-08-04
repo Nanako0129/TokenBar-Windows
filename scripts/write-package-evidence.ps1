@@ -45,6 +45,11 @@ if (-not (Test-Path -LiteralPath $ReleasesRoot -PathType Container)) {
 
 $channel = if ($DeploymentMode -eq "Lite") { "$Rid-lite" } else { $Rid }
 $architecture = if ($Rid -eq "win-x64") { "x64" } else { "arm64" }
+$requiredLiteFramework = if ($Rid -eq "win-x64") {
+    "net10-x64-runtime"
+} else {
+    "net10-arm64-runtime"
+}
 $files = @(Get-ChildItem -LiteralPath $ReleasesRoot -File | Sort-Object Name)
 if ($files.Count -lt 1) {
     throw "No release files under $ReleasesRoot"
@@ -120,11 +125,11 @@ try {
     $runtimeNode = Get-NuspecElement -Document $document -Name "runtimeDependencies" -Optional
     $runtimeDependency = if ($null -eq $runtimeNode) { "" } else { $runtimeNode.InnerText.Trim() }
     if ($DeploymentMode -eq "Lite") {
-        if ([string]::IsNullOrWhiteSpace($ExpectedFramework)) {
-            throw "Lite package evidence requires ExpectedFramework."
+        if ($ExpectedFramework -cne $requiredLiteFramework) {
+            throw "Lite framework must be '$requiredLiteFramework' (runtime family), got '$ExpectedFramework'."
         }
-        if ($runtimeDependency -cne $ExpectedFramework) {
-            throw "Lite runtime dependency mismatch: expected '$ExpectedFramework', got '$runtimeDependency'."
+        if ($runtimeDependency -cne $requiredLiteFramework) {
+            throw "Lite runtime dependency mismatch: expected '$requiredLiteFramework', got '$runtimeDependency'."
         }
     }
     else {
@@ -151,6 +156,7 @@ $evidence = [ordered]@{
     rid = $Rid
     architecture = $architecture
     channel = $channel
+    expectedFramework = if ($ExpectedFramework) { $ExpectedFramework } else { $null }
     runtimeDependency = if ($runtimeDependency) { $runtimeDependency } else { $null }
     nupkgName = $nupkg.name
     nupkgBytes = [int64]$nupkg.bytes
