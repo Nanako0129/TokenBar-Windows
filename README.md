@@ -156,3 +156,8 @@ Shared parsing engine from [tokscale-core](https://github.com/Nanako0129/tokscal
 originally derived from [tokscale](https://github.com/junhoyeo/tokscale) by
 junhoyeo. Original menu-bar concept by
 [handlecusion's tokcat](https://github.com/handlecusion/tokcat).
+
+## Lite channel (framework-dependent)
+
+Optional **Lite** builds omit the bundled .NET 10 runtime. See [docs/lite-distribution.md](docs/lite-distribution.md) for channels, package identity, and the per-surface default policy (README/GitHub default Full; Scoop default Lite; winget Full + Lite package).
+

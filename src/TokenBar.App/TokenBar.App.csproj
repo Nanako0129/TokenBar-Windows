@@ -11,6 +11,7 @@
     <Platforms>x64;ARM64</Platforms>
     <UseWinUI>true</UseWinUI>
     <WindowsPackageType>None</WindowsPackageType>
+    <SelfContained Condition="'$(SelfContained)' == ''">true</SelfContained>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <TbNativePackagingEnabled>true</TbNativePackagingEnabled>
     <ImplicitUsings>enable</ImplicitUsings>
