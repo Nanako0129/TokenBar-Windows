@@ -541,22 +541,67 @@ foreach ($name in $capturedNames) {
 }
 
 # (2) Native Rust/MSVC PDBs next to the locked Cargo release for this RID.
+# Fail closed on tb_core_ffi.pdb freshness: name-only acceptance can archive a
+# stale ignored target/.../tb_core_ffi.pdb when cargo did not rewrite it while
+# the publish still hash-matched a newer tb_core_ffi.dll.
 $nativeReleaseDir = Join-Path $repoRoot ("target\{0}\release" -f $rustTarget)
 if (-not (Test-Path -LiteralPath $nativeReleaseDir -PathType Container)) {
     throw "Native release directory missing for symbols capture: target/$rustTarget/release"
 }
-Get-ChildItem -LiteralPath $nativeReleaseDir -Recurse -File -Filter "*.pdb" -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        Copy-SymbolFile -SourcePath $_.FullName -CopiedNames $copiedSymbolNames
-    }
-# Prefer the exact native DLL sibling PDB name even if only that one exists.
+$nativeDllItem = Get-Item -LiteralPath $nativeSourcePath
+# Prefer the exact sibling of the hash-verified DLL, then deps/.
 $nativePdbCandidates = @(
     (Join-Path $nativeReleaseDir "tb_core_ffi.pdb"),
     (Join-Path $nativeReleaseDir "deps\tb_core_ffi.pdb")
 )
+# Allow tiny FS timestamp jitter; reject PDB meaningfully older than this build's DLL.
+$nativePdbMaxOlderThanDllSeconds = 2
+$freshNativePdbPath = $null
+$freshNativePdbMeta = $null
 foreach ($candidate in $nativePdbCandidates) {
-    Copy-SymbolFile -SourcePath $candidate -CopiedNames $copiedSymbolNames
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        continue
+    }
+    $pdbItem = Get-Item -LiteralPath $candidate
+    if ($pdbItem.Length -le 0) {
+        continue
+    }
+    $olderBySeconds = ($nativeDllItem.LastWriteTimeUtc - $pdbItem.LastWriteTimeUtc).TotalSeconds
+    if ($olderBySeconds -gt $nativePdbMaxOlderThanDllSeconds) {
+        Write-Output ("Skipping stale native PDB older than verified DLL by {0:N1}s: {1}" -f $olderBySeconds, $candidate)
+        continue
+    }
+    $freshNativePdbPath = $pdbItem.FullName
+    $pdbLocation = if ($candidate -like "*\deps\tb_core_ffi.pdb" -or $candidate -like "*/deps/tb_core_ffi.pdb") {
+        "target/$rustTarget/release/deps/tb_core_ffi.pdb"
+    } else {
+        "target/$rustTarget/release/tb_core_ffi.pdb"
+    }
+    $freshNativePdbMeta = [ordered]@{
+        relative = $pdbLocation
+        bytes = [int64]$pdbItem.Length
+        dllLastWriteTimeUtc = $nativeDllItem.LastWriteTimeUtc.ToString("o")
+        pdbLastWriteTimeUtc = $pdbItem.LastWriteTimeUtc.ToString("o")
+        pdbOlderThanDllSeconds = [math]::Round($olderBySeconds, 3)
+        maxOlderThanDllSeconds = $nativePdbMaxOlderThanDllSeconds
+    }
+    break
 }
+if ($null -eq $freshNativePdbPath) {
+    $msg = "No fresh tb_core_ffi.pdb for the verified native DLL under target/{0}/release. PDB must exist next to the cargo-built DLL (or deps/) and must not be older than the DLL by more than {1}s (refuse stale ignored target PDBs)." -f $rustTarget, $nativePdbMaxOlderThanDllSeconds
+    throw $msg
+}
+Copy-SymbolFile -SourcePath $freshNativePdbPath -CopiedNames $copiedSymbolNames
+
+# Other MSVC/Rust PDBs under the same release tree (unique basenames only).
+Get-ChildItem -LiteralPath $nativeReleaseDir -Recurse -File -Filter "*.pdb" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        if ([string]::Equals($_.Name, "tb_core_ffi.pdb", [StringComparison]::OrdinalIgnoreCase)) {
+            # Already accepted via freshness check above; never re-copy a stale sibling.
+            return
+        }
+        Copy-SymbolFile -SourcePath $_.FullName -CopiedNames $copiedSymbolNames
+    }
 
 $symbolFiles = @(Get-ChildItem -LiteralPath $symbolsStaging -File | Sort-Object Name)
 if ($symbolFiles.Count -lt 1) {
@@ -682,6 +727,7 @@ $symbolsEvidence = [ordered]@{
     fileCount = [int]$symbolInventory.Count
     requiredAppPdb = $appPdbName
     requiredNativePdb = "tb_core_ffi.pdb"
+    nativePdbFreshness = $freshNativePdbMeta
     capturedFromPublishStrip = @($capturedFromPublishStrip)
     files = $symbolInventory
 }
