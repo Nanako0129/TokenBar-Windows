@@ -125,8 +125,11 @@
                                       $([System.String]::Copy('%(Filename)').StartsWith('Microsoft.DiaSymReader.Native'))" />
     </ItemGroup>
 
-    <MakeDir Directories="$(TbSupportStagingDir)"
-             Condition="'@(_TbSupportToCapture)' != ''" />
+    <!-- Always recreate the RID-scoped staging dir so stale ignored obj/ files
+         from prior publishes cannot satisfy fail-closed symbol checks. -->
+    <RemoveDir Directories="$(TbSupportStagingDir)"
+               Condition="Exists('$(TbSupportStagingDir)')" />
+    <MakeDir Directories="$(TbSupportStagingDir)" />
     <!-- Copy using the resolved source path (Identity/FullPath) before strip. -->
     <Copy SourceFiles="@(_TbSupportToCapture)"
           DestinationFiles="@(_TbSupportToCapture->'$(TbSupportStagingDir)\%(Filename)%(Extension)')"
@@ -136,8 +139,7 @@
     <WriteLinesToFile File="$(TbSupportStagingDir)\CAPTURED.txt"
                       Lines="@(_TbSupportToCapture->'%(Filename)%(Extension)')"
                       Overwrite="true"
-                      Encoding="UTF-8"
-                      Condition="'@(_TbSupportToCapture)' != ''" />
+                      Encoding="UTF-8" />
 
     <ItemGroup>
       <!-- PDB files should never ship in the installer -->
