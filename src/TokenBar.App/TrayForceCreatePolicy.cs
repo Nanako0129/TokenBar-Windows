@@ -2,16 +2,36 @@ namespace TokenBar.App;
 
 /// <summary>
 /// Pure policy + injectable per-episode ForceCreate state machine.
-/// Free of WinUI types so unit tests can inject attempt and delay functions
-/// without constructing a tray.
+/// Free of WinUI types so unit tests can inject attempt, delay, and clock
+/// functions without constructing a tray.
 /// </summary>
 internal static class TrayForceCreatePolicy
 {
-    /// <summary>Max ForceCreate attempts in a single creation episode.</summary>
-    public const int MaxAttemptsPerEpisode = 5;
+    /// <summary>
+    /// Wall-clock budget for one tray-creation episode (normal launch and smoke).
+    /// Logon autostart is the primary path; the shell can take several seconds
+    /// to accept a tray icon. Exhaustion is time-based, not attempt-count based.
+    /// </summary>
+    public const int EpisodeDeadlineMilliseconds = 10_000;
 
-    /// <summary>Startup-smoke overall wait budget for tray readiness.</summary>
-    public const int StartupSmokeTimeoutMilliseconds = 10_000;
+    /// <summary>
+    /// Minimum total wall-clock window the production soft-fail schedule must
+    /// cover. Tests fail if a schedule change shrinks the recovery window.
+    /// Matches <see cref="EpisodeDeadlineMilliseconds"/> so the episode actually
+    /// runs for the intended logon-tolerant startup window.
+    /// </summary>
+    public const int MinProductionRetryWindowMilliseconds = EpisodeDeadlineMilliseconds;
+
+    /// <summary>
+    /// Startup-smoke outer wait for tray readiness (same window as the episode).
+    /// </summary>
+    public const int StartupSmokeTimeoutMilliseconds = EpisodeDeadlineMilliseconds;
+
+    /// <summary>Cap on a single inter-attempt delay (ms).</summary>
+    public const int MaxDelayMilliseconds = 500;
+
+    /// <summary>Base step for the linear backoff before the cap (ms).</summary>
+    public const int DelayStepMilliseconds = 50;
 
     /// <summary>Delay before the next timer tick after a soft failure (ms).</summary>
     public static int DelayMilliseconds(int attemptNumberAfterFailure)
@@ -21,7 +41,7 @@ internal static class TrayForceCreatePolicy
             return 0;
         }
 
-        return Math.Min(50 * attemptNumberAfterFailure, 500);
+        return Math.Min(DelayStepMilliseconds * attemptNumberAfterFailure, MaxDelayMilliseconds);
     }
 
     /// <summary>
@@ -38,41 +58,51 @@ internal enum TrayForceCreateTickResult
     /// <summary>Icon reported created; stop retrying.</summary>
     Success,
 
-    /// <summary>Soft failure; more attempts remain in this episode.</summary>
+    /// <summary>Soft failure; schedule another tick before the deadline.</summary>
     Continue,
 
-    /// <summary>Episode budget exhausted without success.</summary>
+    /// <summary>Episode wall-clock deadline passed without success.</summary>
     Exhausted,
 }
 
 /// <summary>
-/// Per-episode attempt accounting. Call <see cref="Tick(Func{bool})"/> once per
-/// timer tick. This type never sleeps or owns a timer; production schedules the
-/// next tick with DispatcherQueueTimer and tests inject both attempt and delay
-/// functions deterministically.
+/// Per-episode ForceCreate accounting driven by an elapsed-time deadline.
+/// Call <see cref="Tick(Func{bool})"/> once per timer tick. This type never
+/// sleeps or owns a timer; production schedules the next tick with
+/// DispatcherQueueTimer and tests inject attempt, delay, and clock functions.
 /// </summary>
 internal sealed class TrayForceCreateEpisode
 {
-    private readonly int _maxAttempts;
+    private readonly TimeSpan _deadline;
+    private readonly Func<DateTimeOffset> _utcNow;
+    private readonly DateTimeOffset _startedUtc;
 
     public TrayForceCreateEpisode(
-        int maxAttempts = TrayForceCreatePolicy.MaxAttemptsPerEpisode)
+        TimeSpan? deadline = null,
+        Func<DateTimeOffset>? utcNow = null)
     {
-        if (maxAttempts < 1)
+        _deadline = deadline
+            ?? TimeSpan.FromMilliseconds(TrayForceCreatePolicy.EpisodeDeadlineMilliseconds);
+        if (_deadline <= TimeSpan.Zero)
         {
-            throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+            throw new ArgumentOutOfRangeException(nameof(deadline));
         }
 
-        _maxAttempts = maxAttempts;
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+        _startedUtc = _utcNow();
     }
 
     public int Attempts { get; private set; }
 
-    public bool IsExhausted => Attempts >= _maxAttempts;
+    /// <summary>Elapsed wall time since the episode started (injected clock).</summary>
+    public TimeSpan Elapsed => _utcNow() - _startedUtc;
+
+    /// <summary>True when the wall-clock deadline has been reached or passed.</summary>
+    public bool IsExhausted => Elapsed >= _deadline;
 
     /// <summary>
     /// Delay computed for the next host-scheduled tick after a Continue result.
-    /// Zero in terminal states.
+    /// Zero in terminal states. Never exceeds the delay cap or remaining budget.
     /// </summary>
     public int NextDelayMilliseconds { get; private set; }
 
@@ -83,10 +113,11 @@ internal sealed class TrayForceCreateEpisode
         Tick(attempt, TrayForceCreatePolicy.DelayMilliseconds);
 
     /// <summary>
-    /// Runs exactly one ForceCreate attempt. Propagates non-retryable attempt
-    /// exceptions and invalid delay-policy output. Soft failures return
-    /// Continue or Exhausted. The injected delay function is called only when
-    /// another tick is actually required.
+    /// Runs exactly one ForceCreate attempt unless the deadline has already
+    /// passed. Propagates non-retryable attempt exceptions and invalid delay
+    /// output. Soft failures return Continue while time remains, otherwise
+    /// Exhausted. The injected delay function is called only when another tick
+    /// is actually required.
     /// </summary>
     public TrayForceCreateTickResult Tick(
         Func<bool> attempt,
@@ -94,6 +125,7 @@ internal sealed class TrayForceCreateEpisode
     {
         ArgumentNullException.ThrowIfNull(attempt);
         ArgumentNullException.ThrowIfNull(delayMilliseconds);
+
         if (IsExhausted)
         {
             NextDelayMilliseconds = 0;
@@ -111,10 +143,11 @@ internal sealed class TrayForceCreateEpisode
         }
         catch (Exception ex) when (TrayForceCreatePolicy.IsSoftRetryable(ex))
         {
-            // Soft miss — budget continues.
+            // Soft miss — keep retrying until the wall-clock deadline.
         }
 
-        if (Attempts >= _maxAttempts)
+        var remainingMs = (int)Math.Ceiling((_deadline - Elapsed).TotalMilliseconds);
+        if (remainingMs <= 0)
         {
             NextDelayMilliseconds = 0;
             return TrayForceCreateTickResult.Exhausted;
@@ -125,6 +158,15 @@ internal sealed class TrayForceCreateEpisode
         {
             throw new InvalidOperationException(
                 $"ForceCreate retry delay must be positive after attempt {Attempts}.");
+        }
+
+        // Cap single-step delay, then never schedule past the episode deadline.
+        delay = Math.Min(delay, TrayForceCreatePolicy.MaxDelayMilliseconds);
+        delay = Math.Min(delay, remainingMs);
+        if (delay < 1)
+        {
+            NextDelayMilliseconds = 0;
+            return TrayForceCreateTickResult.Exhausted;
         }
 
         NextDelayMilliseconds = delay;
