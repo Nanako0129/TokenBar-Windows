@@ -27,6 +27,27 @@ public class UpdateFlowTests : IDisposable
         }
     }
 
+
+
+    /// <summary>The Velopack pack id is a literal in two places by design, so a
+    /// product rename cannot move it by accident. That only holds if the two
+    /// cannot drift: a packaging script emitting one id while the installed
+    /// client demands another produces releases that every client silently
+    /// refuses, and the failure appears as "no update available" rather than an
+    /// error.</summary>
+    [Fact]
+    public void PackageIdMatchesPackagingScript()
+    {
+        var script = File.ReadAllText(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "package-velopack.ps1"));
+        var match = System.Text.RegularExpressions.Regex.Match(
+            script, @"^\$packId\s*=\s*""(?<id>[^""]+)""\s*$",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+
+        Assert.True(match.Success, "package-velopack.ps1 has no $packId assignment.");
+        Assert.Equal(UpdateFlow.PackageId, match.Groups["id"].Value);
+    }
+
     [Theory]
     [InlineData("win-x64", "x64")]
     [InlineData("win-x64-lite", "x64")]
