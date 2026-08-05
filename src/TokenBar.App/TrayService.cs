@@ -512,11 +512,13 @@ public sealed class TrayService : IDisposable
                 return;
             case TrayForceCreateTickResult.Exhausted:
                 FailTrayCreation(
-                    $"tray icon not ready after {episode.Attempts} ForceCreate attempts");
+                    $"tray icon not ready after {episode.Attempts} ForceCreate attempt(s) "
+                    + $"over {episode.Elapsed.TotalMilliseconds:0} ms "
+                    + $"(deadline {TrayForceCreatePolicy.EpisodeDeadlineMilliseconds} ms)");
                 return;
             case TrayForceCreateTickResult.Continue:
-                ScheduleRetryTick(
-                    TrayForceCreatePolicy.DelayMilliseconds(episode.Attempts));
+                // Use the episode-computed delay (capped and clamped to remaining budget).
+                ScheduleRetryTick(episode.NextDelayMilliseconds);
                 return;
             default:
                 throw new InvalidOperationException($"unknown tick result {result}");
