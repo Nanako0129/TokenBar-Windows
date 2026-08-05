@@ -55,6 +55,103 @@ public sealed class TrayForceCreatePolicyTests
     }
 
     [Fact]
+    public void Episode_soft_fail_then_success_same_episode()
+    {
+        // Host schedules one tick per delay; soft miss then success must not
+        // consume the full episode budget.
+        var calls = 0;
+        var episode = new TrayForceCreateEpisode(maxAttempts: 5);
+
+        var soft = episode.Tick(
+            () =>
+            {
+                calls++;
+                throw new InvalidOperationException("shell not ready");
+            },
+            attempt => attempt * 10);
+        Assert.Equal(TrayForceCreateTickResult.Continue, soft);
+        Assert.Equal(10, episode.NextDelayMilliseconds);
+        Assert.Equal(1, episode.Attempts);
+
+        var ok = episode.Tick(
+            () =>
+            {
+                calls++;
+                return true;
+            },
+            _ => 99);
+        Assert.Equal(TrayForceCreateTickResult.Success, ok);
+        Assert.Equal(0, episode.NextDelayMilliseconds);
+        Assert.Equal(2, calls);
+        Assert.Equal(2, episode.Attempts);
+        Assert.False(episode.IsExhausted);
+    }
+
+    [Fact]
+    public void Host_simulation_cancellation_stops_before_exhaustion()
+    {
+        // Pure policy has no timer ownership; production Dispose cancels the
+        // ready TCS and stops the DispatcherQueueTimer. Host-side cancellation
+        // must be able to abandon an in-flight episode without further attempts.
+        using var cts = new CancellationTokenSource();
+        var episode = new TrayForceCreateEpisode(maxAttempts: 5);
+        var calls = 0;
+
+        while (!episode.IsExhausted && !cts.IsCancellationRequested)
+        {
+            _ = episode.Tick(
+                () =>
+                {
+                    calls++;
+                    if (calls >= 2)
+                    {
+                        cts.Cancel();
+                    }
+
+                    throw new InvalidOperationException("shell not ready");
+                },
+                attempt => attempt * 10);
+
+            if (cts.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+
+        Assert.True(cts.IsCancellationRequested);
+        Assert.Equal(2, calls);
+        Assert.False(episode.IsExhausted);
+        // No further host ticks after cancellation — attempt count stays put.
+        Assert.Equal(2, episode.Attempts);
+    }
+
+    [Fact]
+    public void StartupSmokeTimeout_is_positive_and_bounded()
+    {
+        Assert.True(TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds > 0);
+        Assert.True(TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds <= 30_000);
+        // Host simulation: soft-fail delays accumulate below the smoke budget for
+        // a full episode (timer path), so the wall-clock timeout remains the outer
+        // bound rather than an unbounded wait.
+        var episode = new TrayForceCreateEpisode();
+        var scheduledDelayMs = 0;
+        while (!episode.IsExhausted)
+        {
+            var result = episode.Tick(
+                () => throw new InvalidOperationException("shell not ready"));
+            if (result == TrayForceCreateTickResult.Continue)
+            {
+                scheduledDelayMs += episode.NextDelayMilliseconds;
+            }
+        }
+
+        Assert.True(
+            scheduledDelayMs < TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds,
+            $"episode retry delays {scheduledDelayMs}ms must fit under smoke timeout "
+            + $"{TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds}ms");
+    }
+
+    [Fact]
     public void Episode_soft_failures_use_injected_delay_then_exhaust()
     {
         var calls = 0;
