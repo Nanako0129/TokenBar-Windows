@@ -528,35 +528,27 @@ $capturedFromPublishStrip = [System.Collections.Generic.List[string]]::new()
 $tfm = "net10.0-windows10.0.19041.0"
 $msbuildSupportDir = Join-Path $repoRoot (
     "src\TokenBar.App\obj\{0}\Release\{1}\{2}\tb-support-staging" -f $platform, $tfm, $Rid)
-if (Test-Path -LiteralPath $msbuildSupportDir -PathType Container) {
-    Get-ChildItem -LiteralPath $msbuildSupportDir -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ne "CAPTURED.txt" } |
-        ForEach-Object {
-            Copy-SymbolFile -SourcePath $_.FullName -CopiedNames $copiedSymbolNames
-            [void]$capturedFromPublishStrip.Add($_.Name)
-        }
-    $capturedListPath = Join-Path $msbuildSupportDir "CAPTURED.txt"
-    if (Test-Path -LiteralPath $capturedListPath -PathType Leaf) {
-        Get-Content -LiteralPath $capturedListPath |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ } |
-            ForEach-Object {
-                if (-not $capturedFromPublishStrip.Contains($_)) {
-                    [void]$capturedFromPublishStrip.Add($_)
-                }
-            }
-    }
+if (-not (Test-Path -LiteralPath $msbuildSupportDir -PathType Container)) {
+    throw "MSBuild support staging missing after publish: $msbuildSupportDir"
 }
-
-# Also accept any other RID-scoped tb-support-staging under App obj (layout drift).
-Get-ChildItem -LiteralPath (Join-Path $repoRoot "src\TokenBar.App\obj") -Recurse -Directory -Filter "tb-support-staging" -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne "CAPTURED.txt" } |
-            ForEach-Object {
-                Copy-SymbolFile -SourcePath $_.FullName -CopiedNames $copiedSymbolNames
-            }
+$capturedListPath = Join-Path $msbuildSupportDir "CAPTURED.txt"
+if (-not (Test-Path -LiteralPath $capturedListPath -PathType Leaf)) {
+    throw "MSBuild support capture manifest missing: CAPTURED.txt (staging must be recreated each publish)"
+}
+# Only trust names listed in this publish's CAPTURED.txt — never orphan files left in obj/.
+$capturedNames = @(
+    Get-Content -LiteralPath $capturedListPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not [string]::Equals($_, "CAPTURED.txt", [StringComparison]::OrdinalIgnoreCase) }
+)
+foreach ($name in $capturedNames) {
+    $src = Join-Path $msbuildSupportDir $name
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        throw "CAPTURED.txt lists '$name' but file is missing from fresh support staging."
     }
+    Copy-SymbolFile -SourcePath $src -CopiedNames $copiedSymbolNames
+    [void]$capturedFromPublishStrip.Add($name)
+}
 
 # (2) Native Rust/MSVC PDBs next to the locked Cargo release for this RID.
 $nativeReleaseDir = Join-Path $repoRoot ("target\{0}\release" -f $rustTarget)
