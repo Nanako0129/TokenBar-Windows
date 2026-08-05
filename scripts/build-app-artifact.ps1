@@ -492,33 +492,140 @@ if ($zipBytes -gt $maxZipBytes) {
 }
 
 # Separate version/RID-bound symbols/support artifact (NOT part of Setup.exe/nupkg).
-# Collect PDBs and DAC/DBI diagnostics from intermediate build output so crash dumps
-# remain analyzable even though the installer payload is strip-clean.
+# Fail closed: never accept empty/partial archives. Capture path:
+#   1) MSBuild TbTrimUnusedPublishPayload copies stripped PDBs/DAC/DBI/DiaSymReader
+#      into obj/.../tb-support-staging BEFORE removing them from ResolvedFileToPublish.
+#   2) Native Rust/MSVC PDBs under target/<rustTarget>/release (recursive).
+#   3) Required: managed App PDB, tb_core_ffi.pdb; DAC/DBI when the capture manifest
+#      or runtime-pack layout indicates they were part of this publish.
 $symbolsStaging = Join-Path $artifactRoot "symbols-staging"
 if (Test-Path -LiteralPath $symbolsStaging) {
     Remove-Item -LiteralPath $symbolsStaging -Recurse -Force
 }
 New-Item -ItemType Directory -Path $symbolsStaging | Out-Null
-$symbolsPatterns = @("*.pdb", "mscordaccore.dll", "mscordbi.dll", "mscordaccore_*.dll", "Microsoft.DiaSymReader.Native*.dll")
-$searchRoots = @(
-    (Join-Path $repoRoot ("src\TokenBar.App\bin\{0}\Release" -f $platform)),
-    (Join-Path $repoRoot ("src\TokenBar.App\obj\{0}\Release" -f $platform)),
-    $publishRoot
-)
+
+function Copy-SymbolFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][hashtable]$CopiedNames
+    )
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        return
+    }
+    $destName = [System.IO.Path]::GetFileName($SourcePath)
+    $key = $destName.ToLowerInvariant()
+    if ($CopiedNames.ContainsKey($key)) {
+        return
+    }
+    Copy-Item -LiteralPath $SourcePath -Destination (Join-Path $symbolsStaging $destName) -Force
+    $CopiedNames[$key] = $true
+}
+
 $copiedSymbolNames = @{}
-foreach ($root in $searchRoots) {
-    if (-not (Test-Path -LiteralPath $root)) { continue }
-    foreach ($pat in $symbolsPatterns) {
-        Get-ChildItem -LiteralPath $root -Recurse -File -Filter $pat -ErrorAction SilentlyContinue |
+$capturedFromPublishStrip = [System.Collections.Generic.List[string]]::new()
+
+# (1) RID-scoped intermediate dir written by TbTrimUnusedPublishPayload.
+$tfm = "net10.0-windows10.0.19041.0"
+$msbuildSupportDir = Join-Path $repoRoot (
+    "src\TokenBar.App\obj\{0}\Release\{1}\{2}\tb-support-staging" -f $platform, $tfm, $Rid)
+if (Test-Path -LiteralPath $msbuildSupportDir -PathType Container) {
+    Get-ChildItem -LiteralPath $msbuildSupportDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne "CAPTURED.txt" } |
+        ForEach-Object {
+            Copy-SymbolFile -SourcePath $_.FullName -CopiedNames $copiedSymbolNames
+            [void]$capturedFromPublishStrip.Add($_.Name)
+        }
+    $capturedListPath = Join-Path $msbuildSupportDir "CAPTURED.txt"
+    if (Test-Path -LiteralPath $capturedListPath -PathType Leaf) {
+        Get-Content -LiteralPath $capturedListPath |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ } |
             ForEach-Object {
-                $destName = $_.Name
-                if ($copiedSymbolNames.ContainsKey($destName.ToLowerInvariant())) { return }
-                Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $symbolsStaging $destName) -Force
-                $copiedSymbolNames[$destName.ToLowerInvariant()] = $true
+                if (-not $capturedFromPublishStrip.Contains($_)) {
+                    [void]$capturedFromPublishStrip.Add($_)
+                }
             }
     }
 }
+
+# Also accept any other RID-scoped tb-support-staging under App obj (layout drift).
+Get-ChildItem -LiteralPath (Join-Path $repoRoot "src\TokenBar.App\obj") -Recurse -Directory -Filter "tb-support-staging" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "CAPTURED.txt" } |
+            ForEach-Object {
+                Copy-SymbolFile -SourcePath $_.FullName -CopiedNames $copiedSymbolNames
+            }
+    }
+
+# (2) Native Rust/MSVC PDBs next to the locked Cargo release for this RID.
+$nativeReleaseDir = Join-Path $repoRoot ("target\{0}\release" -f $rustTarget)
+if (-not (Test-Path -LiteralPath $nativeReleaseDir -PathType Container)) {
+    throw "Native release directory missing for symbols capture: target/$rustTarget/release"
+}
+Get-ChildItem -LiteralPath $nativeReleaseDir -Recurse -File -Filter "*.pdb" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        Copy-SymbolFile -SourcePath $_.FullName -CopiedNames $copiedSymbolNames
+    }
+# Prefer the exact native DLL sibling PDB name even if only that one exists.
+$nativePdbCandidates = @(
+    (Join-Path $nativeReleaseDir "tb_core_ffi.pdb"),
+    (Join-Path $nativeReleaseDir "deps\tb_core_ffi.pdb")
+)
+foreach ($candidate in $nativePdbCandidates) {
+    Copy-SymbolFile -SourcePath $candidate -CopiedNames $copiedSymbolNames
+}
+
 $symbolFiles = @(Get-ChildItem -LiteralPath $symbolsStaging -File | Sort-Object Name)
+if ($symbolFiles.Count -lt 1) {
+    throw "Symbols staging is empty; refuse to emit a partial/empty symbols archive."
+}
+
+$symbolNameSet = [System.Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase)
+foreach ($f in $symbolFiles) {
+    [void]$symbolNameSet.Add($f.Name)
+}
+
+# Fail closed: managed App PDB + native FFI PDB are always required.
+$appPdbName = "{0}.pdb" -f $appAssemblyName
+if (-not $symbolNameSet.Contains($appPdbName)) {
+    throw "Symbols archive missing required managed App PDB: $appPdbName"
+}
+if (-not $symbolNameSet.Contains("tb_core_ffi.pdb")) {
+    throw "Symbols archive missing required native PDB: tb_core_ffi.pdb (expected under target/$rustTarget/release)"
+}
+
+# DAC/DBI: required when the publish strip capture listed them (runtime pack had them).
+$dacRequiredIfCaptured = @("mscordaccore.dll", "mscordbi.dll")
+foreach ($name in $dacRequiredIfCaptured) {
+    $wasCaptured = $false
+    foreach ($c in $capturedFromPublishStrip) {
+        if ([string]::Equals($c, $name, [StringComparison]::OrdinalIgnoreCase)) {
+            $wasCaptured = $true
+            break
+        }
+    }
+    # Self-contained Full publishes always ship these in the runtime pack before strip;
+    # require them whenever we have any strip capture list OR coreclr was published.
+    $coreClrPresentInPublish = Test-Path -LiteralPath (Join-Path $publishRoot "coreclr.dll") -PathType Leaf
+    if ($wasCaptured -or $coreClrPresentInPublish) {
+        if (-not $symbolNameSet.Contains($name)) {
+            throw "Symbols archive missing required diagnostics binary from runtime pack: $name"
+        }
+    }
+}
+
+# Every file listed in the MSBuild capture manifest must appear in the staging set.
+foreach ($name in $capturedFromPublishStrip) {
+    if ([string]::Equals($name, "CAPTURED.txt", [StringComparison]::OrdinalIgnoreCase)) {
+        continue
+    }
+    if (-not $symbolNameSet.Contains($name)) {
+        throw "Symbols archive missing captured stripped support file: $name"
+    }
+}
+
 $symbolInventory = @(
     $symbolFiles | ForEach-Object {
         [pscustomobject]@{
@@ -535,7 +642,9 @@ $symbolsMeta = [ordered]@{
     gitSha = $gitSha.ToLowerInvariant()
     rid = $Rid
     platform = $platform
-    note = "Support/diagnostics archive for matching crash dumps. Not installed by Setup.exe or nupkg. Release operators archive this alongside the release transaction; PR CI uploads only sanitized hash metadata."
+    rustTarget = $rustTarget
+    capturedFromPublishStrip = @($capturedFromPublishStrip)
+    note = "Support/diagnostics archive for matching crash dumps. Not installed by Setup.exe or nupkg. Release operators archive this alongside the release transaction; PR CI uploads only sanitized symbols-evidence.json (never the symbols ZIP)."
     files = $symbolInventory
 }
 $symbolsMetaPath = Join-Path $symbolsStaging "SYMBOLS-MANIFEST.json"
@@ -553,9 +662,32 @@ if (Test-Path -LiteralPath $symbolsZipPath) {
 $symbolsZipHash = (Get-FileHash -LiteralPath $symbolsZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $symbolsZipBytes = [int64](Get-Item -LiteralPath $symbolsZipPath).Length
 Set-Content -LiteralPath (Join-Path $artifactRoot "$symbolsZipName.sha256") -Value "$symbolsZipHash  $symbolsZipName" -Encoding ascii -NoNewline
-# Drop staging tree; keep only the zip + sha256 next to the app artifact.
+
+# Prove ZIP members match the fail-closed inventory (no silent drop on zip).
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip = [System.IO.Compression.ZipFile]::OpenRead($symbolsZipPath)
+try {
+    $zipNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $zip.Entries) {
+        if ([string]::IsNullOrWhiteSpace($entry.Name)) { continue }
+        [void]$zipNames.Add($entry.Name)
+    }
+    foreach ($name in $symbolNameSet) {
+        if (-not $zipNames.Contains($name)) {
+            throw "Symbols ZIP is missing staged support file: $name"
+        }
+    }
+    if (-not $zipNames.Contains("SYMBOLS-MANIFEST.json")) {
+        throw "Symbols ZIP is missing SYMBOLS-MANIFEST.json"
+    }
+}
+finally {
+    $zip.Dispose()
+}
+
+# Drop staging tree; keep only the zip + sha256 + sanitized evidence next to the app artifact.
 Remove-Item -LiteralPath $symbolsStaging -Recurse -Force
-# Sanitized symbols evidence (hashes/sizes only) for PR CI upload surfaces.
+# Sanitized symbols evidence (hashes/sizes only) for PR CI upload surfaces — never the ZIP.
 $symbolsEvidence = [ordered]@{
     schema = "tokenbar-symbols-evidence.v1"
     productName = $versionContract.ProductName
@@ -566,6 +698,9 @@ $symbolsEvidence = [ordered]@{
     archiveSha256 = $symbolsZipHash
     archiveBytes = $symbolsZipBytes
     fileCount = [int]$symbolInventory.Count
+    requiredAppPdb = $appPdbName
+    requiredNativePdb = "tb_core_ffi.pdb"
+    capturedFromPublishStrip = @($capturedFromPublishStrip)
     files = $symbolInventory
 }
 ($symbolsEvidence | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $artifactRoot "symbols-evidence.json") -Encoding utf8

@@ -104,11 +104,41 @@
     </ItemGroup>
   </Target>
 
-  <!-- Ensure the same files plus PDBs and diagnostics DLLs are stripped from
-       the publish manifest.  Belt-and-suspenders with the payload target above,
-       plus files that arrive through the publish pipeline only. -->
+  <!-- Capture stripped support files (PDBs, DAC/DBI, DiaSymReader) into a
+       RID-scoped intermediate directory BEFORE removing them from the publish
+       set, so release operators can still analyze matching crash dumps via a
+       separate symbols ZIP (never Setup.exe/nupkg). -->
   <Target Name="TbTrimUnusedPublishPayload"
           AfterTargets="ComputeFilesToPublish">
+    <PropertyGroup>
+      <TbSupportStagingDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\obj\$(Platform)\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)\tb-support-staging'))</TbSupportStagingDir>
+    </PropertyGroup>
+
+    <!-- Identify support files that must leave the installer payload but stay
+         available for the version/RID-bound symbols archive. -->
+    <ItemGroup>
+      <_TbSupportToCapture Include="@(ResolvedFileToPublish)"
+                           Condition="'%(Extension)' == '.pdb' or
+                                      '%(Filename)%(Extension)' == 'mscordaccore.dll' or
+                                      '%(Filename)%(Extension)' == 'mscordbi.dll' or
+                                      $([System.String]::Copy('%(Filename)').StartsWith('mscordaccore_')) or
+                                      $([System.String]::Copy('%(Filename)').StartsWith('Microsoft.DiaSymReader.Native'))" />
+    </ItemGroup>
+
+    <MakeDir Directories="$(TbSupportStagingDir)"
+             Condition="'@(_TbSupportToCapture)' != ''" />
+    <!-- Copy using the resolved source path (Identity/FullPath) before strip. -->
+    <Copy SourceFiles="@(_TbSupportToCapture)"
+          DestinationFiles="@(_TbSupportToCapture->'$(TbSupportStagingDir)\%(Filename)%(Extension)')"
+          SkipUnchangedFiles="false"
+          OverwriteReadOnlyFiles="true"
+          Condition="'@(_TbSupportToCapture)' != ''" />
+    <WriteLinesToFile File="$(TbSupportStagingDir)\CAPTURED.txt"
+                      Lines="@(_TbSupportToCapture->'%(Filename)%(Extension)')"
+                      Overwrite="true"
+                      Encoding="UTF-8"
+                      Condition="'@(_TbSupportToCapture)' != ''" />
+
     <ItemGroup>
       <!-- PDB files should never ship in the installer -->
       <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
