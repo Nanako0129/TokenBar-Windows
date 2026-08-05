@@ -327,3 +327,52 @@ Write-Output "Release files:"
 foreach ($file in $releaseFiles) {
     Write-Output ("  {0} ({1} bytes)" -f $file.Name, $file.Length)
 }
+
+# Measured per-mode/per-RID size budgets for nupkg and Setup.exe (bytes).
+# ~5% above clean pinned measurements; increase requires explicit source edit.
+$nupkgSetupBudgetByModeRid = @{
+    "Full|win-x64|nupkg"   = [int64]130000000
+    "Full|win-x64|setup"   = [int64]140000000
+    "Full|win-arm64|nupkg" = [int64]130000000
+    "Full|win-arm64|setup" = [int64]140000000
+    "Lite|win-x64|nupkg"   = [int64]80000000
+    "Lite|win-x64|setup"   = [int64]90000000
+    "Lite|win-arm64|nupkg" = [int64]80000000
+    "Lite|win-arm64|setup" = [int64]90000000
+}
+function Assert-SizeBudget {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][int64]$Measured,
+        [Parameter(Mandatory = $true)][int64]$Budget
+    )
+    if ($Measured -gt $Budget) {
+        $over = $Measured - $Budget
+        $measuredMiB = [math]::Round($Measured / 1MB, 3)
+        $budgetMiB = [math]::Round($Budget / 1MB, 3)
+        $overMiB = [math]::Round($over / 1MB, 3)
+        throw ("{0} exceeds size budget for {1}/{2}: measured={3} bytes ({4} MiB), budget={5} bytes ({6} MiB), over by {7} bytes ({8} MiB)." -f `
+            $Label, $DeploymentMode, $Rid, $Measured, $measuredMiB, $Budget, $budgetMiB, $over, $overMiB)
+    }
+}
+$nupkgBytes = [int64](Get-Item -LiteralPath $packagePath).Length
+$nupkgKey = "{0}|{1}|nupkg" -f $DeploymentMode, $Rid
+if (-not $nupkgSetupBudgetByModeRid.ContainsKey($nupkgKey)) {
+    throw "No nupkg size budget for $nupkgKey"
+}
+Assert-SizeBudget -Label "nupkg" -Measured $nupkgBytes -Budget ([int64]$nupkgSetupBudgetByModeRid[$nupkgKey])
+
+$setupCandidates = @(
+    Get-ChildItem -LiteralPath $releasesRoot -File -Filter "*Setup*.exe" -ErrorAction SilentlyContinue
+)
+if ($setupCandidates.Count -lt 1) {
+    throw "Velopack releases missing Setup.exe for size budget check."
+}
+$setupFile = $setupCandidates | Sort-Object Length -Descending | Select-Object -First 1
+$setupBytes = [int64]$setupFile.Length
+$setupKey = "{0}|{1}|setup" -f $DeploymentMode, $Rid
+if (-not $nupkgSetupBudgetByModeRid.ContainsKey($setupKey)) {
+    throw "No Setup.exe size budget for $setupKey"
+}
+Assert-SizeBudget -Label "Setup.exe" -Measured $setupBytes -Budget ([int64]$nupkgSetupBudgetByModeRid[$setupKey])
+Write-Output ("Size budgets ok: nupkg={0} setup={1} ({2})" -f $nupkgBytes, $setupBytes, $setupFile.Name)

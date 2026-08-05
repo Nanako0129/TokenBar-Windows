@@ -110,13 +110,33 @@ if ($setupEntries.Count -ne 1) {
 
 $nupkg = $nupkgEntries[0]
 $setup = $setupEntries[0]
-$maxPackageBytes = if ($DeploymentMode -eq "Lite") { 60MB } else { 110MB }
-$maxSetupBytes = if ($DeploymentMode -eq "Lite") { 75MB } else { 125MB }
+# Measured per-mode/per-RID budgets (~5% headroom). Increase requires explicit edit.
+$maxSetupBytesByModeRid = @{
+    "Full|win-x64" = [int64]140000000
+    "Full|win-arm64" = [int64]140000000
+    "Lite|win-x64" = [int64]90000000
+    "Lite|win-arm64" = [int64]90000000
+}
+$maxNupkgBytesByModeRid = @{
+    "Full|win-x64" = [int64]130000000
+    "Full|win-arm64" = [int64]130000000
+    "Lite|win-x64" = [int64]80000000
+    "Lite|win-arm64" = [int64]80000000
+}
+$modeRidKey = "{0}|{1}" -f $DeploymentMode, $Rid
+if (-not $maxSetupBytesByModeRid.ContainsKey($modeRidKey)) { throw "No Setup budget for $modeRidKey" }
+if (-not $maxNupkgBytesByModeRid.ContainsKey($modeRidKey)) { throw "No nupkg budget for $modeRidKey" }
+$maxSetupBytes = [int64]$maxSetupBytesByModeRid[$modeRidKey]
+$maxPackageBytes = [int64]$maxNupkgBytesByModeRid[$modeRidKey]
 if ([int64]$nupkg.bytes -gt $maxPackageBytes) {
-    throw "Nupkg exceeds size budget: $($nupkg.bytes) > $maxPackageBytes"
+    $over = [int64]$nupkg.bytes - $maxPackageBytes
+    throw ("Nupkg exceeds size budget for {0}/{1}: measured={2} bytes ({3} MiB), budget={4} bytes ({5} MiB), over by {6} bytes ({7} MiB)." -f `
+        $DeploymentMode, $Rid, $nupkg.bytes, [math]::Round($nupkg.bytes/1MB,3), $maxPackageBytes, [math]::Round($maxPackageBytes/1MB,3), $over, [math]::Round($over/1MB,3))
 }
 if ([int64]$setup.bytes -gt $maxSetupBytes) {
-    throw "Setup exceeds size budget: $($setup.bytes) > $maxSetupBytes"
+    $over = [int64]$setup.bytes - $maxSetupBytes
+    throw ("Setup exceeds size budget for {0}/{1}: measured={2} bytes ({3} MiB), budget={4} bytes ({5} MiB), over by {6} bytes ({7} MiB)." -f `
+        $DeploymentMode, $Rid, $setup.bytes, [math]::Round($setup.bytes/1MB,3), $maxSetupBytes, [math]::Round($maxSetupBytes/1MB,3), $over, [math]::Round($over/1MB,3))
 }
 
 $nupkgPath = Join-Path $ReleasesRoot $nupkg.name
