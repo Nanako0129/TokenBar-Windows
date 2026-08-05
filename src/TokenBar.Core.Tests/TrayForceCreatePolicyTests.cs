@@ -10,9 +10,10 @@ public sealed class TrayForceCreatePolicyTests
         Assert.True(
             TrayForceCreatePolicy.EpisodeDeadlineMilliseconds >= 10_000,
             "Episode deadline must cover a multi-second logon shell window.");
-        Assert.Equal(
-            TrayForceCreatePolicy.EpisodeDeadlineMilliseconds,
-            TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds);
+        Assert.True(
+            TrayForceCreatePolicy.StartupSmokeTimeoutMilliseconds
+            > TrayForceCreatePolicy.EpisodeDeadlineMilliseconds,
+            "Smoke wait must have slack beyond the episode deadline.");
         Assert.Equal(
             TrayForceCreatePolicy.EpisodeDeadlineMilliseconds,
             TrayForceCreatePolicy.MinProductionRetryWindowMilliseconds);
@@ -70,11 +71,11 @@ public sealed class TrayForceCreatePolicyTests
     [Fact]
     public void Episode_soft_fail_then_success_same_episode()
     {
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var elapsed = TimeSpan.Zero;
         var calls = 0;
         var episode = new TrayForceCreateEpisode(
             deadline: TimeSpan.FromSeconds(10),
-            utcNow: () => now);
+            getElapsed: () => elapsed);
 
         var soft = episode.Tick(
             () =>
@@ -87,7 +88,7 @@ public sealed class TrayForceCreatePolicyTests
         Assert.Equal(10, episode.NextDelayMilliseconds);
         Assert.Equal(1, episode.Attempts);
 
-        now = now.AddMilliseconds(episode.NextDelayMilliseconds);
+        elapsed += TimeSpan.FromMilliseconds(episode.NextDelayMilliseconds);
 
         var ok = episode.Tick(
             () =>
@@ -107,10 +108,10 @@ public sealed class TrayForceCreatePolicyTests
     public void Host_simulation_cancellation_stops_before_deadline()
     {
         using var cts = new CancellationTokenSource();
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var elapsed = TimeSpan.Zero;
         var episode = new TrayForceCreateEpisode(
             deadline: TimeSpan.FromSeconds(10),
-            utcNow: () => now);
+            getElapsed: () => elapsed);
         var calls = 0;
 
         while (!episode.IsExhausted && !cts.IsCancellationRequested)
@@ -133,7 +134,7 @@ public sealed class TrayForceCreatePolicyTests
                 break;
             }
 
-            now = now.AddMilliseconds(episode.NextDelayMilliseconds);
+            elapsed += TimeSpan.FromMilliseconds(episode.NextDelayMilliseconds);
         }
 
         Assert.True(cts.IsCancellationRequested);
@@ -145,14 +146,12 @@ public sealed class TrayForceCreatePolicyTests
     [Fact]
     public void Production_soft_fail_schedule_covers_minimum_retry_window()
     {
-        // Advance a fake clock by each production delay until Exhausted.
-        // The wall-clock span must not shrink below MinProductionRetryWindowMilliseconds.
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
-        var start = now;
+        // Advance a fake monotonic clock by each production delay until Exhausted.
+        var elapsed = TimeSpan.Zero;
         var episode = new TrayForceCreateEpisode(
             deadline: TimeSpan.FromMilliseconds(
                 TrayForceCreatePolicy.EpisodeDeadlineMilliseconds),
-            utcNow: () => now);
+            getElapsed: () => elapsed);
 
         var safety = 0;
         TrayForceCreateTickResult result;
@@ -166,7 +165,7 @@ public sealed class TrayForceCreatePolicyTests
                 Assert.True(
                     episode.NextDelayMilliseconds
                     <= TrayForceCreatePolicy.MaxDelayMilliseconds);
-                now = now.AddMilliseconds(episode.NextDelayMilliseconds);
+                elapsed += TimeSpan.FromMilliseconds(episode.NextDelayMilliseconds);
             }
 
             safety++;
@@ -175,45 +174,72 @@ public sealed class TrayForceCreatePolicyTests
         while (result == TrayForceCreateTickResult.Continue);
 
         Assert.Equal(TrayForceCreateTickResult.Exhausted, result);
-        var windowMs = (now - start).TotalMilliseconds;
         Assert.True(
-            windowMs >= TrayForceCreatePolicy.MinProductionRetryWindowMilliseconds,
-            $"production soft-fail window {windowMs}ms is below minimum "
+            elapsed.TotalMilliseconds
+            >= TrayForceCreatePolicy.MinProductionRetryWindowMilliseconds,
+            $"production soft-fail window {elapsed.TotalMilliseconds}ms is below minimum "
             + $"{TrayForceCreatePolicy.MinProductionRetryWindowMilliseconds}ms");
-        // Deadline is the effective bound; clock should land at or past it.
         Assert.True(episode.IsExhausted);
         Assert.True(episode.Attempts > 5, "time-based budget must allow more than five attempts");
     }
 
     [Fact]
+    public void Episode_elapsed_ignores_backward_clock_steps()
+    {
+        // Wall-clock going backwards (NTP at logon) must not invert exhaustion
+        // or extend the episode past the monotonic deadline. Injected elapsed
+        // that steps backwards is clamped to zero for IsExhausted math after
+        // production uses Stopwatch; here we prove the clamp on the seam.
+        var elapsed = TimeSpan.FromMilliseconds(200);
+        var episode = new TrayForceCreateEpisode(
+            deadline: TimeSpan.FromMilliseconds(500),
+            getElapsed: () => elapsed);
+
+        Assert.Equal(
+            TrayForceCreateTickResult.Continue,
+            episode.Tick(() => throw new InvalidOperationException("soft")));
+        Assert.Equal(1, episode.Attempts);
+
+        // Step "backwards" — must not throw and must not look like more time remaining
+        // than before (clamped elapsed does not go negative).
+        elapsed = TimeSpan.FromMilliseconds(-5_000);
+        Assert.Equal(TimeSpan.Zero, episode.Elapsed);
+        Assert.False(episode.IsExhausted);
+
+        // Advance past deadline on the monotonic axis.
+        elapsed = TimeSpan.FromMilliseconds(500);
+        Assert.Equal(
+            TrayForceCreateTickResult.Exhausted,
+            episode.Tick(() => throw new InvalidOperationException("soft")));
+        Assert.True(episode.IsExhausted);
+        // Exhausted on entry does not consume another attempt.
+        Assert.Equal(1, episode.Attempts);
+    }
+
+    [Fact]
     public void Episode_soft_failures_continue_until_deadline_then_exhaust()
     {
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
-        var delayAttempts = new List<int>();
+        var elapsed = TimeSpan.Zero;
         var episode = new TrayForceCreateEpisode(
             deadline: TimeSpan.FromMilliseconds(250),
-            utcNow: () => now);
+            getElapsed: () => elapsed);
 
         TrayForceCreateTickResult Tick() => episode.Tick(
             () => throw new InvalidOperationException("shell not ready"),
-            attempt =>
-            {
-                delayAttempts.Add(attempt);
-                return 100;
-            });
+            _ => 100);
 
         Assert.Equal(TrayForceCreateTickResult.Continue, Tick());
         Assert.Equal(100, episode.NextDelayMilliseconds);
-        now = now.AddMilliseconds(100);
+        elapsed += TimeSpan.FromMilliseconds(100);
 
         Assert.Equal(TrayForceCreateTickResult.Continue, Tick());
         Assert.Equal(100, episode.NextDelayMilliseconds);
-        now = now.AddMilliseconds(100);
+        elapsed += TimeSpan.FromMilliseconds(100);
 
         // Elapsed 200ms, remaining 50ms → delay clamped to remaining.
         Assert.Equal(TrayForceCreateTickResult.Continue, Tick());
         Assert.Equal(50, episode.NextDelayMilliseconds);
-        now = now.AddMilliseconds(50);
+        elapsed += TimeSpan.FromMilliseconds(50);
 
         // Elapsed == deadline → Exhausted on entry without another attempt.
         Assert.Equal(TrayForceCreateTickResult.Exhausted, Tick());
@@ -221,7 +247,6 @@ public sealed class TrayForceCreatePolicyTests
         Assert.True(episode.IsExhausted);
         Assert.Equal(3, episode.Attempts);
 
-        // Further ticks stay exhausted without invoking attempt or delay.
         var calls = 0;
         var after = episode.Tick(
             () =>
@@ -258,12 +283,12 @@ public sealed class TrayForceCreatePolicyTests
     [Fact]
     public void Separate_episodes_have_independent_deadlines()
     {
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var elapsed = TimeSpan.Zero;
         var first = new TrayForceCreateEpisode(
             deadline: TimeSpan.FromMilliseconds(50),
-            utcNow: () => now);
+            getElapsed: () => elapsed);
         _ = first.Tick(() => throw new InvalidOperationException("a"));
-        now = now.AddMilliseconds(first.NextDelayMilliseconds);
+        elapsed += TimeSpan.FromMilliseconds(first.NextDelayMilliseconds);
         Assert.Equal(
             TrayForceCreateTickResult.Exhausted,
             first.Tick(() => throw new InvalidOperationException("b")));
@@ -271,7 +296,7 @@ public sealed class TrayForceCreatePolicyTests
 
         var second = new TrayForceCreateEpisode(
             deadline: TimeSpan.FromSeconds(10),
-            utcNow: () => now);
+            getElapsed: () => elapsed);
         var ok = second.Tick(() => true);
         Assert.Equal(TrayForceCreateTickResult.Success, ok);
         Assert.Equal(1, second.Attempts);
@@ -281,7 +306,6 @@ public sealed class TrayForceCreatePolicyTests
     [Fact]
     public void No_ThreadSleep_in_TrayService_source()
     {
-        // Production path must not block the UI thread with Sleep.
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         string? path = null;
         while (dir is not null)

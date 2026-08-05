@@ -1,31 +1,34 @@
+using System.Diagnostics;
+
 namespace TokenBar.App;
 
 /// <summary>
 /// Pure policy + injectable per-episode ForceCreate state machine.
-/// Free of WinUI types so unit tests can inject attempt, delay, and clock
+/// Free of WinUI types so unit tests can inject attempt, delay, and elapsed
 /// functions without constructing a tray.
 /// </summary>
 internal static class TrayForceCreatePolicy
 {
     /// <summary>
-    /// Wall-clock budget for one tray-creation episode (normal launch and smoke).
+    /// Monotonic budget for one tray-creation episode (normal launch).
     /// Logon autostart is the primary path; the shell can take several seconds
-    /// to accept a tray icon. Exhaustion is time-based, not attempt-count based.
+    /// to accept a tray icon. Exhaustion is elapsed-time based, not attempt-count.
     /// </summary>
     public const int EpisodeDeadlineMilliseconds = 10_000;
 
     /// <summary>
-    /// Minimum total wall-clock window the production soft-fail schedule must
-    /// cover. Tests fail if a schedule change shrinks the recovery window.
-    /// Matches <see cref="EpisodeDeadlineMilliseconds"/> so the episode actually
-    /// runs for the intended logon-tolerant startup window.
+    /// Minimum total elapsed window the production soft-fail schedule must cover.
+    /// Tests fail if a schedule change shrinks the recovery window.
     /// </summary>
     public const int MinProductionRetryWindowMilliseconds = EpisodeDeadlineMilliseconds;
 
     /// <summary>
-    /// Startup-smoke outer wait for tray readiness (same window as the episode).
+    /// Startup-smoke outer wait for tray readiness. Longer than the episode
+    /// deadline so the DispatcherQueue terminal tick is not raced by the
+    /// thread-pool CancelAfter timer at the same instant.
     /// </summary>
-    public const int StartupSmokeTimeoutMilliseconds = EpisodeDeadlineMilliseconds;
+    public const int StartupSmokeTimeoutMilliseconds =
+        EpisodeDeadlineMilliseconds + 2_000;
 
     /// <summary>Cap on a single inter-attempt delay (ms).</summary>
     public const int MaxDelayMilliseconds = 500;
@@ -61,25 +64,24 @@ internal enum TrayForceCreateTickResult
     /// <summary>Soft failure; schedule another tick before the deadline.</summary>
     Continue,
 
-    /// <summary>Episode wall-clock deadline passed without success.</summary>
+    /// <summary>Episode elapsed deadline passed without success.</summary>
     Exhausted,
 }
 
 /// <summary>
-/// Per-episode ForceCreate accounting driven by an elapsed-time deadline.
+/// Per-episode ForceCreate accounting driven by a monotonic elapsed deadline.
 /// Call <see cref="Tick(Func{bool})"/> once per timer tick. This type never
 /// sleeps or owns a timer; production schedules the next tick with
-/// DispatcherQueueTimer and tests inject attempt, delay, and clock functions.
+/// DispatcherQueueTimer and tests inject attempt, delay, and elapsed functions.
 /// </summary>
 internal sealed class TrayForceCreateEpisode
 {
     private readonly TimeSpan _deadline;
-    private readonly Func<DateTimeOffset> _utcNow;
-    private readonly DateTimeOffset _startedUtc;
+    private readonly Func<TimeSpan> _getElapsed;
 
     public TrayForceCreateEpisode(
         TimeSpan? deadline = null,
-        Func<DateTimeOffset>? utcNow = null)
+        Func<TimeSpan>? getElapsed = null)
     {
         _deadline = deadline
             ?? TimeSpan.FromMilliseconds(TrayForceCreatePolicy.EpisodeDeadlineMilliseconds);
@@ -88,16 +90,35 @@ internal sealed class TrayForceCreateEpisode
             throw new ArgumentOutOfRangeException(nameof(deadline));
         }
 
-        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
-        _startedUtc = _utcNow();
+        if (getElapsed is null)
+        {
+            // Stopwatch timestamps are monotonic; wall-clock NTP corrections at
+            // logon must not shrink or stretch the tray-creation window.
+            var startTimestamp = Stopwatch.GetTimestamp();
+            _getElapsed = () => Stopwatch.GetElapsedTime(startTimestamp);
+        }
+        else
+        {
+            _getElapsed = getElapsed;
+        }
     }
 
     public int Attempts { get; private set; }
 
-    /// <summary>Elapsed wall time since the episode started (injected clock).</summary>
-    public TimeSpan Elapsed => _utcNow() - _startedUtc;
+    /// <summary>
+    /// Monotonic elapsed time since the episode started. Negative injected
+    /// values are clamped to zero so a bad test clock cannot invert exhaustion.
+    /// </summary>
+    public TimeSpan Elapsed
+    {
+        get
+        {
+            var elapsed = _getElapsed();
+            return elapsed < TimeSpan.Zero ? TimeSpan.Zero : elapsed;
+        }
+    }
 
-    /// <summary>True when the wall-clock deadline has been reached or passed.</summary>
+    /// <summary>True when the monotonic deadline has been reached or passed.</summary>
     public bool IsExhausted => Elapsed >= _deadline;
 
     /// <summary>
@@ -143,7 +164,7 @@ internal sealed class TrayForceCreateEpisode
         }
         catch (Exception ex) when (TrayForceCreatePolicy.IsSoftRetryable(ex))
         {
-            // Soft miss — keep retrying until the wall-clock deadline.
+            // Soft miss — keep retrying until the monotonic deadline.
         }
 
         var remainingMs = (int)Math.Ceiling((_deadline - Elapsed).TotalMilliseconds);
