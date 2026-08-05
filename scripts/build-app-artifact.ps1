@@ -25,6 +25,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "lib\MuiGuard.ps1")
+
 $ExpectedSemanticVersion = "0.2.1"
 $ExpectedAssemblyVersion = "0.2.1.0"
 $ExpectedDotnetVersion = "10.0.301"
@@ -344,31 +346,11 @@ foreach ($locale in $rawLocales) {
     $seenLocaleKeys[$key] = $true
     [void]$requiredLocales.Add($locale)
 }
-# Desktop WinUI resources (XamlControlsResources) need Microsoft.ui.xaml.dll.mui.
-# Matching any .mui under the locale dir is insufficient: keeping only
-# Microsoft.UI.Xaml.Phone.dll.mui would pass a directory-only guard and still
-# ship XamlParseException on non-English Windows.
-$requiredDesktopMuiFileName = "Microsoft.ui.xaml.dll.mui"
-$missingLocales = [System.Collections.Generic.List[string]]::new()
-foreach ($locale in $requiredLocales) {
-    $expectedRel = Join-Path $locale $requiredDesktopMuiFileName
-    $matched = $false
-    foreach ($mui in $muiFiles) {
-        $rel = Get-RelativePath -Root $publishRoot -Path $mui.FullName
-        $normRel = $rel.Replace('/', '\')
-        $normExpected = $expectedRel.Replace('/', '\')
-        if ([string]::Equals($normRel, $normExpected, [StringComparison]::OrdinalIgnoreCase)) {
-            $matched = $true
-            break
-        }
-    }
-    if (-not $matched) {
-        [void]$missingLocales.Add(("{0}/{1}" -f $locale, $requiredDesktopMuiFileName))
-    }
-}
-if ($missingLocales.Count -gt 0) {
-    throw ("Required desktop MUI file(s) missing from publish: {0}" -f ($missingLocales -join ", "))
-}
+# Shared production guard (also driven by scripts/tests/test-required-mui-guard.ps1).
+Assert-RequiredDesktopMuiLocales `
+    -PublishRoot $publishRoot `
+    -RequiredLocales @($requiredLocales) `
+    -MuiFiles $muiFiles
 
 # Forbidden payload / diagnostics / unused SDK binaries (must be absent from installer payload).
 $forbiddenExact = @(
