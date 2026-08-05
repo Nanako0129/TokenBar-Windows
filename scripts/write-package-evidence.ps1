@@ -112,16 +112,16 @@ $nupkg = $nupkgEntries[0]
 $setup = $setupEntries[0]
 # Measured per-mode/per-RID budgets (~5% headroom). Increase requires explicit edit.
 $maxSetupBytesByModeRid = @{
-    "Full|win-x64" = [int64]140000000
-    "Full|win-arm64" = [int64]140000000
-    "Lite|win-x64" = [int64]90000000
-    "Lite|win-arm64" = [int64]90000000
+    "Full|win-x64" = [int64]91040173
+    "Full|win-arm64" = [int64]87104109
+    "Lite|win-x64" = [int64]52496634
+    "Lite|win-arm64" = [int64]50243660
 }
 $maxNupkgBytesByModeRid = @{
-    "Full|win-x64" = [int64]130000000
-    "Full|win-arm64" = [int64]130000000
-    "Lite|win-x64" = [int64]80000000
-    "Lite|win-arm64" = [int64]80000000
+    "Full|win-x64" = [int64]86355526
+    "Full|win-arm64" = [int64]82419463
+    "Lite|win-x64" = [int64]47811988
+    "Lite|win-arm64" = [int64]45559013
 }
 $modeRidKey = "{0}|{1}" -f $DeploymentMode, $Rid
 if (-not $maxSetupBytesByModeRid.ContainsKey($modeRidKey)) { throw "No Setup budget for $modeRidKey" }

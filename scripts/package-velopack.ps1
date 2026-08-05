@@ -331,14 +331,14 @@ foreach ($file in $releaseFiles) {
 # Measured per-mode/per-RID size budgets for nupkg and Setup.exe (bytes).
 # ~5% above clean pinned measurements; increase requires explicit source edit.
 $nupkgSetupBudgetByModeRid = @{
-    "Full|win-x64|nupkg"   = [int64]130000000
-    "Full|win-x64|setup"   = [int64]140000000
-    "Full|win-arm64|nupkg" = [int64]130000000
-    "Full|win-arm64|setup" = [int64]140000000
-    "Lite|win-x64|nupkg"   = [int64]80000000
-    "Lite|win-x64|setup"   = [int64]90000000
-    "Lite|win-arm64|nupkg" = [int64]80000000
-    "Lite|win-arm64|setup" = [int64]90000000
+    "Full|win-x64|nupkg" = [int64]86355526
+    "Full|win-x64|setup" = [int64]91040173
+    "Full|win-arm64|nupkg" = [int64]82419463
+    "Full|win-arm64|setup" = [int64]87104109
+    "Lite|win-x64|nupkg" = [int64]47811988
+    "Lite|win-x64|setup" = [int64]52496634
+    "Lite|win-arm64|nupkg" = [int64]45559013
+    "Lite|win-arm64|setup" = [int64]50243660
 }
 function Assert-SizeBudget {
     param(
