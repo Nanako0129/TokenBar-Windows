@@ -76,6 +76,9 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.301
+      - name: required-desktop-MUI guard unit test
+        shell: pwsh
+        run: pwsh -File ./scripts/tests/test-required-mui-guard.ps1
       # Run the clean-checkout artifact contract before any legacy tracked
       # spike obj/ files can be refreshed by later restores.
       - name: Phase 10 App artifact evidence (x64)
