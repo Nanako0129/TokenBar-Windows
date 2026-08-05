@@ -528,10 +528,12 @@ $zipBytes = [int64](Get-Item -LiteralPath $zipPath).Length
 # (+ ~5%). Lite provisional until later measured commits refine them.
 # A budget increase requires an explicit source edit and explanation.
 $publishZipBudgetByModeRid = @{
+    # Full: post-strip (#29) measured baselines + ~5%
     "Full|win-x64"   = [int64]78691000   # measured 74943809 (2026-08-05 clean Full) + ~5%
     "Full|win-arm64" = [int64]74928327   # measured 71360311 (fork hosted Full arm64-cross 2026-08-05) + ~5%
-    "Lite|win-x64"   = [int64](55MB)     # provisional; refined by later measure commits
-    "Lite|win-arm64" = [int64](55MB)
+    # Lite: hosted measures from #30 (framework-dependent)
+    "Lite|win-x64"   = [int64]45759677   # measured 43580644 + ~5%
+    "Lite|win-arm64" = [int64]43506642   # measured 41434897 + ~5%
 }
 $budgetKey = "{0}|{1}" -f $DeploymentMode, $Rid
 if (-not $publishZipBudgetByModeRid.ContainsKey($budgetKey)) {

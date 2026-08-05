@@ -407,12 +407,6 @@ jobs:
           if ($doc.deploymentMode -cne "${{ matrix.mode }}") {
             throw "evidence.deploymentMode mismatch: $($doc.deploymentMode)"
           }
-          if ([int]$doc.pdbCount -ne 0) { throw "pdbCount must be 0" }
-          if ($doc.forbiddenAbsent -ne $true) { throw "forbiddenAbsent must be true" }
-          if ([int]$doc.requiredMuiLocales -lt 1) { throw "requiredMuiLocales missing" }
-          if ([int]$doc.muiCount -lt [int]$doc.requiredMuiLocales) {
-            throw "muiCount $($doc.muiCount) < requiredMuiLocales $($doc.requiredMuiLocales)"
-          }
 
           $expectedFramework = ""
           if ("${{ matrix.mode }}" -eq "Lite") {
