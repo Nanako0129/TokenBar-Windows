@@ -192,9 +192,16 @@ $propsPath = Join-Path $repoRoot "Directory.Build.props"
 $buildScript = Join-Path $repoRoot "scripts\build-app-artifact.ps1"
 $outputRootResolved = Assert-NewOutputRoot -Path $OutputRoot
 $packProperties = Read-PackProperties -Path $propsPath
-# Keep the update identity stable across product renames so installed clients
-# continue to find the same release lineage.
-$packId = "Nyanako.TokenBar"
+# Velopack's durable install identity: it names the install directory, the
+# artifact filenames, and the package an installed client will accept. Changing
+# it orphans every existing install. It was held at the pre-rename value to keep
+# that lineage stable, but the value is a stale product name that surfaces in
+# %LocalAppData%\<packId> and in the Setup/nupkg filenames, so it was aligned to
+# Syrtis while the installed base was two machines. That window is closed: treat
+# this as frozen. Deliberately a literal here and in UpdateFlow.cs rather than
+# derived from $(TbProductName), so a future product rename cannot move it by
+# accident; UpdateFlowTests.PackageIdMatchesPackagingScript pins the two.
+$packId = "Nyanako.Syrtis"
 $appExecutableName = "{0}.App.exe" -f $packProperties.ProductName
 $machineArchitecture = if ($Rid -eq "win-x64") { "x64" } else { "arm64" }
 

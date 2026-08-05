@@ -27,6 +27,25 @@ public class UpdateFlowTests : IDisposable
         }
     }
 
+    /// <summary>The Velopack pack id is a literal in two places by design, so a
+    /// product rename cannot move it by accident. That only holds if the two
+    /// cannot drift: a packaging script emitting one id while the installed
+    /// client demands another produces releases that every client silently
+    /// refuses, and the failure appears as "no update available" rather than an
+    /// error.</summary>
+    [Fact]
+    public void PackageIdMatchesPackagingScript()
+    {
+        var script = File.ReadAllText(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "package-velopack.ps1"));
+        var match = System.Text.RegularExpressions.Regex.Match(
+            script, @"^\$packId\s*=\s*""(?<id>[^""]+)""\s*$",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+
+        Assert.True(match.Success, "package-velopack.ps1 has no $packId assignment.");
+        Assert.Equal(UpdateFlow.PackageId, match.Groups["id"].Value);
+    }
+
     [Theory]
     [InlineData("win-x64", "x64")]
     [InlineData("win-arm64", "arm64")]
@@ -90,15 +109,15 @@ public class UpdateFlowTests : IDisposable
                     break;
                 case "same-version":
                     target.Version = SemanticVersion.Parse("0.2.0");
-                    target.FileName = "Nyanako.TokenBar-0.2.0-win-x64-full.nupkg";
+                    target.FileName = "Nyanako.Syrtis-0.2.0-win-x64-full.nupkg";
                     break;
                 case "lower-version":
                     target.Version = SemanticVersion.Parse("0.1.0");
-                    target.FileName = "Nyanako.TokenBar-0.1.0-win-x64-full.nupkg";
+                    target.FileName = "Nyanako.Syrtis-0.1.0-win-x64-full.nupkg";
                     break;
                 case "prerelease-version":
                     target.Version = SemanticVersion.Parse("0.3.0-beta.1");
-                    target.FileName = "Nyanako.TokenBar-0.3.0-beta.1-win-x64-full.nupkg";
+                    target.FileName = "Nyanako.Syrtis-0.3.0-beta.1-win-x64-full.nupkg";
                     break;
                 case "missing-sha256":
                     target.SHA256 = "";
@@ -122,8 +141,8 @@ public class UpdateFlowTests : IDisposable
 
     [Theory]
     [InlineData("Other.Package", "win-x64")]
-    [InlineData("Nyanako.TokenBar", "win")]
-    [InlineData("Nyanako.TokenBar", "linux-x64")]
+    [InlineData("Nyanako.Syrtis", "win")]
+    [InlineData("Nyanako.Syrtis", "linux-x64")]
     public async Task RejectsInvalidInstalledIdentityOrChannelBeforeNetwork(
         string appId,
         string channel)
