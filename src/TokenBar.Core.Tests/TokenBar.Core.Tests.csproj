@@ -35,6 +35,13 @@
     <None Include="..\..\crosscheck\fixtures\provider-quota-pace-v3.json"
           Link="Fixtures\provider-quota-pace-v3.json"
           CopyToOutputDirectory="PreserveNewest" />
+    <!-- Read by UpdateFlowTests.PackageIdMatchesPackagingScript: the Velopack
+         pack id is an independent literal in the packaging script and in
+         UpdateFlow, and a silent divergence would ship packages no installed
+         client accepts. -->
+    <None Include="..\..\scripts\package-velopack.ps1"
+          Link="Fixtures\package-velopack.ps1"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

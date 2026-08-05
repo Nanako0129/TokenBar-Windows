@@ -11,7 +11,17 @@ internal class UpdateFlow
 {
     internal const string RepositoryUrl =
         "https://github.com/Nanako0129/TokenBar-Windows";
-    internal const string PackageId = "Nyanako.TokenBar";
+    /// <summary>Velopack's durable install identity: it names the install
+    /// directory, the artifact filenames, and the package this client will
+    /// accept. Changing it orphans every existing install — that client keeps
+    /// comparing against the old value and silently refuses the renamed
+    /// package. Aligned to the Syrtis product name while the installed base
+    /// was two machines; that window is closed, so treat this as frozen.
+    /// It is deliberately a literal in both this file and
+    /// scripts/package-velopack.ps1 rather than derived from
+    /// $(TbProductName): a future product rename must not move it by
+    /// accident. PackageIdMatchesPackagingScript pins the two together.</summary>
+    internal const string PackageId = "Nyanako.Syrtis";
     private const int MaxNuspecBytes = 65_536;
     private const long MaxCompressionRatio = 100;
 
