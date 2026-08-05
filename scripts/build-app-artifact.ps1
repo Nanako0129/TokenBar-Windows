@@ -475,8 +475,8 @@ $zipBytes = [int64](Get-Item -LiteralPath $zipPath).Length
 # A budget increase requires an explicit source edit and explanation.
 # Placeholder zeros are replaced after clean measured publish on this branch.
 $fullPublishZipBudgetByRid = @{
-    "win-x64"   = [int64]95000000   # provisional; tighten after measurement
-    "win-arm64" = [int64]95000000
+    "win-x64"   = [int64]78691000   # measured 74943809 (2026-08-05 clean Full) + ~5%
+    "win-arm64" = [int64]82000000   # provisional pending arm64 measure; tighten in follow-up if needed
 }
 if (-not $fullPublishZipBudgetByRid.ContainsKey($Rid)) {
     throw "No publish-zip size budget configured for RID $Rid."
