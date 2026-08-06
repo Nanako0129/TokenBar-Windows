@@ -541,9 +541,24 @@ foreach ($name in $capturedNames) {
 }
 
 # (2) Native Rust/MSVC PDBs next to the locked Cargo release for this RID.
-# Fail closed on tb_core_ffi.pdb freshness: name-only acceptance can archive a
-# stale ignored target/.../tb_core_ffi.pdb when cargo did not rewrite it while
-# the publish still hash-matched a newer tb_core_ffi.dll.
+# tb_core_ffi.pdb freshness. Name-only acceptance can archive a stale ignored
+# target/.../tb_core_ffi.pdb that cargo did not rewrite while the publish still
+# hash-matched a newer tb_core_ffi.dll — an archive that cannot symbolicate the
+# binary it claims to describe.
+#
+# This is a timestamp heuristic, NOT an identity check. Proving a PDB belongs to
+# a DLL means comparing the CodeView RSDS GUID and age in the DLL's debug
+# directory against the PDB's own signature, and nothing here reads either. It
+# therefore fails closed against the named case above and stays open wherever
+# timestamps pass while the PDB is stale: an incremental cargo run that rewrites
+# neither file, a CI cache or artifact restore that resets write times, and
+# filesystem granularity coarse enough to collapse distinct writes. The
+# candidate loop also stops at the first acceptance, so a plausible-looking
+# top-level PDB wins before deps/ is examined.
+#
+# Issue #34 records a fix cheaper than PE parsing: gate on "written after this
+# build started", which the script already knows and which closes every case
+# above.
 $nativeReleaseDir = Join-Path $repoRoot ("target\{0}\release" -f $rustTarget)
 if (-not (Test-Path -LiteralPath $nativeReleaseDir -PathType Container)) {
     throw "Native release directory missing for symbols capture: target/$rustTarget/release"
@@ -554,7 +569,8 @@ $nativePdbCandidates = @(
     (Join-Path $nativeReleaseDir "tb_core_ffi.pdb"),
     (Join-Path $nativeReleaseDir "deps\tb_core_ffi.pdb")
 )
-# Allow tiny FS timestamp jitter; reject PDB meaningfully older than this build's DLL.
+# Tolerance for filesystem write-time jitter between the linker emitting the PDB
+# and the DLL. Not a matching contract — see the heuristic note above.
 $nativePdbMaxOlderThanDllSeconds = 2
 $freshNativePdbPath = $null
 $freshNativePdbMeta = $null
