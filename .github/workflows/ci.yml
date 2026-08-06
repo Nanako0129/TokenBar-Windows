@@ -410,13 +410,16 @@ jobs:
 
           $expectedFramework = ""
           if ("${{ matrix.mode }}" -eq "Lite") {
-            if ([string]::IsNullOrWhiteSpace([string]$doc.liteVelopackFramework)) {
-              throw "Lite evidence missing liteVelopackFramework"
+            # WinUI Lite pack is runtime-only (desktop family is intentionally rejected by pack).
+            $arch = if ("${{ matrix.rid }}" -eq "win-x64") { "x64" } else { "arm64" }
+            $requiredLiteFramework = "net10-$arch-runtime"
+            if ($doc.liteFrameworkFamily -cne "runtime") {
+              throw "Lite evidence.liteFrameworkFamily must be 'runtime', got: $($doc.liteFrameworkFamily)"
             }
-            if ($doc.liteFrameworkFamily -cne "runtime" -and $doc.liteFrameworkFamily -cne "desktop") {
-              throw "Lite evidence has invalid liteFrameworkFamily"
+            if ([string]$doc.liteVelopackFramework -cne $requiredLiteFramework) {
+              throw "Lite evidence.liteVelopackFramework mismatch: expected '$requiredLiteFramework', got '$($doc.liteVelopackFramework)'"
             }
-            $expectedFramework = [string]$doc.liteVelopackFramework
+            $expectedFramework = $requiredLiteFramework
           }
 
           $releases = Join-Path $root "releases"
@@ -431,12 +434,6 @@ jobs:
           ./scripts/write-package-evidence.ps1 @args
 
           $pkg = Get-Content -LiteralPath $pkgEvidence -Raw | ConvertFrom-Json
-          if ($pkg.channel -cne $doc.rid -and "${{ matrix.mode }}" -eq "Full") {
-            # Full channel equals RID
-            if ($pkg.channel -cne "${{ matrix.rid }}") {
-              throw "Full package channel mismatch: $($pkg.channel)"
-            }
-          }
           if ("${{ matrix.mode }}" -eq "Lite") {
             if ($pkg.channel -cne "${{ matrix.rid }}-lite") {
               throw "Lite package channel mismatch: $($pkg.channel)"
@@ -445,6 +442,9 @@ jobs:
               throw "Lite nupkg filename mismatch: $($pkg.nupkgName)"
             }
           } else {
+            if ($pkg.channel -cne "${{ matrix.rid }}") {
+              throw "Full package channel mismatch: $($pkg.channel)"
+            }
             if ($pkg.nupkgName -notlike "*-${{ matrix.rid }}-full.nupkg") {
               throw "Full nupkg filename mismatch: $($pkg.nupkgName)"
             }

@@ -362,17 +362,16 @@ if (-not $nupkgSetupBudgetByModeRid.ContainsKey($nupkgKey)) {
 }
 Assert-SizeBudget -Label "nupkg" -Measured $nupkgBytes -Budget ([int64]$nupkgSetupBudgetByModeRid[$nupkgKey])
 
-$setupCandidates = @(
-    Get-ChildItem -LiteralPath $releasesRoot -File -Filter "*Setup*.exe" -ErrorAction SilentlyContinue
-)
-if ($setupCandidates.Count -lt 1) {
-    throw "Velopack releases missing Setup.exe for size budget check."
+# Pin the channel-scoped Setup identity (same contract as write-package-evidence.ps1).
+$expectedSetupName = "{0}-{1}-Setup.exe" -f $packId, $channel
+$setupPath = Join-Path $releasesRoot $expectedSetupName
+if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+    throw "Velopack releases missing expected Setup.exe: $expectedSetupName"
 }
-$setupFile = $setupCandidates | Sort-Object Length -Descending | Select-Object -First 1
-$setupBytes = [int64]$setupFile.Length
+$setupBytes = [int64](Get-Item -LiteralPath $setupPath).Length
 $setupKey = "{0}|{1}|setup" -f $DeploymentMode, $Rid
 if (-not $nupkgSetupBudgetByModeRid.ContainsKey($setupKey)) {
     throw "No Setup.exe size budget for $setupKey"
 }
 Assert-SizeBudget -Label "Setup.exe" -Measured $setupBytes -Budget ([int64]$nupkgSetupBudgetByModeRid[$setupKey])
-Write-Output ("Size budgets ok: nupkg={0} setup={1} ({2})" -f $nupkgBytes, $setupBytes, $setupFile.Name)
+Write-Output ("Size budgets ok: nupkg={0} setup={1} ({2})" -f $nupkgBytes, $setupBytes, $expectedSetupName)
