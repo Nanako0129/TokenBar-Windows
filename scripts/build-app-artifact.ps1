@@ -429,6 +429,35 @@ if ($nativeHash -ne $nativeSourceHash) {
     throw "Published native DLL does not match the BuildTbNative source bytes."
 }
 
+# The native DLL must not depend on the Visual C++ Redistributable. A fresh
+# Windows 11 ships ucrtbase.dll (satisfying api-ms-win-crt-*) but not
+# vcruntime140.dll, so an import of it made every P/Invoke fail with
+# 0x8007007E on a clean machine while the app opened normally and spun
+# forever with no error surfaced (issue #36). .cargo/config.toml links the
+# CRT statically to prevent that; this asserts the result rather than trusting
+# the setting, because RUSTFLAGS in the environment silently overrides the
+# config file and nothing else here would notice.
+#
+# This scans the file's bytes for the import name rather than walking the PE
+# import directory. An imported DLL's name is stored as a plain ASCII string
+# there, so the scan cannot miss a real import; it could in principle fire on
+# the name appearing as unrelated data, which for this library it does not.
+# CI runners and dev boxes all carry the redistributable, so this is the only
+# thing standing between a reintroduced dependency and a user seeing it.
+$nativeBytes = [System.IO.File]::ReadAllBytes($nativeSourcePath)
+$nativeAscii = [System.Text.Encoding]::ASCII.GetString($nativeBytes)
+$forbiddenCrtImports = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')
+$foundCrtImports = @($forbiddenCrtImports | Where-Object {
+    $nativeAscii.IndexOf($_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+})
+if ($foundCrtImports.Count -gt 0) {
+    throw ("tb_core_ffi.dll depends on the Visual C++ Redistributable ({0}), " +
+        "which a clean Windows install does not have. Expected a statically " +
+        "linked CRT — check that .cargo/config.toml applies and that RUSTFLAGS " +
+        "is not overriding it." -f ($foundCrtImports -join ', '))
+}
+Write-Output "Native CRT: statically linked (no VC++ redistributable imports)"
+
 $fileVersionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exePath)
 if ($fileVersionInfo.FileVersion -ne $ExpectedAssemblyVersion) {
     throw "Published App FileVersion '$($fileVersionInfo.FileVersion)' does not match $ExpectedAssemblyVersion."

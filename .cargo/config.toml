@@ -1,0 +1,27 @@
+# Statically link the MSVC C runtime into the native library.
+#
+# Rust's *-pc-windows-msvc targets link vcruntime140.dll dynamically by default.
+# That DLL ships with the Visual C++ Redistributable, which a fresh Windows 11
+# does not have — Windows provides ucrtbase.dll (satisfying api-ms-win-crt-*)
+# but not vcruntime140.dll. We neither bundled nor declared it, so on a clean
+# machine every P/Invoke into tb_core_ffi failed with 0x8007007E
+# (ERROR_MOD_NOT_FOUND) and the app opened to a dashboard that spun forever
+# with no error shown. See issue #36.
+#
+# Static linking is safe here specifically because no CRT resource crosses the
+# FFI boundary. The contract is stated in src/TokenBar.Interop/NativeMethods.cs:
+# every returned pointer is "released with tb_free exactly once", and
+# TbCore.TakeString is the single legal path. Rust allocates, Rust frees; the
+# managed side never calls a CRT free on Rust memory. If that contract is ever
+# relaxed — if C# starts freeing Rust allocations directly, or a FILE* or errno
+# is shared — this setting must be revisited before that change lands.
+#
+# Chosen over shipping vcruntime140.dll app-locally (which would make us
+# responsible for its security updates) and over declaring a vcredist
+# prerequisite (which adds an install-time download and a failure point).
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
