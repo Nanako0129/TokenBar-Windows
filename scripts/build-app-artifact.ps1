@@ -353,6 +353,11 @@ Assert-RequiredDesktopMuiLocales `
     -MuiFiles $muiFiles
 
 # Forbidden payload / diagnostics / unused SDK binaries (must be absent from installer payload).
+# This list mirrors the removals in TokenBar.App.csproj and must stay in step
+# with them: an entry here without the matching strip fails the build on a
+# correct payload, and a strip without an entry here goes unguarded.
+# WinUIEdit.dll was in both and is now in neither - the XAML runtime loads it
+# while building the visual tree, so removing it stopped the app from opening.
 $forbiddenExact = @(
     "onnxruntime.dll",
     "onnxruntime_providers_shared.dll",
@@ -360,7 +365,6 @@ $forbiddenExact = @(
     "Microsoft.Windows.Widgets.dll",
     "Microsoft.Windows.Widgets.Projection.dll",
     "Microsoft.Windows.Widgets.winmd",
-    "WinUIEdit.dll",
     "mscordaccore.dll",
     "mscordbi.dll"
 )
