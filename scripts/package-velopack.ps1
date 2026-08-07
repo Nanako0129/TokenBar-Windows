@@ -264,7 +264,8 @@ $buildOutputRoot = Join-Path $outputRootResolved "app-artifact"
 # $ErrorActionPreference is Stop, so a failure propagates on its own.
 & $buildScript -Rid $Rid -OutputRoot $buildOutputRoot -DeploymentMode $DeploymentMode
 
-$artifactName = "{0}-App-{1}-{2}" -f $packProperties.ProductName, $packProperties.SemanticVersion, $Rid
+# Must match scripts/build-app-artifact.ps1 naming (includes DeploymentMode).
+$artifactName = "{0}-App-{1}-{2}-{3}" -f $packProperties.ProductName, $packProperties.SemanticVersion, $Rid, $DeploymentMode
 $publishRoot = Join-Path $buildOutputRoot (Join-Path $artifactName "publish")
 if (-not (Test-Path -LiteralPath $publishRoot -PathType Container)) {
     throw "Verified publish directory is missing: $publishRoot"

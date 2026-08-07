@@ -221,7 +221,9 @@ $outputRootResolved = Assert-NewOutputRoot -Path $OutputRoot
 $appAssemblyName = "{0}.App" -f $versionContract.ProductName
 $appExecutableName = "$appAssemblyName.exe"
 $appPriName = "$appAssemblyName.pri"
-$artifactName = "{0}-App-{1}-{2}" -f $versionContract.ProductName, $versionContract.SemanticVersion, $Rid
+# Include DeploymentMode so Full and Lite private artifacts (ZIP/symbols/checksums)
+# never collide when the same RID+version are built into one OutputRoot or release set.
+$artifactName = "{0}-App-{1}-{2}-{3}" -f $versionContract.ProductName, $versionContract.SemanticVersion, $Rid, $DeploymentMode
 $artifactRoot = Join-Path $outputRootResolved $artifactName
 if (Test-Path -LiteralPath $artifactRoot) {
     throw "Artifact output already exists; choose a new OutputRoot: $artifactRoot"
@@ -759,7 +761,7 @@ $symbolsMeta = [ordered]@{
 }
 $symbolsMetaPath = Join-Path $symbolsStaging "SYMBOLS-MANIFEST.json"
 ($symbolsMeta | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $symbolsMetaPath -Encoding utf8
-$symbolsZipName = "{0}-Symbols-{1}-{2}.zip" -f $versionContract.ProductName, $versionContract.SemanticVersion, $Rid
+$symbolsZipName = "{0}-Symbols-{1}-{2}-{3}.zip" -f $versionContract.ProductName, $versionContract.SemanticVersion, $Rid, $DeploymentMode
 $symbolsZipPath = Join-Path $artifactRoot $symbolsZipName
 if (Test-Path -LiteralPath $symbolsZipPath) {
     throw "Symbols archive already exists: $symbolsZipName"
