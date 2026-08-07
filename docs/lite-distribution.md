@@ -9,11 +9,12 @@ Framework-dependent **Lite** packages omit the bundled .NET 10 runtime. Full rem
 | README / primary download button | Full | none |
 | GitHub Releases asset list | Full listed first | Lite |
 | winget | `Nyanako.Syrtis` = Full | `Nyanako.Syrtis.Lite` |
-| Scoop | Lite | Full optional |
+| Scoop | Lite *(intent)* | Full optional |
 
 ## Guidance
 
-- Scoop users are more likely to already have .NET 10, so Lite is the useful default there.
+- Scoop default is **intent only**, not yet decided: Scoop manages `~/scoop/apps/<name>/<version>` with its own `current` junction, while Velopack installs under `%LocalAppData%\<packId>`. Whether Scoop consumes a portable artifact or runs the Velopack installer is still open and determines whether the Lite-default row is implementable.
+- Scoop users are more likely to already have .NET 10, so Lite is the useful default *once* that packaging path is chosen.
 - On a clean machine, Lite download plus runtime bootstrap may approach the Full total download size.
 - Do **not** advertise Lite as an unconditional ~50% saving for every user.
 - The .NET runtime bootstrap remains **Velopack's** responsibility.
