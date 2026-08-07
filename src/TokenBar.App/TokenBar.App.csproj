@@ -79,16 +79,34 @@
        not help because the binaries arrive through the self-contained payload.
        The SDK adds the payload as None items, so drop them by name after it does.
 
-       Stripped binaries and justification (confirmed by repository-wide search):
+       Stripped binaries and justification:
          onnxruntime.dll + DirectML.dll      (38.5 MB) — no AI/ONNX/WinML usage
          onnxruntime_providers_shared.dll     (0.05 MB) — companion of onnxruntime
          Microsoft.Windows.Widgets.*         ( 2.5 MB) — no Widget API usage
-         WinUIEdit.dll                       ( 3.3 MB) — no TextBox/RichEditBox
          Microsoft.DiaSymReader.Native.*.dll ( 2.1 MB) — debug symbol reader only
 
-       NOTE: .mui locale files and SatelliteResourceLanguages are intentionally
-       NOT stripped — doing so breaks XAML resource resolution on non-English
-       Windows systems (zh-TW, ja-JP, etc.) with XamlParseException. -->
+       NOT stripped, and each entry here is a scar:
+
+       WinUIEdit.dll (3.3 MB) was stripped on the grounds that a repository-wide
+       search found no TextBox, RichEditBox, AutoSuggestBox, PasswordBox or
+       NumberBox. That search answered the wrong question. WinUI loads this
+       binary while building the visual tree regardless of which controls the
+       source names, so the app died at startup with
+       XamlParseException: Cannot create instance of type 'DashboardView',
+       from FlyoutWindow.InitializeComponent. Restoring this one file, with
+       every other removal left in place, is the difference between an app that
+       will not open at all and one that starts normally. Do not strip it again
+       on the strength of a source-text search; the only evidence that settles
+       a payload removal is launching the built app.
+
+       .mui locale files and SatelliteResourceLanguages are likewise NOT
+       stripped — that breaks XAML resource resolution on non-English Windows
+       (zh-TW, ja-JP) with the same exception class.
+
+       The general rule both scars point at: these binaries are loaded by the
+       XAML runtime, not called from our code, so "we never reference it" is not
+       evidence that it is unused. -->
+
   <Target Name="TbTrimUnusedWindowsAppSdkPayload"
           AfterTargets="AddMicrosoftWindowsAppSDKPayloadFilesFromMsix;AddMicrosoftWindowsAppSDKPayloadFilesFromComponents">
     <ItemGroup>
@@ -99,7 +117,6 @@
                        '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.dll' or
                        '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.Projection.dll' or
                        '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.winmd' or
-                       '%(Filename)%(Extension)' == 'WinUIEdit.dll' or
                        $([System.String]::Copy('%(Filename)').StartsWith('Microsoft.DiaSymReader.Native'))" />
     </ItemGroup>
   </Target>
@@ -154,8 +171,7 @@
                                         '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.dll' or
                                         '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.Projection.dll' or
                                         '%(Filename)%(Extension)' == 'Microsoft.Windows.Widgets.winmd' or
-                                        '%(Filename)%(Extension)' == 'WinUIEdit.dll' or
-                                        $([System.String]::Copy('%(Filename)').StartsWith('Microsoft.DiaSymReader.Native'))" />
+                                                         $([System.String]::Copy('%(Filename)').StartsWith('Microsoft.DiaSymReader.Native'))" />
 
       <!-- .NET diagnostics DLLs (crash-dump analysis tools, not needed at runtime;
            clrjit is required and is NOT stripped) -->
