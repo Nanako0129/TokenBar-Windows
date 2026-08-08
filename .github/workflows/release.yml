@@ -24,7 +24,30 @@ permissions:
   contents: write
 
 jobs:
+  # Resolve the tag to a commit exactly once. Every later checkout takes that
+  # SHA rather than the tag name, so the four package legs and the publish job
+  # cannot disagree about what they built: a tag force-moved mid-run would
+  # otherwise be resolved independently by each leg, and the release would
+  # combine artifacts from different commits with nothing to reveal it.
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pin.outputs.tag }}
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: pin
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          sha="$(git rev-parse HEAD)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "pinned $tag -> $sha"
+
   package:
+    needs: resolve
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -45,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,7 +88,7 @@ jobs:
       - name: Tag must match the version contract
         shell: pwsh
         run: |
-          $tag = "${{ inputs.tag || github.ref_name }}"
+          $tag = "${{ needs.resolve.outputs.tag }}"
           $expected = $tag -replace '^v', ''
           [xml]$props = Get-Content -LiteralPath ./Directory.Build.props
           $semantic = ($props.Project.PropertyGroup.TbSemanticVersion | Where-Object { $_ }) -join ''
@@ -105,13 +128,41 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # package-velopack produces a version- and RID-bound symbols archive next
+      # to the app artifact, deliberately kept out of Setup.exe and the nupkg.
+      # It is the only way to symbolicate a crash dump from a shipped build, so
+      # letting it die with the runner would make that whole mechanism do
+      # nothing for exactly the binaries it exists for.
+      #
+      # A workflow artifact rather than a release asset: it carries PDBs, which
+      # belong with whoever is diagnosing a crash, not on a public download
+      # page. Retention outlives the release-set artifacts above because those
+      # are consumed minutes later by publish, while these are wanted the first
+      # time someone reports a crash.
+      - name: Locate symbols archive
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "rel-${{ matrix.mode }}-${{ matrix.rid }}"
+          $zip = Get-ChildItem -LiteralPath (Join-Path $root 'app-artifact') -Recurse -Filter 'Syrtis-Symbols-*.zip' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($null -eq $zip) { throw "symbols archive missing under $root/app-artifact" }
+          "  {0}  {1:N0} bytes" -f $zip.Name, $zip.Length
+          "SYMBOLS_ZIP=$($zip.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: symbols-${{ matrix.rid }}-${{ matrix.mode }}
+          path: ${{ env.SYMBOLS_ZIP }}
+          if-no-files-found: error
+          retention-days: 90
+
   publish:
-    needs: package
+    needs: [resolve, package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -150,10 +201,15 @@ jobs:
       - name: Generate SHA256SUMS.txt
         run: |
           built_sha="$(git rev-parse HEAD)"
+          pinned="${{ needs.resolve.outputs.sha }}"
+          if [ "$built_sha" != "$pinned" ]; then
+            echo "checkout HEAD $built_sha does not match pinned $pinned" >&2
+            exit 1
+          fi
           echo "built from: $built_sha"
           cd staging
           {
-            echo "# Syrtis ${{ inputs.tag || github.ref_name }}"
+            echo "# Syrtis ${{ needs.resolve.outputs.tag }}"
             echo "# built from ${built_sha} by ${{ github.workflow }} run ${{ github.run_id }}"
             echo
             sha256sum * | sort -k2
@@ -173,7 +229,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${{ needs.resolve.outputs.tag }}"
           NOTES=".github/release-notes/${TAG}.md"
           if [ -f "$NOTES" ]; then
             NOTES_ARG=(--notes-file "$NOTES")
