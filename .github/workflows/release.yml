@@ -197,23 +197,46 @@ jobs:
           path: staging
           merge-multiple: true
 
-      # Four channels, four files each. Anything else means a matrix leg was
-      # skipped or two legs collided on a filename, and publishing a partial
-      # set is worse than failing: the feed for a missing channel would 404 for
-      # every client already on it.
-      - name: Exactly sixteen assets, one set per channel
+      # Name every publishable file rather than counting what landed. The
+      # first attempt asserted "16 files in staging" and failed on a correct
+      # build: vpk also emits <channel>-Portable.zip and assets.<channel>.json,
+      # so a channel produces six files, not four. That 16 came from counting
+      # what v0.2.1 happened to publish — a human's earlier selection mistaken
+      # for the tool's contract — and would have broken again the next time
+      # Velopack added an output.
+      #
+      # Excluded on purpose, not overlooked:
+      #   *-Portable.zip        v0.2.1 states the installer is the supported
+      #                         form; publishing both invites installing one
+      #                         and updating the other.
+      #   assets.<ch>.json      a local build manifest listing what the pack
+      #                         produced. UpdateFlow never reads it, and v0.2.1
+      #                         shipped without it through a verified update.
+      - name: Select the publishable assets
         run: |
-          cd staging
-          ls -l
-          count=$(ls -1 | wc -l)
+          VERSION="${{ needs.resolve.outputs.tag }}"
+          VERSION="${VERSION#v}"
+          mkdir -p upload
+          for ch in win-x64 win-x64-lite win-arm64 win-arm64-lite; do
+            for f in "Nyanako.Syrtis-${VERSION}-${ch}-full.nupkg" \
+                     "Nyanako.Syrtis-${ch}-Setup.exe" \
+                     "releases.${ch}.json" \
+                     "RELEASES-${ch}"; do
+              if [ ! -f "staging/$f" ]; then
+                echo "missing publishable asset: $f" >&2
+                echo "staging holds:" >&2
+                ls -1 staging >&2
+                exit 1
+              fi
+              cp "staging/$f" upload/
+            done
+          done
+          count=$(ls -1 upload | wc -l)
           if [ "$count" -ne 16 ]; then
-            echo "expected 16 assets, found $count" >&2
+            echo "selected $count assets, expected 16" >&2
             exit 1
           fi
-          for ch in win-x64 win-x64-lite win-arm64 win-arm64-lite; do
-            test -f "releases.$ch.json" || { echo "missing feed for $ch" >&2; exit 1; }
-            test -f "RELEASES-$ch"      || { echo "missing RELEASES for $ch" >&2; exit 1; }
-          done
+          ls -l upload
 
       # The feed a client reads carries the SHA256 of the package it will
       # download, so a corrupted upload fails closed on the client. This file
@@ -234,7 +257,7 @@ jobs:
             exit 1
           fi
           echo "built from: $built_sha"
-          cd staging
+          cd upload
           {
             echo "# Syrtis ${{ needs.resolve.outputs.tag }}"
             echo "# built from ${built_sha} by ${{ github.workflow }} run ${{ github.run_id }}"
@@ -280,7 +303,7 @@ jobs:
               exit 1
             fi
             echo "draft $TAG exists — replacing its assets"
-            gh release upload "$TAG" staging/* SHA256SUMS.txt --clobber
+            gh release upload "$TAG" upload/* SHA256SUMS.txt --clobber
             gh release edit "$TAG" --draft --title "Syrtis ${TAG#v}" "${NOTES_ARG[@]}"
           else
             # --verify-tag: gh otherwise creates a missing tag from the default
@@ -293,7 +316,7 @@ jobs:
               --verify-tag \
               --title "Syrtis ${TAG#v}" \
               "${NOTES_ARG[@]}" \
-              staging/* SHA256SUMS.txt
+              upload/* SHA256SUMS.txt
           fi
 
           gh release view "$TAG" --json isDraft,assets \
