@@ -52,9 +52,14 @@ jobs:
       tag: ${{ steps.pin.outputs.tag }}
       sha: ${{ steps.pin.outputs.sha }}
     steps:
+      # refs/tags/ explicitly. actions/checkout resolves a bare name as a
+      # branch first, so a dispatch input naming something that exists as both
+      # would build the branch commit while --verify-tag passed on the
+      # same-named tag, and the release would point somewhere the binaries
+      # never came from. The push trigger already supplies a full ref.
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
       - id: pin
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
