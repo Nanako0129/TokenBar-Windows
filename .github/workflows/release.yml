@@ -225,7 +225,17 @@ jobs:
       # the version guard, and gh would then mint a tag at the default branch
       # head while the attached binaries came from somewhere else. This
       # workflow only ever builds tags that already exist.
-      - name: Create draft release
+      # Creating the release and uploading its assets are separate API calls,
+      # so ~480 MB of uploads can fail partway and leave a draft holding some
+      # of them. A rerun would then hit "release already exists" and the only
+      # recovery would be deleting the draft by hand. Transient upload failure
+      # is ordinary, not adversarial, so the rerun path is the one that has to
+      # work: an existing draft is topped up with --clobber instead.
+      #
+      # A published release is never touched. Retry is meaningful for a draft
+      # nobody has seen; replacing assets under something already distributed
+      # is a different act and this workflow does not get to perform it.
+      - name: Create or update draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -236,10 +246,28 @@ jobs:
           else
             NOTES_ARG=(--notes "Draft. Release notes were not committed at .github/release-notes/${TAG}.md; fill these in before publishing.")
           fi
-          gh release create "$TAG" \
-            --draft \
-            --verify-tag \
-            --title "Syrtis ${TAG#v}" \
-            "${NOTES_ARG[@]}" \
-            staging/* SHA256SUMS.txt
-          gh release view "$TAG" --json isDraft,assets --jq '{draft:.isDraft, assets:[.assets[].name]}'
+
+          if existing_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$existing_draft" != "true" ]; then
+              echo "release $TAG already exists and is published; refusing to modify it" >&2
+              exit 1
+            fi
+            echo "draft $TAG exists — replacing its assets"
+            gh release upload "$TAG" staging/* SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --draft --title "Syrtis ${TAG#v}" "${NOTES_ARG[@]}"
+          else
+            # --verify-tag: gh otherwise creates a missing tag from the default
+            # branch. A dispatch input naming something that is not a tag — a
+            # same-named branch, a typo — checks out fine and can pass the
+            # version guard, and gh would then mint a tag at the default branch
+            # head while the binaries came from elsewhere.
+            gh release create "$TAG" \
+              --draft \
+              --verify-tag \
+              --title "Syrtis ${TAG#v}" \
+              "${NOTES_ARG[@]}" \
+              staging/* SHA256SUMS.txt
+          fi
+
+          gh release view "$TAG" --json isDraft,assets \
+            --jq '{draft:.isDraft, assetCount:(.assets|length), assets:[.assets[].name]}'
