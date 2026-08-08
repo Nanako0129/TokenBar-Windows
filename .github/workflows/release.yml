@@ -1,0 +1,173 @@
+name: Release
+
+# The release-authority contract that CI deliberately does not carry. ci.yml
+# builds these same packages on every push and uploads sanitized evidence only,
+# never Setup.exe or nupkg, so release binaries have until now existed only on
+# whichever machine a human built them on. That made every release depend on
+# moving ~480 MB off a laptop, and gave users a binary whose provenance was
+# "someone says their checkout was clean".
+#
+# Pushing a v* tag is the authority signal. The result is a DRAFT release: the
+# assets are built and attached, and a human still decides whether it goes out.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.2.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            mode: Full
+            rust_target: x86_64-pc-windows-msvc
+          - rid: win-x64
+            mode: Lite
+            rust_target: x86_64-pc-windows-msvc
+          - rid: win-arm64
+            mode: Full
+            rust_target: aarch64-pc-windows-msvc
+          - rid: win-arm64
+            mode: Lite
+            rust_target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.rid }}-${{ matrix.mode }}
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.301
+
+      # A tag can be pushed at any commit. Without this, tagging v0.3.0 on a
+      # tree that still says 0.2.2 would publish 0.2.2 assets under a 0.3.0
+      # release and the mismatch would only surface when an installed client
+      # refused the update.
+      - name: Tag must match the version contract
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          $expected = $tag -replace '^v', ''
+          [xml]$props = Get-Content -LiteralPath ./Directory.Build.props
+          $semantic = ($props.Project.PropertyGroup.TbSemanticVersion | Where-Object { $_ }) -join ''
+          "tag=$tag  contract=$semantic"
+          if ($semantic -cne $expected) {
+            throw "Tag $tag does not match TbSemanticVersion $semantic. Bump the version contract, or tag the commit that carries it."
+          }
+
+      - name: Package ${{ matrix.mode }} / ${{ matrix.rid }}
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "rel-${{ matrix.mode }}-${{ matrix.rid }}"
+          ./scripts/package-velopack.ps1 -Rid ${{ matrix.rid }} -OutputRoot $root -DeploymentMode ${{ matrix.mode }}
+          "RELEASE_DIR=$root/releases" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # package-velopack already asserts pack id, version, mainExe, machine
+      # architecture and channel. This only checks the set of files is the
+      # shape the publish job expects, so a missing feed is caught here rather
+      # than as a release with an asset silently absent.
+      - name: Release directory must hold exactly one channel's four files
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -LiteralPath $env:RELEASE_DIR -File | Sort-Object Name)
+          $files | ForEach-Object { "  {0}  {1:N0} bytes" -f $_.Name, $_.Length }
+          $nupkg  = @($files | Where-Object { $_.Extension -eq '.nupkg' }).Count
+          $setup  = @($files | Where-Object { $_.Name -like '*Setup.exe' }).Count
+          $feed   = @($files | Where-Object { $_.Name -like 'releases.*.json' }).Count
+          $legacy = @($files | Where-Object { $_.Name -like 'RELEASES-*' }).Count
+          if ($nupkg -ne 1 -or $setup -ne 1 -or $feed -ne 1 -or $legacy -ne 1) {
+            throw "Unexpected release set: nupkg=$nupkg setup=$setup feed=$feed legacy=$legacy"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.rid }}-${{ matrix.mode }}
+          path: ${{ env.RELEASE_DIR }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: staging
+          merge-multiple: true
+
+      # Four channels, four files each. Anything else means a matrix leg was
+      # skipped or two legs collided on a filename, and publishing a partial
+      # set is worse than failing: the feed for a missing channel would 404 for
+      # every client already on it.
+      - name: Exactly sixteen assets, one set per channel
+        run: |
+          cd staging
+          ls -l
+          count=$(ls -1 | wc -l)
+          if [ "$count" -ne 16 ]; then
+            echo "expected 16 assets, found $count" >&2
+            exit 1
+          fi
+          for ch in win-x64 win-x64-lite win-arm64 win-arm64-lite; do
+            test -f "releases.$ch.json" || { echo "missing feed for $ch" >&2; exit 1; }
+            test -f "RELEASES-$ch"      || { echo "missing RELEASES for $ch" >&2; exit 1; }
+          done
+
+      # The feed a client reads carries the SHA256 of the package it will
+      # download, so a corrupted upload fails closed on the client. This file
+      # is for a human checking a Setup.exe before running it, which the feed
+      # does not cover.
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd staging
+          {
+            echo "# Syrtis ${{ inputs.tag || github.ref_name }}"
+            echo "# built from ${{ github.sha }} by ${{ github.workflow }} run ${{ github.run_id }}"
+            echo
+            sha256sum * | sort -k2
+          } > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
+      # Draft, always. The tag authorises building the assets; a person still
+      # decides whether they reach anyone.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          NOTES=".github/release-notes/${TAG}.md"
+          if [ -f "$NOTES" ]; then
+            NOTES_ARG=(--notes-file "$NOTES")
+          else
+            NOTES_ARG=(--notes "Draft. Release notes were not committed at .github/release-notes/${TAG}.md; fill these in before publishing.")
+          fi
+          gh release create "$TAG" \
+            --draft \
+            --title "Syrtis ${TAG#v}" \
+            "${NOTES_ARG[@]}" \
+            staging/* SHA256SUMS.txt
+          gh release view "$TAG" --json isDraft,assets --jq '{draft:.isDraft, assets:[.assets[].name]}'
