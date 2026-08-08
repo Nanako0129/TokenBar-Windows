@@ -20,8 +20,25 @@ on:
         required: true
         type: string
 
+# Two runs for the same tag would both reach the --clobber retry path and
+# overwrite each other's assets one file at a time. Two packaging executions do
+# not produce identical bytes, so the release could end up holding one run's
+# SHA256SUMS.txt against another run's binaries — checksum verification and
+# Velopack updates would then both fail on something already published.
+#
+# Not cancel-in-progress: interrupting a run midway through uploading ~480 MB
+# leaves exactly the partial draft this serialisation exists to avoid. Queue
+# instead.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# Read by default. Only publish creates a release, and the package jobs run
+# third-party actions behind mutable refs — dtolnay/rust-toolchain@stable,
+# Swatinem/rust-cache@v2 — with whatever token the job carries. A tag takeover
+# on either would otherwise hold repository write for the length of a build.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Resolve the tag to a commit exactly once. Every later checkout takes that
@@ -159,6 +176,11 @@ jobs:
   publish:
     needs: [resolve, package]
     runs-on: ubuntu-latest
+    # The only job that writes anything. Scoped here rather than at workflow
+    # level so the four package jobs, which run third-party actions, never hold
+    # a write token.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
