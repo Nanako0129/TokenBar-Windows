@@ -705,6 +705,7 @@ public sealed partial class DashboardView : UserControl
             snapshot.Graph,
             _selectedClients,
             _chartStackBy,
+            _chartMetric,
             colors,
             Format.TodayKey(),
             rangeEnd: stats.DateRange.End);
@@ -1195,25 +1196,7 @@ public sealed partial class DashboardView : UserControl
     {
         var panel = new StackPanel { Spacing = 6 };
         var colors = new ModelColorMap(snapshot.Models);
-        var days = snapshot.Graph.Contributions
-            .Select(day =>
-            {
-                var clients = day.Clients
-                    .Where(c => _selectedSet.Contains(ClientRegistry.CanonicalClient(c.Client)))
-                    .OrderByDescending(c => c.Cost)
-                    .ToList();
-                var tokens = clients.Aggregate(
-                    0L, (total, client) => total.SaturatingAdd(client.Tokens.Total));
-                return (
-                    Day: day,
-                    Clients: clients,
-                    Tokens: tokens,
-                    Cost: clients.Sum(c => c.Cost),
-                    Messages: clients.Sum(c => c.Messages));
-            })
-            .Where(day => day.Tokens > 0 || day.Cost > 0)
-            .Reverse()
-            .ToList();
+        var days = DailyRows.Build(snapshot.Graph, _selectedClients);
         if (days.Count == 0)
         {
             panel.Children.Add(Ui.Dim("No active days."));
@@ -1221,16 +1204,26 @@ public sealed partial class DashboardView : UserControl
 
         foreach (var selectedDay in days)
         {
-            var day = selectedDay.Day;
             var block = new StackPanel { Spacing = 4 };
+            var summary = $"{selectedDay.Messages} msgs";
+            if (selectedDay.Turns is { } turns)
+            {
+                var scope = selectedDay.TurnClients.Count switch
+                {
+                    1 => $"{ClientRegistry.ShortName(selectedDay.TurnClients[0])} only",
+                    > 1 => $"{string.Join(" + ", selectedDay.TurnClients.Select(ClientRegistry.ShortName))} only",
+                    _ => "selected clients",
+                };
+                summary += $" · {turns} turns · {scope}";
+            }
+
+            summary += $" · {Format.CompactTokens(selectedDay.Tokens)} · {Format.Usd(selectedDay.Cost)}";
             var head = Ui.Row(
-                Ui.Text(Format.MonthDay(day.Date), 12, bold: true),
-                Ui.Text(
-                    $"{selectedDay.Messages} msgs · {Format.CompactTokens(selectedDay.Tokens)} · {Format.Usd(selectedDay.Cost)}",
-                    11, 0.8));
+                Ui.Text(Format.MonthDay(selectedDay.Date), 12, bold: true),
+                Ui.Text(summary, 11, 0.8));
             block.Children.Add(head);
 
-            if (_expandedDay == day.Date)
+            if (_expandedDay == selectedDay.Date)
             {
                 foreach (var client in selectedDay.Clients)
                 {
@@ -1289,7 +1282,7 @@ public sealed partial class DashboardView : UserControl
                 Padding = new Thickness(10, 8, 10, 8),
                 Child = block,
             };
-            var date = day.Date;
+            var date = selectedDay.Date;
             card.Tapped += (_, _) =>
             {
                 _expandedDay = _expandedDay == date ? null : date;

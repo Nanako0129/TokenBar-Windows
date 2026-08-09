@@ -59,13 +59,22 @@ public readonly record struct ISODay(int Number)
     public int Weekday => ((Number + 4) % 7 + 7) % 7;
 }
 
-public sealed record PerDay(string Date, long Tokens, double Cost, int Intensity);
+public static class UsageActivity
+{
+    public static bool IsActive(long tokens, double cost, long messages) =>
+        tokens > 0 || cost > 0 || messages > 0;
+}
+
+public sealed record PerDay(string Date, long Tokens, double Cost, long Messages, int Intensity)
+{
+    public bool IsActive => UsageActivity.IsActive(Tokens, Cost, Messages);
+}
 
 public sealed record Streaks(int Longest, int Current)
 {
     /// <summary>Port of computeStreaks: walk every calendar day in the range;
-    /// a day is active when it has tokens. Current counts back from the range
-    /// end.</summary>
+    /// a day is active when it has tokens, cost, or messages. Current counts
+    /// back from the range end.</summary>
     public static Streaks Compute(
         IReadOnlyDictionary<string, PerDay> perDayMap, string rangeStart, string rangeEnd)
     {
@@ -77,7 +86,7 @@ public sealed record Streaks(int Longest, int Current)
         }
 
         bool Active(int n) =>
-            perDayMap.TryGetValue(new ISODay(n).Iso, out var day) && day.Tokens > 0;
+            perDayMap.TryGetValue(new ISODay(n).Iso, out var day) && day.IsActive;
 
         var longest = 0;
         var run = 0;
@@ -115,17 +124,24 @@ public sealed class UsageStats
     public IReadOnlyList<PerDay> PerDay { get; }
     public IReadOnlyDictionary<string, PerDay> PerDayMap { get; }
     public Streaks Streaks { get; }
+    /// <summary>Raw ids observed in contribution stripes, kept for display and
+    /// diagnostics. Selection membership is canonicalized internally.</summary>
     public IReadOnlyList<string> PresentClients { get; }
     public long MaxTokens { get; }
 
     /// <summary>Port of computeStats: aggregate per-day totals over
     /// <paramref name="selectedClients"/> (empty set = nothing selected; pass
-    /// all present clients for the all-agent view).</summary>
+    /// all present clients for the all-agent view). Selection membership is
+    /// canonical, while the payload's raw ids remain untouched.</summary>
     public UsageStats(UsagePayload payload, IReadOnlySet<string> selectedClients)
     {
+        var selected = selectedClients
+            .Select(ClientRegistry.CanonicalClient)
+            .ToHashSet(StringComparer.Ordinal);
         var perDay = new List<PerDay>();
         var perDayMap = new Dictionary<string, PerDay>();
         var present = new SortedSet<string>(StringComparer.Ordinal);
+        var canonicalPresent = new HashSet<string>(StringComparer.Ordinal);
         long totalTokens = 0;
         var totalCost = 0.0;
         (string Date, double Cost)? bestDay = null;
@@ -134,11 +150,14 @@ public sealed class UsageStats
         foreach (var c in payload.Contributions)
         {
             long dayTokens = 0;
+            long dayMessages = 0;
             var dayCost = 0.0;
             foreach (var cc in c.Clients)
             {
                 present.Add(cc.Client);
-                if (!selectedClients.Contains(cc.Client))
+                var canonical = ClientRegistry.CanonicalClient(cc.Client);
+                canonicalPresent.Add(canonical);
+                if (!selected.Contains(canonical))
                 {
                     continue;
                 }
@@ -148,15 +167,16 @@ public sealed class UsageStats
                 // folds these here — a wrapping/throwing += would corrupt or
                 // crash the dashboard.
                 dayTokens = dayTokens.SaturatingAdd(cc.Tokens.Total);
+                dayMessages = dayMessages.SaturatingAdd(cc.Messages);
                 dayCost += cc.Cost;
             }
 
-            if (dayTokens == 0 && dayCost == 0)
+            if (!UsageActivity.IsActive(dayTokens, dayCost, dayMessages))
             {
                 continue;
             }
 
-            var entry = new PerDay(c.Date, dayTokens, dayCost, c.Intensity);
+            var entry = new PerDay(c.Date, dayTokens, dayCost, dayMessages, c.Intensity);
             perDay.Add(entry);
             perDayMap[c.Date] = entry;
             totalTokens = totalTokens.SaturatingAdd(dayTokens);
@@ -183,7 +203,7 @@ public sealed class UsageStats
         // that case, matching a payload in which the hidden clients never
         // existed. The all-present (nothing hidden) and empty (nothing active)
         // cases keep meta.DateRange — byte-identical to before.
-        var filtering = !present.IsSubsetOf(selectedClients);
+        var filtering = !canonicalPresent.IsSubsetOf(selected);
         var selectedDates = perDay.Select(p => p.Date).ToList();
         DateRange effectiveRange;
         if (filtering && selectedDates.Count > 0)
@@ -211,13 +231,14 @@ public sealed class UsageStats
 
 public static class UsageStatsVisibility
 {
-    /// <summary>A contribution stripe is "visible activity" when its client
-    /// isn't hidden and it carries tokens or cost.</summary>
+    /// <summary>A contribution stripe is "visible activity" when its raw client
+    /// canonicalizes to a non-hidden id and it carries tokens, cost, or messages.</summary>
     private static bool IsVisible(ContributionClient cc, IReadOnlySet<string> hidden) =>
-        !hidden.Contains(cc.Client) && (cc.Tokens.Total > 0 || cc.Cost > 0);
+        !hidden.Contains(ClientRegistry.CanonicalClient(cc.Client))
+        && UsageActivity.IsActive(cc.Tokens.Total, cc.Cost, cc.Messages);
 
     /// <summary>The set of YYYY years in which at least one NON-hidden client
-    /// had activity (tokens or cost), derived from a payload's contributions.
+    /// had activity (tokens, cost, or messages), derived from a payload's contributions.
     /// Used to drop from the year picker years that only hidden clients used.
     /// Only meaningful over an all-time payload (contributions spanning every
     /// year); callers fall back to the unfiltered known-year list when the

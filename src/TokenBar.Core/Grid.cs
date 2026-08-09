@@ -49,7 +49,7 @@ public static class Grid
                 var inYear = date.StartsWith(yearPrefix, StringComparison.Ordinal);
                 perDayMap.TryGetValue(date, out var entry);
                 var tokens = entry?.Tokens ?? 0;
-                var active = inYear && tokens > 0;
+                var active = inYear && entry?.IsActive == true;
                 if (active)
                 {
                     maxTokens = Math.Max(maxTokens, tokens);
