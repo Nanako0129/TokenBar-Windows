@@ -131,6 +131,7 @@ no DIP conversion; text scale comes from `GetDpiForWindow` as usual
 | Taskbar/tray/task-list rect moves (resolution, DPI, auto-hide slide, tray icons, overflow/task-list controls) | `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` filtered to the taskbar, tray, task-list host, and overflow-relevant HWNDs | re-evaluate orientation, candidate rect, and available boundary; reposition or hide |
 | Explorer restart | `RegisterWindowMessage("TaskbarCreated")` broadcast, received by subclassing the widget HWND (`SetWindowSubclass`) | re-resolve HWNDs, reposition, re-assert topmost |
 | Fullscreen app on the same monitor | `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` switches the current foreground HWND; `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` re-evaluates the taskbar, tray, and current foreground HWND rects | hide/show immediately when the same HWND enters or leaves browser/video fullscreen |
+| Windows system theme setting changes | subscribe to the OS theme/settings notification that covers `SystemUsesLightTheme`, rather than relying only on WinUI app-theme notifications | re-read `IsSystemDark()` and rerender the pill colors even when the title is unchanged |
 | Auto-hide taskbar | falls out of the LocationChange handling: taskbar rect mostly off-screen → hide widget | follow taskbar visibility |
 | Anything the hooks miss | piggyback `TrayFeed`'s existing 30 s fast tick with a cheap rect re-check — **no new polling timer** | self-heal |
 
