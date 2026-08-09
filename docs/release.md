@@ -26,8 +26,8 @@ dependency/toolchain、產物、evidence，以及哪些檢查必須在 Windows �
 > 這些名稱為準。產品名之後改為 `Syrtis`，`build-app-artifact.ps1` 一律從
 > `TbProductName` 推導名稱，所以**今天**執行同一條命令會得到
 > `Syrtis-App-<version>-win-<rid>.zip` 與 `Syrtis.App.exe`。下一次發布屬於
-> Phase 11（Velopack installer/updater），會有自己的 release contract 文件；
-> 本文件不再更新為當前命名。
+> Phase 11（Velopack installer/updater），其 release contract 是
+> [`docs/release-velopack.md`](release-velopack.md)；本文件不再更新為當前命名。
 
 Preview history: [`v0.1.0-preview.1` published prerelease](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0-preview.1).
 
