@@ -91,36 +91,44 @@ of the tray, sharing its `TrayFeed` and lifetime).
 - Content: the selected `TrayMode`'s full `Title()` string (the icon truncates
   via `IconTitle`; the widget doesn't need to), quota gauge color accent when
   in `QuotaLeft` mode. One `TextBlock` + optional colored dot — no lens
-  content on the taskbar. When the mode is `TrayMode.Hidden` / “Icon only”,
-  the widget is not created or remains hidden; it never shows a blank pill.
-  The existing toggle remains available, and switching back to a displayable
-  mode restores the widget.
+  content on the taskbar. When `TrayMode.Title()` is temporarily empty,
+  including before the first async refresh, the widget remains hidden; it never
+  shows a loading placeholder or blank pill. The first non-empty title shows it,
+  and a later empty title hides it again. `TrayMode.Hidden` / “Icon only” follows
+  the same rule. The existing toggle remains available, and switching back to a
+  displayable mode restores the widget.
 - Input: left-click → `FlyoutWindow.ToggleFlyout()` (pointer events arrive
   without activation). Hover tooltip (`HoverTip` reuse) and right-click menu
   are Phase 2.
 
 ### Placement
 
-Right-anchored next to the system tray — on Win11 centered *and* left-aligned
-layouts the region just left of `TrayNotifyWnd` is the only spot that app
-icons never grow into.
+Placement is supported only for a horizontal primary taskbar. Read the
+`Shell_TrayWnd` rect orientation first; on Windows 10, a left or right vertical
+taskbar hides the widget rather than applying the horizontal formula.
+
+For a horizontal taskbar, first compute a candidate rect next to the system
+tray, then obtain a verifiable task-list/overflow available boundary. If the
+candidate intersects the task-list host or its controls, hide the widget;
+show it again when space returns. If Gate 0 cannot reliably resolve that
+boundary on a Windows build, fail closed and hide the widget; that is a No-Go,
+not permission to cover clickable icons.
 
 ```
-widget.right  = TrayNotifyWnd.rect.left − gap      (physical px)
-widget.centerY = Shell_TrayWnd.rect.centerY
-widget.height ≈ taskbar height − 2·margin; width fits the text
+candidate.right  = TrayNotifyWnd.rect.left − gap   (physical px)
+candidate.centerY = Shell_TrayWnd.rect.centerY
+candidate.height ≈ taskbar height − 2·margin; width fits the text
 ```
 
 All inputs are physical-pixel rects from `GetWindowRect`, so placement needs
 no DIP conversion; text scale comes from `GetDpiForWindow` as usual
-(PerMonitorV2 manifest already in place). Primary taskbar only in v1
-(`Shell_SecondaryTrayWnd` is Phase 2).
+(PerMonitorV2 manifest already in place). `Shell_SecondaryTrayWnd` is Phase 2.
 
 ### Tracking & resilience
 
 | Event | Mechanism | Response |
 |---|---|---|
-| Taskbar/tray rect moves (resolution, DPI, auto-hide slide, tray icons added) | `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` filtered to the two HWNDs | reposition |
+| Taskbar/tray/task-list rect moves (resolution, DPI, auto-hide slide, tray icons, overflow/task-list controls) | `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` filtered to the taskbar, tray, task-list host, and overflow-relevant HWNDs | re-evaluate orientation, candidate rect, and available boundary; reposition or hide |
 | Explorer restart | `RegisterWindowMessage("TaskbarCreated")` broadcast, received by subclassing the widget HWND (`SetWindowSubclass`) | re-resolve HWNDs, reposition, re-assert topmost |
 | Fullscreen app on the same monitor | `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` switches the current foreground HWND; `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` re-evaluates the taskbar, tray, and current foreground HWND rects | hide/show immediately when the same HWND enters or leaves browser/video fullscreen |
 | Auto-hide taskbar | falls out of the LocationChange handling: taskbar rect mostly off-screen → hide widget | follow taskbar visibility |
@@ -164,18 +172,18 @@ menu, secondary taskbars, gauge rendering, entrance animation.
 | Axis | Cases |
 |---|---|
 | DPI | 100% / 125% / 150%, live DPI change |
-| Taskbar | centered / left-aligned icons; auto-hide on/off; tray icon count change (rect shift) |
+| Taskbar | centered / left-aligned icons; auto-hide on/off; tray icon count change (rect shift); Windows 10 left/right vertical taskbar → hide and do not cover controls |
 | Resilience | `taskkill /f /im explorer.exe` + restart → widget re-appears correctly ≤ 2 s |
 | Fullscreen | video fullscreen + a game/borderless window → widget hides, returns on exit |
 | Theme | light / dark switch live |
-| Crowding | many open windows → no overlap with app icons (right-anchor holds) |
+| Crowding | many open windows and overflow pressure → hide before the candidate reaches task-list/overflow controls; show again when space returns |
 | Arch | x64 physical + ARM64 VM (RDP resolution changes included) |
 
 ## 6. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Windows update changes taskbar internals | We depend only on two window-class *rects* — the most stable surface available (survived every Win11 build to date). Failure mode: widget hides/misplaces; tray icon unaffected. Default-off + toggle = instant user-side rollback. |
+| Windows update changes taskbar internals | We depend on verifiable taskbar, tray, and task-list/overflow *rects*; if the available boundary cannot be resolved, the widget fails closed and hides. Failure mode: widget unavailable; tray icon unaffected. Default-off + toggle = instant user-side rollback. |
 | Topmost z-order battles (shell re-asserts taskbar above us) | Re-assert `HWND_TOPMOST` on every hook event; verified in Gate 0. |
 | Widget floats over fullscreen video (classic overlay bug) | Foreground-fullscreen detection is a Gate 0 pass/fail criterion, not a nice-to-have. |
 | WinUI window per-monitor quirks when the taskbar is on a secondary display | v1 is primary-taskbar-only; explicit non-goal until Phase 2. |
@@ -187,5 +195,6 @@ menu, secondary taskbars, gauge rendering, entrance animation.
 - `SetParent` embedding / living inside explorer's window tree.
 - Faking the taskbar's Mica material.
 - Replacing the tray icon — the widget is additive and opt-in.
+- Vertical primary taskbars — v1 supports horizontal primary taskbars only.
 - Graphs/charts on the taskbar (taskbar-monitor's whole point, not ours —
   our rich surface is the flyout, one click away).
