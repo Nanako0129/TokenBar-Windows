@@ -147,8 +147,12 @@ The app already ships a WH_MOUSE_LL precedent.
   toggle available but shows a short helper that the widget stays hidden until
   a displayable mode is selected; no separate widget mode is introduced.
 - `TrayService` creates/destroys the window on the setting change, same
-  pattern as the animator. Tray icon behavior is completely unchanged — it
-  remains the fallback and the only surface when the widget is off or hidden.
+  pattern as the animator. Destruction is idempotent: it calls
+  `UnhookWinEvent` for both hooks before releasing their callback delegates or
+  widget state, then removes the subclass and destroys the HWND. Re-enabling
+  creates one fresh hook pair, so repeated toggles cannot accumulate
+  registrations. Tray icon behavior is completely unchanged — it remains the
+  fallback and the only surface when the widget is off or hidden.
 - This is a **Windows-only divergence from macOS parity** (macOS has a real
   text menu-bar item and needs none of this), same bucket as the parked
   global hotkey — hence opt-in, and quota/agent-limit content follows
