@@ -45,29 +45,29 @@ public static class DayBars
 {
     public const int Window = 30;
 
-    /// <summary>Build the trailing Window-day series ending at
-    /// <paramref name="rangeEnd"/> (today, via <paramref name="endFallback"/>,
-    /// when absent). Days outside the data render as empty bars.
+    /// <summary>Build the trailing Window-day series using the active metric's
+    /// last positive selected datum as the anchor. If that metric has no datum,
+    /// fall back to the selected range end, payload range end, then the caller's
+    /// fallback date. Days outside the data render as empty bars.
     ///
-    /// <paramref name="rangeEnd"/> must be the SELECTED clients' range end
+    /// <paramref name="rangeEnd"/> is the SELECTED clients' range end
     /// (UsageStats.DateRange.End, selection-derived), NOT the unfiltered
-    /// payload.Meta.DateRange.End: a hidden client whose activity extends past
-    /// the visible clients' last day would otherwise shift the trailing window
-    /// forward and push visible activity off the chart while the range-filtered
-    /// headline stats disagree. When nothing is hidden the two are equal, so the
-    /// window is unchanged. Passing null falls back to the unfiltered
-    /// payload range end (the pre-hide behavior for callers not yet plumbed for
-    /// selection-derived ranges).</summary>
+    /// payload.Meta.DateRange.End. Membership is canonical, but agent segment
+    /// keys and labels retain each stripe's raw id.</summary>
     public static IReadOnlyList<DayBar> Build(
         UsagePayload payload,
         IReadOnlyList<string> clientIds,
         StackBy stackBy,
+        ChartMetric metric,
         ModelColorMap colors,
         string endFallback,
         string? rangeEnd = null)
     {
-        var allowed = new HashSet<string>(clientIds);
+        var allowed = clientIds
+            .Select(ClientRegistry.CanonicalClient)
+            .ToHashSet(StringComparer.Ordinal);
         var byDate = new Dictionary<string, DayBar>();
+        string? metricEnd = null;
         foreach (var contribution in payload.Contributions)
         {
             var day = BuildDayBar(contribution, allowed, stackBy, colors);
@@ -75,13 +75,37 @@ public static class DayBars
             {
                 byDate[day.Date] = day;
             }
+
+            if (contribution.Clients.Any(client =>
+                allowed.Contains(ClientRegistry.CanonicalClient(client.Client))
+                && (metric == ChartMetric.Cost
+                    ? client.Cost > 0
+                    : client.Tokens.Total > 0))
+                && (metricEnd is null
+                    || string.CompareOrdinal(contribution.Date, metricEnd) > 0))
+            {
+                metricEnd = contribution.Date;
+            }
         }
 
-        var effectiveRangeEnd = rangeEnd ?? payload.Meta.DateRange.End;
-        var end = effectiveRangeEnd.Length == 0 ? endFallback : effectiveRangeEnd;
-        // A malformed (non-empty but unparseable) range end shouldn't blank the
-        // whole chart — fall back to today's key, which is always parseable.
-        var endDay = ISODay.Parse(end) ?? ISODay.Parse(endFallback);
+        // A metric-specific tail is authoritative: a message-only tail must not
+        // move the chart, and a cost chart must not follow token-only data.
+        ISODay? endDay = null;
+        foreach (var candidate in new[]
+        {
+            metricEnd,
+            rangeEnd,
+            payload.Meta.DateRange.End,
+            endFallback,
+        })
+        {
+            if (!string.IsNullOrEmpty(candidate) && ISODay.Parse(candidate) is { } parsed)
+            {
+                endDay = parsed;
+                break;
+            }
+        }
+
         if (endDay is null)
         {
             return [];
@@ -105,13 +129,13 @@ public static class DayBars
         var grouped = new Dictionary<string, DaySegment>();
         foreach (var client in contribution.Clients)
         {
-            if (!allowed.Contains(client.Client))
+            if (!allowed.Contains(ClientRegistry.CanonicalClient(client.Client)))
             {
                 continue;
             }
 
             var tokens = client.Tokens.Total;
-            if (tokens <= 0 && client.Cost <= 0)
+            if (!UsageActivity.IsActive(tokens, client.Cost, 0))
             {
                 continue;
             }

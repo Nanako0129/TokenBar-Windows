@@ -8,10 +8,11 @@ namespace TokenBar.Core.Tests;
 public class UsageStatsTests
 {
     private static Dictionary<string, PerDay> PerDayOf(params string[] dates) =>
-        dates.ToDictionary(d => d, d => new PerDay(d, Tokens: 10, Cost: 1, Intensity: 1));
+        dates.ToDictionary(d => d, d => new PerDay(d, Tokens: 10, Cost: 1, Messages: 0, Intensity: 1));
 
-    private static ContributionClient Client(string id, long tokens, double cost = 1) =>
-        new(id, "m", "anthropic", new TokenBreakdown(tokens, 0, 0, 0, 0), cost, Messages: 1);
+    private static ContributionClient Client(
+        string id, long tokens, double cost = 1, int messages = 1) =>
+        new(id, "m", "anthropic", new TokenBreakdown(tokens, 0, 0, 0, 0), cost, messages);
 
     private static Contribution Day(string date, params ContributionClient[] clients) =>
         new(date, new ContributionTotals(0, 0, 0), 1, new TokenBreakdown(0, 0, 0, 0, 0), clients);
@@ -70,8 +71,8 @@ public class UsageStatsTests
     {
         var grid = Grid.Build("2026", new Dictionary<string, PerDay>
         {
-            ["2026-01-01"] = new("2026-01-01", 500, 1, 1),
-            ["2025-12-29"] = new("2025-12-29", 900, 1, 1),
+            ["2026-01-01"] = new("2026-01-01", 500, 1, 0, 1),
+            ["2025-12-29"] = new("2025-12-29", 900, 1, 0, 1),
         });
 
         Assert.Equal(7, grid.Rows);
@@ -84,7 +85,7 @@ public class UsageStatsTests
         var jan1 = grid.Cells.First(c => c.Date == "2026-01-01");
         Assert.Equal((0, 4, true), (jan1.Col, jan1.Row, jan1.Active));
         // Out-of-year tokens don't drive max and out-of-year cells are inactive.
-        Assert.Equal(500, grid.MaxTokens);
+        Assert.Equal(500L, grid.MaxTokens);
         Assert.False(grid.Cells.First(c => c.Date == "2025-12-29").Active);
     }
 
@@ -173,5 +174,74 @@ public class UsageStatsTests
             onlyHidden, new HashSet<string> { "gemini" }));
         Assert.True(UsageStatsVisibility.HasVisibleActivity(
             onlyHidden, new HashSet<string>()));
+    }
+
+    [Fact]
+    public void ActivityRequiresTokensCostOrMessages()
+    {
+        Assert.False(UsageActivity.IsActive(0, 0, 0));
+        Assert.True(UsageActivity.IsActive(1, 0, 0));
+        Assert.True(UsageActivity.IsActive(0, 0.01, 0));
+        Assert.True(UsageActivity.IsActive(0, 0, 1));
+    }
+
+    [Fact]
+    public void StatsCanonicalizeSelectionButKeepRawPresence()
+    {
+        var payload = Payload(
+            "2026-06-01", "2026-06-02",
+            Day("2026-06-01",
+                Client("claude-code", 10, 1, 2),
+                Client("claude", 20, 2, 3),
+                Client("codex-cli", 5, 0.5, 1),
+                Client("gemini", 100, 9, 7)));
+
+        var stats = new UsageStats(payload, new HashSet<string> { "claude", "codex" });
+        Assert.Equal(35L, stats.TotalTokens);
+        Assert.Equal(3.5, stats.TotalCost);
+        Assert.Equal(6L, Assert.Single(stats.PerDay).Messages);
+        Assert.Equal(35L, stats.MaxTokens);
+        Assert.Equal(["claude", "claude-code", "codex-cli", "gemini"], stats.PresentClients);
+    }
+
+    [Fact]
+    public void MessageOnlyAndCostOnlyDaysAreActiveEverywhere()
+    {
+        var payload = Payload(
+            "2026-06-01", "2026-06-03",
+            Day("2026-06-01", Client("claude", 0, 0, 2)),
+            Day("2026-06-02", Client("claude", 0, 1, 0)),
+            Day("2026-06-03", Client("claude", 0, 0, 0)));
+
+        var stats = new UsageStats(payload, new HashSet<string> { "claude" });
+        Assert.Equal(2, stats.ActiveDays);
+        Assert.Equal(2L, stats.PerDay.Sum(day => day.Messages));
+        Assert.Equal(1, stats.TotalCost);
+        Assert.All(stats.PerDay, day => Assert.True(day.IsActive));
+        Assert.Equal(2, stats.Streaks.Longest);
+        Assert.Equal(0, stats.Streaks.Current);
+    }
+
+    [Fact]
+    public void GridUsesSharedActivityWithoutChangingTokenScale()
+    {
+        var grid = Grid.Build("2026", new Dictionary<string, PerDay>
+        {
+            ["2026-01-01"] = new("2026-01-01", 0, 0, 2, 1),
+            ["2026-01-02"] = new("2026-01-02", 500, 0, 0, 1),
+        });
+
+        Assert.True(grid.Cells.First(c => c.Date == "2026-01-01").Active);
+        Assert.Equal(500L, grid.MaxTokens);
+    }
+
+    [Fact]
+    public void VisibilityCanonicalizesAliasesAndDoesNotTakeSelection()
+    {
+        var aliasOnly = new[] { Day("2026-05-01", Client("claude-code", 0, 0, 1)) };
+        Assert.False(UsageStatsVisibility.HasVisibleActivity(
+            aliasOnly, new HashSet<string> { "claude" }));
+        Assert.Contains("2026", UsageStatsVisibility.YearsWithVisibleActivity(
+            aliasOnly, new HashSet<string>()));
     }
 }
