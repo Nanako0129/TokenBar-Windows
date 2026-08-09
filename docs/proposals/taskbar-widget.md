@@ -91,7 +91,10 @@ of the tray, sharing its `TrayFeed` and lifetime).
 - Content: the selected `TrayMode`'s full `Title()` string (the icon truncates
   via `IconTitle`; the widget doesn't need to), quota gauge color accent when
   in `QuotaLeft` mode. One `TextBlock` + optional colored dot — no lens
-  content on the taskbar.
+  content on the taskbar. When the mode is `TrayMode.Hidden` / “Icon only”,
+  the widget is not created or remains hidden; it never shows a blank pill.
+  The existing toggle remains available, and switching back to a displayable
+  mode restores the widget.
 - Input: left-click → `FlyoutWindow.ToggleFlyout()` (pointer events arrive
   without activation). Hover tooltip (`HoverTip` reuse) and right-click menu
   are Phase 2.
@@ -119,19 +122,22 @@ no DIP conversion; text scale comes from `GetDpiForWindow` as usual
 |---|---|---|
 | Taskbar/tray rect moves (resolution, DPI, auto-hide slide, tray icons added) | `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` filtered to the two HWNDs | reposition |
 | Explorer restart | `RegisterWindowMessage("TaskbarCreated")` broadcast, received by subclassing the widget HWND (`SetWindowSubclass`) | re-resolve HWNDs, reposition, re-assert topmost |
-| Fullscreen app on the same monitor | `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` + foreground-rect ≈ monitor-rect check (the ElevenClock rule) | hide; show again when foreground shrinks |
+| Fullscreen app on the same monitor | `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` switches the current foreground HWND; `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)` re-evaluates the taskbar, tray, and current foreground HWND rects | hide/show immediately when the same HWND enters or leaves browser/video fullscreen |
 | Auto-hide taskbar | falls out of the LocationChange handling: taskbar rect mostly off-screen → hide widget | follow taskbar visibility |
 | Anything the hooks miss | piggyback `TrayFeed`'s existing 30 s fast tick with a cheap rect re-check — **no new polling timer** | self-heal |
 
 No `SetParent`, no layered color-key, no injected hooks beyond the two
-out-of-context WinEvent hooks (same machinery taskbar-monitor uses, and the
-app already ships a WH_MOUSE_LL precedent).
+out-of-context WinEvent hooks: foreground changes select the current HWND,
+and location changes re-evaluate the taskbar, tray, and that foreground HWND.
+The app already ships a WH_MOUSE_LL precedent.
 
 ### Settings & lifecycle
 
 - `tokenbar.taskbar.widget` (bool, **default off**). One toggle in Settings;
   the widget reuses the existing "Menu bar shows" mode selection rather than
-  growing its own.
+  growing its own. In `TrayMode.Hidden` / “Icon only”, Settings keeps the
+  toggle available but shows a short helper that the widget stays hidden until
+  a displayable mode is selected; no separate widget mode is introduced.
 - `TrayService` creates/destroys the window on the setting change, same
   pattern as the animator. Tray icon behavior is completely unchanged — it
   remains the fallback and the only surface when the widget is off or hidden.
