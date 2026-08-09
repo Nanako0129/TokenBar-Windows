@@ -1,8 +1,8 @@
 //! Per-model usage breakdown for the popover, backed by tokscale-core's
 //! `get_model_report`. Mirrors the design of tokscale's TUI "Models" view
-//! (`crates/tokscale-cli/src/tui/ui/models.rs`): one row per model with the
-//! token breakdown, message count, cost, and throughput (ms/1K), sorted by
-//! cost on the frontend.
+//! (`crates/tokscale-cli/src/tui/ui/models.rs`): one row per exact
+//! `(client, provider, model)` with the token breakdown, message count, cost,
+//! and throughput (ms/1K), sorted by cost on the frontend.
 //!
 //! Like `usage_graph`, this drives the async core on a short-lived
 //! current-thread runtime (callers run it inside `spawn_blocking`) and maps the
@@ -49,16 +49,29 @@ struct ModelReportData {
 /// Build the per-model report for `year` (empty string = all time).
 pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Value, String> {
     let year = normalize_year(year)?;
-    let options = context.report_options(year, None);
+    let data = load_report(report_options(context, year))?;
+    serde_json::to_value(data).map_err(|e| format!("serialize model report: {}", e))
+}
 
+fn report_options(
+    context: &crate::LocalSourceContext,
+    year: Option<String>,
+) -> tokscale_core::ReportOptions {
+    let mut options = context.report_options(year, None);
+    // Group before the FFI boundary: ClientModel would comma-join providers and
+    // C# cannot recover the original rows from that pre-aggregated value.
+    options.group_by = tokscale_core::GroupBy::ClientProviderModel;
+    options
+}
+
+fn load_report(options: tokscale_core::ReportOptions) -> Result<ModelReportData, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_model_report(options))?;
-
-    let data = map_report(report);
-    serde_json::to_value(data).map_err(|e| format!("serialize model report: {}", e))
+    runtime
+        .block_on(tokscale_core::get_model_report(options))
+        .map(map_report)
 }
 
 fn normalize_year(year: &str) -> Result<Option<String>, String> {
@@ -122,7 +135,13 @@ mod tests {
     /// #766 clamps corrupt Antigravity varints to `i64::MAX` per bucket. Two
     /// such buckets in one model entry must saturate the mapped `total`, not
     /// overflow it (a plain `+` panics in debug / wraps in release).
-    fn entry(input: i64, output: i64, cache_read: i64, cache_write: i64, reasoning: i64) -> tokscale_core::ModelUsage {
+    fn entry(
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+    ) -> tokscale_core::ModelUsage {
         tokscale_core::ModelUsage {
             client: "antigravity_cli".to_string(),
             merged_clients: None,
@@ -181,5 +200,122 @@ mod tests {
         let report = wrap(vec![entry(1, 2, 4, 8, 16)]);
         let mapped = map_report(report);
         assert_eq!(mapped.entries[0].total, 31);
+    }
+
+    #[test]
+    fn producer_groups_same_client_model_by_exact_provider() {
+        const CHILD_HOME: &str = "TB_MODEL_REPORT_PROVIDER_FIXTURE_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            run_provider_fixture(std::path::Path::new(&home));
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "tb-core-ffi-model-provider-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fixture_dir = root.join(".mux/sessions/provider-fixture");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        std::fs::write(
+            fixture_dir.join("session-usage.json"),
+            r#"{
+                "version": 1,
+                "byModel": {
+                    "openai:same-model": {
+                        "input": { "tokens": 1, "cost_usd": 0.1 },
+                        "output": { "tokens": 2 }
+                    },
+                    "nvidia:same-model": {
+                        "input": { "tokens": 3, "cost_usd": 0.2 },
+                        "output": { "tokens": 4 }
+                    },
+                    "same-model": {
+                        "input": { "tokens": 5, "cost_usd": 0.3 },
+                        "output": { "tokens": 6 }
+                    }
+                },
+                "lastRequest": { "timestamp": 1700000000000 }
+            }"#,
+        )
+        .unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("model_report::tests::producer_groups_same_client_model_by_exact_provider")
+            .arg("--exact")
+            .env(CHILD_HOME, &root)
+            .env("HOME", &root)
+            .env("TOKSCALE_CONFIG_DIR", root.join("tokscale-config"))
+            .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(status.success(), "isolated provider fixture failed");
+    }
+
+    fn run_provider_fixture(home: &std::path::Path) {
+        let context = crate::LocalSourceContext {
+            home_dir: Some(home.to_path_buf()),
+        };
+        let mut options = report_options(&context, None);
+        options.use_env_roots = false;
+        options.clients = Some(vec!["mux".to_string()]);
+        assert_eq!(
+            options.group_by,
+            tokscale_core::GroupBy::ClientProviderModel
+        );
+
+        let report = load_report(options).unwrap();
+        assert_eq!(report.entries.len(), 3);
+        assert!(report.entries.iter().all(|entry| entry.client == "mux"
+            && entry.model == "same-model"
+            && !entry.provider.contains(',')));
+
+        let by_provider: std::collections::HashMap<_, _> = report
+            .entries
+            .iter()
+            .map(|entry| (entry.provider.as_str(), entry))
+            .collect();
+        assert_eq!(
+            (
+                by_provider["openai"].input,
+                by_provider["openai"].output,
+                by_provider["openai"].total,
+                by_provider["openai"].message_count,
+            ),
+            (1, 2, 3, 1)
+        );
+        assert_eq!(
+            (
+                by_provider["nvidia"].input,
+                by_provider["nvidia"].output,
+                by_provider["nvidia"].total,
+                by_provider["nvidia"].message_count,
+            ),
+            (3, 4, 7, 1)
+        );
+        assert_eq!(
+            (
+                by_provider[""].input,
+                by_provider[""].output,
+                by_provider[""].total,
+                by_provider[""].message_count,
+            ),
+            (5, 6, 11, 1)
+        );
+        assert!((by_provider["openai"].cost - 0.1).abs() < f64::EPSILON);
+        assert!((by_provider["nvidia"].cost - 0.2).abs() < f64::EPSILON);
+        assert!((by_provider[""].cost - 0.3).abs() < f64::EPSILON);
+        assert_eq!(
+            report.entries.iter().map(|entry| entry.total).sum::<i64>(),
+            21
+        );
+        assert_eq!(report.total_input, 9);
+        assert_eq!(report.total_output, 12);
+        assert_eq!(report.total_messages, 3);
+        assert!((report.total_cost - 0.6).abs() < f64::EPSILON);
     }
 }

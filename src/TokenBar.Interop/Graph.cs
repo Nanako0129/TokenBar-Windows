@@ -68,7 +68,8 @@ public sealed record Contribution(
     ContributionTotals Totals,
     int Intensity,
     TokenBreakdown TokenBreakdown,
-    IReadOnlyList<ContributionClient> Clients);
+    IReadOnlyList<ContributionClient> Clients,
+    IReadOnlyDictionary<string, long>? TurnsByClient = null);
 
 public sealed record DateRange(
     string Start,

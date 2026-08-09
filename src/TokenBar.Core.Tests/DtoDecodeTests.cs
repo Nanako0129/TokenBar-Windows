@@ -369,6 +369,7 @@ public class DtoDecodeTests
                "range":{"start":"2026-01-01","end":"2026-07-02"}}],
              "contributions":[{"date":"2026-07-01","totals":{"tokens":50,"cost":0.7,"messages":3},
                "intensity":2,"tokenBreakdown":{"input":10,"output":20,"cacheRead":15,"cacheWrite":5,"reasoning":0},
+               "turnsByClient":{"cc-mirror/foo":2},
                "clients":[{"client":"claude","modelId":"m","providerId":"anthropic",
                  "tokens":{"input":10,"output":20,"cacheRead":15,"cacheWrite":5,"reasoning":0},
                  "cost":0.7,"messages":3}]}]}}
@@ -377,6 +378,19 @@ public class DtoDecodeTests
         Assert.Equal(8, p.Summary.ActiveDays);
         Assert.Equal("anthropic", p.Contributions[0].Clients[0].ProviderId);
         Assert.Equal(15, p.Contributions[0].TokenBreakdown.CacheRead);
+        Assert.Equal(2, p.Contributions[0].TurnsByClient!["cc-mirror/foo"]);
+    }
+
+    [Fact]
+    public void ContributionTurnsByClientAllowsAbsentOrEmptyMaps()
+    {
+        Contribution DecodeContribution(string suffix) =>
+            JsonSerializer.Deserialize<Contribution>(
+                $$"""{"date":"2026-08-09","totals":{"tokens":0,"cost":0,"messages":1},"intensity":0,"tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},"clients":[]{{suffix}}}""",
+                Web) ?? throw new InvalidOperationException("contribution decoded to null");
+
+        Assert.Null(DecodeContribution("").TurnsByClient);
+        Assert.Empty(DecodeContribution(",\"turnsByClient\":{}").TurnsByClient!);
     }
 
     [Fact]

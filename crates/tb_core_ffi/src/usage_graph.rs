@@ -7,6 +7,8 @@
 //! maps the resulting `GraphResult` back onto the camelCase JSON shape the
 //! frontend already consumes (`src/lib/types.ts` `UsagePayload`).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -49,6 +51,7 @@ struct DailyContribution {
     intensity: u8,
     token_breakdown: TokenBreakdown,
     clients: Vec<ClientContribution>,
+    turns_by_client: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +200,7 @@ fn map_contribution(day: tokscale_core::DailyContribution) -> DailyContribution 
                 messages: c.messages,
             })
             .collect(),
+        turns_by_client: day.turns_by_client,
     }
 }
 
@@ -207,5 +211,53 @@ fn map_breakdown(breakdown: &tokscale_core::TokenBreakdown) -> TokenBreakdown {
         cache_read: breakdown.cache_read,
         cache_write: breakdown.cache_write,
         reasoning: breakdown.reasoning,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine_day(
+        date: &str,
+        messages: i32,
+        turns_by_client: BTreeMap<String, i64>,
+    ) -> tokscale_core::DailyContribution {
+        tokscale_core::DailyContribution {
+            date: date.to_string(),
+            totals: tokscale_core::DailyTotals {
+                messages,
+                ..Default::default()
+            },
+            intensity: 0,
+            token_breakdown: tokscale_core::TokenBreakdown::default(),
+            clients: Vec::new(),
+            active_time_ms: None,
+            turns_by_client,
+        }
+    }
+
+    #[test]
+    fn maps_daily_turns_by_exact_client_and_keeps_message_only_days_empty() {
+        let mapped = map_contribution(engine_day(
+            "2026-08-08",
+            4,
+            BTreeMap::from([("cc-mirror/foo".to_string(), 1), ("claude".to_string(), 2)]),
+        ));
+
+        assert_eq!(mapped.turns_by_client.get("cc-mirror/foo"), Some(&1));
+        assert_eq!(mapped.turns_by_client.get("claude"), Some(&2));
+        assert_eq!(mapped.turns_by_client.values().sum::<i64>(), 3);
+        let wire = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(wire["turnsByClient"]["cc-mirror/foo"], 1);
+        assert!(wire.get("turns_by_client").is_none());
+
+        let message_only = map_contribution(engine_day("2026-08-09", 5, BTreeMap::new()));
+        assert_eq!(message_only.totals.messages, 5);
+        assert!(message_only.turns_by_client.is_empty());
+        assert_eq!(
+            serde_json::to_value(message_only).unwrap()["turnsByClient"],
+            serde_json::json!({})
+        );
     }
 }
