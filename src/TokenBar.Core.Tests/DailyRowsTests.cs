@@ -18,7 +18,7 @@ public class DailyRowsTests
 
     private static UsagePayload Payload(params Contribution[] days) =>
         new(
-            new UsageMeta("g", "v", new DateRange("2026-06-01", "2026-06-30")),
+            new UsageMeta("g", "v", new DateRange("2026-06-01", "2026-06-30"), PricingMode.BestEffort, CostCoverage.Complete),
             new UsageSummary(0, 0, 0, 0, 0, 0, [], []), [], days);
 
     [Fact]

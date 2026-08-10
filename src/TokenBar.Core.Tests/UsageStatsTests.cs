@@ -19,7 +19,7 @@ public class UsageStatsTests
 
     private static UsagePayload Payload(string metaStart, string metaEnd, params Contribution[] days) =>
         new(
-            new UsageMeta("g", "v", new DateRange(metaStart, metaEnd)),
+            new UsageMeta("g", "v", new DateRange(metaStart, metaEnd), PricingMode.BestEffort, CostCoverage.Complete),
             new UsageSummary(0, 0, 0, 0, 0, 0, [], []),
             [],
             days);

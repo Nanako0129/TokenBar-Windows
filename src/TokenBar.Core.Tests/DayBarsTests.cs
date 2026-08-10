@@ -16,7 +16,7 @@ public class DayBarsTests
 
     private static UsagePayload Payload(string metaEnd, params Contribution[] days) =>
         new(
-            new UsageMeta("g", "v", new DateRange("2026-06-01", metaEnd)),
+            new UsageMeta("g", "v", new DateRange("2026-06-01", metaEnd), PricingMode.BestEffort, CostCoverage.Complete),
             new UsageSummary(0, 0, 0, 0, 0, 0, [], []),
             [],
             days);

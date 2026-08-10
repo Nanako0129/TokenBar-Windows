@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace TokenBar.Interop;
 
 // Contribution-graph payload (`UsagePayload` in the Tauri frontend's
@@ -81,10 +83,35 @@ public sealed record YearMeta(
     double TotalCost,
     DateRange Range);
 
+public enum PricingMode
+{
+    [JsonStringEnumMemberName("localOnly")]
+    LocalOnly,
+
+    [JsonStringEnumMemberName("bestEffort")]
+    BestEffort,
+}
+
+public enum CostCoverage
+{
+    [JsonStringEnumMemberName("complete")]
+    Complete,
+
+    [JsonStringEnumMemberName("partial")]
+    Partial,
+
+    [JsonStringEnumMemberName("none")]
+    None,
+}
+
 public sealed record UsageMeta(
     string GeneratedAt,
     string Version,
-    DateRange DateRange);
+    DateRange DateRange,
+    [property: JsonRequired]
+    [property: JsonPropertyName("pricingMode")] PricingMode PricingMode,
+    [property: JsonRequired]
+    [property: JsonPropertyName("costCoverage")] CostCoverage CostCoverage);
 
 public sealed record UsageSummary(
     long TotalTokens,

@@ -22,6 +22,9 @@ internal static partial class NativeMethods
     internal static partial nint tb_graph(string? year);
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint tb_graph_local_first(string? year);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint tb_refresh_graph(string? year);
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
