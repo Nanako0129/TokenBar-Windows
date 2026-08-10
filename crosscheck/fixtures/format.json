@@ -3,7 +3,9 @@
     "meta": {
       "generatedAt": "2026-07-10T10:30:00Z",
       "version": "crosscheck",
-      "dateRange": { "start": "2026-07-08", "end": "2026-07-10" }
+      "dateRange": { "start": "2026-07-08", "end": "2026-07-10" },
+      "pricingMode": "bestEffort",
+      "costCoverage": "complete"
     },
     "summary": {
       "totalTokens": 5100, "totalCost": 2.13, "totalDays": 2, "activeDays": 2,
