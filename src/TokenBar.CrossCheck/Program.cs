@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using TokenBar.Core;
 using TokenBar.Interop;
@@ -32,6 +33,11 @@ var wire = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 {
     RespectRequiredConstructorParameters = true,
     RespectNullableAnnotations = true,
+    Converters =
+    {
+        new JsonStringEnumConverter<PricingMode>(allowIntegerValues: false),
+        new JsonStringEnumConverter<CostCoverage>(allowIntegerValues: false),
+    },
 };
 var outOpts = new JsonSerializerOptions { WriteIndented = true };
 

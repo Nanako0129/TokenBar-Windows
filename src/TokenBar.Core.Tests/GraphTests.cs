@@ -41,7 +41,7 @@ public class GraphTests
 
     private static UsagePayload PayloadWith(params Contribution[] contributions) =>
         new(
-            new UsageMeta("g", "v", new DateRange("2026-07-01", "2026-07-02")),
+            new UsageMeta("g", "v", new DateRange("2026-07-01", "2026-07-02"), PricingMode.BestEffort, CostCoverage.Complete),
             new UsageSummary(999, 9.9, 2, 2, 5, 5, ["claude", "codex"], ["m"]),
             [],
             contributions);

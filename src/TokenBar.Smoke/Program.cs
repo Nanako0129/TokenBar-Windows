@@ -60,6 +60,16 @@ Step("tb_graph", () =>
            $"totalTokens={g.Summary.TotalTokens} totalCost={g.Summary.TotalCost:F2}";
 });
 
+Step("tb_graph_local_first", () =>
+{
+    var g = TbCore.GraphLocalFirst();
+    if (expectedClient is not null && !g.Summary.Clients.Contains(expectedClient))
+        throw new InvalidOperationException(
+            $"tb_graph_local_first expected client '{expectedClient}' in Summary.Clients");
+    return $"ok days={g.Contributions.Count} totalTokens={g.Summary.TotalTokens} " +
+           $"mode={g.Meta.PricingMode} coverage={g.Meta.CostCoverage}";
+});
+
 Step("tb_refresh_graph", () =>
 {
     var g = TbCore.RefreshGraph();

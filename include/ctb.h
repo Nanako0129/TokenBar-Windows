@@ -57,6 +57,9 @@ char *tb_probe(void);
 
 // Contribution graph (UsagePayload). Serves a <=30s-old cached payload.
 char *tb_graph(const char *year);
+// Contribution graph, local-first per call: bypasses pricing resolution and the
+// authoritative year-only graph cache. Provider-reported costs remain intact.
+char *tb_graph_local_first(const char *year);
 // Contribution graph, always recomputed (cache refreshed as a side effect).
 char *tb_refresh_graph(const char *year);
 

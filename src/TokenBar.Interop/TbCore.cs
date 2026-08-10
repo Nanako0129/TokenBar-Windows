@@ -27,6 +27,8 @@ public static class TbCore
         Converters =
         {
             new JsonStringEnumConverter<FilterParityStatus>(allowIntegerValues: false),
+            new JsonStringEnumConverter<PricingMode>(allowIntegerValues: false),
+            new JsonStringEnumConverter<CostCoverage>(allowIntegerValues: false),
         },
     };
 
@@ -47,6 +49,14 @@ public static class TbCore
     /// time). Served from a &lt;=30s cache inside the cdylib when warm.</summary>
     public static UsagePayload Graph(string? year = null) =>
         Unwrap<UsagePayload>(NativeMethods.tb_graph(year));
+
+    /// <summary>
+    /// Contribution graph from the local scan for this call only. This is a
+    /// blocking off-UI-thread operation; it bypasses outbound pricing
+    /// resolution and the authoritative year-only graph cache.
+    /// </summary>
+    public static UsagePayload GraphLocalFirst(string? year = null) =>
+        Unwrap<UsagePayload>(NativeMethods.tb_graph_local_first(year));
 
     /// <summary>Contribution graph, always recomputed.</summary>
     public static UsagePayload RefreshGraph(string? year = null) =>

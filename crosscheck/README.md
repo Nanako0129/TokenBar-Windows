@@ -25,7 +25,7 @@ Canonical fixture fingerprints:
 |---|---:|---|
 | `fixtures/provider-quota-pace-v3.json` | 7,625 | `412f6ffd05f23f00266820c243376f265d29024d9e419217e55f8e1559b36c50` |
 | `fixtures/usage-pace.json` | 13,532 | `9a83616ea5053b2073dcfbcfb975c923d8597c0c41ddd5877ac0ddd8a9b7806c` |
-| `fixtures/format.json` | 7,504 | `408ac7604e1661b2732c05c8e113d62b6d365cd8ea02004933f681cf99ad0913` |
+| `fixtures/format.json` | 7,573 | `eff7638ba5c1826ae2dff3a24055f907d718b15eba801db30b3066db1efb9d6d` |
 
 Observed provider-v3 output fingerprints at the reconciliation gate:
 

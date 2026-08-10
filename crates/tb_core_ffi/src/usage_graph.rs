@@ -88,6 +88,8 @@ struct ExportMeta {
     generated_at: String,
     version: String,
     date_range: DateRange,
+    pricing_mode: String,
+    cost_coverage: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,12 +103,25 @@ struct TokenContributionData {
 
 /// Build the contribution-graph payload for `year` (empty string = all time).
 ///
-/// Invoked from `lib.rs` inside `spawn_blocking`, so the calling thread has no
-/// Tokio reactor — we spin up a short-lived current-thread runtime to drive
-/// the async `generate_local_graph_report`. That entry point uses cached
-/// pricing with a graceful offline fallback, and `PricingService` is a process
-/// -wide `OnceCell`, so the network fetch happens at most once per launch.
+/// The existing path remains best-effort and retains its pricing fallback.
 pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Value, String> {
+    run_mode(context, year, false)
+}
+
+/// Build a per-call local-first graph. The engine entry structurally bypasses
+/// pricing resolution and therefore cannot invoke an outbound pricing loader.
+pub(crate) fn run_local_first(
+    context: &crate::LocalSourceContext,
+    year: &str,
+) -> Result<Value, String> {
+    run_mode(context, year, true)
+}
+
+fn run_mode(
+    context: &crate::LocalSourceContext,
+    year: &str,
+    local_only: bool,
+) -> Result<Value, String> {
     let year = normalize_year(year)?;
     let options = context.report_options(year, None);
 
@@ -114,9 +129,17 @@ pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Val
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let graph = runtime.block_on(tokscale_core::generate_local_graph_report(options))?;
+    let report = if local_only {
+        runtime.block_on(tokscale_core::generate_local_graph_report_local_only(
+            options,
+        ))?
+    } else {
+        runtime.block_on(tokscale_core::generate_local_graph_report_with_contract(
+            options,
+        ))?
+    };
 
-    let payload = map_graph(graph);
+    let payload = map_graph(report);
     serde_json::to_value(payload).map_err(|e| format!("serialize usage graph: {}", e))
 }
 
@@ -137,7 +160,15 @@ fn normalize_year(year: &str) -> Result<Option<String>, String> {
 /// `range_start/end`, the frontend expects nested `{ start, end }`. Extra
 /// tokscale fields (`active_time_ms`, `time_metrics`, `processing_time_ms`)
 /// are intentionally dropped. The reported `version` is branded as tokenbar.
-fn map_graph(graph: tokscale_core::GraphResult) -> TokenContributionData {
+fn map_graph(report: tokscale_core::GraphResultWithContract) -> TokenContributionData {
+    let (graph, contract) = report.into_parts();
+    map_graph_with_contract(graph, contract)
+}
+
+fn map_graph_with_contract(
+    graph: tokscale_core::GraphResult,
+    contract: tokscale_core::GraphMetaContract,
+) -> TokenContributionData {
     TokenContributionData {
         meta: ExportMeta {
             generated_at: graph.meta.generated_at,
@@ -146,6 +177,8 @@ fn map_graph(graph: tokscale_core::GraphResult) -> TokenContributionData {
                 start: graph.meta.date_range_start,
                 end: graph.meta.date_range_end,
             },
+            pricing_mode: contract.pricing_mode.as_wire().to_string(),
+            cost_coverage: contract.cost_coverage.as_wire().to_string(),
         },
         summary: DataSummary {
             total_tokens: graph.summary.total_tokens,
@@ -235,6 +268,30 @@ mod tests {
             active_time_ms: None,
             turns_by_client,
         }
+    }
+
+    #[test]
+    fn maps_graph_meta_to_exact_camel_case_mode_and_coverage() {
+        let graph = tokscale_core::build_graph_result_from_messages(&[], None);
+        let payload = map_graph_with_contract(
+            graph,
+            tokscale_core::GraphMetaContract {
+                pricing_mode: tokscale_core::GraphPricingMode::LocalOnly,
+                cost_coverage: tokscale_core::CostCoverage::Partial,
+            },
+        );
+        let wire = serde_json::to_value(payload).unwrap();
+        assert_eq!(wire["meta"]["pricingMode"], "localOnly");
+        assert_eq!(wire["meta"]["costCoverage"], "partial");
+        assert!(wire["meta"].get("pricing_mode").is_none());
+        assert!(wire["meta"].get("cost_coverage").is_none());
+    }
+
+    #[test]
+    fn invalid_year_is_rejected_before_engine_scan() {
+        let context = crate::LocalSourceContext { home_dir: None };
+        let error = run_local_first(&context, "26").unwrap_err();
+        assert!(error.contains("invalid year filter"));
     }
 
     #[test]

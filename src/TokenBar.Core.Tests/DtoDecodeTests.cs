@@ -362,7 +362,8 @@ public class DtoDecodeTests
     {
         var json = """
             {"ok":true,"data":{
-             "meta":{"generatedAt":"g","version":"v","dateRange":{"start":"2026-01-01","end":"2026-07-02"}},
+             "meta":{"generatedAt":"g","version":"v","dateRange":{"start":"2026-01-01","end":"2026-07-02"},
+               "pricingMode":"localOnly","costCoverage":"partial"},
              "summary":{"totalTokens":100,"totalCost":1.5,"totalDays":10,"activeDays":8,
                "averagePerDay":10.0,"maxCostInSingleDay":0.9,"clients":["claude"],"models":["m"]},
              "years":[{"year":"2026","totalTokens":100,"totalCost":1.5,
@@ -376,9 +377,63 @@ public class DtoDecodeTests
             """;
         var p = TbCore.DecodeEnvelope<UsagePayload>(json);
         Assert.Equal(8, p.Summary.ActiveDays);
+        Assert.Equal(PricingMode.LocalOnly, p.Meta.PricingMode);
+        Assert.Equal(CostCoverage.Partial, p.Meta.CostCoverage);
         Assert.Equal("anthropic", p.Contributions[0].Clients[0].ProviderId);
         Assert.Equal(15, p.Contributions[0].TokenBreakdown.CacheRead);
         Assert.Equal(2, p.Contributions[0].TurnsByClient!["cc-mirror/foo"]);
+    }
+
+    private static string GraphEnvelope(string metadata) =>
+        $$"""
+        {
+          "ok":true,
+          "data":{
+            "meta":{
+              "generatedAt":"g",
+              "version":"v",
+              "dateRange":{"start":"2026-01-01","end":"2026-07-02"}{{metadata}}
+            },
+            "summary":{
+              "totalTokens":0,
+              "totalCost":0,
+              "totalDays":0,
+              "activeDays":0,
+              "averagePerDay":0,
+              "maxCostInSingleDay":0,
+              "clients":[],
+              "models":[]
+            },
+            "years":[],
+            "contributions":[]
+          }
+        }
+        """;
+
+    [Fact]
+    public void UsageMetaRequiresKnownStringModeAndCoverage()
+    {
+        var payload = TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":\"localOnly\",\"costCoverage\":\"complete\""));
+        Assert.Equal(PricingMode.LocalOnly, payload.Meta.PricingMode);
+        Assert.Equal(CostCoverage.Complete, payload.Meta.CostCoverage);
+
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"costCoverage\":\"complete\"")));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":\"localOnly\"")));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":null,\"costCoverage\":\"complete\"")));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":\"future\",\"costCoverage\":\"complete\"")));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":0,\"costCoverage\":\"complete\"")));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":\"localOnly\",\"costCoverage\":null")));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":\"localOnly\",\"costCoverage\":\"future\"")));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<UsagePayload>(
+            GraphEnvelope(",\"pricingMode\":\"localOnly\",\"costCoverage\":0")));
     }
 
     [Fact]

@@ -401,6 +401,24 @@ pub unsafe extern "C" fn tb_graph(year: *const c_char) -> *mut c_char {
     })
 }
 
+/// Contribution graph for `year` (NULL/empty = all time), computed from the
+/// local scan without reading or writing the authoritative `GRAPH_CACHE`.
+/// The engine's local-first entry also bypasses pricing resolution by
+/// construction; provider-reported message costs remain authoritative.
+///
+/// # Safety
+/// `year` must be NULL or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_graph_local_first(year: *const c_char) -> *mut c_char {
+    guarded("tb_graph_local_first", || {
+        let context = LocalSourceContext::current();
+        envelope(
+            unsafe { year_from(year) }
+                .and_then(|year| usage_graph::run_local_first(&context, &year)),
+        )
+    })
+}
+
 /// Force-recompute the contribution graph for `year`, bypassing the cache.
 ///
 /// # Safety
@@ -563,7 +581,41 @@ pub unsafe extern "C" fn tb_free(p: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
     use usage_tail::UsageTailer;
+
+    static GRAPH_CACHE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+            let guard = Self(
+                vars.iter()
+                    .map(|(key, _)| (*key, std::env::var_os(key)))
+                    .collect(),
+            );
+            unsafe {
+                for (key, value) in vars {
+                    std::env::set_var(key, value);
+                }
+            }
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn select_user_home_prefers_non_empty_home() {
@@ -855,6 +907,89 @@ mod tests {
         let st = lock_tick();
         assert!(!st.in_flight);
         assert!(st.last.is_none()); // unstamped → next poll re-ticks
+    }
+
+    #[test]
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    fn local_first_is_cache_isolated_in_both_call_orders_and_validates_abi_year() {
+        let _lock = GRAPH_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "tokenbar-ffi-local-first-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let data_root = root.join("data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", root.as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", root.as_os_str()),
+            ("XDG_DATA_HOME", data_root.as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        // Best-effort first populates the authoritative cache; local-first must
+        // neither hit it nor change its payload.
+        let best_effort = unsafe { take(tb_graph(std::ptr::null())) };
+        assert!(best_effort.contains(r#""ok":true"#), "{best_effort}");
+        let cached_after_best_effort = GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("")
+            .cloned()
+            .expect("best-effort graph should populate its cache");
+        let local_first = unsafe { take(tb_graph_local_first(std::ptr::null())) };
+        assert!(local_first.contains(r#""ok":true"#), "{local_first}");
+        assert!(
+            local_first.contains(r#""pricingMode":"localOnly""#),
+            "{local_first}"
+        );
+        assert_eq!(
+            GRAPH_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get("")
+                .cloned(),
+            Some(cached_after_best_effort)
+        );
+
+        // Reverse order: local-first computes an empty fixture without creating
+        // an authoritative cache entry, then the legacy path still can create it.
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let local_first_first = unsafe { take(tb_graph_local_first(std::ptr::null())) };
+        assert!(
+            local_first_first.contains(r#""ok":true"#),
+            "{local_first_first}"
+        );
+        assert!(GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        let _best_effort_after = unsafe { take(tb_graph(std::ptr::null())) };
+        assert!(GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(""));
+
+        let invalid_year = std::ffi::CString::new("26").unwrap();
+        let invalid = unsafe { take(tb_graph_local_first(invalid_year.as_ptr())) };
+        assert!(invalid.contains(r#""ok":false"#), "{invalid}");
+        assert!(invalid.contains("invalid year filter"), "{invalid}");
+
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        drop(_env);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
