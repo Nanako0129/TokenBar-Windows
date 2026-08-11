@@ -497,9 +497,10 @@ public sealed class DashboardModel
 
         if (previous is { } old && old.Query != requestId.Query)
         {
+            // Year payloads cannot reconstruct hidden-only year visibility.
+            // Keep the retained all-time graph while clearing the rendered query.
             Current = null;
             _lastSnapshot = null;
-            _allTimeGraph = null;
             Updated?.Invoke();
             return;
         }
@@ -560,19 +561,9 @@ public sealed class DashboardModel
             }
 
             var year = publication.RequestId.Query.Year;
-            if (year is not null
-                && !publication.Payload.Years.Any(y => y.Year == year))
+            if (GraphYearPolicy.ShouldClearToAllTime(_year, publication))
             {
-                lock (_yearGate)
-                {
-                    if (_year == year)
-                    {
-                        _year = null;
-                        AppSettings.Store.Remove("tokenbar.dashboard.year");
-                    }
-                }
-
-                Updated?.Invoke();
+                SetYear(null);
                 return;
             }
 

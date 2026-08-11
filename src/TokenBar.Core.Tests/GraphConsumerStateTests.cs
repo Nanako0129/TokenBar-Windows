@@ -7,7 +7,8 @@ public class GraphConsumerStateTests
 {
     private static UsagePayload Payload(
         PricingMode pricing = PricingMode.BestEffort,
-        CostCoverage coverage = CostCoverage.Complete) =>
+        CostCoverage coverage = CostCoverage.Complete,
+        IReadOnlyList<YearMeta>? years = null) =>
         new(
             new UsageMeta(
                 "generated",
@@ -16,7 +17,7 @@ public class GraphConsumerStateTests
                 pricing,
                 coverage),
             new UsageSummary(1, 2, 1, 1, 2, 2, [], []),
-            [],
+            years ?? [],
             []);
 
     private static GraphRequestId Id(string? year, long generation) =>
@@ -54,6 +55,33 @@ public class GraphConsumerStateTests
         Assert.True(rerun.IsCurrent);
         Assert.True(rerun.ShouldRerun);
         Assert.False(rerun.ClearRefreshing);
+    }
+
+    [Fact]
+    public void MissingYearPolicyClearsOnlyTheExactSelectedYear()
+    {
+        var missing = new GraphPublication(
+            Id("2026", 1),
+            GraphPublicationStage.LocalFirst,
+            Payload());
+        var present = missing with
+        {
+            Payload = Payload(years:
+            [
+                new YearMeta(
+                    "2026",
+                    1,
+                    2,
+                    new DateRange("2026-01-01", "2026-12-31")),
+            ]),
+        };
+        var allTime = missing with { RequestId = Id(null, 2) };
+
+        Assert.True(GraphYearPolicy.ShouldClearToAllTime("2026", missing));
+        Assert.False(GraphYearPolicy.ShouldClearToAllTime("2025", missing));
+        Assert.False(GraphYearPolicy.ShouldClearToAllTime(null, missing));
+        Assert.False(GraphYearPolicy.ShouldClearToAllTime("2026", present));
+        Assert.False(GraphYearPolicy.ShouldClearToAllTime("2026", allTime));
     }
 
     [Fact]

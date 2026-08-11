@@ -27,6 +27,16 @@ public static class GraphResumePolicy
         attachment.RequestId.Query.Year is not null && !attachment.InFlight;
 }
 
+public static class GraphYearPolicy
+{
+    public static bool ShouldClearToAllTime(
+        string? selectedYear,
+        GraphPublication publication) =>
+        selectedYear is not null
+        && publication.RequestId.Query.Year == selectedYear
+        && !publication.Payload.Years.Any(year => year.Year == selectedYear);
+}
+
 /// <summary>Pure consumer gate for one retained graph pipeline. UI-facing
 /// properties may only change after these exact request/generation checks.</summary>
 public sealed class GraphConsumerState : IDisposable
