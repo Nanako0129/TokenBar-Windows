@@ -38,7 +38,7 @@ public sealed class TrayService : IDisposable
     private TaskCompletionSource<bool>? _readyTcs;
     private bool _trayCreationFailed;
 
-    public TrayService(FlyoutWindow flyout)
+    public TrayService(FlyoutWindow flyout, GraphRequestCoordinator graphCoordinator)
     {
         _icon = new TaskbarIcon
         {
@@ -59,7 +59,7 @@ public sealed class TrayService : IDisposable
         _icon.ContextMenuMode = ContextMenuMode.PopupMenu;
 
         _dispatcher = DispatcherQueue.GetForCurrentThread();
-        _feed = new TrayFeed(_dispatcher);
+        _feed = new TrayFeed(_dispatcher, graphCoordinator);
         _animator = new TrayAnimator(_dispatcher, () => _feed.TokensPerMin, ApplyCachedIcon);
         OpenSettings = ShowSettings;
         _feed.Changed += () =>
@@ -348,8 +348,10 @@ public sealed class TrayService : IDisposable
         var lines = new List<string>
         {
             ProductIdentity.Name,
-            $"Today {Format.CompactTokens(totals.TodayTokens)} · {Format.Usd(totals.TodayCost)}",
-            $"All time {Format.CompactTokens(totals.TotalTokens)} · {Format.Usd(totals.TotalCost)}",
+            $"Today {Format.CompactTokens(totals.TodayTokens)} · "
+                + CostSurfaceProjection.CostText(totals.TodayCost, _feed.CostAuthoritative),
+            $"All time {Format.CompactTokens(totals.TotalTokens)} · "
+                + CostSurfaceProjection.CostText(totals.TotalCost, _feed.CostAuthoritative),
         };
         var persistedSelection = AppSettings.Store.GetString(
             "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
@@ -372,7 +374,12 @@ public sealed class TrayService : IDisposable
             AppSettings.Store.GetString("tokenbar.icon.coloring"));
         var dark = IsSystemDark();
         var remaining = _feed.QuotaRemaining;
-        var title = mode.Title(_feed.VisibleTotals, _feed.TokensPerMin, remaining);
+        var title = CostSurfaceProjection.TrayTitle(
+            mode,
+            _feed.VisibleTotals,
+            _feed.TokensPerMin,
+            remaining,
+            _feed.CostAuthoritative);
 
         // The tooltip is the summary layer (parity table #1): it carries the
         // full figures whatever the icon shows — including the icon-only

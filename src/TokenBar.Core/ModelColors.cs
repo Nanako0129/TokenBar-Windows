@@ -5,8 +5,8 @@ namespace TokenBar.Core;
 
 // Provider-based model coloring, port of TokenBarCore/ModelColors.swift
 // (originally src/lib/modelColors.ts, itself ported from tokscale's TUI).
-// Each provider has a base color; models within a provider are cost-ranked
-// and tinted toward white by rank, so the priciest model reads darkest.
+// Each provider has a base color; models within a provider are ranked and
+// tinted toward white by rank. Cost ranking is used only for authoritative data.
 // Colors are hex strings so this stays UI-framework-free.
 
 public static class ModelColors
@@ -102,7 +102,9 @@ public sealed class ModelColorMap
 {
     private readonly Dictionary<string, string> _colorByKeyModel = [];
 
-    public ModelColorMap(IEnumerable<(string Provider, string Model, double Cost)> entries)
+    public ModelColorMap(
+        IEnumerable<(string Provider, string Model, double Cost)> entries,
+        bool costAuthoritative = true)
     {
         // provider key → model → summed cost
         var byProvider = new Dictionary<string, Dictionary<string, double>>();
@@ -123,9 +125,11 @@ public sealed class ModelColorMap
         {
             var baseColor = ModelColors.ProviderBase.GetValueOrDefault(
                 providerKey, ModelColors.ProviderBase["unknown"]);
-            var ranked = models
-                .OrderByDescending(kv => kv.Value)
-                .ThenBy(kv => kv.Key, StringComparer.Ordinal);
+            var ranked = costAuthoritative
+                ? models
+                    .OrderByDescending(kv => kv.Value)
+                    .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                : models.OrderBy(kv => kv.Key, StringComparer.Ordinal);
             var rank = 0;
             foreach (var (model, _) in ranked)
             {
@@ -135,8 +139,10 @@ public sealed class ModelColorMap
         }
     }
 
-    public ModelColorMap(ModelReport? report)
-        : this((report?.Entries ?? []).Select(e => (e.Provider, e.Model, e.Cost)))
+    public ModelColorMap(ModelReport? report, bool costAuthoritative = true)
+        : this(
+            (report?.Entries ?? []).Select(e => (e.Provider, e.Model, e.Cost)),
+            costAuthoritative)
     {
     }
 

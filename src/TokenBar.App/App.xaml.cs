@@ -11,6 +11,7 @@ public partial class App : Application
 
     private TrayService? _tray;
     private FlyoutWindow? _flyout;
+    private GraphRequestCoordinator? _graphCoordinator;
     private bool _started;
     private bool _startupSmokeRequested;
     private string? _startupSmokePath;
@@ -54,10 +55,12 @@ public partial class App : Application
 
         try
         {
+            DevLog.Write("launch: creating graph coordinator");
+            _graphCoordinator = new GraphRequestCoordinator();
             DevLog.Write("launch: creating flyout");
-            _flyout = new FlyoutWindow();
+            _flyout = new FlyoutWindow(_graphCoordinator);
             DevLog.Write("launch: creating tray");
-            _tray = new TrayService(_flyout);
+            _tray = new TrayService(_flyout, _graphCoordinator);
             DevLog.Write("launch: tray up");
 
             if (Environment.GetCommandLineArgs().Contains("--dump-tray-icons"))

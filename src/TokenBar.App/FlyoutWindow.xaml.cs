@@ -22,11 +22,12 @@ public sealed partial class FlyoutWindow : Window
 
     private readonly DashboardModel _model;
 
-    public FlyoutWindow()
+    public FlyoutWindow(GraphRequestCoordinator graphCoordinator)
     {
         InitializeComponent();
 
-        _model = new DashboardModel(DispatcherQueue);
+        _model = new DashboardModel(DispatcherQueue, graphCoordinator);
+        Closed += (_, _) => _model.Dispose();
         _model.Updated += RenderSnapshot;
         Dashboard.Bind(_model);
         Dashboard.HideRequested += HideFlyout;
