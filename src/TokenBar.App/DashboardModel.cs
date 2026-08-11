@@ -428,7 +428,11 @@ public sealed class DashboardModel
         Volatile.Write(ref _slowInFlight, 1);
         var year = _year;
         var force = Interlocked.Exchange(ref _forceRequested, 0) == 1;
-        _graphCoordinator.Request(year, force, OnGraphRequestStarted);
+        _graphCoordinator.Request(
+            year,
+            force,
+            OnGraphRequestStarted,
+            OnGraphPublished);
     }
 
     private void AttachGraph(string? year)

@@ -50,21 +50,33 @@ public sealed class GraphRequestCoordinator
         public bool CurrentSucceeded;
     }
 
+    private sealed class NoopScope : IDisposable
+    {
+        public static readonly NoopScope Instance = new();
+
+        public void Dispose()
+        {
+        }
+    }
+
     private readonly object _gate = new();
     private readonly Dictionary<GraphQuery, QueryState> _states = [];
     private readonly Func<string?, UsagePayload> _localFirst;
     private readonly Func<string?, UsagePayload> _graph;
     private readonly Func<string?, UsagePayload> _refreshGraph;
+    private readonly Func<IDisposable> _boost;
     private long _nextGeneration;
 
     public GraphRequestCoordinator(
         Func<string?, UsagePayload>? localFirst = null,
         Func<string?, UsagePayload>? graph = null,
-        Func<string?, UsagePayload>? refreshGraph = null)
+        Func<string?, UsagePayload>? refreshGraph = null,
+        Func<IDisposable>? boost = null)
     {
         _localFirst = localFirst ?? TbCore.GraphLocalFirst;
         _graph = graph ?? refreshGraph ?? TbCore.RefreshGraph;
         _refreshGraph = refreshGraph ?? graph ?? TbCore.RefreshGraph;
+        _boost = boost ?? (() => NoopScope.Instance);
     }
 
     public event Action<GraphRequestId>? Started;
@@ -132,7 +144,8 @@ public sealed class GraphRequestCoordinator
     public GraphRequestId Request(
         string? year,
         bool force = false,
-        Action<GraphRequestId>? onBegin = null)
+        Action<GraphRequestId>? onBegin = null,
+        Action<GraphPublication>? onReplay = null)
     {
         var query = GraphQuery.Normalize(year);
         QueryState state;
@@ -159,6 +172,23 @@ public sealed class GraphRequestCoordinator
         }
 
         onBegin?.Invoke(requestId);
+        if (!start && onReplay is not null)
+        {
+            GraphPublication? latest;
+            lock (_gate)
+            {
+                // The consumer begins outside the coordinator lock. Reacquire
+                // the newest exact stage so a publication racing that handoff
+                // cannot be lost or replayed behind a newer richer stage.
+                latest = state.Latest?.RequestId == requestId ? state.Latest : null;
+            }
+
+            if (latest is not null)
+            {
+                onReplay(latest);
+            }
+        }
+
         if (start)
         {
             StartPipeline(state, requestId, force);
@@ -202,7 +232,11 @@ public sealed class GraphRequestCoordinator
             UsagePayload local;
             try
             {
-                local = _localFirst(requestId.Query.Year);
+                using (_boost())
+                {
+                    local = _localFirst(requestId.Query.Year);
+                }
+
                 localSucceeded = true;
             }
             catch
@@ -219,7 +253,12 @@ public sealed class GraphRequestCoordinator
 
             try
             {
-                var richer = (force ? _refreshGraph : _graph)(requestId.Query.Year);
+                UsagePayload richer;
+                using (_boost())
+                {
+                    richer = (force ? _refreshGraph : _graph)(requestId.Query.Year);
+                }
+
                 richerSucceeded = true;
                 PublishIfCurrent(state, requestId,
                     new GraphPublication(requestId, GraphPublicationStage.Richer, richer));

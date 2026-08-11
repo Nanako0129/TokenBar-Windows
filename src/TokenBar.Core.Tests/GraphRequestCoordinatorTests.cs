@@ -176,6 +176,60 @@ public class GraphRequestCoordinatorTests
     }
 
     [Fact]
+    public async Task CoalescedRequestReplaysLatestAfterConsumerBegins()
+    {
+        var localPublished = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var richerGate = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var completed = new TaskCompletionSource<GraphRequestCompletion>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var local = Payload(null);
+        var coordinator = new GraphRequestCoordinator(
+            _ => local,
+            _ =>
+            {
+                richerGate.Task.GetAwaiter().GetResult();
+                throw new InvalidOperationException("blocked richer");
+            });
+        coordinator.Published += publication =>
+        {
+            if (publication.Stage == GraphPublicationStage.LocalFirst)
+            {
+                localPublished.TrySetResult(true);
+            }
+        };
+        coordinator.Completed += completion => completed.TrySetResult(completion);
+
+        var requestId = coordinator.Request(null);
+        await localPublished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var consumer = new GraphConsumerState();
+        GraphPublication? replayed = null;
+        var coalesced = coordinator.Request(
+            null,
+            onBegin: id => Assert.True(consumer.Begin(id)),
+            onReplay: publication =>
+            {
+                replayed = publication;
+                Assert.True(consumer.TryAcceptGraph(
+                    publication.RequestId,
+                    publication.Payload,
+                    publication.Stage));
+            });
+
+        Assert.Equal(requestId, coalesced);
+        Assert.Equal(GraphPublicationStage.LocalFirst, replayed?.Stage);
+        Assert.Same(local, consumer.AcceptedGraph);
+
+        richerGate.TrySetResult(true);
+        var result = await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(result.LocalSucceeded);
+        Assert.False(result.RicherSucceeded);
+        Assert.Same(local, consumer.AcceptedGraph);
+    }
+
+    [Fact]
     public async Task AttachAndNonForceRequestCoalesceInFlight()
     {
         var localGate = new TaskCompletionSource<bool>(
@@ -489,6 +543,56 @@ public class GraphRequestCoordinatorTests
     }
 
     [Fact]
+    public async Task GraphStagesRunInsideInjectedBoostScopes()
+    {
+        var completed = new TaskCompletionSource<GraphRequestCompletion>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var active = 0;
+        var opened = 0;
+        var closed = 0;
+        var localBoosted = false;
+        var richerBoosted = false;
+        IDisposable Boost()
+        {
+            Interlocked.Increment(ref opened);
+            Interlocked.Increment(ref active);
+            return new CallbackScope(() =>
+            {
+                Interlocked.Decrement(ref active);
+                Interlocked.Increment(ref closed);
+            });
+        }
+
+        var coordinator = new GraphRequestCoordinator(
+            localFirst: _ =>
+            {
+                localBoosted = Volatile.Read(ref active) == 1;
+                return Payload(null);
+            },
+            graph: _ =>
+            {
+                richerBoosted = Volatile.Read(ref active) == 1;
+                return Payload(
+                    null,
+                    PricingMode.BestEffort,
+                    CostCoverage.Complete);
+            },
+            boost: Boost);
+        coordinator.Completed += completion => completed.TrySetResult(completion);
+
+        var requestId = coordinator.Request(null);
+        var result = await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(requestId, result.RequestId);
+        Assert.True(result.Succeeded);
+        Assert.True(localBoosted);
+        Assert.True(richerBoosted);
+        Assert.Equal(2, opened);
+        Assert.Equal(2, closed);
+        Assert.Equal(0, active);
+    }
+
+    [Fact]
     public void CompletionMatchesOnlyExactSuccessfulRicherRequest()
     {
         var allTime = new GraphRequestId(GraphQuery.Normalize(null), 7);
@@ -545,6 +649,13 @@ public class GraphRequestCoordinatorTests
         Assert.Single(richerPublications);
         Assert.Equal(GraphPublicationStage.LocalFirst,
             richerPublications.Single().Stage);
+    }
+
+    private sealed class CallbackScope(Action dispose) : IDisposable
+    {
+        private Action? _dispose = dispose;
+
+        public void Dispose() => Interlocked.Exchange(ref _dispose, null)?.Invoke();
     }
 
     private static async Task WaitForCompletion(
