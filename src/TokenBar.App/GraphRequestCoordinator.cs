@@ -63,8 +63,8 @@ public sealed class GraphRequestCoordinator
         Func<string?, UsagePayload>? refreshGraph = null)
     {
         _localFirst = localFirst ?? TbCore.GraphLocalFirst;
-        _graph = graph ?? TbCore.Graph;
-        _refreshGraph = refreshGraph ?? TbCore.RefreshGraph;
+        _graph = graph ?? refreshGraph ?? TbCore.RefreshGraph;
+        _refreshGraph = refreshGraph ?? graph ?? TbCore.RefreshGraph;
     }
 
     public event Action<GraphRequestId>? Started;

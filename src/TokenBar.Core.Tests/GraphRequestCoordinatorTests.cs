@@ -449,6 +449,46 @@ public class GraphRequestCoordinatorTests
     }
 
     [Fact]
+    public async Task NormalDefaultRicherUsesInjectedRefreshWhenGraphDelegateIsMissing()
+    {
+        var completed = new TaskCompletionSource<GraphRequestCompletion>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var publications = new ConcurrentQueue<GraphPublication>();
+        var local = Payload(null);
+        var refreshed = Payload(null, PricingMode.BestEffort, CostCoverage.Complete);
+        var refreshCalls = 0;
+        var coordinator = new GraphRequestCoordinator(
+            localFirst: _ => local,
+            graph: null,
+            refreshGraph: _ =>
+            {
+                Interlocked.Increment(ref refreshCalls);
+                return refreshed;
+            });
+        coordinator.Published += publications.Enqueue;
+        coordinator.Completed += completion => completed.TrySetResult(completion);
+
+        var requestId = coordinator.Request(null);
+        var result = await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(requestId, result.RequestId);
+        Assert.True(result.RicherSucceeded);
+        Assert.Equal(1, refreshCalls);
+        Assert.Collection(
+            publications,
+            publication =>
+            {
+                Assert.Equal(GraphPublicationStage.LocalFirst, publication.Stage);
+                Assert.Same(local, publication.Payload);
+            },
+            publication =>
+            {
+                Assert.Equal(GraphPublicationStage.Richer, publication.Stage);
+                Assert.Same(refreshed, publication.Payload);
+            });
+    }
+
+    [Fact]
     public void CompletionMatchesOnlyExactSuccessfulRicherRequest()
     {
         var allTime = new GraphRequestId(GraphQuery.Normalize(null), 7);

@@ -2,6 +2,25 @@ using TokenBar.Interop;
 
 namespace TokenBar.App;
 
+public static class GraphCompletionPolicy
+{
+    public static (bool IsCurrent, bool ShouldRerun, bool ClearRefreshing) Decide(
+        bool isCurrent,
+        bool polling,
+        bool sameYear,
+        bool forceRequested,
+        bool refreshing)
+    {
+        if (!isCurrent)
+        {
+            return default;
+        }
+
+        var shouldRerun = polling && (!sameYear || forceRequested);
+        return (true, shouldRerun, refreshing && !shouldRerun);
+    }
+}
+
 /// <summary>Pure consumer gate for one retained graph pipeline. UI-facing
 /// properties may only change after these exact request/generation checks.</summary>
 public sealed class GraphConsumerState : IDisposable

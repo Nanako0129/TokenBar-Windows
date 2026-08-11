@@ -657,18 +657,23 @@ public sealed class DashboardModel
 
     private void OnGraphCompleted(GraphRequestCompletion completion)
     {
-        if (!_polling || !_graphState.IsCurrent(completion.RequestId))
+        var decision = GraphCompletionPolicy.Decide(
+            _graphState.IsCurrent(completion.RequestId),
+            _polling,
+            _year == completion.RequestId.Query.Year,
+            Volatile.Read(ref _forceRequested) == 1,
+            _refreshing);
+        if (!decision.IsCurrent)
         {
             return;
         }
 
         Volatile.Write(ref _slowInFlight, 0);
-        if (_year != completion.RequestId.Query.Year
-            || Volatile.Read(ref _forceRequested) == 1)
+        if (decision.ShouldRerun)
         {
             RefreshSlow();
         }
-        else if (_refreshing)
+        else if (decision.ClearRefreshing)
         {
             _refreshing = false;
             _ = _dispatcher.TryEnqueue(() => Updated?.Invoke());

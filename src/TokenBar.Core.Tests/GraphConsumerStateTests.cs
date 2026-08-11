@@ -23,6 +23,40 @@ public class GraphConsumerStateTests
         new(GraphQuery.Normalize(year), generation);
 
     [Fact]
+    public void CompletionPolicyFencesStaleSettlesHiddenAndKeepsRerunSpinner()
+    {
+        var stale = GraphCompletionPolicy.Decide(
+            isCurrent: false,
+            polling: true,
+            sameYear: true,
+            forceRequested: false,
+            refreshing: true);
+        Assert.False(stale.IsCurrent);
+        Assert.False(stale.ShouldRerun);
+        Assert.False(stale.ClearRefreshing);
+
+        var hidden = GraphCompletionPolicy.Decide(
+            isCurrent: true,
+            polling: false,
+            sameYear: false,
+            forceRequested: true,
+            refreshing: true);
+        Assert.True(hidden.IsCurrent);
+        Assert.False(hidden.ShouldRerun);
+        Assert.True(hidden.ClearRefreshing);
+
+        var rerun = GraphCompletionPolicy.Decide(
+            isCurrent: true,
+            polling: true,
+            sameYear: false,
+            forceRequested: false,
+            refreshing: true);
+        Assert.True(rerun.IsCurrent);
+        Assert.True(rerun.ShouldRerun);
+        Assert.False(rerun.ClearRefreshing);
+    }
+
+    [Fact]
     public void BeginRevokesOldGraphAndRejectsDelayedCallback()
     {
         var state = new GraphConsumerState();
