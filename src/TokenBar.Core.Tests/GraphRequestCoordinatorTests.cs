@@ -23,6 +23,14 @@ public class GraphRequestCoordinatorTests
             []);
 
     [Fact]
+    public void GraphQueryNormalizesDashboardYearIdentity()
+    {
+        Assert.Equal("2026", GraphQuery.Normalize(" 2026 ").Year);
+        Assert.Null(GraphQuery.Normalize(" ").Year);
+        Assert.Null(GraphQuery.Normalize(null).Year);
+    }
+
+    [Fact]
     public async Task LocalPublishesBeforeBlockedRicherAndRetainedAttachAddsNoCalls()
     {
         var richerGate = new TaskCompletionSource<bool>(

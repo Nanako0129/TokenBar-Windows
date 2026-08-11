@@ -146,15 +146,17 @@ public sealed class DashboardModel
     {
         var flag = Environment.GetCommandLineArgs()
             .FirstOrDefault(a => a.StartsWith("--year=", StringComparison.Ordinal));
-        return flag is not null
-            ? (flag["--year=".Length..] is { Length: > 0 } y ? y : null)
+        var year = flag is not null
+            ? flag["--year=".Length..]
             : AppSettings.Store.GetString("tokenbar.dashboard.year");
+        return GraphQuery.Normalize(year).Year;
     }
 
     /// <summary>Switch the year filter and re-fetch every lens for the new
     /// slice (served from the engine's per-year cache when fresh).</summary>
     public void SetYear(string? year)
     {
+        year = GraphQuery.Normalize(year).Year;
         lock (_yearGate)
         {
             if (year == _year)
