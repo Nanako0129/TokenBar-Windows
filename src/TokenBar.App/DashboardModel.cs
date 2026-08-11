@@ -444,6 +444,11 @@ public sealed class DashboardModel
         {
             OnGraphPublished(latest);
         }
+
+        if (GraphResumePolicy.ShouldRefreshAfterAttach(attachment))
+        {
+            RefreshSlow();
+        }
     }
 
     private void OnGraphStarted(GraphRequestId requestId)

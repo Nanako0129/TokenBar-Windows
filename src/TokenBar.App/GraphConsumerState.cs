@@ -21,6 +21,12 @@ public static class GraphCompletionPolicy
     }
 }
 
+public static class GraphResumePolicy
+{
+    public static bool ShouldRefreshAfterAttach(GraphAttachment attachment) =>
+        attachment.RequestId.Query.Year is not null && !attachment.InFlight;
+}
+
 /// <summary>Pure consumer gate for one retained graph pipeline. UI-facing
 /// properties may only change after these exact request/generation checks.</summary>
 public sealed class GraphConsumerState : IDisposable
