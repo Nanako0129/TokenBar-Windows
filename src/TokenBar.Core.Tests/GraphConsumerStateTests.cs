@@ -85,6 +85,19 @@ public class GraphConsumerStateTests
     }
 
     [Fact]
+    public void LazyRefreshSchedulesOncePerExactGraphRequest()
+    {
+        var first = Id(null, 1);
+        var second = Id(null, 2);
+        var otherQuery = Id("2026", 1);
+
+        Assert.True(GraphLazyRefreshPolicy.ShouldRequest(null, first));
+        Assert.False(GraphLazyRefreshPolicy.ShouldRequest(first, first));
+        Assert.True(GraphLazyRefreshPolicy.ShouldRequest(first, second));
+        Assert.True(GraphLazyRefreshPolicy.ShouldRequest(first, otherQuery));
+    }
+
+    [Fact]
     public void BeginRevokesOldGraphAndRejectsDelayedCallback()
     {
         var state = new GraphConsumerState();

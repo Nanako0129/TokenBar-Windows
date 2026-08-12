@@ -37,6 +37,14 @@ public static class GraphYearPolicy
         && !publication.Payload.Years.Any(year => year.Year == selectedYear);
 }
 
+public static class GraphLazyRefreshPolicy
+{
+    public static bool ShouldRequest(
+        GraphRequestId? scheduledRequestId,
+        GraphRequestId requestId) =>
+        scheduledRequestId != requestId;
+}
+
 /// <summary>Pure consumer gate for one retained graph pipeline. UI-facing
 /// properties may only change after these exact request/generation checks.</summary>
 public sealed class GraphConsumerState : IDisposable

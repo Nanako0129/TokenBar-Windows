@@ -55,6 +55,7 @@ public sealed class DashboardModel
     private bool _selectionInitialized;
     private int _lazyInFlight;
     private int _lazyPending;
+    private GraphRequestId? _lazyGraphRequestId;
 
     public string? Year => _year;
 
@@ -175,12 +176,9 @@ public sealed class DashboardModel
             }
         }
 
-        // Drop the old year's lazy lenses now: the graph publishes for the
-        // new year before the lens refetch lands, and a lingering Hourly/
-        // Agents report would render the old year's rows under the new
-        // filter until then.
+        // Drop the old year's lazy lenses now. The next exact graph request
+        // publication schedules their replacement once for that request.
         ClearLazyReports(emptySelection: SelectionIsEmpty());
-        RequestLazyRefresh();
 
         _refreshing = true; // macOS setYear spins the header control too
         RefreshSlow(); // an in-flight lane re-runs itself when the year flips
@@ -611,7 +609,12 @@ public sealed class DashboardModel
             };
             _lastSnapshot = Current;
             Updated?.Invoke();
-            RequestLazyRefresh();
+            if (GraphLazyRefreshPolicy.ShouldRequest(
+                    _lazyGraphRequestId, publication.RequestId))
+            {
+                _lazyGraphRequestId = publication.RequestId;
+                RequestLazyRefresh();
+            }
         });
     }
 
