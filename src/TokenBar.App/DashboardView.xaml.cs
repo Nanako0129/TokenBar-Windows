@@ -350,7 +350,7 @@ public sealed partial class DashboardView : UserControl
         UpdateRefreshControl(loading: snapshot is null);
         if (snapshot is null)
         {
-            FooterText.Text = "loading usage…";
+            RenderLoadingState();
             return;
         }
 
@@ -359,6 +359,31 @@ public sealed partial class DashboardView : UserControl
         UpdateYearPicker();
         UpdateGraph3DData(snapshot);
         RenderContent(animated: false);
+    }
+
+    private void RenderLoadingState()
+    {
+        TodayValue.Text = "—";
+        TotalValue.Text = "—";
+        RateValue.Text = "—";
+        CostLine.Text = CostSurfaceProjection.Checking;
+        FooterText.Text = "loading usage…";
+        UpdateYearPicker();
+
+        _displayClients = [];
+        _selectedClients = [];
+        _selectedSet = new HashSet<string>(StringComparer.Ordinal);
+        _selectedStats = null;
+        _activeClientTab = ClientRegistry.OverviewTab;
+        _clientTabsSignature = "";
+        ClientTabsPanel.Children.Clear();
+
+        DetachGraph3DContentHost();
+        ContentHost.Content = null;
+        if (!_graph3dDevMode)
+        {
+            _graph3d?.Release();
+        }
     }
 
     private void RefreshSelection(bool animated)
