@@ -47,6 +47,7 @@ public sealed class GraphSnapshotStore
     public const int MaxDepth = 16;
     public const int MaxTokens = 1_000_000;
     public const int MaxStringBytes = 8 * 1024;
+    private const int MaxEscapedStringBytes = MaxStringBytes * 6;
     public const int MaxSourceContextBytes = 4 * 1024;
     public const int MaxYears = 256;
     public const int MaxContributions = 100_000;
@@ -1153,8 +1154,17 @@ public sealed class GraphSnapshotStore
         private static string ReadBoundedString(ref Utf8JsonReader reader)
         {
             var rawLength = reader.HasValueSequence ? reader.ValueSequence.Length : reader.ValueSpan.Length;
-            if (rawLength > MaxStringBytes) throw new SnapshotTooLargeException();
-            var value = reader.GetString() ?? throw new SnapshotFormatException();
+            var rawLimit = reader.ValueIsEscaped ? MaxEscapedStringBytes : MaxStringBytes;
+            if (rawLength > rawLimit) throw new SnapshotTooLargeException();
+            string value;
+            try
+            {
+                value = reader.GetString() ?? throw new SnapshotFormatException();
+            }
+            catch (InvalidOperationException)
+            {
+                throw new SnapshotFormatException();
+            }
             if (Utf8Length(value) > MaxStringBytes) throw new SnapshotTooLargeException();
             return value;
         }
@@ -1268,8 +1278,17 @@ public sealed class GraphSnapshotStore
         private string ReadCurrentString()
         {
             var rawLength = _reader.HasValueSequence ? _reader.ValueSequence.Length : _reader.ValueSpan.Length;
-            if (rawLength > MaxStringBytes) throw new SnapshotTooLargeException();
-            var value = _reader.GetString() ?? throw new SnapshotFormatException();
+            var rawLimit = _reader.ValueIsEscaped ? MaxEscapedStringBytes : MaxStringBytes;
+            if (rawLength > rawLimit) throw new SnapshotTooLargeException();
+            string value;
+            try
+            {
+                value = _reader.GetString() ?? throw new SnapshotFormatException();
+            }
+            catch (InvalidOperationException)
+            {
+                throw new SnapshotFormatException();
+            }
             if (Utf8Length(value) > MaxStringBytes) throw new SnapshotTooLargeException();
             return value;
         }

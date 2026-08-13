@@ -245,6 +245,53 @@ public sealed class GraphSnapshotStoreTests : IDisposable
     }
 
     [Fact]
+    public void EscapedStringsUseDecodedUtf8LengthAsTheContract()
+    {
+        var withinLimit = string.Concat(Enumerable.Repeat("😀", GraphSnapshotStore.MaxStringBytes / 4));
+        var payload = Payload("2026-01-01") with
+        {
+            Summary = new UsageSummary(1, 1, 1, 1, 1, 1, ["claude"], [withinLimit]),
+        };
+        var store = new GraphSnapshotStore(StorePath);
+        Assert.Equal(GraphSnapshotWriteStatus.Written,
+            store.Write("ctx", "2026", DateTimeOffset.UnixEpoch, payload));
+        var result = store.Read("ctx", "2026");
+        Assert.Equal(GraphSnapshotReadStatus.Hit, result.Status);
+        Assert.Equal(withinLimit, result.Payload!.Summary.Models[0]);
+
+        var overLimit = withinLimit + "😀";
+        Assert.Equal(GraphSnapshotWriteStatus.TooLarge,
+            store.Write("ctx", "2026", DateTimeOffset.UnixEpoch, payload with
+            {
+                Summary = payload.Summary with { Models = [overLimit] },
+            }));
+    }
+
+    [Theory]
+    [InlineData("value-high", "\\uD83D")]
+    [InlineData("value-low", "\\uDE00")]
+    [InlineData("map-key", "\\uD83D")]
+    [InlineData("future-value", "\\uDE00")]
+    public void MalformedSurrogatesAreInvalidData(string location, string surrogate)
+    {
+        WriteGood();
+        var json = File.ReadAllText(StorePath);
+        json = location switch
+        {
+            "value-high" or "value-low" => json.Replace("\"generatedAt\":\"g\"",
+                "\"generatedAt\":\"" + surrogate + "\"", StringComparison.Ordinal),
+            "map-key" => json.Replace("\"turnsByClient\":{\"claude\":1}",
+                "\"turnsByClient\":{\"" + surrogate + "\":1}", StringComparison.Ordinal),
+            _ => json.Replace("\"schemaVersion\":1",
+                "\"future\":{\"value\":\"" + surrogate + "\"},\"schemaVersion\":2",
+                StringComparison.Ordinal),
+        };
+        File.WriteAllText(StorePath, json);
+
+        Assert.Equal(GraphSnapshotReadStatus.InvalidData, ReadGood().Status);
+    }
+
+    [Fact]
     public void PerContributionAndAggregateBoundsRejectBeforePublication()
     {
         var clients = Enumerable.Range(0, GraphSnapshotStore.MaxItemsPerContribution + 1)
