@@ -88,6 +88,10 @@ public sealed class GraphSnapshotStore
             }
 
             var bytes = ReadBounded(path);
+            if (SnapshotCodec.ReadSchemaVersion(bytes) != SchemaVersion)
+            {
+                return new(GraphSnapshotReadStatus.IncompatibleSchema);
+            }
             var envelope = SnapshotCodec.Read(bytes);
             if (envelope.SchemaVersion != SchemaVersion)
             {
@@ -524,7 +528,11 @@ public sealed class GraphSnapshotStore
 
         private static void ValidateString(string value)
         {
-            if (value is null || Utf8Length(value) > MaxStringBytes)
+            if (value is null)
+            {
+                throw new SnapshotFormatException();
+            }
+            if (Utf8Length(value) > MaxStringBytes)
             {
                 throw new SnapshotTooLargeException();
             }
@@ -587,6 +595,50 @@ public sealed class GraphSnapshotStore
 
     private static class SnapshotCodec
     {
+        public static int ReadSchemaVersion(ReadOnlySpan<byte> bytes)
+        {
+            var reader = new Utf8JsonReader(bytes, new JsonReaderOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = MaxDepth,
+            });
+            var tokens = 0;
+            if (!ReadNext(ref reader, ref tokens) || reader.TokenType != JsonTokenType.StartObject)
+                throw new SnapshotFormatException();
+
+            var rootNames = NewNames();
+            int? schemaVersion = null;
+            string? rootProperty = null;
+            while (ReadNext(ref reader, ref tokens))
+            {
+                if (reader.TokenType is JsonTokenType.PropertyName or JsonTokenType.String)
+                    _ = ReadBoundedString(ref reader);
+
+                if (reader.CurrentDepth == 1 && reader.TokenType == JsonTokenType.PropertyName)
+                {
+                    rootProperty = reader.GetString() ?? throw new SnapshotFormatException();
+                    if (!rootNames.Add(rootProperty)) throw new SnapshotFormatException();
+                    continue;
+                }
+
+                if (rootProperty == "schemaVersion" && reader.CurrentDepth == 1)
+                {
+                    if (reader.TokenType != JsonTokenType.Number || !reader.TryGetInt32(out var version))
+                        throw new SnapshotFormatException();
+                    schemaVersion = version;
+                    rootProperty = null;
+                }
+
+                if (reader.CurrentDepth == 0 && reader.TokenType == JsonTokenType.EndObject)
+                    break;
+            }
+
+            if (reader.TokenType != JsonTokenType.EndObject || reader.Read())
+                throw new SnapshotFormatException();
+            return schemaVersion ?? throw new SnapshotFormatException();
+        }
+
         public static SnapshotEnvelope Read(ReadOnlySpan<byte> bytes)
         {
             var reader = new StrictReader(bytes);
@@ -1088,6 +1140,23 @@ public sealed class GraphSnapshotStore
             writer.WriteString("start", range.Start);
             writer.WriteString("end", range.End);
             writer.WriteEndObject();
+        }
+
+        private static bool ReadNext(ref Utf8JsonReader reader, ref int tokens)
+        {
+            if (!reader.Read()) return false;
+            tokens++;
+            if (tokens > MaxTokens) throw new SnapshotTooLargeException();
+            return true;
+        }
+
+        private static string ReadBoundedString(ref Utf8JsonReader reader)
+        {
+            var rawLength = reader.HasValueSequence ? reader.ValueSequence.Length : reader.ValueSpan.Length;
+            if (rawLength > MaxStringBytes) throw new SnapshotTooLargeException();
+            var value = reader.GetString() ?? throw new SnapshotFormatException();
+            if (Utf8Length(value) > MaxStringBytes) throw new SnapshotTooLargeException();
+            return value;
         }
 
         private static HashSet<string> NewNames() => new(StringComparer.OrdinalIgnoreCase);

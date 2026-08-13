@@ -80,6 +80,36 @@ public sealed class GraphSnapshotStoreTests : IDisposable
     }
 
     [Fact]
+    public void UnsupportedSchemaIsClassifiedBeforeV1PayloadDecode()
+    {
+        WriteGood();
+        var json = File.ReadAllText(StorePath);
+        json = json.Replace("\"schemaVersion\":1", "\"schemaVersion\":2", StringComparison.Ordinal)
+            .Replace("\"payload\":{", "\"futureRoot\":true,\"payload\":{\"futurePayload\":true,", StringComparison.Ordinal);
+        File.WriteAllText(StorePath, json);
+
+        Assert.Equal(GraphSnapshotReadStatus.IncompatibleSchema, ReadGood().Status);
+    }
+
+    [Fact]
+    public void SchemaPreflightKeepsBoundsAndScansTheCompleteRoot()
+    {
+        File.WriteAllText(StorePath,
+            "{\"schemaVersion\":2,\"SchemaVersion\":2}");
+        Assert.Equal(GraphSnapshotReadStatus.InvalidData, ReadGood().Status);
+
+        File.WriteAllText(StorePath,
+            "{\"future\":{\"" + new string('x', GraphSnapshotStore.MaxStringBytes + 1)
+            + "\":0},\"schemaVersion\":2}");
+        Assert.Equal(GraphSnapshotReadStatus.TooLarge, ReadGood().Status);
+
+        var values = string.Join(',', Enumerable.Repeat("0", GraphSnapshotStore.MaxTokens + 10));
+        File.WriteAllText(StorePath,
+            "{\"future\":[" + values + "],\"schemaVersion\":2}");
+        Assert.Equal(GraphSnapshotReadStatus.TooLarge, ReadGood().Status);
+    }
+
+    [Fact]
     public void RejectsWrongContextQueryAndSchemaWithoutLeakingInputs()
     {
         var store = new GraphSnapshotStore(StorePath);
@@ -257,6 +287,18 @@ public sealed class GraphSnapshotStoreTests : IDisposable
             valid with { Summary = null! },
             valid with { Years = null! },
             valid with { Contributions = null! },
+            valid with { Meta = valid.Meta with { GeneratedAt = null! } },
+            valid with { Summary = valid.Summary with { Clients = [null!] } },
+            valid with
+            {
+                Contributions =
+                [
+                    valid.Contributions[0] with
+                    {
+                        Clients = [valid.Contributions[0].Clients[0] with { Client = null! }],
+                    },
+                ],
+            },
             valid with { Meta = valid.Meta with { DateRange = null! } },
             valid with { Summary = valid.Summary with { Clients = null! } },
             valid with { Summary = valid.Summary with { Models = null! } },
