@@ -25,6 +25,9 @@
     <Compile Include="..\TokenBar.App\ProductIdentity.cs" Link="ProductIdentity.cs" />
     <Compile Include="..\TokenBar.App\TrayForceCreatePolicy.cs" Link="TrayForceCreatePolicy.cs" />
     <Compile Include="..\TokenBar.App\UpdateFlow.cs" Link="UpdateFlow.cs" />
+    <Compile Include="..\TokenBar.App\GraphRequestCoordinator.cs" Link="GraphRequestCoordinator.cs" />
+    <Compile Include="..\TokenBar.App\GraphConsumerState.cs" Link="GraphConsumerState.cs" />
+    <Compile Include="..\TokenBar.App\CostSurfaceProjection.cs" Link="CostSurfaceProjection.cs" />
   </ItemGroup>
 
   <ItemGroup>

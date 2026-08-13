@@ -16,6 +16,8 @@ public sealed class DashboardModel
     private static Snapshot? _lastSnapshot; // process lifetime, like macOS
 
     private readonly DispatcherQueue _dispatcher;
+    private readonly GraphRequestCoordinator _graphCoordinator;
+    private readonly GraphConsumerState _graphState = new();
     private DispatcherQueueTimer? _slowTimer;
     private DispatcherQueueTimer? _fastTimer;
     // 0/1 via Interlocked throughout: every gate is entered on the UI thread
@@ -39,6 +41,9 @@ public sealed class DashboardModel
     private volatile string? _year = ResolveYear();
     private volatile List<string> _knownYears = [];
     private volatile UsagePayload? _allTimeGraph;
+    private GraphRequestId? _snapshotRequestId;
+    private GraphRequestId? _pendingModelRequestId;
+    private ModelReport? _pendingModel;
 
     // Hourly/Agents are already aggregated across clients, so their FFI scans
     // capture one immutable selection generation. Graph/Models stay all-client.
@@ -50,6 +55,7 @@ public sealed class DashboardModel
     private bool _selectionInitialized;
     private int _lazyInFlight;
     private int _lazyPending;
+    private GraphRequestId? _lazyGraphRequestId;
 
     public string? Year => _year;
 
@@ -141,15 +147,17 @@ public sealed class DashboardModel
     {
         var flag = Environment.GetCommandLineArgs()
             .FirstOrDefault(a => a.StartsWith("--year=", StringComparison.Ordinal));
-        return flag is not null
-            ? (flag["--year=".Length..] is { Length: > 0 } y ? y : null)
+        var year = flag is not null
+            ? flag["--year=".Length..]
             : AppSettings.Store.GetString("tokenbar.dashboard.year");
+        return GraphQuery.Normalize(year).Year;
     }
 
     /// <summary>Switch the year filter and re-fetch every lens for the new
     /// slice (served from the engine's per-year cache when fresh).</summary>
     public void SetYear(string? year)
     {
+        year = GraphQuery.Normalize(year).Year;
         lock (_yearGate)
         {
             if (year == _year)
@@ -168,15 +176,11 @@ public sealed class DashboardModel
             }
         }
 
-        // Drop the old year's lazy lenses now: the graph publishes for the
-        // new year before the lens refetch lands, and a lingering Hourly/
-        // Agents report would render the old year's rows under the new
-        // filter until then.
+        // Drop the old year's lazy lenses now. The next exact graph request
+        // publication schedules their replacement once for that request.
         ClearLazyReports(emptySelection: SelectionIsEmpty());
-        RequestLazyRefresh();
 
         _refreshing = true; // macOS setYear spins the header control too
-        Updated?.Invoke();
         RefreshSlow(); // an in-flight lane re-runs itself when the year flips
     }
 
@@ -185,6 +189,7 @@ public sealed class DashboardModel
     // spinner and holds until the pass that serves the request completes.
     private int _forceRequested;
     private volatile bool _refreshing;
+    private volatile bool _polling;
 
     public bool Refreshing => _refreshing;
 
@@ -203,9 +208,15 @@ public sealed class DashboardModel
         RefreshSlow();
     }
 
-    public DashboardModel(DispatcherQueue dispatcher)
+    public DashboardModel(
+        DispatcherQueue dispatcher,
+        GraphRequestCoordinator graphCoordinator)
     {
         _dispatcher = dispatcher;
+        _graphCoordinator = graphCoordinator;
+        _graphCoordinator.Started += OnGraphStarted;
+        _graphCoordinator.Published += OnGraphPublished;
+        _graphCoordinator.Completed += OnGraphCompleted;
         if (_lastSnapshot is not null)
         {
             Current = _lastSnapshot;
@@ -222,7 +233,8 @@ public sealed class DashboardModel
         AgentUsagePayload? Quota,
         double TokensPerMin,
         IReadOnlyList<TraceBucket> Trace,
-        DateTimeOffset FetchedAt)
+        DateTimeOffset FetchedAt,
+        bool CostAuthoritative = false)
     {
         // Lazily-loaded lenses (macOS ensureData parity): fetched on first
         // visit, then refreshed by the slow lane like everything else.
@@ -362,6 +374,7 @@ public sealed class DashboardModel
     /// both cadences, then 60s / 10s timers.</summary>
     public void Start()
     {
+        _polling = true;
         if (_slowTimer is null)
         {
             _slowTimer = _dispatcher.CreateTimer();
@@ -378,7 +391,7 @@ public sealed class DashboardModel
 
         _slowTimer.Start();
         _fastTimer!.Start();
-        RefreshSlow();
+        AttachGraph(_year);
         RefreshQuota();
         RefreshFast();
     }
@@ -386,111 +399,290 @@ public sealed class DashboardModel
     /// <summary>Stop polling (flyout hidden). State stays for instant reopen.</summary>
     public void Stop()
     {
+        _polling = false;
         _slowTimer?.Stop();
         _fastTimer?.Stop();
     }
 
+    public void Dispose()
+    {
+        Stop();
+        _graphState.Dispose();
+        _pendingModelRequestId = null;
+        _pendingModel = null;
+        _graphCoordinator.Started -= OnGraphStarted;
+        _graphCoordinator.Published -= OnGraphPublished;
+        _graphCoordinator.Completed -= OnGraphCompleted;
+    }
+
     private void RefreshSlow()
     {
-        if (Interlocked.Exchange(ref _slowInFlight, 1) == 1)
+        if (!_polling)
         {
             return;
         }
 
+        // The coordinator coalesces duplicate same-query requests; do not use
+        // one global lane gate here because a year switch must supersede an
+        // older query immediately.
+        Volatile.Write(ref _slowInFlight, 1);
+        var year = _year;
+        var force = Interlocked.Exchange(ref _forceRequested, 0) == 1;
+        _graphCoordinator.Request(
+            year,
+            force,
+            OnGraphRequestStarted,
+            OnGraphPublished);
+    }
+
+    private void AttachGraph(string? year)
+    {
+        Interlocked.Exchange(ref _slowInFlight, 1);
+        var attachment = _graphCoordinator.Attach(year, OnGraphRequestStarted);
+        if (!attachment.InFlight)
+        {
+            Volatile.Write(ref _slowInFlight, 0);
+        }
+
+        if (attachment.Latest is { } latest)
+        {
+            OnGraphPublished(latest);
+        }
+
+        if (GraphResumePolicy.ShouldRefreshAfterAttach(attachment))
+        {
+            RefreshSlow();
+        }
+    }
+
+    private void OnGraphStarted(GraphRequestId requestId)
+    {
+        if (!_polling || _year != requestId.Query.Year)
+        {
+            return;
+        }
+
+        OnGraphRequestStarted(requestId);
+    }
+
+    private void OnGraphRequestStarted(GraphRequestId requestId)
+    {
+        if (!_polling || _year != requestId.Query.Year
+            || !_graphState.Begin(requestId))
+        {
+            return;
+        }
+
+        if (_dispatcher.HasThreadAccess)
+        {
+            ApplyGraphRequestStart(requestId);
+        }
+        else
+        {
+            _ = _dispatcher.TryEnqueue(() => ApplyGraphRequestStart(requestId));
+        }
+    }
+
+    private void ApplyGraphRequestStart(GraphRequestId requestId)
+    {
+        if (!_graphState.IsCurrent(requestId))
+        {
+            return;
+        }
+
+        var previous = _snapshotRequestId;
+        _snapshotRequestId = requestId;
+        if (_pendingModelRequestId is { } pending
+            && pending != requestId)
+        {
+            _pendingModelRequestId = null;
+            _pendingModel = null;
+        }
+
+        if (previous is { } old && old.Query != requestId.Query)
+        {
+            // Year payloads cannot reconstruct hidden-only year visibility.
+            // Keep the retained all-time graph while clearing the rendered query.
+            Current = null;
+            _lastSnapshot = null;
+            Updated?.Invoke();
+            return;
+        }
+
+        if (Current is { } current)
+        {
+            // Keep same-query topology as a visual baseline, but revoke
+            // the old model identity and every cost-bearing surface.
+            Current = current with
+            {
+                Models = null,
+                CostAuthoritative = false,
+                FetchedAt = DateTimeOffset.Now,
+            };
+            _lastSnapshot = Current;
+            Updated?.Invoke();
+        }
+
+    }
+
+    private void OnGraphPublished(GraphPublication publication)
+    {
+        if (!_graphState.TryAcceptGraph(
+                publication.RequestId, publication.Payload, publication.Stage))
+        {
+            return;
+        }
+
+        if (_graphState.TryBeginModel(publication.RequestId))
+        {
+            StartModelReport(publication.RequestId);
+        }
+
+        _ = _dispatcher.TryEnqueue(() =>
+        {
+            // Dispatcher-delayed callbacks repeat the exact state check before
+            // touching Current, so an old query/generation cannot repaint it.
+            if (!_graphState.TryAcceptGraph(
+                    publication.RequestId, publication.Payload, publication.Stage)
+                || _year != publication.RequestId.Query.Year)
+            {
+                return;
+            }
+
+            // A request can begin on a worker completion path. If its
+            // dispatcher begin callback is still queued behind this
+            // publication, apply that revoke first so an old same-query
+            // snapshot cannot receive the new generation's graph/model data.
+            if (_snapshotRequestId != publication.RequestId)
+            {
+                ApplyGraphRequestStart(publication.RequestId);
+            }
+
+            if (!_graphState.IsCurrent(publication.RequestId)
+                || _snapshotRequestId != publication.RequestId)
+            {
+                return;
+            }
+
+            var year = publication.RequestId.Query.Year;
+            if (GraphYearPolicy.ShouldClearToAllTime(_year, publication))
+            {
+                SetYear(null);
+                return;
+            }
+
+            RememberYears(publication.Payload);
+            if (year is null)
+            {
+                _allTimeGraph = publication.Payload;
+            }
+
+            var baseline = Current;
+            if (baseline is null)
+            {
+                baseline = new Snapshot(
+                    publication.Payload,
+                    null,
+                    _latestQuota,
+                    0,
+                    [],
+                    DateTimeOffset.Now,
+                    _graphState.CostAuthoritative);
+                DevLog.Write("first snapshot ready");
+            }
+
+            var pendingModel = _pendingModelRequestId == publication.RequestId
+                ? _pendingModel
+                : null;
+            if (pendingModel is not null)
+            {
+                _pendingModelRequestId = null;
+                _pendingModel = null;
+            }
+
+            Current = baseline with
+            {
+                Graph = publication.Payload,
+                Models = pendingModel ?? baseline.Models,
+                CostAuthoritative = _graphState.CostAuthoritative,
+                FetchedAt = DateTimeOffset.Now,
+            };
+            _lastSnapshot = Current;
+            Updated?.Invoke();
+            if (GraphLazyRefreshPolicy.ShouldRequest(
+                    _lazyGraphRequestId, publication.RequestId))
+            {
+                _lazyGraphRequestId = publication.RequestId;
+                RequestLazyRefresh();
+            }
+        });
+    }
+
+    private void StartModelReport(GraphRequestId requestId)
+    {
         _ = Task.Run(() =>
         {
-            var year = _year; // one slice per pass; a mid-flight switch re-runs below
-            var force = Interlocked.Exchange(ref _forceRequested, 0) == 1;
-            try
+            var report = TryFetch(
+                () => TbCore.ModelReport(requestId.Query.Year), "modelReport");
+            if (report is null || !_graphState.TryAcceptModel(requestId, report))
             {
-                // macOS parity: the model report runs concurrently with the
-                // graph parse (the engine shares one pass), and neither the
-                // network nor the lazy lenses gate the first paint.
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                UsagePayload? graph;
-                ModelReport? models;
-                using (ProcessPower.Boost()) // EcoQoS off while parsing
-                {
-                    var modelsTask = Task.Run(() =>
-                        TryFetch(() => TbCore.ModelReport(year), "modelReport"));
-                    graph = TryFetch(() => force
-                        ? TbCore.RefreshGraph(year) : TbCore.Graph(year), "graph");
-                    models = modelsTask.Result; // joined before the boost lifts
-                }
+                return;
+            }
 
-                DevLog.Write($"slow lane: graph+models={sw.ElapsedMilliseconds}ms " +
-                    $"year={year ?? "all"}{(force ? " force" : "")}");
-                if (graph is not null && year is not null
-                    && !graph.Years.Any(y => y.Year == year))
+            _ = _dispatcher.TryEnqueue(() =>
+            {
+                // Repeat the exact generation guard at the UI boundary.
+                if (!_graphState.TryAcceptModel(requestId, report)
+                    || _year != requestId.Query.Year)
                 {
-                    // macOS apply() parity: the selected year's logs vanished —
-                    // clear the filter instead of stranding the dashboard on an
-                    // empty slice. Only if it is still THIS pass's year, though:
-                    // a pick the user made mid-flight must survive. The finally
-                    // below re-runs the lane either way.
-                    lock (_yearGate)
-                    {
-                        if (_year == year)
-                        {
-                            _year = null;
-                            AppSettings.Store.Remove("tokenbar.dashboard.year");
-                        }
-                    }
-
-                    // No publish happens on this path, so nudge the UI to
-                    // resync the year picker with the cleared filter.
-                    _ = _dispatcher.TryEnqueue(() => Updated?.Invoke());
                     return;
                 }
 
-                if (_year != year)
+                // ModelReport may beat the graph publication callback to the
+                // dispatcher. Retain it for this exact generation instead of
+                // dropping a valid once-only result when Current is still null
+                // or still carries the prior same-query request.
+                if (Current is null || _snapshotRequestId != requestId)
                 {
-                    return; // stale slice; the finally re-runs with the new year
+                    _pendingModelRequestId = requestId;
+                    _pendingModel = report;
+                    return;
                 }
 
-                if (graph is not null)
+                Current = Current with
                 {
-                    RememberYears(graph);
-                    if (year is null)
-                    {
-                        _allTimeGraph = graph;
-                    }
-
-                    var seeded = graph;
-                    Publish(s => s with
-                    {
-                        Graph = seeded ?? s.Graph,
-                        Models = models ?? s.Models,
-                    }, graph, stillValid: () => _year == year);
-                }
-                else if (models is not null)
-                {
-                    var m = models;
-                    Publish(s => s with { Models = m }, graph: null,
-                        stillValid: () => _year == year);
-                }
-
-                // Lazy reports use their own single-flight coordinator so a
-                // selection/year change can invalidate and retry without
-                // spawning overlapping scans.
-                RequestLazyRefresh();
-            }
-            finally
-            {
-                Volatile.Write(ref _slowInFlight, 0);
-                if (_year != year || Volatile.Read(ref _forceRequested) == 1)
-                {
-                    RefreshSlow(); // stale year or a force queued mid-pass
-                }
-                else if (_refreshing)
-                {
-                    // This pass served the manual refresh / year switch; the
-                    // publishes carry no spinner state, so nudge the UI off.
-                    _refreshing = false;
-                    _ = _dispatcher.TryEnqueue(() => Updated?.Invoke());
-                }
-            }
+                    Models = report,
+                    FetchedAt = DateTimeOffset.Now,
+                };
+                _lastSnapshot = Current;
+                Updated?.Invoke();
+            });
         });
+    }
+
+    private void OnGraphCompleted(GraphRequestCompletion completion)
+    {
+        var decision = GraphCompletionPolicy.Decide(
+            _graphState.IsCurrent(completion.RequestId),
+            _polling,
+            _year == completion.RequestId.Query.Year,
+            Volatile.Read(ref _forceRequested) == 1,
+            _refreshing);
+        if (!decision.IsCurrent)
+        {
+            return;
+        }
+
+        Volatile.Write(ref _slowInFlight, 0);
+        if (decision.ShouldRerun)
+        {
+            RefreshSlow();
+        }
+        else if (decision.ClearRefreshing)
+        {
+            _refreshing = false;
+            _ = _dispatcher.TryEnqueue(() => Updated?.Invoke());
+        }
     }
 
     private void RememberYears(UsagePayload graph)

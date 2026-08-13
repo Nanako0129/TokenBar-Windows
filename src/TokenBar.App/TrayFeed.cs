@@ -15,11 +15,14 @@ namespace TokenBar.App;
 public sealed class TrayFeed : IDisposable
 {
     private readonly DispatcherQueue _dispatcher;
+    private readonly GraphRequestCoordinator _graphCoordinator;
+    private readonly GraphConsumerState _graphState = new();
     private readonly DispatcherQueueTimer _fast;
     private readonly DispatcherQueueTimer _slow;
     private readonly Action<string> _onStoreChanged;
     private int _fastInFlight; // Interlocked: reset in a background finally
     private int _slowInFlight;
+    private int _quotaInFlight;
     private bool _disposed;
 
     public UsagePayload? Graph { get; private set; }
@@ -32,6 +35,8 @@ public sealed class TrayFeed : IDisposable
 
     public AgentUsagePayload? Quota { get; private set; }
 
+    public bool CostAuthoritative => _graphState.CostAuthoritative;
+
     private bool _hasTrace;
     private string? _cachedQuotaSelection;
     private double? _cachedQuotaRemaining;
@@ -43,9 +48,15 @@ public sealed class TrayFeed : IDisposable
 
     public event Action? Changed;
 
-    public TrayFeed(DispatcherQueue dispatcher)
+    public TrayFeed(
+        DispatcherQueue dispatcher,
+        GraphRequestCoordinator graphCoordinator)
     {
         _dispatcher = dispatcher;
+        _graphCoordinator = graphCoordinator;
+        _graphCoordinator.Started += OnGraphStarted;
+        _graphCoordinator.Published += OnGraphPublished;
+        _graphCoordinator.Completed += OnGraphCompleted;
         var persistedSelection = AppSettings.Store.GetString(
             "tokenbar.quota.lastSelection");
         var currentSelection = AppSettings.Store.GetString(
@@ -66,8 +77,9 @@ public sealed class TrayFeed : IDisposable
         _slow.Interval = TimeSpan.FromSeconds(300);
         _slow.Tick += (_, _) => RefreshSlow();
         _slow.Start();
+        AttachGraph();
         RefreshFast();
-        RefreshSlow();
+        RefreshQuota();
 
         _onStoreChanged = key =>
         {
@@ -97,6 +109,10 @@ public sealed class TrayFeed : IDisposable
     public void Dispose()
     {
         _disposed = true; // fences any in-flight lane's enqueued callback
+        _graphState.Dispose();
+        _graphCoordinator.Started -= OnGraphStarted;
+        _graphCoordinator.Published -= OnGraphPublished;
+        _graphCoordinator.Completed -= OnGraphCompleted;
         _fast.Stop();
         _slow.Stop();
         AppSettings.Store.Changed -= _onStoreChanged;
@@ -143,7 +159,8 @@ public sealed class TrayFeed : IDisposable
     // the cached path keeps data fresh continuously; this is the macOS title
     // loop's belt against anything the incremental scan misses. An instance
     // field, so restarting timers never triggers an immediate re-read.
-    private DateTimeOffset _lastFullRefresh = DateTimeOffset.Now;
+    private long _lastFullRefreshTicks = DateTimeOffset.UtcNow.Ticks;
+    private long _forcedRefreshGeneration;
 
     private void RefreshSlow()
     {
@@ -153,44 +170,137 @@ public sealed class TrayFeed : IDisposable
         }
 
         var intervalMin = Math.Max(1, AppSettings.Store.GetInt("tokenbar.refresh.intervalMin", 30));
-        var force = DateTimeOffset.Now - _lastFullRefresh >= TimeSpan.FromMinutes(intervalMin);
+        var lastFullRefresh = new DateTimeOffset(
+            Volatile.Read(ref _lastFullRefreshTicks), TimeSpan.Zero);
+        var force = DateTimeOffset.UtcNow - lastFullRefresh
+            >= TimeSpan.FromMinutes(intervalMin);
+
+        _graphCoordinator.Request(null, force, requestId =>
+        {
+            OnGraphStarted(requestId);
+            if (force)
+            {
+                Volatile.Write(ref _forcedRefreshGeneration, requestId.Generation);
+            }
+        });
+        RefreshQuota();
+    }
+
+    private void AttachGraph()
+    {
+        Interlocked.Exchange(ref _slowInFlight, 1);
+        var attachment = _graphCoordinator.Attach(null, OnGraphRequestStarted);
+        if (!attachment.InFlight)
+        {
+            Volatile.Write(ref _slowInFlight, 0);
+        }
+
+        if (attachment.Latest is { } latest)
+        {
+            OnGraphPublished(latest);
+        }
+    }
+
+    private void OnGraphStarted(GraphRequestId requestId)
+    {
+        if (requestId.Query.Year is not null || !_graphState.Begin(requestId))
+        {
+            return;
+        }
+
+        // Revoke cost authority before the graph callback lands; token/rate/
+        // quota projections remain usable from the retained topology.
+        _ = _dispatcher.TryEnqueue(() =>
+        {
+            if (!_disposed && _graphState.IsCurrent(requestId))
+            {
+                Changed?.Invoke();
+            }
+        });
+    }
+
+    private void OnGraphRequestStarted(GraphRequestId requestId) =>
+        OnGraphStarted(requestId);
+
+    private void OnGraphPublished(GraphPublication publication)
+    {
+        if (!_graphState.TryAcceptGraph(
+                publication.RequestId, publication.Payload, publication.Stage))
+        {
+            return;
+        }
+
+        _ = _dispatcher.TryEnqueue(() =>
+        {
+            // Repeat the exact request/generation/disposal gate after dispatch.
+            if (_disposed || !_graphState.TryAcceptGraph(
+                    publication.RequestId, publication.Payload, publication.Stage))
+            {
+                return;
+            }
+
+            Graph = publication.Payload;
+            RecomputeVisibleUsage();
+            ResolveRemaining();
+            Changed?.Invoke();
+        });
+    }
+
+    private void OnGraphCompleted(GraphRequestCompletion completion)
+    {
+        if (!_graphState.IsCurrent(completion.RequestId))
+        {
+            return;
+        }
+
+        Volatile.Write(ref _slowInFlight, 0);
+        var forcedGeneration = Volatile.Read(ref _forcedRefreshGeneration);
+        var forcedRequest = new GraphRequestId(
+            GraphQuery.Normalize(null), forcedGeneration);
+        if (forcedGeneration != 0
+            && completion.IsSuccessfulRicherFor(forcedRequest)
+            && Interlocked.CompareExchange(
+                ref _forcedRefreshGeneration, 0, forcedGeneration)
+                == forcedGeneration)
+        {
+            Interlocked.Exchange(
+                ref _lastFullRefreshTicks, DateTimeOffset.UtcNow.Ticks);
+        }
+    }
+
+    private void RefreshQuota()
+    {
+        if (Interlocked.Exchange(ref _quotaInFlight, 1) == 1)
+        {
+            return;
+        }
+
         _ = Task.Run(() =>
         {
             try
             {
-                UsagePayload? graph;
-                using (ProcessPower.Boost())
-                {
-                    graph = TryFetch(() => force
-                        ? TbCore.RefreshGraph() : TbCore.Graph(), "tray graph");
-                }
-
-                if (force && graph is not null)
-                {
-                    _lastFullRefresh = DateTimeOffset.Now;
-                }
-
                 var quota = TryFetch(
                     () => AgentUsageFetchCoordinator.Shared.FetchAsync().GetAwaiter().GetResult(),
                     "tray quota");
+                if (quota is null)
+                {
+                    return;
+                }
+
                 _ = _dispatcher.TryEnqueue(() =>
                 {
                     if (_disposed)
                     {
-                        return; // don't touch the tray icon after shutdown
+                        return;
                     }
 
-                    Graph = graph ?? Graph;
-                    Quota = quota ?? Quota;
-                    if (quota is not null)
+                    Quota = quota;
+                    var persistedSelection = AppSettings.Store.GetString(
+                        "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
+                    if (QuotaSelectionPolicy.MigrationToPersist(quota, persistedSelection)
+                        is { } migrated)
                     {
-                        var persistedSelection = AppSettings.Store.GetString(
-                            "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
-                        if (QuotaSelectionPolicy.MigrationToPersist(quota, persistedSelection)
-                            is { } migrated)
-                        {
-                            AppSettings.Store.SetString("tokenbar.quota.source", migrated);
-                        }
+                        AppSettings.Store.SetString("tokenbar.quota.source", migrated);
                     }
 
                     RecomputeVisibleUsage();
@@ -200,7 +310,7 @@ public sealed class TrayFeed : IDisposable
             }
             finally
             {
-                Volatile.Write(ref _slowInFlight, 0);
+                Volatile.Write(ref _quotaInFlight, 0);
             }
         });
     }

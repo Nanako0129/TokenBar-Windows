@@ -26,6 +26,7 @@ internal sealed class Graph3DPanel : SwapChainPanel
     private Graph3DRenderer? _renderer;
     private GridLayout? _grid;
     private bool _dark;
+    private bool _costAuthoritative;
     private bool _hasData;
     private bool _active;
     private bool _creating;
@@ -65,13 +66,14 @@ internal sealed class Graph3DPanel : SwapChainPanel
 
     /// <summary>Cache data regardless of visibility. If a renderer exists,
     /// rebuild it and render exactly one updated frame.</summary>
-    public void SetData(GridLayout grid, bool dark)
+    public void SetData(GridLayout grid, bool dark, bool costAuthoritative)
     {
-        var signature = DataSignature(grid, dark);
+        var signature = DataSignature(grid, dark, costAuthoritative);
         var changed = signature != _dataSignature;
         _dataSignature = signature;
         _grid = grid;
         _dark = dark;
+        _costAuthoritative = costAuthoritative;
         _hasData = true;
         if (!_active)
         {
@@ -561,13 +563,14 @@ internal sealed class Graph3DPanel : SwapChainPanel
         _dragRenderTicks = 0;
     }
 
-    private static UIElement BuildTooltip(GridCell cell)
+    private UIElement BuildTooltip(GridCell cell)
     {
         var panel = new StackPanel { Spacing = 4, MinWidth = 150 };
         panel.Children.Add(TooltipText(Format.MonthDay(cell.Date), 12, bold: true));
         panel.Children.Add(TooltipText(
             $"{Format.ExactTokens(cell.Tokens)} tokens", 11, 0.9));
-        panel.Children.Add(TooltipText(Format.Usd(cell.Cost), 11, 0.9));
+        panel.Children.Add(TooltipText(
+            CostSurfaceProjection.CostText(cell.Cost, _costAuthoritative), 11, 0.9));
         return panel;
     }
 
@@ -586,7 +589,8 @@ internal sealed class Graph3DPanel : SwapChainPanel
     /// <summary>The Swift reference gates on cols|maxTokens|activeCount|theme.
     /// Keep that contract, plus a compact content fingerprint so two years with
     /// coincidentally equal aggregates cannot retain stale geometry/tooltips.</summary>
-    private static string DataSignature(GridLayout grid, bool dark)
+    private static string DataSignature(
+        GridLayout grid, bool dark, bool costAuthoritative)
     {
         const ulong offset = 14695981039346656037;
         const ulong prime = 1099511628211;
@@ -623,7 +627,7 @@ internal sealed class Graph3DPanel : SwapChainPanel
             }
         }
 
-        return $"{grid.Cols}|{grid.MaxTokens}|{activeCount}|{dark}|{fingerprint:X16}";
+        return $"{grid.Cols}|{grid.MaxTokens}|{activeCount}|{dark}|{costAuthoritative}|{fingerprint:X16}";
     }
 
     /// <summary>Device-removed/reset (TDR, driver update, GPU reset): count it

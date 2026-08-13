@@ -45,4 +45,17 @@ public class ModelColorsTests
         Assert.NotEqual("#da7756", map.Color("anthropic", "claude-haiku-4-5")); // cheaper = tinted
         Assert.Equal("#06b6d4", map.Color(null, "gemini-3-pro")); // unseen → provider base
     }
+
+    [Fact]
+    public void CheckingRankingUsesLexicalModelOrder()
+    {
+        var map = new ModelColorMap(
+        [
+            ("anthropic", "model-z", 100.0),
+            ("anthropic", "model-a", 1.0),
+        ], costAuthoritative: false);
+
+        Assert.Equal("#da7756", map.Color("anthropic", "model-a"));
+        Assert.NotEqual("#da7756", map.Color("anthropic", "model-z"));
+    }
 }

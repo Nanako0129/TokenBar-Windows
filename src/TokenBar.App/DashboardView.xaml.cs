@@ -238,7 +238,10 @@ public sealed partial class DashboardView : UserControl
         var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
         var year = _model?.Year ?? Format.TodayKey()[..4];
         var grid = TokenBar.Core.Grid.Build(year, stats.PerDayMap);
-        _graph3d.SetData(grid, ActualTheme == ElementTheme.Dark);
+        _graph3d.SetData(
+            grid,
+            ActualTheme == ElementTheme.Dark,
+            snapshot.CostAuthoritative);
     }
 
     private void DetachGraph3DContentHost()
@@ -347,7 +350,7 @@ public sealed partial class DashboardView : UserControl
         UpdateRefreshControl(loading: snapshot is null);
         if (snapshot is null)
         {
-            FooterText.Text = "loading usage…";
+            RenderLoadingState();
             return;
         }
 
@@ -356,6 +359,31 @@ public sealed partial class DashboardView : UserControl
         UpdateYearPicker();
         UpdateGraph3DData(snapshot);
         RenderContent(animated: false);
+    }
+
+    private void RenderLoadingState()
+    {
+        TodayValue.Text = "—";
+        TotalValue.Text = "—";
+        RateValue.Text = "—";
+        CostLine.Text = CostSurfaceProjection.Checking;
+        FooterText.Text = "loading usage…";
+        UpdateYearPicker();
+
+        _displayClients = [];
+        _selectedClients = [];
+        _selectedSet = new HashSet<string>(StringComparer.Ordinal);
+        _selectedStats = null;
+        _activeClientTab = ClientRegistry.OverviewTab;
+        _clientTabsSignature = "";
+        ClientTabsPanel.Children.Clear();
+
+        DetachGraph3DContentHost();
+        ContentHost.Content = null;
+        if (!_graph3dDevMode)
+        {
+            _graph3d?.Release();
+        }
     }
 
     private void RefreshSelection(bool animated)
@@ -409,9 +437,8 @@ public sealed partial class DashboardView : UserControl
         TodayValue.Text = Format.CompactTokens(today?.Tokens ?? 0);
         TotalValue.Text = Format.CompactTokens(stats.TotalTokens);
         RateValue.Text = Format.CompactTokens((long)rate);
-        CostLine.Text =
-            $"{Format.Usd(today?.Cost ?? 0)} today · {Format.Usd(stats.TotalCost)} all time · " +
-            $"{stats.ActiveDays} active days";
+        CostLine.Text = CostSurfaceProjection.HeaderCostLine(
+            today?.Cost ?? 0, stats, snapshot.CostAuthoritative);
         FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
     }
 
@@ -699,20 +726,7 @@ public sealed partial class DashboardView : UserControl
             return BuildGraph3D(snapshot);
         }
 
-        var colors = new ModelColorMap(snapshot.Models);
-        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
-        var bars = DayBars.Build(
-            snapshot.Graph,
-            _selectedClients,
-            _chartStackBy,
-            _chartMetric,
-            colors,
-            Format.TodayKey(),
-            rangeEnd: stats.DateRange.End);
-
         var holder = new StackPanel();
-        var canvas = new Canvas { Height = 120 };
-        holder.Children.Add(canvas);
 
         // Stack-by + metric pills, the macOS UsageChartCard secondary row.
         var toggles = new StackPanel
@@ -727,9 +741,20 @@ public sealed partial class DashboardView : UserControl
         byModel.Click += (_, _) => SetStackBy(StackBy.Model);
         byAgent.Click += (_, _) => SetStackBy(StackBy.Agent);
         var byTokens = LensPill("Tokens", _chartMetric == ChartMetric.Tokens);
-        var byCost = LensPill("Price", _chartMetric == ChartMetric.Cost);
+        var costEnabled = CostSurfaceProjection.CanUseCost(
+            snapshot.CostAuthoritative);
+        var byCost = LensPill(
+            CostSurfaceProjection.ChartCostLabel(costEnabled),
+            _chartMetric == ChartMetric.Cost);
+        byCost.IsEnabled = costEnabled;
         byTokens.Click += (_, _) => SetMetric(ChartMetric.Tokens);
-        byCost.Click += (_, _) => SetMetric(ChartMetric.Cost);
+        byCost.Click += (_, _) =>
+        {
+            if (costEnabled)
+            {
+                SetMetric(ChartMetric.Cost);
+            }
+        };
         toggles.Children.Add(byModel);
         toggles.Children.Add(byAgent);
         toggles.Children.Add(new Border { Width = 8 });
@@ -746,15 +771,41 @@ public sealed partial class DashboardView : UserControl
 
         void SetMetric(ChartMetric value)
         {
+            if (value == ChartMetric.Cost && !costEnabled)
+            {
+                return;
+            }
+
             _chartMetric = value;
             AppSettings.Store.SetString("tokenbar.chart.metric",
                 value == ChartMetric.Cost ? "cost" : "tokens");
             RenderContent(false);
         }
         holder.Children.Add(toggles);
+        if (CostSurfaceProjection.IsChartCostChecking(
+                snapshot.CostAuthoritative, _chartMetric))
+        {
+            holder.Children.Add(Ui.Dim(CostSurfaceProjection.ChartChecking));
+            return holder;
+        }
+
+        var colors = new ModelColorMap(snapshot.Models, snapshot.CostAuthoritative);
+        var metric = _chartMetric;
+        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
+        var bars = DayBars.Build(
+            snapshot.Graph,
+            _selectedClients,
+            _chartStackBy,
+            metric,
+            colors,
+            Format.TodayKey(),
+            rangeEnd: stats.DateRange.End);
+        var canvas = new Canvas { Height = 120 };
+        holder.Children.Insert(0, canvas);
+
         // Wrapping legend, capped like the macOS FlowLayout (12 + "+N").
         var legend = new WrapRow { Margin = new Thickness(0, 8, 0, 0) };
-        var allSegments = DayBars.Legend(bars, _chartMetric);
+        var allSegments = DayBars.Legend(bars, metric);
         foreach (var seg in allSegments.Take(12))
         {
             var item = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
@@ -782,9 +833,9 @@ public sealed partial class DashboardView : UserControl
 
             // Bar length follows the metric toggle (tokens or spend).
             double SegValue(DaySegment s) =>
-                _chartMetric == ChartMetric.Cost ? s.Cost : s.Tokens;
+                metric == ChartMetric.Cost ? s.Cost : s.Tokens;
             double BarValue(DayBar b) =>
-                _chartMetric == ChartMetric.Cost ? b.TotalCost : b.TotalTokens;
+                metric == ChartMetric.Cost ? b.TotalCost : b.TotalTokens;
             var maxValue = Math.Max(bars.Max(BarValue), 1e-9);
             const double gap = 3;
             var barWidth = Math.Max(2, (width - gap * (bars.Count - 1)) / bars.Count);
@@ -862,7 +913,9 @@ public sealed partial class DashboardView : UserControl
                         outline.Stroke = hovered
                             ? HoverOutlineBrush()
                             : new SolidColorBrush(Colors.Transparent));
-                    HoverTip.AttachRich(overlay, () => DayTip(capturedBar));
+                    HoverTip.AttachRich(
+                        overlay,
+                        () => DayTip(capturedBar, snapshot.CostAuthoritative));
                     canvas.Children.Add(overlay);
                 }
             }
@@ -1002,7 +1055,8 @@ public sealed partial class DashboardView : UserControl
         row.Children.Add(Metric($"{stats.Streaks.Current}d", "current"));
         row.Children.Add(Metric($"{stats.Streaks.Longest}d", "longest"));
         row.Children.Add(Metric(
-            stats.BestDay is { } best ? Format.MonthDay(best.Date) : "—", "best day"));
+            CostSurfaceProjection.BestDayText(
+                stats.BestDay, snapshot.CostAuthoritative), "best day"));
         return row;
     }
 
@@ -1016,8 +1070,9 @@ public sealed partial class DashboardView : UserControl
         var subtitleParts = new List<string>();
         if (report is not null)
         {
-            subtitleParts.Add($"{entries.Count} models · {Format.Usd(entries.Sum(e => e.Cost))}");
-            if (report.PricingUpdatedAt is { } ts)
+            subtitleParts.Add(CostSurfaceProjection.ModelsSubtitle(
+                entries, snapshot.CostAuthoritative));
+            if (snapshot.CostAuthoritative && report.PricingUpdatedAt is { } ts)
             {
                 subtitleParts.Add($"Prices updated {Format.RelativeTime(ts)}");
             }
@@ -1064,9 +1119,8 @@ public sealed partial class DashboardView : UserControl
     private FrameworkElement BuildModelRows(DashboardModel.Snapshot snapshot, int? maxRows)
     {
         var panel = new StackPanel { Spacing = 8 };
-        var entries = SelectedModelEntries(snapshot)
-            .OrderByDescending(e => e.Cost)
-            .ToList();
+        var entries = CostSurfaceProjection.OrderModels(
+            SelectedModelEntries(snapshot), snapshot.CostAuthoritative).ToList();
         if (maxRows is { } cap)
         {
             entries = entries.Take(cap).ToList();
@@ -1078,7 +1132,8 @@ public sealed partial class DashboardView : UserControl
             return panel;
         }
 
-        var colors = new ModelColorMap(snapshot.Models);
+        var colors = new ModelColorMap(
+            snapshot.Models, snapshot.CostAuthoritative);
         foreach (var entry in entries)
         {
             var block = new StackPanel { Spacing = 3 };
@@ -1090,7 +1145,9 @@ public sealed partial class DashboardView : UserControl
             var trailing = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
             var tokensText = Ui.Text(Format.CompactTokens(entry.Total), 11, 0.9);
             tokensText.HorizontalAlignment = HorizontalAlignment.Right;
-            var costText = Ui.Text(Format.Usd(entry.Cost), 10, 0.65);
+            var costText = Ui.Text(
+                CostSurfaceProjection.CostText(
+                    entry.Cost, snapshot.CostAuthoritative), 10, 0.65);
             costText.HorizontalAlignment = HorizontalAlignment.Right;
             trailing.Children.Add(tokensText);
             trailing.Children.Add(costText);
@@ -1126,7 +1183,9 @@ public sealed partial class DashboardView : UserControl
                 barGlow.Opacity = hovered ? 1 : 0;
                 discGlow.Opacity = hovered ? 1 : 0;
             });
-            HoverTip.AttachRich(block, () => ModelTip(captured, colors));
+            HoverTip.AttachRich(
+                block,
+                () => ModelTip(captured, colors, snapshot.CostAuthoritative));
             panel.Children.Add(block);
         }
 
@@ -1195,7 +1254,8 @@ public sealed partial class DashboardView : UserControl
     private UIElement BuildDaily(DashboardModel.Snapshot snapshot)
     {
         var panel = new StackPanel { Spacing = 6 };
-        var colors = new ModelColorMap(snapshot.Models);
+        var colors = new ModelColorMap(
+            snapshot.Models, snapshot.CostAuthoritative);
         var days = DailyRows.Build(snapshot.Graph, _selectedClients);
         if (days.Count == 0)
         {
@@ -1217,7 +1277,9 @@ public sealed partial class DashboardView : UserControl
                 summary += $" · {turns} turns · {scope}";
             }
 
-            summary += $" · {Format.CompactTokens(selectedDay.Tokens)} · {Format.Usd(selectedDay.Cost)}";
+            summary += $" · {Format.CompactTokens(selectedDay.Tokens)} · "
+                + CostSurfaceProjection.CostText(
+                    selectedDay.Cost, snapshot.CostAuthoritative);
             var head = Ui.Row(
                 Ui.Text(Format.MonthDay(selectedDay.Date), 12, bold: true),
                 Ui.Text(summary, 11, 0.8));
@@ -1225,7 +1287,8 @@ public sealed partial class DashboardView : UserControl
 
             if (_expandedDay == selectedDay.Date)
             {
-                foreach (var client in selectedDay.Clients)
+                foreach (var client in CostSurfaceProjection.OrderContributionClients(
+                    selectedDay.Clients, snapshot.CostAuthoritative))
                 {
                     var name = new StackPanel
                     {
@@ -1240,7 +1303,12 @@ public sealed partial class DashboardView : UserControl
                         $"{client.ModelId} · {ClientRegistry.ShortName(client.Client)}", 10, 0.85));
                     var row = Ui.Row(
                         name,
-                        Ui.Text($"{Format.CompactTokens(client.Tokens.Total)} · {Format.Usd(client.Cost)}", 10, 0.7));
+                        Ui.Text(
+                            $"{Format.CompactTokens(client.Tokens.Total)} · "
+                                + CostSurfaceProjection.CostText(
+                                    client.Cost, snapshot.CostAuthoritative),
+                            10,
+                            0.7));
                     var capturedClient = client;
                     // Same treatment as the Models lens: the disc lights up with
                     // the card, so the row the card describes is unambiguous.
@@ -1270,7 +1338,10 @@ public sealed partial class DashboardView : UserControl
                         subDiscGlow.Opacity = hovered ? 1 : 0;
                         rowGlow.Opacity = hovered ? 0.55 : 0;
                     });
-                    HoverTip.AttachRich(rowHost, () => ModelTip(capturedClient, colors));
+                    HoverTip.AttachRich(
+                        rowHost,
+                        () => ModelTip(
+                            capturedClient, colors, snapshot.CostAuthoritative));
                     block.Children.Add(rowHost);
                 }
             }
@@ -1371,7 +1442,11 @@ public sealed partial class DashboardView : UserControl
                 panel.Children.Add(Ui.Row(
                     label,
                     Ui.Text(
-                        $"{Format.CompactTokens(entry.Total)} · {Format.Usd(entry.Cost)}", 11, 0.75)));
+                        $"{Format.CompactTokens(entry.Total)} · "
+                            + CostSurfaceProjection.HourlyCost(
+                                entry.Cost, snapshot.CostAuthoritative),
+                        11,
+                        0.75)));
             }
 
             if (entries.Count > _hourlyWindow)
@@ -1402,16 +1477,18 @@ public sealed partial class DashboardView : UserControl
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.RowDefinitions.Add(new RowDefinition());
         grid.RowDefinitions.Add(new RowDefinition());
-        var favorite = SelectedModelEntries(snapshot)
-            .OrderByDescending(e => e.Cost)
-            .FirstOrDefault();
+        var favorite = CostSurfaceProjection.FavoriteModel(
+            SelectedModelEntries(snapshot), snapshot.CostAuthoritative);
         (string Value, string Label)[] metrics =
         [
-            (Format.Usd(stats.TotalCost), "total spend"),
+            (CostSurfaceProjection.CostText(
+                stats.TotalCost, snapshot.CostAuthoritative), "total spend"),
             (Format.CompactTokens(stats.TotalTokens), "tokens"),
             ($"{stats.ActiveDays}", "active days"),
-            (Format.Usd(stats.AveragePerDay), "avg/day"),
-            (stats.BestDay is { } b ? Format.MonthDay(b.Date) : "—", "best day"),
+            (CostSurfaceProjection.CostText(
+                stats.AveragePerDay, snapshot.CostAuthoritative), "avg/day"),
+            (CostSurfaceProjection.BestDayText(
+                stats.BestDay, snapshot.CostAuthoritative), "best day"),
         ];
         for (var i = 0; i < metrics.Length; i++)
         {
@@ -1446,17 +1523,25 @@ public sealed partial class DashboardView : UserControl
         }
 
         var panel = new StackPanel { Spacing = 8 };
-        var entries = agents.Entries.OrderByDescending(e => e.Cost).ToList();
-        var maxCost = Math.Max(entries.FirstOrDefault()?.Cost ?? 0, 0.0001);
+        var entries = CostSurfaceProjection.OrderAgents(
+            agents.Entries, snapshot.CostAuthoritative);
+        var maxCost = CostSurfaceProjection.AgentScale(
+            entries, snapshot.CostAuthoritative);
         foreach (var entry in entries)
         {
             var block = new StackPanel { Spacing = 3 };
             block.Children.Add(Ui.Row(
                 Ui.Text(entry.Agent, 11, bold: true),
                 Ui.Text(
-                    $"{entry.Messages} msgs · {Format.CompactTokens(entry.Total)} · {Format.Usd(entry.Cost)}",
-                    10, 0.75)));
-            block.Children.Add(Ui.ShareBar(entry.Cost / maxCost, "#3b82f6"));
+                    $"{entry.Messages} msgs · {Format.CompactTokens(entry.Total)} · "
+                        + CostSurfaceProjection.CostText(
+                            entry.Cost, snapshot.CostAuthoritative),
+                    10,
+                    0.75)));
+            block.Children.Add(Ui.ShareBar(
+                CostSurfaceProjection.AgentBarValue(
+                    entry, snapshot.CostAuthoritative) / maxCost,
+                "#3b82f6"));
             block.Children.Add(Ui.Dim(string.Join(", ",
                 entry.Clients.Select(ClientRegistry.ShortName)), 9));
             panel.Children.Add(block);
@@ -1468,7 +1553,9 @@ public sealed partial class DashboardView : UserControl
         }
 
         stack.Children.Add(Ui.Card(
-            "Agents by cost", panel, $"{agents.TotalMessages} messages"));
+            CostSurfaceProjection.AgentsTitle(snapshot.CostAuthoritative),
+            panel,
+            $"{agents.TotalMessages} messages"));
         return stack;
     }
 
@@ -1546,21 +1633,22 @@ public sealed partial class DashboardView : UserControl
 
     /// <summary>Whole-day chart tooltip: date, totals row, then one dotted
     /// line per segment — the macOS bar tooltip.</summary>
-    private UIElement DayTip(DayBar bar)
+    private UIElement DayTip(DayBar bar, bool costAuthoritative)
     {
         var panel = new StackPanel { Spacing = 5, MinWidth = 200 };
         panel.Children.Add(TipText(Format.MonthDay(bar.Date), 12, bold: true));
         panel.Children.Add(TipRow(
             TipText($"{Format.ExactTokens(bar.TotalTokens)} tokens", 11, 0.9),
-            Format.Usd(bar.TotalCost), 0.9));
-        var ordered = _chartMetric == ChartMetric.Cost
-            ? bar.Segments.OrderByDescending(s => s.Cost)
-            : bar.Segments.OrderByDescending(s => s.Tokens);
+            CostSurfaceProjection.DayTipCost(bar.TotalCost, costAuthoritative), 0.9));
+        var ordered = CostSurfaceProjection.OrderDaySegments(
+            bar.Segments, costAuthoritative, _chartMetric);
         foreach (var seg in ordered)
         {
             panel.Children.Add(TipRow(
                 TipLabel(seg.Color, seg.Label),
-                $"{Format.CompactTokens(seg.Tokens)} · {Format.Usd(seg.Cost)}"));
+                $"{Format.CompactTokens(seg.Tokens)} · "
+                    + CostSurfaceProjection.DayTipCost(
+                        seg.Cost, costAuthoritative)));
         }
 
         return panel;
@@ -1569,7 +1657,10 @@ public sealed partial class DashboardView : UserControl
     /// <summary>Model-row tooltip: header disc + name, source line, totals,
     /// then per-kind colored rows with share percentages — the macOS
     /// ModelBreakdownCard hover.</summary>
-    private static UIElement ModelTip(ContributionClient entry, ModelColorMap colors) =>
+    private static UIElement ModelTip(
+        ContributionClient entry,
+        ModelColorMap colors,
+        bool costAuthoritative) =>
         ModelTip(new ModelReportEntry(
             entry.Client,
             entry.ModelId,
@@ -1581,10 +1672,16 @@ public sealed partial class DashboardView : UserControl
             entry.Tokens.Reasoning,
             entry.Tokens.Total,
             entry.Messages,
-            entry.Cost), colors, includeZeroKinds: true);
+            entry.Cost),
+            colors,
+            costAuthoritative,
+            includeZeroKinds: true);
 
     private static UIElement ModelTip(
-        ModelReportEntry entry, ModelColorMap colors, bool includeZeroKinds = false)
+        ModelReportEntry entry,
+        ModelColorMap colors,
+        bool costAuthoritative,
+        bool includeZeroKinds = false)
     {
         long[] values =
             [entry.Input, entry.Output, entry.CacheRead, entry.CacheWrite, entry.Reasoning];
@@ -1602,7 +1699,8 @@ public sealed partial class DashboardView : UserControl
             $"{ClientRegistry.ShortName(entry.Client)} · {entry.Provider}", 10, 0.6));
         panel.Children.Add(TipRow(
             TipText($"{Format.CompactTokens(entry.Total)} tokens", 11, 0.9),
-            Format.Usd(entry.Cost), 0.9));
+            CostSurfaceProjection.ModelTipCost(
+                entry.Cost, costAuthoritative), 0.9));
         (string Label, string Color)[] kinds =
         [
             ("Input", Ui.TokenKinds[0].Color),

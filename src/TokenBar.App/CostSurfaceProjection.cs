@@ -1,0 +1,140 @@
+using TokenBar.Core;
+using TokenBar.Interop;
+
+namespace TokenBar.App;
+
+/// <summary>One authority-aware policy for every cost-bearing surface. The
+/// graph metadata, accepted by GraphConsumerState, is the only authority input;
+/// a numeric cost is never used to infer readiness.</summary>
+public static class CostSurfaceProjection
+{
+    public const string Checking = "Checking";
+    public const string ChartChecking = "Checking cost…";
+
+    public static bool CanUseCost(bool authoritative) => authoritative;
+
+    public static bool IsChartCostChecking(
+        bool authoritative, ChartMetric requested) =>
+        !authoritative && requested == ChartMetric.Cost;
+
+    public static bool IsAuthoritative(UsagePayload? graph) =>
+        graph?.Meta.PricingMode == PricingMode.BestEffort
+        && graph.Meta.CostCoverage == CostCoverage.Complete;
+
+    public static string CostText(double cost, bool authoritative) =>
+        authoritative ? Format.Usd(cost) : Checking;
+
+    public static string HeaderCostLine(
+        double todayCost, UsageStats stats, bool authoritative) =>
+        authoritative
+            ? $"{Format.Usd(todayCost)} today · "
+                + $"{Format.Usd(stats.TotalCost)} all time · {stats.ActiveDays} active days"
+            : $"{Checking} · {stats.ActiveDays} active days";
+
+    public static string HeaderCostLine(UsageStats stats, bool authoritative) =>
+        HeaderCostLine(
+            stats.PerDayMap.TryGetValue(Format.TodayKey(), out var today)
+                ? today.Cost
+                : 0,
+            stats,
+            authoritative);
+
+    public static string ModelsSubtitle(
+        IReadOnlyList<ModelReportEntry> entries, bool authoritative) =>
+        $"{entries.Count} models · "
+        + (authoritative ? Format.Usd(entries.Sum(e => e.Cost)) : Checking);
+
+    public static IReadOnlyList<ModelReportEntry> OrderModels(
+        IEnumerable<ModelReportEntry> entries, bool authoritative)
+    {
+        var query = entries
+            .OrderByDescending(e => authoritative ? FiniteOrZero(e.Cost) : e.Total)
+            .ThenBy(e => e.Provider, StringComparer.Ordinal)
+            .ThenBy(e => e.Model, StringComparer.Ordinal)
+            .ThenBy(e => e.Client, StringComparer.Ordinal);
+        return [.. query];
+    }
+
+    public static ModelReportEntry? FavoriteModel(
+        IEnumerable<ModelReportEntry> entries, bool authoritative) =>
+        OrderModels(entries, authoritative).FirstOrDefault();
+
+    public static IReadOnlyList<ContributionClient> OrderContributionClients(
+        IEnumerable<ContributionClient> clients, bool authoritative)
+    {
+        var query = clients
+            .OrderByDescending(e => authoritative ? FiniteOrZero(e.Cost) : e.Tokens.Total)
+            .ThenBy(e => e.ProviderId, StringComparer.Ordinal)
+            .ThenBy(e => e.ModelId, StringComparer.Ordinal)
+            .ThenBy(e => e.Client, StringComparer.Ordinal);
+        return [.. query];
+    }
+
+    public static string BestDayText((string Date, double Cost)? bestDay, bool authoritative) =>
+        !authoritative ? Checking
+        : bestDay is { } best ? Format.MonthDay(best.Date) : "—";
+
+    public static ChartMetric EffectiveMetric(bool authoritative, ChartMetric requested) =>
+        authoritative || requested != ChartMetric.Cost ? requested : ChartMetric.Tokens;
+
+    public static string ChartCostLabel(bool authoritative) =>
+        authoritative ? "Price" : "Price · Checking";
+
+    public static IReadOnlyList<DaySegment> OrderDaySegments(
+        IEnumerable<DaySegment> segments,
+        bool authoritative,
+        ChartMetric requested)
+    {
+        var metric = EffectiveMetric(authoritative, requested);
+        var query = metric == ChartMetric.Cost
+            ? segments.OrderByDescending(s => s.Cost)
+            : segments.OrderByDescending(s => s.Tokens);
+        return [.. query.ThenBy(s => s.Key, StringComparer.Ordinal)];
+    }
+
+    public static IReadOnlyList<AgentReportEntry> OrderAgents(
+        IEnumerable<AgentReportEntry> entries, bool authoritative)
+    {
+        var query = entries
+            .OrderByDescending(e => authoritative ? FiniteOrZero(e.Cost) : e.Total)
+            .ThenBy(e => e.Agent, StringComparer.Ordinal);
+        return [.. query];
+    }
+
+    public static double AgentScale(
+        IReadOnlyList<AgentReportEntry> entries, bool authoritative)
+    {
+        var max = entries.Count == 0
+            ? 0
+            : entries.Max(e => authoritative ? FiniteOrZero(e.Cost) : e.Total);
+        return Math.Max(max, authoritative ? 0.0001 : 1);
+    }
+
+    public static double AgentBarValue(AgentReportEntry entry, bool authoritative) =>
+        authoritative ? FiniteOrZero(entry.Cost) : entry.Total;
+
+    public static string AgentsTitle(bool authoritative) =>
+        authoritative ? "Agents by cost" : "Agents by tokens";
+
+    public static string TrayTitle(
+        TrayMode mode,
+        TrayTotals? totals,
+        double? tokensPerMin,
+        double? quotaRemaining,
+        bool authoritative) =>
+        !authoritative
+            && mode is (TrayMode.TodayCost or TrayMode.TotalCost)
+            ? Checking
+            : mode.Title(totals, tokensPerMin, quotaRemaining);
+
+    public static string HourlyCost(double cost, bool authoritative) =>
+        CostText(cost, authoritative);
+
+    public static string DayTipCost(double cost, bool authoritative) =>
+        CostText(cost, authoritative);
+
+    public static string ModelTipCost(double cost, bool authoritative) =>
+        CostText(cost, authoritative);
+
+    private static double FiniteOrZero(double value) => double.IsFinite(value) ? value : 0;
+}
