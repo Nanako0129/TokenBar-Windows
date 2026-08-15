@@ -52,7 +52,10 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_hourly_report(options))?;
+    let report = runtime.block_on(tokscale_core::get_hourly_report_with_source_context(
+        context.resolved(),
+        options,
+    ))?;
 
     let data = map_report(report);
     serde_json::to_value(data).map_err(|e| format!("serialize hourly report: {}", e))
@@ -113,7 +116,13 @@ mod tests {
     /// #766 clamps corrupt Antigravity varints to `i64::MAX` per bucket. Two
     /// such buckets in one hourly entry must saturate the mapped `total`, not
     /// overflow it (a plain `+` panics in debug / wraps in release).
-    fn entry(input: i64, output: i64, cache_read: i64, cache_write: i64, reasoning: i64) -> tokscale_core::HourlyUsage {
+    fn entry(
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+    ) -> tokscale_core::HourlyUsage {
         tokscale_core::HourlyUsage {
             hour: "2026-07-12 00:00".to_string(),
             clients: vec!["antigravity_cli".to_string()],

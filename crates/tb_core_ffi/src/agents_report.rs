@@ -54,7 +54,10 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_agents_report(options))?;
+    let report = runtime.block_on(tokscale_core::get_agents_report_with_source_context(
+        context.resolved(),
+        options,
+    ))?;
 
     let data = map_report(report);
     serde_json::to_value(data).map_err(|e| format!("serialize agents report: {}", e))

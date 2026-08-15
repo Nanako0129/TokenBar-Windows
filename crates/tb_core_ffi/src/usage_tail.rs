@@ -75,7 +75,7 @@ impl UsageTailer {
     /// Re-parse recent local sessions via tokscale-core and replace the event
     /// window. Returns the number of events now in the window (cheap to compute
     /// and only used as a "did anything happen" hint by callers).
-    pub fn tick(&self) -> usize {
+    pub fn tick(&self, context: &crate::LocalSourceContext) -> usize {
         // `since` is date-granular; reach back one day so a sub-hour window that
         // straddles midnight still sees yesterday's tail.
         let since = (Local::now() - Duration::days(1))
@@ -87,19 +87,25 @@ impl UsageTailer {
         // only files active within the window — plus a small margin for write
         // latency and clock skew — are re-parsed each tick.
         let window_reach_ms = (EVENT_WINDOW_SECS + 300) * 1000;
-        let context = crate::LocalSourceContext::current();
         let mut options = context.parse_options(None, None);
         options.since = Some(since);
         options.modified_after = Some((now_ms() - window_reach_ms) as u64);
 
         // No source changed since the last parse → the window is already
         // correct; skip the parse. Probe failure falls through to a parse.
-        let token = tokscale_core::local_source_change_token(&options).ok();
+        let token = tokscale_core::local_source_change_token_with_source_context(
+            context.resolved(),
+            &options,
+        )
+        .ok();
         if token.is_some() && *self.last_source_token.lock() == token {
             return self.events.lock().len();
         }
 
-        let parsed = match tokscale_core::parse_local_clients(options) {
+        let parsed = match tokscale_core::parse_local_clients_with_source_context(
+            context.resolved(),
+            options,
+        ) {
             Ok(parsed) => parsed,
             Err(_) => return self.events.lock().len(),
         };

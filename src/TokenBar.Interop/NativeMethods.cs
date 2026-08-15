@@ -37,6 +37,9 @@ internal static partial class NativeMethods
     internal static partial nint tb_agents_report(string? year, string? clients);
 
     [LibraryImport(Lib)]
+    internal static partial nint tb_source_context_id();
+
+    [LibraryImport(Lib)]
     internal static partial nint tb_filter_parity_probe();
 
     [LibraryImport(Lib)]

@@ -49,7 +49,7 @@ struct ModelReportData {
 /// Build the per-model report for `year` (empty string = all time).
 pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Value, String> {
     let year = normalize_year(year)?;
-    let data = load_report(report_options(context, year))?;
+    let data = load_report(context, report_options(context, year))?;
     serde_json::to_value(data).map_err(|e| format!("serialize model report: {}", e))
 }
 
@@ -64,13 +64,19 @@ fn report_options(
     options
 }
 
-fn load_report(options: tokscale_core::ReportOptions) -> Result<ModelReportData, String> {
+fn load_report(
+    context: &crate::LocalSourceContext,
+    options: tokscale_core::ReportOptions,
+) -> Result<ModelReportData, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
     runtime
-        .block_on(tokscale_core::get_model_report(options))
+        .block_on(tokscale_core::get_model_report_with_source_context(
+            context.resolved(),
+            options,
+        ))
         .map(map_report)
 }
 
@@ -257,18 +263,20 @@ mod tests {
     }
 
     fn run_provider_fixture(home: &std::path::Path) {
-        let context = crate::LocalSourceContext {
-            home_dir: Some(home.to_path_buf()),
-        };
+        let context = crate::LocalSourceContext::capture(
+            Some(home.to_path_buf()),
+            false,
+            tokscale_core::ScannerSettings::default(),
+        )
+        .unwrap();
         let mut options = report_options(&context, None);
-        options.use_env_roots = false;
         options.clients = Some(vec!["mux".to_string()]);
         assert_eq!(
             options.group_by,
             tokscale_core::GroupBy::ClientProviderModel
         );
 
-        let report = load_report(options).unwrap();
+        let report = load_report(&context, options).unwrap();
         assert_eq!(report.entries.len(), 3);
         assert!(report.entries.iter().all(|entry| entry.client == "mux"
             && entry.model == "same-model"

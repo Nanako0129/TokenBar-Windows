@@ -71,6 +71,13 @@ char *tb_hourly_report(const char *year, const char *clients);
 // Per-(sub-)agent report (AgentsReport). `clients` as in tb_hourly_report.
 char *tb_agents_report(const char *year, const char *clients);
 
+// Process-stable source configuration identity. Success uses the standard
+// envelope with `data` equal to exactly `sc1:` plus 64 lowercase hex digits.
+// Failure is the fixed redacted `sourceContextUnavailable`; no path, descriptor,
+// panic payload, or native cause crosses this boundary. The ID is not a secret
+// and must not be written to normal diagnostics, UI, or Smoke output.
+char *tb_source_context_id(void);
+
 // Source-generation-aware hourly/Agents filter parity diagnostic. The graph
 // client list is derived from a fresh graph and all reports are bracketed by
 // one opaque local-source token sequence. The success payload contains only

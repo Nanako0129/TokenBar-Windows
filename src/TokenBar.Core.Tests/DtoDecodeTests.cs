@@ -158,6 +158,31 @@ public class DtoDecodeTests
     }
 
     [Fact]
+    public void SourceContextIdAcceptsOnlyExactVersionedLowercaseSha256Grammar()
+    {
+        var valid = "sc1:" + new string('a', 64);
+        Assert.Equal(valid, TbCore.ValidateSourceContextId(valid));
+
+        foreach (var invalid in new[]
+        {
+            "", "sc1:" + new string('a', 63), "sc1:" + new string('a', 65),
+            "sc2:" + new string('a', 64), "SC1:" + new string('a', 64),
+            "sc1:" + new string('A', 64), "sc1:" + new string('g', 64),
+            "sc1:" + new string('a', 63) + "\n", " " + valid, valid + "suffix",
+        })
+        {
+            Assert.Throws<TbCoreException>(() => TbCore.ValidateSourceContextId(invalid));
+        }
+    }
+
+    [Fact]
+    public void SourceContextIdEnvelopeRejectsMissingAndNonStringPayloads()
+    {
+        Assert.Throws<TbCoreException>(() => TbCore.DecodeEnvelope<string>("""{"ok":true}"""));
+        Assert.Throws<JsonException>(() => TbCore.DecodeEnvelope<string>("""{"ok":true,"data":1}"""));
+    }
+
+    [Fact]
     public void FilterParityProbeDecodesStatusesNullableAggregatesAndBoundedSummary()
     {
         var payload = TbCore.DecodeEnvelope<FilterParityProbe>(

@@ -120,7 +120,10 @@ type ReportFn<'a> = dyn FnMut(&LocalSourceContext, Option<&[String]>) -> Result<
 /// Run the production parity probe using one context and a fresh graph.
 pub(crate) fn run(context: &LocalSourceContext) -> Result<FilterParityPayload, String> {
     let mut token = |context: &LocalSourceContext| {
-        tokscale_core::local_source_change_token(&context.parse_options(None, None))
+        tokscale_core::local_source_change_token_with_source_context(
+            context.resolved(),
+            &context.parse_options(None, None),
+        )
     };
     let mut graph = |context: &LocalSourceContext| usage_graph::run(context, "");
     let mut hourly = |context: &LocalSourceContext, clients: Option<&[String]>| {
@@ -350,13 +353,22 @@ mod tests {
     use std::cell::RefCell;
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::path::PathBuf;
     use std::rc::Rc;
 
     fn context() -> LocalSourceContext {
-        LocalSourceContext {
-            home_dir: Some(PathBuf::from("fixture-home")),
-        }
+        LocalSourceContext::capture(
+            Some(std::env::temp_dir().join(format!(
+                "tokenbar-filter-context-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))),
+            false,
+            tokscale_core::ScannerSettings::default(),
+        )
+        .unwrap()
     }
 
     fn graph() -> Value {
@@ -623,14 +635,22 @@ mod tests {
         let source = root.join(".codex/sessions/session.jsonl");
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, b"seed\n").unwrap();
+        let context = LocalSourceContext::capture(
+            Some(root.clone()),
+            false,
+            tokscale_core::ScannerSettings::default(),
+        )
+        .unwrap();
         let options = tokscale_core::LocalParseOptions {
-            home_dir: Some(root.to_string_lossy().into_owned()),
-            use_env_roots: false,
             clients: Some(vec!["codex".to_string()]),
             ..Default::default()
         };
-        let mut token =
-            |_context: &LocalSourceContext| tokscale_core::local_source_change_token(&options);
+        let mut token = |context: &LocalSourceContext| {
+            tokscale_core::local_source_change_token_with_source_context(
+                context.resolved(),
+                &options,
+            )
+        };
         let calls = Rc::new(RefCell::new(Vec::new()));
         let graph_calls = Rc::clone(&calls);
         let mut graph_fn = |_context: &LocalSourceContext| {
@@ -658,9 +678,7 @@ mod tests {
         };
 
         let result = run_with(
-            &LocalSourceContext {
-                home_dir: Some(root.clone()),
-            },
+            &context,
             &mut token,
             &mut graph_fn,
             &mut hourly_fn,
