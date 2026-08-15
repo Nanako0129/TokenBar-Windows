@@ -42,6 +42,17 @@ void Step(string name, Func<string> body)
     }
 }
 
+try
+{
+    _ = TbCore.SourceContextId();
+    Console.WriteLine("source-context:v1 valid");
+}
+catch
+{
+    failed++;
+    Console.WriteLine("source-context:v1 FAILED");
+}
+
 long probeMessages = -1;
 Step("tb_probe", () =>
 {

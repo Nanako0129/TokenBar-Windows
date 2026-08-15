@@ -130,13 +130,19 @@ fn run_mode(
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
     let report = if local_only {
-        runtime.block_on(tokscale_core::generate_local_graph_report_local_only(
-            options,
-        ))?
+        runtime.block_on(
+            tokscale_core::generate_local_graph_report_local_only_with_source_context(
+                context.resolved(),
+                options,
+            ),
+        )?
     } else {
-        runtime.block_on(tokscale_core::generate_local_graph_report_with_contract(
-            options,
-        ))?
+        runtime.block_on(
+            tokscale_core::generate_local_graph_report_with_source_context(
+                context.resolved(),
+                options,
+            ),
+        )?
     };
 
     let payload = map_graph(report);
@@ -289,7 +295,15 @@ mod tests {
 
     #[test]
     fn invalid_year_is_rejected_before_engine_scan() {
-        let context = crate::LocalSourceContext { home_dir: None };
+        let context = crate::LocalSourceContext::capture(
+            Some(std::env::temp_dir().join(format!(
+                "tokenbar-usage-graph-invalid-year-{}",
+                std::process::id()
+            ))),
+            false,
+            tokscale_core::ScannerSettings::default(),
+        )
+        .unwrap();
         let error = run_local_first(&context, "26").unwrap_err();
         assert!(error.contains("invalid year filter"));
     }

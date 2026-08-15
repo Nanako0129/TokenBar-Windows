@@ -83,6 +83,34 @@ public static class TbCore
     public static AgentsReport AgentsReport(string? year = null, IReadOnlyList<string>? clients = null) =>
         Unwrap<AgentsReport>(NativeMethods.tb_agents_report(year, JoinClients(clients)));
 
+    /// <summary>
+    /// Process-stable source configuration identity. The full value is for
+    /// cache binding only and must not be written to normal diagnostics or UI.
+    /// </summary>
+    public static string SourceContextId() =>
+        ValidateSourceContextId(Unwrap<string>(NativeMethods.tb_source_context_id()));
+
+    public static string ValidateSourceContextId(string value)
+    {
+        if (value is null || value.Length != 68 ||
+            !value.StartsWith("sc1:", StringComparison.Ordinal))
+        {
+            throw new TbCoreException("source context ID has invalid format");
+        }
+
+        for (var index = 4; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (!((character >= '0' && character <= '9') ||
+                  (character >= 'a' && character <= 'f')))
+            {
+                throw new TbCoreException("source context ID has invalid format");
+            }
+        }
+
+        return value;
+    }
+
     /// <summary>Source-generation-aware nil/full parity diagnostic for the
     /// hourly and Agents report filters.</summary>
     public static FilterParityProbe FilterParityProbe() =>

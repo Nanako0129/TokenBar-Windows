@@ -35,7 +35,7 @@ mod usage_tail;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use usage_tail::UsageTailer;
@@ -54,19 +54,40 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
     )
 }
 
-/// Snapshot the local source roots used by every FFI report and parse path.
-/// Environment roots are process-startup configuration: changing them requires
-/// restarting the FFI process. Cache keys intentionally do not fingerprint roots.
+/// Immutable engine-owned source resolution shared by every production local
+/// source entry point in this process.
 #[derive(Debug, Clone)]
 pub(crate) struct LocalSourceContext {
-    home_dir: Option<PathBuf>,
+    resolved: Arc<tokscale_core::ResolvedLocalSourceContext>,
 }
 
 impl LocalSourceContext {
-    pub(crate) fn current() -> Self {
-        Self {
-            home_dir: user_home_dir(),
-        }
+    #[cfg(test)]
+    pub(crate) fn capture(
+        home_dir: Option<PathBuf>,
+        use_env_roots: bool,
+        scanner_settings: tokscale_core::ScannerSettings,
+    ) -> Result<Self, tokscale_core::SourceContextUnavailable> {
+        tokscale_core::ResolvedLocalSourceContext::capture(
+            home_dir,
+            use_env_roots,
+            scanner_settings,
+        )
+        .map(Arc::new)
+        .map(|resolved| Self { resolved })
+    }
+
+    pub(crate) fn process() -> Result<Self, tokscale_core::SourceContextUnavailable> {
+        PROCESS_SOURCE_CONTEXT
+            .as_ref()
+            .map(|resolved| Self {
+                resolved: Arc::clone(resolved),
+            })
+            .map_err(|error| *error)
+    }
+
+    pub(crate) fn resolved(&self) -> &tokscale_core::ResolvedLocalSourceContext {
+        &self.resolved
     }
 
     pub(crate) fn report_options(
@@ -75,11 +96,6 @@ impl LocalSourceContext {
         clients: Option<Vec<String>>,
     ) -> tokscale_core::ReportOptions {
         tokscale_core::ReportOptions {
-            home_dir: self
-                .home_dir
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-            use_env_roots: true,
             year,
             clients,
             ..Default::default()
@@ -92,17 +108,23 @@ impl LocalSourceContext {
         clients: Option<Vec<String>>,
     ) -> tokscale_core::LocalParseOptions {
         tokscale_core::LocalParseOptions {
-            home_dir: self
-                .home_dir
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-            use_env_roots: true,
             year,
             clients,
             ..Default::default()
         }
     }
 }
+
+static PROCESS_SOURCE_CONTEXT: LazyLock<
+    Result<Arc<tokscale_core::ResolvedLocalSourceContext>, tokscale_core::SourceContextUnavailable>,
+> = LazyLock::new(|| {
+    tokscale_core::ResolvedLocalSourceContext::capture(
+        user_home_dir(),
+        true,
+        tokscale_core::ScannerSettings::default(),
+    )
+    .map(Arc::new)
+});
 
 /// Serve `tb_graph` from cache when the last computation is at most this old;
 /// `tb_refresh_graph` always recomputes. Mirrors the Tauri app's oneshot cache.
@@ -274,7 +296,11 @@ unsafe fn clients_from(clients: *const c_char) -> Result<Option<Vec<String>>, St
     Ok(if list.is_empty() { None } else { Some(list) })
 }
 
-fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
+fn graph_cached(
+    context: &LocalSourceContext,
+    year: &str,
+    max_age: Duration,
+) -> Option<serde_json::Value> {
     // Read the entry and release the lock before any filesystem I/O — never hold
     // GRAPH_CACHE across the source-state probe below (mirrors graph_compute,
     // which probes outside the lock too), so concurrent tb_graph callers don't
@@ -292,9 +318,11 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     // briefly to re-stamp so the next calls inside the oneshot window skip the
     // probe entirely. A lost re-stamp (entry evicted/replaced meanwhile) just
     // degrades to the next call re-probing — benign.
-    let context = LocalSourceContext::current();
-    let fresh =
-        tokscale_core::local_source_change_token(&context.parse_options(None, None)).ok()?;
+    let fresh = tokscale_core::local_source_change_token_with_source_context(
+        context.resolved(),
+        &context.parse_options(None, None),
+    )
+    .ok()?;
     if fresh == token {
         let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = cache.get_mut(year) {
@@ -305,15 +333,17 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     None
 }
 
-fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
+fn graph_compute(context: &LocalSourceContext, year: &str) -> Result<serde_json::Value, String> {
     // Probe before parsing: a source write or topology change that lands
     // mid-compute changes the token, so the next aged-out read recomputes
     // rather than serving a graph that missed it. Keep the same context for
     // both paths so the probe and report scan observe identical source roots.
-    let context = LocalSourceContext::current();
-    let token =
-        tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0);
-    let data = usage_graph::run(&context, year)?;
+    let token = tokscale_core::local_source_change_token_with_source_context(
+        context.resolved(),
+        &context.parse_options(None, None),
+    )
+    .unwrap_or(0);
+    let data = usage_graph::run(context, year)?;
     GRAPH_CACHE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -346,7 +376,7 @@ impl Drop for TickGuard {
 /// heavy `TAILER.tick()` runs with no lock held; the stamp is taken only after
 /// it completes, so a slow (> `TAIL_TICK_SECS`) parse can't be seen as stale
 /// mid-flight, and a tick panic leaves `last` unstamped to retry next call.
-fn tail_tick_if_stale() {
+fn tail_tick_if_stale(context: &LocalSourceContext) {
     let claimed = {
         let mut st = lock_tick();
         if st.in_flight {
@@ -363,7 +393,7 @@ fn tail_tick_if_stale() {
     };
     if claimed {
         let _guard = TickGuard; // clears in_flight on drop (success or panic)
-        TAILER.tick();
+        TAILER.tick(context);
         lock_tick().last = Some(Instant::now()); // success only — panic skips this
     }
 }
@@ -374,8 +404,15 @@ fn tail_tick_if_stale() {
 #[no_mangle]
 pub extern "C" fn tb_probe() -> *mut c_char {
     guarded("tb_probe", || {
-        let context = LocalSourceContext::current();
-        let json = match tokscale_core::parse_local_clients(context.parse_options(None, None)) {
+        let result = LocalSourceContext::process()
+            .map_err(|error| error.to_string())
+            .and_then(|context| {
+                tokscale_core::parse_local_clients_with_source_context(
+                    context.resolved(),
+                    context.parse_options(None, None),
+                )
+            });
+        let json = match result {
             Ok(pm) => format!(r#"{{"ok":true,"messages":{}}}"#, pm.messages.len()),
             Err(e) => serde_json::json!({"ok": false, "err": e}).to_string(),
         };
@@ -392,12 +429,20 @@ pub extern "C" fn tb_probe() -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_graph(year: *const c_char) -> *mut c_char {
     guarded("tb_graph", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| {
-            if let Some(data) = graph_cached(&year, Duration::from_secs(ONESHOT_MAX_AGE_SECS)) {
-                return Ok(data);
-            }
-            graph_compute(&year)
-        }))
+        envelope(
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| {
+                    unsafe { year_from(year) }.and_then(|year| {
+                        if let Some(data) =
+                            graph_cached(&context, &year, Duration::from_secs(ONESHOT_MAX_AGE_SECS))
+                        {
+                            return Ok(data);
+                        }
+                        graph_compute(&context, &year)
+                    })
+                }),
+        )
     })
 }
 
@@ -411,10 +456,13 @@ pub unsafe extern "C" fn tb_graph(year: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_graph_local_first(year: *const c_char) -> *mut c_char {
     guarded("tb_graph_local_first", || {
-        let context = LocalSourceContext::current();
         envelope(
-            unsafe { year_from(year) }
-                .and_then(|year| usage_graph::run_local_first(&context, &year)),
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| {
+                    unsafe { year_from(year) }
+                        .and_then(|year| usage_graph::run_local_first(&context, &year))
+                }),
         )
     })
 }
@@ -426,7 +474,13 @@ pub unsafe extern "C" fn tb_graph_local_first(year: *const c_char) -> *mut c_cha
 #[no_mangle]
 pub unsafe extern "C" fn tb_refresh_graph(year: *const c_char) -> *mut c_char {
     guarded("tb_refresh_graph", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| graph_compute(&year)))
+        envelope(
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| {
+                    unsafe { year_from(year) }.and_then(|year| graph_compute(&context, &year))
+                }),
+        )
     })
 }
 
@@ -437,8 +491,13 @@ pub unsafe extern "C" fn tb_refresh_graph(year: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_model_report(year: *const c_char) -> *mut c_char {
     guarded("tb_model_report", || {
-        let context = LocalSourceContext::current();
-        envelope(unsafe { year_from(year) }.and_then(|year| model_report::run(&context, &year)))
+        envelope(
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| {
+                    unsafe { year_from(year) }.and_then(|year| model_report::run(&context, &year))
+                }),
+        )
     })
 }
 
@@ -455,11 +514,16 @@ pub unsafe extern "C" fn tb_hourly_report(
     clients: *const c_char,
 ) -> *mut c_char {
     guarded("tb_hourly_report", || {
-        let context = LocalSourceContext::current();
-        envelope(unsafe { year_from(year) }.and_then(|year| {
-            let clients = unsafe { clients_from(clients) }?;
-            hourly_report::run(&context, &year, clients)
-        }))
+        envelope(
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| {
+                    unsafe { year_from(year) }.and_then(|year| {
+                        let clients = unsafe { clients_from(clients) }?;
+                        hourly_report::run(&context, &year, clients)
+                    })
+                }),
+        )
     })
 }
 
@@ -477,11 +541,35 @@ pub unsafe extern "C" fn tb_agents_report(
     clients: *const c_char,
 ) -> *mut c_char {
     guarded("tb_agents_report", || {
-        let context = LocalSourceContext::current();
-        envelope(unsafe { year_from(year) }.and_then(|year| {
-            let clients = unsafe { clients_from(clients) }?;
-            agents_report::run(&context, &year, clients)
-        }))
+        envelope(
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| {
+                    unsafe { year_from(year) }.and_then(|year| {
+                        let clients = unsafe { clients_from(clients) }?;
+                        agents_report::run(&context, &year, clients)
+                    })
+                }),
+        )
+    })
+}
+
+fn source_context_id_envelope(
+    identity: impl FnOnce() -> Result<String, tokscale_core::SourceContextUnavailable>,
+) -> *mut c_char {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(identity)) {
+        Ok(Ok(identity)) => envelope(Ok(serde_json::Value::String(identity))),
+        Ok(Err(_)) | Err(_) => envelope(Err("sourceContextUnavailable".to_string())),
+    }
+}
+
+/// Return the process-stable, configuration-only source-context identity.
+/// Failures are fixed and redacted so paths and panic payloads never cross the
+/// ABI. Identity capture and formatting stay wholly inside the unwind boundary.
+#[no_mangle]
+pub extern "C" fn tb_source_context_id() -> *mut c_char {
+    source_context_id_envelope(|| {
+        LocalSourceContext::process().map(|context| context.resolved().identity_string())
     })
 }
 
@@ -496,8 +584,9 @@ pub extern "C" fn tb_filter_parity_probe() -> *mut c_char {
     // contain a private source path, model, or provider value.
     LazyLock::force(&RAYON_INIT);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let context = LocalSourceContext::current();
-        filter_parity_probe::run(&context)
+        LocalSourceContext::process()
+            .map_err(|error| error.to_string())
+            .and_then(|context| filter_parity_probe::run(&context))
     }));
     match result {
         Ok(Ok(payload)) => envelope(
@@ -514,10 +603,14 @@ pub extern "C" fn tb_filter_parity_probe() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn tb_usage_trace(window_secs: i64) -> *mut c_char {
     guarded("tb_usage_trace", || {
-        tail_tick_if_stale();
         envelope(
-            serde_json::to_value(TAILER.trace(window_secs))
-                .map_err(|e| format!("serialize usage trace: {}", e)),
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| {
+                    tail_tick_if_stale(&context);
+                    serde_json::to_value(TAILER.trace(window_secs))
+                        .map_err(|error| format!("serialize usage trace: {error}"))
+                }),
         )
     })
 }
@@ -527,10 +620,14 @@ pub extern "C" fn tb_usage_trace(window_secs: i64) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn tb_tokens_per_min() -> *mut c_char {
     guarded("tb_tokens_per_min", || {
-        tail_tick_if_stale();
-        envelope(Ok(
-            serde_json::json!({"tokensPerMin": TAILER.rate_in_window(600)}),
-        ))
+        envelope(
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .map(|context| {
+                    tail_tick_if_stale(&context);
+                    serde_json::json!({"tokensPerMin": TAILER.rate_in_window(600)})
+                }),
+        )
     })
 }
 
@@ -585,36 +682,19 @@ mod tests {
     use usage_tail::UsageTailer;
 
     static GRAPH_CACHE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    const LOCAL_FIRST_CHILD_HOME: &str = "TB_TEST_LOCAL_FIRST_CHILD_HOME";
 
-    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl EnvGuard {
-        fn set(vars: &[(&'static str, &std::ffi::OsStr)]) -> Self {
-            let guard = Self(
-                vars.iter()
-                    .map(|(key, _)| (*key, std::env::var_os(key)))
-                    .collect(),
-            );
-            unsafe {
-                for (key, value) in vars {
-                    std::env::set_var(key, value);
-                }
-            }
-            guard
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                for (key, previous) in self.0.drain(..) {
-                    match previous {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
+    fn test_context(label: &str) -> LocalSourceContext {
+        let home = std::env::temp_dir().join(format!(
+            "tokenbar-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        LocalSourceContext::capture(Some(home), false, tokscale_core::ScannerSettings::default())
+            .unwrap()
     }
 
     #[test]
@@ -646,26 +726,19 @@ mod tests {
     }
 
     #[test]
-    fn local_source_context_builders_preserve_home_filters_and_env_roots() {
-        let platform_home = PathBuf::from("platform-home");
-        let context = LocalSourceContext {
-            home_dir: select_user_home(None, Some(platform_home.clone())),
-        };
+    fn local_source_context_builders_preserve_filters() {
+        let context = test_context("source-context-options");
         let year = Some("2026".to_string());
         let clients = Some(vec!["claude".to_string(), "codex".to_string()]);
 
         let report = context.report_options(year.clone(), clients.clone());
         let parse = context.parse_options(year.clone(), clients.clone());
-        let expected_home = Some(platform_home.to_string_lossy().into_owned());
 
-        assert_eq!(report.home_dir, expected_home);
-        assert_eq!(parse.home_dir, expected_home);
-        assert!(report.use_env_roots);
-        assert!(parse.use_env_roots);
         assert_eq!(report.year, year);
         assert_eq!(parse.year, year);
         assert_eq!(report.clients, clients);
         assert_eq!(parse.clients, clients);
+        assert!(!context.resolved().use_env_roots());
     }
 
     /// Read a heap JSON pointer into an owned String and free it — the test-side
@@ -674,6 +747,44 @@ mod tests {
         let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
         unsafe { tb_free(p) };
         s
+    }
+
+    #[test]
+    fn source_context_identity_envelope_uses_exact_grammar_from_explicit_context() {
+        let context = test_context("source-context-identity");
+        let expected = context.resolved().identity_string();
+        let json = unsafe {
+            take(source_context_id_envelope(|| {
+                Ok(context.resolved().identity_string())
+            }))
+        };
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let identity = value["data"].as_str().unwrap();
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(identity, expected);
+        assert_eq!(identity.len(), 68);
+        assert!(identity.starts_with("sc1:"));
+        assert!(identity[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+    }
+
+    #[test]
+    fn source_context_identity_failure_and_panic_are_exactly_redacted() {
+        let failure = unsafe {
+            take(source_context_id_envelope(|| {
+                Err(tokscale_core::SourceContextUnavailable)
+            }))
+        };
+        let panic = unsafe {
+            take(source_context_id_envelope(|| {
+                std::panic::resume_unwind(Box::new("injected source-context panic"))
+            }))
+        };
+
+        assert_eq!(failure, r#"{"err":"sourceContextUnavailable","ok":false}"#);
+        assert_eq!(panic, failure);
     }
 
     #[test]
@@ -912,22 +1023,44 @@ mod tests {
     #[test]
     #[allow(clippy::undocumented_unsafe_blocks)]
     fn local_first_is_cache_isolated_in_both_call_orders_and_validates_abi_year() {
-        let _lock = GRAPH_CACHE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(root) = std::env::var_os(LOCAL_FIRST_CHILD_HOME) {
+            run_local_first_fixture(std::path::Path::new(&root));
+            return;
+        }
+
         let root = std::env::temp_dir().join(format!(
             "tokenbar-ffi-local-first-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-        let data_root = root.join("data");
-        std::fs::create_dir_all(&data_root).unwrap();
-        let _env = EnvGuard::set(&[
-            ("HOME", root.as_os_str()),
-            ("TOKSCALE_CONFIG_DIR", root.as_os_str()),
-            ("XDG_DATA_HOME", data_root.as_os_str()),
-            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
-        ]);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("tests::local_first_is_cache_isolated_in_both_call_orders_and_validates_abi_year")
+            .arg("--exact")
+            .env_clear()
+            .env(LOCAL_FIRST_CHILD_HOME, &root)
+            .env("HOME", &root)
+            .env("TMPDIR", root.join("tmp"))
+            .env("TOKSCALE_CONFIG_DIR", root.join("tokscale-config"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(status.success(), "isolated local-first fixture failed");
+    }
+
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    fn run_local_first_fixture(root: &std::path::Path) {
+        assert_eq!(std::env::var_os("HOME").as_deref(), Some(root.as_os_str()));
+        let _lock = GRAPH_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         GRAPH_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -988,8 +1121,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        drop(_env);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
