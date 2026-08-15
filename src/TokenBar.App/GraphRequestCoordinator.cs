@@ -520,7 +520,8 @@ public sealed class GraphRequestCoordinator
                         {
                             lock (_gate)
                             {
-                                if (state.Current == requestId)
+                                if (state.Current == requestId
+                                    && requestId.Generation == _nextGeneration)
                                 {
                                     commit();
                                 }

@@ -882,6 +882,69 @@ public class GraphRequestCoordinatorTests
         }
     }
 
+    [Fact]
+    public async Task OlderQueryCannotCommitAfterNewerQueryStarts()
+    {
+        var firstWriteStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstWrite = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstWriteFinished = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondCommitted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var commits = new ConcurrentQueue<string>();
+        var access = new SnapshotAccess(
+            _ => new GraphSnapshotReadResult(GraphSnapshotReadStatus.Missing),
+            (year, _, _, fence) =>
+            {
+                if (year is null)
+                {
+                    firstWriteStarted.TrySetResult(true);
+                    releaseFirstWrite.Task.GetAwaiter().GetResult();
+                }
+
+                var committed = false;
+                fence!(() =>
+                {
+                    committed = true;
+                    commits.Enqueue(year ?? "all");
+                    if (year == "2026")
+                    {
+                        secondCommitted.TrySetResult(true);
+                    }
+                });
+                if (year is null)
+                {
+                    firstWriteFinished.TrySetResult(true);
+                }
+                return committed
+                    ? GraphSnapshotWriteStatus.Written
+                    : GraphSnapshotWriteStatus.Skipped;
+            });
+        var coordinator = new GraphRequestCoordinator(
+            year => Payload(year),
+            year => Payload(year, PricingMode.BestEffort, CostCoverage.Complete),
+            snapshot: access);
+
+        try
+        {
+            coordinator.Request(null);
+            await firstWriteStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            coordinator.Request("2026");
+            await secondCommitted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            releaseFirstWrite.TrySetResult(true);
+            await firstWriteFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(["2026"], commits);
+        }
+        finally
+        {
+            releaseFirstWrite.TrySetResult(true);
+        }
+    }
+
     private sealed class CallbackScope(Action dispose) : IDisposable
     {
         private Action? _dispose = dispose;
