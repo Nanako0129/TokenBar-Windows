@@ -23,6 +23,7 @@ public enum GraphSnapshotReadStatus
 public enum GraphSnapshotWriteStatus
 {
     Written,
+    Skipped,
     InvalidInput,
     UnsafePath,
     InvalidData,
@@ -136,7 +137,8 @@ public sealed class GraphSnapshotStore
         string sourceContextId,
         string? year,
         DateTimeOffset capturedAt,
-        UsagePayload payload)
+        UsagePayload payload,
+        Action<Action>? commitFence = null)
     {
         if (payload is null || !TryNormalizeInputs(sourceContextId, year, out var normalizedYear))
         {
@@ -182,6 +184,8 @@ public sealed class GraphSnapshotStore
         }
 
         string? temp = null;
+        var committed = false;
+        var commitAttempted = 0;
         try
         {
             if (InspectTarget(path) == TargetState.Unsafe)
@@ -206,9 +210,30 @@ public sealed class GraphSnapshotStore
             // Same-directory rename is the platform primitive that preserves an
             // old-or-new target during normal execution; power-loss durability
             // is deliberately outside this reconstructible cache's contract.
-            File.Move(temp, path, overwrite: true);
-            temp = null;
-            return GraphSnapshotWriteStatus.Written;
+            void Commit()
+            {
+                if (Interlocked.Exchange(ref commitAttempted, 1) != 0)
+                {
+                    return;
+                }
+
+                File.Move(temp!, path, overwrite: true);
+                committed = true;
+                temp = null;
+            }
+
+            if (commitFence is null)
+            {
+                Commit();
+            }
+            else
+            {
+                commitFence(Commit);
+            }
+
+            return committed
+                ? GraphSnapshotWriteStatus.Written
+                : GraphSnapshotWriteStatus.Skipped;
         }
         catch (Exception ex) when (IsExpectedFileFailure(ex))
         {

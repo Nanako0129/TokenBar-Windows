@@ -56,7 +56,7 @@ public partial class App : Application
         try
         {
             DevLog.Write("launch: creating graph coordinator");
-            _graphCoordinator = new GraphRequestCoordinator(
+            _graphCoordinator = GraphRequestCoordinator.CreateForApp(
                 boost: ProcessPower.Boost);
             DevLog.Write("launch: creating flyout");
             _flyout = new FlyoutWindow(_graphCoordinator);

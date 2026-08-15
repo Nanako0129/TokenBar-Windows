@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using TokenBar.App;
+using TokenBar.Core;
 using TokenBar.Interop;
 
 namespace TokenBar.Core.Tests;
@@ -657,6 +658,291 @@ public class GraphRequestCoordinatorTests
         Assert.Single(richerPublications);
         Assert.Equal(GraphPublicationStage.LocalFirst,
             richerPublications.Single().Stage);
+    }
+
+    [Fact]
+    public async Task FreshSnapshotPublishesOnceWithoutSuppressingLiveStages()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var localStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseLocal = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var snapshotPublished = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = new TaskCompletionSource<GraphRequestCompletion>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var snapshot = Payload("2026", PricingMode.BestEffort);
+        var local = Payload("2026");
+        var richer = Payload("2026", PricingMode.BestEffort, CostCoverage.Complete);
+        var publications = new ConcurrentQueue<GraphPublication>();
+        var access = new SnapshotAccess(
+            _ => new GraphSnapshotReadResult(
+                GraphSnapshotReadStatus.Hit, snapshot, now.AddMinutes(-5)),
+            (_, _, _, _) => GraphSnapshotWriteStatus.Skipped);
+        var coordinator = new GraphRequestCoordinator(
+            _ =>
+            {
+                localStarted.TrySetResult(true);
+                releaseLocal.Task.GetAwaiter().GetResult();
+                return local;
+            },
+            _ => richer,
+            snapshot: access,
+            utcNow: () => now);
+        coordinator.Published += publication =>
+        {
+            publications.Enqueue(publication);
+            if (ReferenceEquals(publication.Payload, snapshot))
+            {
+                snapshotPublished.TrySetResult(true);
+            }
+        };
+        coordinator.Completed += value => completion.TrySetResult(value);
+
+        var requestId = coordinator.Attach(" 2026 ").RequestId;
+        await localStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await snapshotPublished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        releaseLocal.TrySetResult(true);
+        var result = await completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(result.Succeeded);
+        Assert.Equal(3, publications.Count);
+        Assert.Equal(requestId, publications.First().RequestId);
+        Assert.Same(snapshot, publications.First().Payload);
+        Assert.Contains(publications, value => ReferenceEquals(value.Payload, local));
+        Assert.Contains(publications, value => ReferenceEquals(value.Payload, richer));
+    }
+
+    [Fact]
+    public async Task LivePublicationWinsAndLateSnapshotIsNotEmitted()
+    {
+        var snapshotStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSnapshot = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var livePublished = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = new TaskCompletionSource<GraphRequestCompletion>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var snapshot = Payload("2026", PricingMode.BestEffort);
+        var local = Payload("2026");
+        var richer = Payload("2026", PricingMode.BestEffort, CostCoverage.Complete);
+        var publications = new ConcurrentQueue<GraphPublication>();
+        var access = new SnapshotAccess(
+            _ =>
+            {
+                snapshotStarted.TrySetResult(true);
+                releaseSnapshot.Task.GetAwaiter().GetResult();
+                return new GraphSnapshotReadResult(
+                    GraphSnapshotReadStatus.Hit, snapshot, DateTimeOffset.UtcNow);
+            },
+            (_, _, _, _) => GraphSnapshotWriteStatus.Skipped);
+        var coordinator = new GraphRequestCoordinator(
+            _ => local,
+            _ => richer,
+            snapshot: access);
+        coordinator.Published += publication =>
+        {
+            publications.Enqueue(publication);
+            if (ReferenceEquals(publication.Payload, local))
+            {
+                livePublished.TrySetResult(true);
+            }
+        };
+        coordinator.Completed += value => completion.TrySetResult(value);
+
+        coordinator.Attach("2026");
+        await snapshotStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await livePublished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        releaseSnapshot.TrySetResult(true);
+        await completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+
+        Assert.DoesNotContain(publications, value => ReferenceEquals(value.Payload, snapshot));
+        Assert.Equal(2, publications.Count);
+        Assert.Same(richer, publications.Last().Payload);
+    }
+
+    [Fact]
+    public async Task NonHitAndSnapshotFailuresLeaveLivePipelineUnchanged()
+    {
+        var statuses = new[]
+        {
+            GraphSnapshotReadStatus.Missing,
+            GraphSnapshotReadStatus.InvalidData,
+            GraphSnapshotReadStatus.ContextMismatch,
+            GraphSnapshotReadStatus.QueryMismatch,
+            GraphSnapshotReadStatus.IoFailure,
+        };
+
+        foreach (var status in statuses)
+        {
+            var completion = new TaskCompletionSource<GraphRequestCompletion>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var publications = new ConcurrentQueue<GraphPublication>();
+            var coordinator = new GraphRequestCoordinator(
+                _ => Payload("2026"),
+                _ => Payload("2026", PricingMode.BestEffort, CostCoverage.Complete),
+                snapshot: new SnapshotAccess(
+                    _ => new GraphSnapshotReadResult(status),
+                    (_, _, _, _) => GraphSnapshotWriteStatus.Skipped));
+            coordinator.Published += publications.Enqueue;
+            coordinator.Completed += value => completion.TrySetResult(value);
+
+            var requestId = coordinator.Attach("2026").RequestId;
+            var result = await completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(requestId, result.RequestId);
+            Assert.True(result.Succeeded);
+            Assert.Equal(2, publications.Count);
+            Assert.Equal(GraphPublicationStage.LocalFirst, publications.First().Stage);
+            Assert.Equal(GraphPublicationStage.Richer, publications.Last().Stage);
+        }
+
+        var thrownCompletion = new TaskCompletionSource<GraphRequestCompletion>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thrownPublications = new ConcurrentQueue<GraphPublication>();
+        var thrown = new GraphRequestCoordinator(
+            _ => Payload("2026"),
+            _ => Payload("2026", PricingMode.BestEffort, CostCoverage.Complete),
+            snapshot: new SnapshotAccess(
+                _ => throw new InvalidOperationException(),
+                (_, _, _, _) => GraphSnapshotWriteStatus.Skipped));
+        thrown.Published += thrownPublications.Enqueue;
+        thrown.Completed += value => thrownCompletion.TrySetResult(value);
+        var thrownId = thrown.Attach("2026").RequestId;
+        Assert.Equal(thrownId,
+            (await thrownCompletion.Task.WaitAsync(TimeSpan.FromSeconds(5))).RequestId);
+        Assert.Equal(2, thrownPublications.Count);
+
+        var now = DateTimeOffset.UtcNow;
+        foreach (var capturedAt in new[] { now.AddMinutes(-31), now.AddMinutes(1) })
+        {
+            var completion = new TaskCompletionSource<GraphRequestCompletion>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var publications = new ConcurrentQueue<GraphPublication>();
+            var coordinator = new GraphRequestCoordinator(
+                _ => Payload("2026"),
+                _ => Payload("2026", PricingMode.BestEffort, CostCoverage.Complete),
+                snapshot: new SnapshotAccess(
+                    _ => new GraphSnapshotReadResult(
+                        GraphSnapshotReadStatus.Hit,
+                        Payload("2026", PricingMode.BestEffort),
+                        capturedAt),
+                    (_, _, _, _) => GraphSnapshotWriteStatus.Skipped),
+                utcNow: () => now);
+            coordinator.Published += publications.Enqueue;
+            coordinator.Completed += value => completion.TrySetResult(value);
+
+            coordinator.Attach("2026");
+            await completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(2, publications.Count);
+        }
+    }
+
+    [Fact]
+    public async Task BlockedSnapshotReadDoesNotDelayAttachLiveOrSupersession()
+    {
+        var readStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRead = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var livePublished = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var coordinator = new GraphRequestCoordinator(
+            _ =>
+            {
+                livePublished.TrySetResult(true);
+                return Payload("2026");
+            },
+            _ => Payload("2026", PricingMode.BestEffort, CostCoverage.Complete),
+            snapshot: new SnapshotAccess(
+                _ =>
+                {
+                    readStarted.TrySetResult(true);
+                    releaseRead.Task.GetAwaiter().GetResult();
+                    return new GraphSnapshotReadResult(GraphSnapshotReadStatus.Missing);
+                },
+                (_, _, _, _) => GraphSnapshotWriteStatus.Skipped));
+
+        try
+        {
+            var attach = await Task.Run(() => coordinator.Attach("2026"))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            await readStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await livePublished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var newer = coordinator.Request("2026", force: true);
+            Assert.True(newer.Generation > attach.RequestId.Generation);
+        }
+        finally
+        {
+            releaseRead.TrySetResult(true);
+        }
+    }
+
+    [Fact]
+    public async Task OlderQueryCannotCommitAfterNewerQueryStarts()
+    {
+        var firstWriteStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstWrite = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstWriteFinished = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondCommitted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var commits = new ConcurrentQueue<string>();
+        var access = new SnapshotAccess(
+            _ => new GraphSnapshotReadResult(GraphSnapshotReadStatus.Missing),
+            (year, _, _, fence) =>
+            {
+                if (year is null)
+                {
+                    firstWriteStarted.TrySetResult(true);
+                    releaseFirstWrite.Task.GetAwaiter().GetResult();
+                }
+
+                var committed = false;
+                fence!(() =>
+                {
+                    committed = true;
+                    commits.Enqueue(year ?? "all");
+                    if (year == "2026")
+                    {
+                        secondCommitted.TrySetResult(true);
+                    }
+                });
+                if (year is null)
+                {
+                    firstWriteFinished.TrySetResult(true);
+                }
+                return committed
+                    ? GraphSnapshotWriteStatus.Written
+                    : GraphSnapshotWriteStatus.Skipped;
+            });
+        var coordinator = new GraphRequestCoordinator(
+            year => Payload(year),
+            year => Payload(year, PricingMode.BestEffort, CostCoverage.Complete),
+            snapshot: access);
+
+        try
+        {
+            coordinator.Request(null);
+            await firstWriteStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            coordinator.Request("2026");
+            await secondCommitted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            releaseFirstWrite.TrySetResult(true);
+            await firstWriteFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(["2026"], commits);
+        }
+        finally
+        {
+            releaseFirstWrite.TrySetResult(true);
+        }
     }
 
     private sealed class CallbackScope(Action dispose) : IDisposable
