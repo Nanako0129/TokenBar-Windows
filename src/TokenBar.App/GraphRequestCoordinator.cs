@@ -1,3 +1,4 @@
+using TokenBar.Core;
 using TokenBar.Interop;
 
 namespace TokenBar.App;
@@ -37,10 +38,30 @@ public readonly record struct GraphAttachment(
     GraphPublication? Latest,
     bool InFlight);
 
+internal sealed class SnapshotAccess
+{
+    public SnapshotAccess(
+        Func<string?, GraphSnapshotReadResult> read,
+        Func<string?, DateTimeOffset, UsagePayload, Action<Action>?, GraphSnapshotWriteStatus> write)
+    {
+        Read = read ?? throw new ArgumentNullException(nameof(read));
+        Write = write ?? throw new ArgumentNullException(nameof(write));
+    }
+
+    public Func<string?, GraphSnapshotReadResult> Read { get; }
+
+    public Func<string?, DateTimeOffset, UsagePayload, Action<Action>?, GraphSnapshotWriteStatus> Write { get; }
+}
+
 /// <summary>Process-shared graph pipeline. Every production graph call enters
 /// here, so local-first publication and request supersession have one owner.</summary>
 public sealed class GraphRequestCoordinator
 {
+    internal const Environment.SpecialFolder SnapshotProfileRoot =
+        Environment.SpecialFolder.LocalApplicationData;
+
+    private static readonly TimeSpan SnapshotMaxAge = TimeSpan.FromMinutes(30);
+
     private sealed class QueryState(GraphQuery query)
     {
         public GraphQuery Query { get; } = query;
@@ -60,11 +81,14 @@ public sealed class GraphRequestCoordinator
     }
 
     private readonly object _gate = new();
+    private readonly object _publicationGate = new();
     private readonly Dictionary<GraphQuery, QueryState> _states = [];
     private readonly Func<string?, UsagePayload> _localFirst;
     private readonly Func<string?, UsagePayload> _graph;
     private readonly Func<string?, UsagePayload> _refreshGraph;
     private readonly Func<IDisposable> _boost;
+    private readonly SnapshotAccess? _snapshot;
+    private readonly Func<DateTimeOffset> _utcNow;
     private long _nextGeneration;
 
     public GraphRequestCoordinator(
@@ -72,16 +96,117 @@ public sealed class GraphRequestCoordinator
         Func<string?, UsagePayload>? graph = null,
         Func<string?, UsagePayload>? refreshGraph = null,
         Func<IDisposable>? boost = null)
+        : this(localFirst, graph, refreshGraph, boost, null, null)
+    {
+    }
+
+    internal GraphRequestCoordinator(
+        Func<string?, UsagePayload>? localFirst,
+        Func<string?, UsagePayload>? graph,
+        Func<string?, UsagePayload>? refreshGraph,
+        Func<IDisposable>? boost,
+        SnapshotAccess? snapshot,
+        Func<DateTimeOffset>? utcNow)
     {
         _localFirst = localFirst ?? TbCore.GraphLocalFirst;
         _graph = graph ?? refreshGraph ?? TbCore.RefreshGraph;
         _refreshGraph = refreshGraph ?? graph ?? TbCore.RefreshGraph;
         _boost = boost ?? (() => NoopScope.Instance);
+        _snapshot = snapshot;
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
     }
+
+    internal GraphRequestCoordinator(
+        Func<string?, UsagePayload>? localFirst,
+        Func<string?, UsagePayload>? graph,
+        SnapshotAccess snapshot,
+        Func<DateTimeOffset>? utcNow = null)
+        : this(localFirst, graph, null, null, snapshot, utcNow)
+    {
+    }
+
+    internal GraphRequestCoordinator(
+        Func<string?, UsagePayload>? localFirst,
+        Func<string?, UsagePayload>? graph,
+        Func<string?, UsagePayload>? refreshGraph,
+        SnapshotAccess snapshot,
+        Func<DateTimeOffset>? utcNow = null)
+        : this(localFirst, graph, refreshGraph, null, snapshot, utcNow)
+    {
+    }
+
+    internal SnapshotAccess? Snapshot => _snapshot;
 
     public event Action<GraphRequestId>? Started;
     public event Action<GraphPublication>? Published;
     public event Action<GraphRequestCompletion>? Completed;
+
+    /// <summary>Build the production graph pipeline and its profile-local
+    /// snapshot. Any profile setup failure leaves the live pipeline usable.</summary>
+    internal static GraphRequestCoordinator CreateForApp(
+        Func<IDisposable>? boost = null,
+        Func<Environment.SpecialFolder, string?>? getFolderPath = null,
+        Func<string>? sourceContextId = null,
+        Action<string>? createDirectory = null,
+        Func<string?, UsagePayload>? localFirst = null,
+        Func<string?, UsagePayload>? graph = null,
+        Func<string?, UsagePayload>? refreshGraph = null,
+        Func<DateTimeOffset>? utcNow = null)
+    {
+        try
+        {
+            var root = getFolderPath is null
+                ? Environment.GetFolderPath(SnapshotProfileRoot)
+                : getFolderPath(SnapshotProfileRoot);
+            if (string.IsNullOrWhiteSpace(root)
+                || !Path.IsPathFullyQualified(root))
+            {
+                throw new InvalidOperationException();
+            }
+
+            var profile = Path.Combine(root, "TokenBar");
+            if (createDirectory is null)
+            {
+                Directory.CreateDirectory(profile);
+            }
+            else
+            {
+                createDirectory(profile);
+            }
+
+            var sourceId = sourceContextId is null
+                ? TbCore.SourceContextId()
+                : sourceContextId();
+            if (string.IsNullOrWhiteSpace(sourceId))
+            {
+                throw new InvalidOperationException();
+            }
+
+            var store = new GraphSnapshotStore(
+                Path.Combine(profile, "graph-snapshot.json"));
+            var snapshot = new SnapshotAccess(
+                year => store.Read(sourceId, year),
+                (year, capturedAt, payload, commitFence) =>
+                    store.Write(sourceId, year, capturedAt, payload, commitFence));
+            return new GraphRequestCoordinator(
+                localFirst,
+                graph,
+                refreshGraph,
+                boost,
+                snapshot,
+                utcNow);
+        }
+        catch
+        {
+            return new GraphRequestCoordinator(
+                localFirst,
+                graph,
+                refreshGraph,
+                boost,
+                snapshot: null,
+                utcNow: utcNow);
+        }
+    }
 
     /// <summary>Attach an observer's exact query. A retained exact publication
     /// is returned synchronously; otherwise one pipeline is started.</summary>
@@ -113,7 +238,6 @@ public sealed class GraphRequestCoordinator
                 requestId = BeginLocked(state);
                 start = true;
             }
-
         }
 
         if (start)
@@ -134,6 +258,7 @@ public sealed class GraphRequestCoordinator
         if (start)
         {
             StartPipeline(state, requestId, force: false);
+            StartRestore(state, requestId);
         }
 
         return new GraphAttachment(requestId, latest, inFlight);
@@ -213,6 +338,7 @@ public sealed class GraphRequestCoordinator
     {
         var requestId = new GraphRequestId(state.Query, ++_nextGeneration);
         state.Current = requestId;
+        state.Latest = null;
         state.InFlight = true;
         state.CurrentSucceeded = false;
         return requestId;
@@ -220,7 +346,29 @@ public sealed class GraphRequestCoordinator
 
     private void StartPipeline(QueryState state, GraphRequestId requestId, bool force)
     {
-        _ = Task.Run(() => RunPipeline(state, requestId, force));
+        try
+        {
+            _ = Task.Run(() => RunPipeline(state, requestId, force));
+        }
+        catch
+        {
+        }
+    }
+
+    private void StartRestore(QueryState state, GraphRequestId requestId)
+    {
+        if (_snapshot is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _ = Task.Run(() => RestoreSnapshot(state, requestId));
+        }
+        catch
+        {
+        }
     }
 
     private void RunPipeline(QueryState state, GraphRequestId requestId, bool force)
@@ -244,7 +392,9 @@ public sealed class GraphRequestCoordinator
                 return;
             }
 
-            if (!PublishIfCurrent(state, requestId,
+            if (!PublishIfCurrent(
+                    state,
+                    requestId,
                     new GraphPublication(
                         requestId, GraphPublicationStage.LocalFirst, local)))
             {
@@ -260,8 +410,14 @@ public sealed class GraphRequestCoordinator
                 }
 
                 richerSucceeded = true;
-                PublishIfCurrent(state, requestId,
-                    new GraphPublication(requestId, GraphPublicationStage.Richer, richer));
+                if (PublishIfCurrent(
+                        state,
+                        requestId,
+                        new GraphPublication(
+                            requestId, GraphPublicationStage.Richer, richer)))
+                {
+                    StartPersist(state, requestId, richer);
+                }
             }
             catch
             {
@@ -276,7 +432,8 @@ public sealed class GraphRequestCoordinator
                 if (state.Current == requestId)
                 {
                     state.InFlight = false;
-                    state.CurrentSucceeded = localSucceeded;
+                    state.CurrentSucceeded = localSucceeded
+                        || state.Latest?.RequestId == requestId;
                     current = true;
                 }
             }
@@ -289,29 +446,122 @@ public sealed class GraphRequestCoordinator
         }
     }
 
-    private bool PublishIfCurrent(
-        QueryState state, GraphRequestId requestId, GraphPublication publication)
+    private void RestoreSnapshot(QueryState state, GraphRequestId requestId)
     {
-        var current = false;
-        lock (_gate)
+        var access = _snapshot;
+        if (access is null)
         {
-            if (state.Current == requestId)
+            return;
+        }
+
+        GraphSnapshotReadResult? result;
+        try
+        {
+            result = access.Read(requestId.Query.Year);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (result is null
+            || result.Status != GraphSnapshotReadStatus.Hit
+            || result.Payload is null
+            || result.CapturedAt is not { } capturedAt)
+        {
+            return;
+        }
+
+        try
+        {
+            var now = _utcNow().ToUniversalTime();
+            var age = now - capturedAt.ToUniversalTime();
+            if (age < TimeSpan.Zero || age > SnapshotMaxAge)
             {
-                state.Latest = publication;
-                state.CurrentSucceeded = true;
-                current = true;
+                return;
             }
         }
-
-        if (!current)
+        catch
         {
-            return false;
+            return;
         }
 
-        InvokePublished(publication);
-        lock (_gate)
+        PublishIfCurrent(
+            state,
+            requestId,
+            new GraphPublication(
+                requestId, GraphPublicationStage.LocalFirst, result.Payload),
+            snapshot: true);
+    }
+
+    private void StartPersist(
+        QueryState state,
+        GraphRequestId requestId,
+        UsagePayload payload)
+    {
+        var access = _snapshot;
+        if (access is null)
         {
-            return state.Current == requestId;
+            return;
+        }
+
+        try
+        {
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var capturedAt = _utcNow();
+                    access.Write(
+                        requestId.Query.Year,
+                        capturedAt,
+                        payload,
+                        commit =>
+                        {
+                            lock (_gate)
+                            {
+                                if (state.Current == requestId)
+                                {
+                                    commit();
+                                }
+                            }
+                        });
+                }
+                catch
+                {
+                }
+            });
+        }
+        catch
+        {
+        }
+    }
+
+    private bool PublishIfCurrent(
+        QueryState state,
+        GraphRequestId requestId,
+        GraphPublication publication,
+        bool snapshot = false)
+    {
+        lock (_publicationGate)
+        {
+            lock (_gate)
+            {
+                if (state.Current != requestId
+                    || snapshot && state.Latest is not null)
+                {
+                    return false;
+                }
+
+                state.Latest = publication;
+                state.CurrentSucceeded = true;
+            }
+
+            InvokePublished(publication);
+            lock (_gate)
+            {
+                return state.Current == requestId;
+            }
         }
     }
 

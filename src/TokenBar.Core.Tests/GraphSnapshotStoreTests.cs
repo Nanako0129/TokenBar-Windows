@@ -483,6 +483,45 @@ public sealed class GraphSnapshotStoreTests : IDisposable
         Assert.False(Directory.Exists(Path.GetDirectoryName(absent)));
     }
 
+    [Fact]
+    public void SkippedFenceKeepsPreviousBytesAndInvokedFenceReplacesAtomically()
+    {
+        var store = new GraphSnapshotStore(StorePath);
+        Assert.Equal(
+            GraphSnapshotWriteStatus.Written,
+            store.Write("ctx", "2026", DateTimeOffset.UnixEpoch, Payload("2026-01-01")));
+        var oldBytes = File.ReadAllBytes(StorePath);
+
+        Assert.Equal(
+            GraphSnapshotWriteStatus.Skipped,
+            store.Write(
+                "ctx",
+                "2026",
+                DateTimeOffset.UnixEpoch.AddDays(1),
+                Payload("2026-02-01"),
+                _ => { }));
+        Assert.Equal(oldBytes, File.ReadAllBytes(StorePath));
+        Assert.Empty(Directory.EnumerateFiles(_dir, ".*.tmp"));
+
+        Assert.Equal(
+            GraphSnapshotWriteStatus.Written,
+            store.Write(
+                "ctx",
+                "2026",
+                DateTimeOffset.UnixEpoch.AddDays(2),
+                Payload("2026-03-01"),
+                commit =>
+                {
+                    commit();
+                    commit();
+                }));
+        Assert.Equal(
+            "2026-03-01",
+            new GraphSnapshotStore(StorePath).Read("ctx", "2026").Payload!
+                .Contributions[0].Date);
+        Assert.Empty(Directory.EnumerateFiles(_dir, ".*.tmp"));
+    }
+
     private static bool HasDate(UsagePayload? payload, string date) =>
         payload is { Contributions.Count: 1 }
         && string.Equals(payload.Contributions[0].Date, date, StringComparison.Ordinal);
