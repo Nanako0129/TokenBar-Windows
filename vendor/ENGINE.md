@@ -10,24 +10,26 @@ app consumer advances its reviewed pin.
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `95b7f33f25e09b3514384776ad353a2efbf6c2b5` |
+| Reviewed pin | `6a9de8ca5b35ed96e5c56e219e9b95a98633372d` |
 | TokenBar alignment | `v1.12.0` → `v1.13.1` |
-| Engine alignment | `84e0d66413d4e0d87b734f66f7a848b3bc323258` → `95b7f33f25e09b3514384776ad353a2efbf6c2b5` |
+| Engine alignment | `84e0d66413d4e0d87b734f66f7a848b3bc323258` → `6a9de8ca5b35ed96e5c56e219e9b95a98633372d` |
 | Native consumer baseline | `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea` |
 | Windows pre-migration baseline | `68e2541c5e9adb14a47433f8b25e26b0be84d1fc` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/95b7f33f25e09b3514384776ad353a2efbf6c2b5/UPSTREAM.md) |
+| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/6a9de8ca5b35ed96e5c56e219e9b95a98633372d/UPSTREAM.md) |
 
 > **Warning:** Do not edit shared source on a consumer branch. Engine changes
 > must pass review in `tokscale-core`; this repository then advances only the
 > reviewed gitlink and runs the Windows consumer gates.
 
-## v1.13 source-context consumer alignment
+## v1.13 source-context and retained-token alignment
 
-The reviewed pin is the immutable GitHub merge commit for tokscale-core PR #10,
-`feat(source-context): capture immutable local source identity`. The Windows FFI
-captures that engine-owned context once per process and routes graph, report,
-parse, source-token, and live-tail work through the context-aware APIs. This
-slice does not include UI, cache-token redesign, or performance claims.
+The reviewed pin is the immutable GitHub merge commit for tokscale-core PR #12,
+following the source-context foundation in PR #10. The Windows FFI captures the
+engine-owned context once per process and routes graph, report, parse,
+source-token, and live-tail work through the context-aware APIs. The engine
+source token now includes report-visible retained-only Claude cache state while
+keeping its cache schema and public interfaces unchanged. This consumer slice
+advances only the reviewed gitlink and its provenance record.
 
 ## Ownership
 
