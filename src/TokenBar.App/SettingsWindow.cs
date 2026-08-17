@@ -41,6 +41,38 @@ public sealed class SettingsWindow : Window
         VerticalAlignment = VerticalAlignment.Top,
     };
 
+    // Sidebar (macOS SettingsPanel.Page): one NavigationView built once, its
+    // four items never rebuilt. Rebuild() only regenerates each page's
+    // StackPanel and re-attaches whichever one matches _selectedTag — the
+    // NavigationView's own SelectedItem is untouched by a rebuild, which is
+    // what keeps the user on the same page across a settings write and
+    // across hide/show (the window is hidden, never destroyed, so this
+    // singleton's state simply survives).
+    private readonly NavigationView _nav = new()
+    {
+        PaneDisplayMode = NavigationViewPaneDisplayMode.Left,
+        IsSettingsVisible = false,
+        IsBackButtonVisible = NavigationViewBackButtonVisible.Collapsed,
+        // The window is fixed at 900x640 and not resizable, so collapsing the
+        // pane buys nothing — and the items carry no icons, so the compact
+        // state has nothing to fall back to and just clips the labels to
+        // "Menu"/"Dash"/"Gene"/"Abou". macOS has no such control either.
+        IsPaneToggleButtonVisible = false,
+        // NavigationView's default is 320, which would eat the width the 732
+        // -> 900 widening was meant to give the content column: 900 - 304
+        // (preview) - 320 - 36 (scroll padding) leaves ~240 for a panel whose
+        // MaxWidth is 380, i.e. NARROWER than before the widening. 180 is the
+        // macOS sidebar width (170pt) rounded to the Fluent metric, and keeps
+        // the content column at its pre-existing ~380.
+        OpenPaneLength = 180,
+    };
+    private readonly NavigationViewItem _menuBarItem = new() { Content = "Menu bar", Tag = "menubar" };
+    private readonly NavigationViewItem _dashboardItem = new() { Content = "Dashboard", Tag = "dashboard" };
+    private readonly NavigationViewItem _generalItem = new() { Content = "General", Tag = "general" };
+    private readonly NavigationViewItem _aboutItem = new() { Content = "About", Tag = "about" };
+    private readonly Dictionary<string, StackPanel> _pages = new(StringComparer.Ordinal);
+    private string _selectedTag = "menubar";
+
     public static void Present(
         Func<AgentUsagePayload?> quota, Func<UsagePayload?> graph)
     {
@@ -58,7 +90,7 @@ public sealed class SettingsWindow : Window
         _ = _shared.DispatcherQueue.TryEnqueue(
             Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
             DevLog.Write($"settings layout: scroll={_shared._scroll.ActualWidth:F0}x" +
-                $"{_shared._scroll.ActualHeight:F0} children=" +
+                $"{_shared._scroll.ActualHeight:F0} page={_shared._selectedTag} children=" +
                 $"{(_shared._scroll.Content as StackPanel)?.Children.Count ?? -1}"));
     }
 
@@ -75,7 +107,30 @@ public sealed class SettingsWindow : Window
             Width = new GridLength(1, GridUnitType.Star),
         });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        root.Children.Add(_scroll);
+
+        // NavigationView paints its content region with an opaque theme brush,
+        // which reads as a lighter slab between the Mica pane and the Mica
+        // preview column — one window showing two materials. The pane and the
+        // preview column are both already transparent to the MicaBackdrop, so
+        // clearing this one brush is what makes the whole window one surface.
+        _nav.Resources["NavigationViewContentBackground"] =
+            new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        _nav.Content = _scroll;
+        _nav.PaneFooter = BuildFooter();
+        _nav.MenuItems.Add(_menuBarItem);
+        _nav.MenuItems.Add(_dashboardItem);
+        _nav.MenuItems.Add(_generalItem);
+        _nav.MenuItems.Add(_aboutItem);
+        _nav.SelectedItem = _menuBarItem;
+        _nav.SelectionChanged += (_, e) =>
+        {
+            if (e.SelectedItem is NavigationViewItem { Tag: string tag })
+            {
+                _selectedTag = tag;
+                ShowPage(tag);
+            }
+        };
+        root.Children.Add(_nav);
         Grid.SetColumn(_preview, 1);
         root.Children.Add(_preview);
         Content = root;
@@ -138,14 +193,21 @@ public sealed class SettingsWindow : Window
     private void ApplySize()
     {
         var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
-        var size = new Windows.Graphics.SizeInt32((int)(732 * scale), (int)(640 * scale));
+        var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        // Clamp before resizing: the window is fixed and not resizable, so a
+        // display narrower than the requested size has no recovery path. The
+        // centering below would compute a negative X and push both edges —
+        // including the title-bar controls — off-screen. 640 is clamped for
+        // the same reason on short work areas.
+        var size = new Windows.Graphics.SizeInt32(
+            Math.Min((int)(900 * scale), area.Width),
+            Math.Min((int)(640 * scale), area.Height));
         if (AppWindow.Size == size)
         {
             return;
         }
 
         AppWindow.Resize(size);
-        var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
         AppWindow.Move(new Windows.Graphics.PointInt32(
             area.X + (area.Width - AppWindow.Size.Width) / 2,
             area.Y + (area.Height - AppWindow.Size.Height) / 3));
@@ -154,6 +216,35 @@ public sealed class SettingsWindow : Window
     private void Rebuild()
     {
         var store = AppSettings.Store;
+        _pages["menubar"] = BuildMenuBarPage(store);
+        _pages["dashboard"] = BuildDashboardPage(store);
+        _pages["general"] = BuildGeneralPage(store);
+        _pages["about"] = BuildAboutPage();
+        ShowPage(_selectedTag);
+        RebuildPreview();
+    }
+
+    /// <summary>Re-attaches whichever page's StackPanel matches
+    /// <paramref name="tag"/> to the ScrollViewer. Called both from a fresh
+    /// Rebuild() and directly from the NavigationView's SelectionChanged, so
+    /// switching pages never waits on a rebuild.</summary>
+    private void ShowPage(string tag)
+    {
+        if (_pages.TryGetValue(tag, out var page))
+        {
+            _scroll.Content = page;
+            // Every page shares this one ScrollViewer, which keeps its offset
+            // when the content swaps if that offset is still valid for the new
+            // extent. Scrolling down Dashboard and switching to Menu bar would
+            // otherwise open it part-way down with its first section cut off.
+            // Offset 0 is always in range, so this needs no layout pass.
+            _scroll.ChangeView(null, 0, null, disableAnimation: true);
+        }
+    }
+
+    // ── Menu bar page: Tray shows, Tray icon, Quota source ──────────────
+    private StackPanel BuildMenuBarPage(SettingsStore store)
+    {
         var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
 
         // ── Menubar title (tray value) ─────────────────────────────────
@@ -162,22 +253,6 @@ public sealed class SettingsWindow : Window
             TrayModes.All.Select(m => (m.RawValue(), m.Label())),
             TrayModes.Parse(store.GetString(TrayModes.StorageKey)).RawValue(),
             raw => store.SetString(TrayModes.StorageKey, raw))));
-
-        // ── Startup ────────────────────────────────────────────────────
-        var autostart = new ToggleSwitch
-        {
-            IsOn = AutostartService.IsEnabled,
-            OnContent = null,
-            OffContent = null,
-        };
-        autostart.Toggled += (_, _) =>
-        {
-            if (!AutostartService.SetEnabled(autostart.IsOn))
-            {
-                autostart.IsOn = AutostartService.IsEnabled; // stay honest
-            }
-        };
-        panel.Children.Add(Section("Startup", ToggleRow("Launch at login", autostart)));
 
         // ── Tray icon ──────────────────────────────────────────────────
         var styleRaw = store.GetString("tokenbar.tray.animationStyle", "cat") ?? "cat";
@@ -222,9 +297,6 @@ public sealed class SettingsWindow : Window
 
         panel.Children.Add(Section("Tray icon", icon));
 
-        // ── Client tabs ────────────────────────────────────────────────
-        panel.Children.Add(Section("Client tabs", BuildClientTabs(store)));
-
         // ── Quota source ───────────────────────────────────────────────
         var persistedSelection = store.GetString(
             "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
@@ -252,6 +324,14 @@ public sealed class SettingsWindow : Window
         quotaGroup.Children.Add(Hint(
             "Feeds the gauge icon and the Quota left tray mode."));
         panel.Children.Add(Section("Quota source", quotaGroup));
+
+        return panel;
+    }
+
+    // ── Dashboard page: Agent limits, Client tabs, Live trace, Flyout size ──
+    private StackPanel BuildDashboardPage(SettingsStore store)
+    {
+        var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
 
         // ── Agent limits ───────────────────────────────────────────────
         var limits = new StackPanel { Spacing = 8 };
@@ -287,6 +367,9 @@ public sealed class SettingsWindow : Window
         }
 
         panel.Children.Add(Section("Agent limits", limits));
+
+        // ── Client tabs ────────────────────────────────────────────────
+        panel.Children.Add(Section("Client tabs", BuildClientTabs(store)));
 
         // ── Live trace ─────────────────────────────────────────────────
         var detailed = new ToggleSwitch
@@ -350,6 +433,30 @@ public sealed class SettingsWindow : Window
         sizeRow.Children.Add(slider);
         panel.Children.Add(Section("Flyout size", sizeRow));
 
+        return panel;
+    }
+
+    // ── General page: Startup, Data refresh ──────────────────────────────
+    private StackPanel BuildGeneralPage(SettingsStore store)
+    {
+        var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
+
+        // ── Startup ────────────────────────────────────────────────────
+        var autostart = new ToggleSwitch
+        {
+            IsOn = AutostartService.IsEnabled,
+            OnContent = null,
+            OffContent = null,
+        };
+        autostart.Toggled += (_, _) =>
+        {
+            if (!AutostartService.SetEnabled(autostart.IsOn))
+            {
+                autostart.IsOn = AutostartService.IsEnabled; // stay honest
+            }
+        };
+        panel.Children.Add(Section("Startup", ToggleRow("Launch at login", autostart)));
+
         // ── Data refresh ───────────────────────────────────────────────
         var refresh = new StackPanel { Spacing = 8 };
         refresh.Children.Add(RadioGroup(
@@ -366,6 +473,14 @@ public sealed class SettingsWindow : Window
             "continuous either way."));
         panel.Children.Add(Section("Data refresh", refresh));
 
+        return panel;
+    }
+
+    // ── About page: About ─────────────────────────────────────────────────
+    private static StackPanel BuildAboutPage()
+    {
+        var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
+
         // ── About ──────────────────────────────────────────────────────
         var about = new StackPanel { Spacing = 4 };
         about.Children.Add(Ui.Row(
@@ -381,8 +496,55 @@ public sealed class SettingsWindow : Window
             "handlecusion's tokcat."));
         panel.Children.Add(Section("About", about));
 
-        _scroll.Content = panel;
-        RebuildPreview();
+        return panel;
+    }
+
+    /// <summary>NavigationView.PaneFooter: GitHub and Sponsor links (macOS
+    /// SettingsWindowView's FooterLink) — plain color (not the system link
+    /// blue), a hover chip so two adjacent links read as separate targets.
+    /// HyperlinkButton gives the pointing-hand cursor and the click-to-launch
+    /// behavior for free via NavigateUri.</summary>
+    private static StackPanel BuildFooter()
+    {
+        var footer = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 4,
+            Margin = new Thickness(12, 4, 12, 12),
+        };
+        footer.Children.Add(FooterLink(
+            "GitHub", "https://github.com/Nanako0129/TokenBar-Windows"));
+        footer.Children.Add(FooterLink(
+            "Sponsor", "https://www.patreon.com/cw/Nanako0129/membership"));
+        return footer;
+    }
+
+    private static HyperlinkButton FooterLink(string title, string url)
+    {
+        var transparent = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+        var chip = new SolidColorBrush(Windows.UI.Color.FromArgb(23, 128, 128, 128));
+        var secondary = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+        var primary = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+        var link = new HyperlinkButton
+        {
+            Content = title,
+            NavigateUri = new Uri(url),
+            FontSize = 11,
+            Padding = new Thickness(7, 3, 7, 4),
+            Background = transparent,
+            Foreground = secondary,
+        };
+        link.PointerEntered += (_, _) =>
+        {
+            link.Background = chip;
+            link.Foreground = primary;
+        };
+        link.PointerExited += (_, _) =>
+        {
+            link.Background = transparent;
+            link.Foreground = secondary;
+        };
+        return link;
     }
 
     private StackPanel BuildClientTabs(SettingsStore store)
