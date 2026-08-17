@@ -2,6 +2,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
+using TokenBar.Core;
+using TokenBar.Interop;
 using Windows.UI;
 
 namespace TokenBar.App;
@@ -137,6 +139,37 @@ public static class Ui
             CornerRadius = new CornerRadius(2),
         });
         return track;
+    }
+
+    /// <summary>Live-session rows (macOS UsageTraceCard): one collapsed row per
+    /// app, or one row per agent-and-model bucket when detailed. Returns null
+    /// when nothing is running so the caller can drop the whole card instead of
+    /// showing an empty one. Selection happens before collapse and Take(5), or a
+    /// high-rate hidden client can evict every selected row.</summary>
+    public static FrameworkElement? TraceRows(
+        IReadOnlyList<TraceBucket> trace, IReadOnlySet<string> selected, bool detailed)
+    {
+        var picked = TraceCollapse.FilterByClients(trace, selected);
+        var rows = detailed
+            ? picked.Select(b => (b.Client, b.Model, b.TokensPerMin)).Take(5).ToList()
+            : TraceCollapse.CollapseByClient(picked)
+                .Select(r => (r.Client, r.Model, r.TokensPerMin)).Take(5).ToList();
+        if (rows.Count == 0)
+        {
+            return null;
+        }
+
+        var panel = new StackPanel { Spacing = 6 };
+        foreach (var row in rows)
+        {
+            var name = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+            name.Children.Add(Disc(ClientRegistry.Style(row.Client).Color));
+            name.Children.Add(Text($"{ClientRegistry.ShortName(row.Client)} · {row.Model}", 11));
+            panel.Children.Add(Row(
+                name, Text($"{Format.CompactTokens((long)row.TokensPerMin)}/min", 11, 0.75)));
+        }
+
+        return panel;
     }
 
     public static SolidColorBrush BrushFromHex(string hex)

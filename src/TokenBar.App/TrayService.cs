@@ -130,7 +130,7 @@ public sealed class TrayService : IDisposable
     public static Action? OpenSettings { get; private set; }
 
     public void ShowSettings() => SettingsWindow.Present(
-        () => _feed.Quota, () => _feed.Graph);
+        () => _feed.Quota, () => _feed.Graph, () => _feed.Trace);
 
     internal bool CanHandoff => !Volatile.Read(ref _disposed);
 

@@ -24,6 +24,7 @@ public sealed class SettingsWindow : Window
     private static SettingsWindow? _shared;
     private readonly Func<AgentUsagePayload?> _quota;
     private readonly Func<UsagePayload?> _graph;
+    private readonly Func<IReadOnlyList<TraceBucket>> _trace;
     private readonly ScrollViewer _scroll = new()
     {
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
@@ -74,9 +75,10 @@ public sealed class SettingsWindow : Window
     private string _selectedTag = "menubar";
 
     public static void Present(
-        Func<AgentUsagePayload?> quota, Func<UsagePayload?> graph)
+        Func<AgentUsagePayload?> quota, Func<UsagePayload?> graph,
+        Func<IReadOnlyList<TraceBucket>> trace)
     {
-        _shared ??= new SettingsWindow(quota, graph);
+        _shared ??= new SettingsWindow(quota, graph, trace);
         _shared.Rebuild();
         _shared.AppWindow.Show();
         // Activate() alone cannot bring the window forward when the opener
@@ -95,10 +97,12 @@ public sealed class SettingsWindow : Window
     }
 
     private SettingsWindow(
-        Func<AgentUsagePayload?> quota, Func<UsagePayload?> graph)
+        Func<AgentUsagePayload?> quota, Func<UsagePayload?> graph,
+        Func<IReadOnlyList<TraceBucket>> trace)
     {
         _quota = quota;
         _graph = graph;
+        _trace = trace;
         Title = $"{ProductIdentity.Name} Settings";
         SystemBackdrop = new MicaBackdrop();
         var root = new Grid();
@@ -832,6 +836,25 @@ public sealed class SettingsWindow : Window
         }
 
         _preview.Children.Add(card);
+
+        // Live session (macOS UsageTraceCard, the preview column's third
+        // block). Rendered through the same Ui.TraceRows the Overview lens
+        // uses, so the preview cannot drift from the real card. TrayFeed
+        // already polls the live tail and marshals it back, so this reads a
+        // value rather than making an FFI call on the UI thread.
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var present = (_graph()?.Summary.Clients ?? [])
+            .Select(ClientRegistry.CanonicalClient)
+            .Where(seen.Add)
+            .ToList();
+        var selected = new HashSet<string>(
+            ClientRegistry.DisplayClients(present, store), StringComparer.Ordinal);
+        var detailed = store.GetBool("tokenbar.trace.detailed", false);
+        if (Ui.TraceRows(_trace(), selected, detailed) is { } rows)
+        {
+            _preview.Children.Add(Ui.Text("LIVE SESSION", 10, 0.55, bold: true));
+            _preview.Children.Add(rows);
+        }
     }
 
     /// <summary>frame-00 of the cat/parrot set, letterboxed like the
