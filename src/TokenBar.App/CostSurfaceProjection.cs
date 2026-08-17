@@ -17,9 +17,17 @@ public static class CostSurfaceProjection
         bool authoritative, ChartMetric requested) =>
         !authoritative && requested == ChartMetric.Cost;
 
+    /// <summary>Partial counts as authoritative. The engine's coverage fold
+    /// reports Partial when at least one message priced and at least one did
+    /// not, so the total is every cost it could resolve with the rest folded in
+    /// at zero — the same number macOS displays, since macOS has no coverage
+    /// gate at all. Only None is withheld: there the total really would be a
+    /// fabricated $0. Treating Partial as unauthoritative made the cost surface
+    /// read "Checking" permanently on any profile holding one unpriced model,
+    /// because Partial is a terminal state, not a loading one.</summary>
     public static bool IsAuthoritative(UsagePayload? graph) =>
         graph?.Meta.PricingMode == PricingMode.BestEffort
-        && graph.Meta.CostCoverage == CostCoverage.Complete;
+        && graph.Meta.CostCoverage != CostCoverage.None;
 
     public static string CostText(double cost, bool authoritative) =>
         authoritative ? Format.Usd(cost) : Checking;
