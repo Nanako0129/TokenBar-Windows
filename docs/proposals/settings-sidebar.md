@@ -122,9 +122,11 @@ macOS 的預覽欄**不隨分頁變化**，永遠顯示同樣三塊。Windows �
 
 | 預覽區塊 | macOS | Windows | 顯示條件 |
 |---|---|---|---|
-| Menu bar mock | 深色 + 淺色兩條 | 單條 | 無條件 |
+| Menu bar mock | 深色 + 淺色兩條 | ✅ 兩條 | 無條件 |
 | Agent limits card | ✅ | ✅ | `limitsEnabled` 為真 |
-| Live session card | ✅ | **缺** | 無條件 |
+| Live session card | ✅ | **缺** | 有 rows 才顯示 |
+
+> **更正（S2 discovery）：** 本表原記「Windows 只有單條 menu bar mock」，是錯的。`RebuildPreview()` 的 `foreach (var dark in new[] { true, false })` 早就渲染深淺兩條；當初只搜到一次 `_preview.Children.Add(strip)`，沒看出它在迴圈內。S2 因此只需補 Live session card 一塊。
 
 > **注意：** 預覽欄不隨分頁變化這件事必須在實作前確認清楚。它讓側邊欄改造只需要動左半部，`_preview` 的建構邏輯完全不必碰——這是切片 S1 能維持小 diff 的前提。
 
