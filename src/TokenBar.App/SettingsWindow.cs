@@ -193,14 +193,21 @@ public sealed class SettingsWindow : Window
     private void ApplySize()
     {
         var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
-        var size = new Windows.Graphics.SizeInt32((int)(900 * scale), (int)(640 * scale));
+        var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        // Clamp before resizing: the window is fixed and not resizable, so a
+        // display narrower than the requested size has no recovery path. The
+        // centering below would compute a negative X and push both edges —
+        // including the title-bar controls — off-screen. 640 is clamped for
+        // the same reason on short work areas.
+        var size = new Windows.Graphics.SizeInt32(
+            Math.Min((int)(900 * scale), area.Width),
+            Math.Min((int)(640 * scale), area.Height));
         if (AppWindow.Size == size)
         {
             return;
         }
 
         AppWindow.Resize(size);
-        var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
         AppWindow.Move(new Windows.Graphics.PointInt32(
             area.X + (area.Width - AppWindow.Size.Width) / 2,
             area.Y + (area.Height - AppWindow.Size.Height) / 3));
@@ -226,6 +233,12 @@ public sealed class SettingsWindow : Window
         if (_pages.TryGetValue(tag, out var page))
         {
             _scroll.Content = page;
+            // Every page shares this one ScrollViewer, which keeps its offset
+            // when the content swaps if that offset is still valid for the new
+            // extent. Scrolling down Dashboard and switching to Menu bar would
+            // otherwise open it part-way down with its first section cut off.
+            // Offset 0 is always in range, so this needs no layout pass.
+            _scroll.ChangeView(null, 0, null, disableAnimation: true);
         }
     }
 
