@@ -12,19 +12,10 @@ using Grid = Microsoft.UI.Xaml.Controls.Grid;
 
 namespace TokenBar.App;
 
-public enum AppView
-{
-    Overview,
-    Models,
-    Daily,
-    Hourly,
-    Stats,
-    Agents,
-}
-
 /// <summary>
-/// The dashboard shell: global header, lens switch, and the six lenses from
-/// the macOS AppView router, each built in code from the current snapshot.
+/// The dashboard shell: global header, lens switch, and the lenses of the
+/// macOS AppView router, each built in code from the current snapshot. Six of
+/// the seven are ported; Monthly is not (see AppView).
 /// </summary>
 public sealed partial class DashboardView : UserControl
 {
@@ -77,6 +68,7 @@ public sealed partial class DashboardView : UserControl
             TabsPanel.Children.Add(button);
         }
 
+        ApplyLensVisibility();
         UpdateTabChrome();
 
         AddHandler(
@@ -102,6 +94,10 @@ public sealed partial class DashboardView : UserControl
             if (key is ClientRegistry.TabHiddenKey or ClientRegistry.TabOrderKey)
             {
                 _ = DispatcherQueue.TryEnqueue(() => RefreshSelection(animated: false));
+            }
+            else if (key == AppViews.HiddenKey)
+            {
+                _ = DispatcherQueue.TryEnqueue(ApplyLensVisibility);
             }
             else if (key.StartsWith("tokenbar.limits.", StringComparison.Ordinal)
                 || key == "tokenbar.trace.detailed")
@@ -291,11 +287,35 @@ public sealed partial class DashboardView : UserControl
         KeyboardAccelerators.Add(accel);
     }
 
+    /// <summary>Push the hidden-lens set into the tab row. Buttons are built
+    /// once in the constructor, so this toggles Visibility rather than
+    /// rebuilding, and then re-runs the current selection through SwitchTo —
+    /// whose Effective() guard moves us off a lens that was just hidden.
+    /// Hiding the lens you are looking at must not leave it on screen with no
+    /// tab to return to.</summary>
+    private void ApplyLensVisibility()
+    {
+        var visible = AppViews.Visible(AppSettings.Store);
+        foreach (var (view, button) in _tabs)
+        {
+            button.Visibility = visible.Contains(view)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        SwitchTo(_view);
+    }
+
     private void CycleLens(int step)
     {
-        var lenses = Enum.GetValues<AppView>();
-        var index = Array.IndexOf(lenses, _view);
-        SwitchTo(lenses[(index + step + lenses.Length) % lenses.Length]);
+        var lenses = AppViews.Visible(AppSettings.Store);
+        var index = lenses.IndexOf(_view);
+        if (index < 0)
+        {
+            index = 0;
+        }
+
+        SwitchTo(lenses[(index + step + lenses.Count) % lenses.Count]);
     }
 
     /// <summary>One control, two states (macOS refreshButton): the glyph
@@ -324,6 +344,10 @@ public sealed partial class DashboardView : UserControl
 
     public void SwitchTo(AppView view)
     {
+        // One guard for every caller: the Ctrl+1..9 accelerators each bind a
+        // fixed lens at construction, so a hidden lens would otherwise stay
+        // reachable by shortcut even though its tab is gone.
+        view = AppViews.Effective(view, AppSettings.Store);
         if (_view == view)
         {
             return;

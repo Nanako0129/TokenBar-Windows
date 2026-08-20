@@ -93,7 +93,7 @@ WinUI 3 的 `NavigationView` 就是這個控制項，`PaneDisplayMode="Left"` �
 | | Quota source | `Quota source` | ✅ 一致 |
 | | Individual items | **非目標** | `ClientTray.settingsRows` |
 | **Dashboard** | Agent limits | `Agent limits` | ✅ 一致 |
-| | View tabs | **缺** | `tokenbar.views.hidden` |
+| | View tabs | S3 | `tokenbar.views.hidden` |
 | | Client tabs (top bar) | `Client tabs` | ✅ 一致 |
 | | Live trace | `Live trace` | ✅ 一致 |
 | | Popover size | `Flyout size` | ✅ 一致（名稱依平台） |
@@ -142,8 +142,11 @@ macOS 的預覽欄**不隨分頁變化**，永遠顯示同樣三塊。Windows �
 | **S4** | General / Language 分節 + i18n 基礎建設 | S1 | 全 UI 字串可切換語言 |
 | **S5** | General / Discord 分節 + Rich Presence | S1 | Discord 狀態列顯示用量 |
 | **S6** | Usage attribution 分頁 + 歸因邏輯 | S1 | 側邊欄出現第五頁 |
+| **S7** | Monthly lens 移植（macOS `MonthlyView.swift`，275 行） | — | flyout 分頁列出現 Monthly，且可在 View tabs 中隱藏 |
 
 S4 排在 S5 之前，因為 i18n 會碰到每一個字串；先做 Discord 等於保證之後要再改一次 Discord 的所有文案。
+
+> **S3 discovery 的發現：** macOS `AppView` 有**七個** case（`overview, models, monthly, daily, hourly, stats, agents`），Windows 只有六個——`monthly` 從未移植。原本的 parity 盤點誤信了 `DashboardView` 那句「the six lenses from the macOS AppView router」註解，而那句話本身就是錯的。S7 因此獨立登記，不併入 S3；它不相依 S1，只是排在後面。
 
 ### S1 範圍細節
 
