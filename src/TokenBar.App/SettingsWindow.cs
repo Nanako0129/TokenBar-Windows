@@ -372,6 +372,9 @@ public sealed class SettingsWindow : Window
 
         panel.Children.Add(Section("Agent limits", limits));
 
+        // ── View tabs ──────────────────────────────────────────────────
+        panel.Children.Add(Section("View tabs", BuildViewTabs(store)));
+
         // ── Client tabs ────────────────────────────────────────────────
         panel.Children.Add(Section("Client tabs", BuildClientTabs(store)));
 
@@ -549,6 +552,49 @@ public sealed class SettingsWindow : Window
             link.Foreground = secondary;
         };
         return link;
+    }
+
+    /// <summary>One switch per hideable lens (macOS SettingsPanel's
+    /// "View tabs"). Overview and Models are absent by construction — Overview
+    /// is the fallback every hidden lens returns to, so offering to hide it
+    /// would let the user remove the only guaranteed destination.</summary>
+    private static StackPanel BuildViewTabs(SettingsStore store)
+    {
+        var panel = new StackPanel { Spacing = 2 };
+        foreach (var view in AppViews.Toggleable)
+        {
+            var hidden = ClientRegistry.ParseIdSet(
+                store.GetString(AppViews.HiddenKey) ?? string.Empty);
+            var toggle = new ToggleSwitch
+            {
+                IsOn = !hidden.Contains(AppViews.Id(view)),
+                OnContent = null,
+                OffContent = null,
+            };
+            var id = AppViews.Id(view);
+            toggle.Toggled += (_, _) =>
+            {
+                var next = new SortedSet<string>(ClientRegistry.ParseIdSet(
+                    store.GetString(AppViews.HiddenKey) ?? string.Empty),
+                    StringComparer.Ordinal);
+                if (toggle.IsOn)
+                {
+                    next.Remove(id);
+                }
+                else
+                {
+                    next.Add(id);
+                }
+
+                store.SetString(AppViews.HiddenKey, string.Join(',', next));
+            };
+            panel.Children.Add(ToggleRow(view.ToString(), toggle));
+        }
+
+        panel.Children.Add(Hint(
+            "Off removes a tab from the flyout's tab row. "
+            + "Cost and token data are unaffected."));
+        return panel;
     }
 
     private StackPanel BuildClientTabs(SettingsStore store)
