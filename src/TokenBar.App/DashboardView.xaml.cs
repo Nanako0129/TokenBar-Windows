@@ -1017,36 +1017,11 @@ public sealed partial class DashboardView : UserControl
         return panel;
     }
 
-    private FrameworkElement? BuildTrace(DashboardModel.Snapshot snapshot)
-    {
-        // tokenbar.trace.detailed (macOS UsageTraceCard): one row per
-        // agent-and-model bucket instead of one collapsed row per app.
-        // Selection must happen before collapse and Take(5), or a high-rate
-        // hidden client can evict every selected row from the card.
-        var selected = TraceCollapse.FilterByClients(snapshot.Trace, _selectedSet);
-        var detailed = AppSettings.Store.GetBool("tokenbar.trace.detailed", false);
-        var rows = detailed
-            ? selected
-                .Select(b => (b.Client, b.Model, b.TokensPerMin)).Take(5).ToList()
-            : TraceCollapse.CollapseByClient(selected)
-                .Select(r => (r.Client, r.Model, r.TokensPerMin)).Take(5).ToList();
-        if (rows.Count == 0)
-        {
-            return null;
-        }
-
-        var panel = new StackPanel { Spacing = 6 };
-        foreach (var row in rows)
-        {
-            var name = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            name.Children.Add(Ui.Disc(ClientRegistry.Style(row.Client).Color));
-            name.Children.Add(Ui.Text($"{ClientRegistry.ShortName(row.Client)} · {row.Model}", 11));
-            panel.Children.Add(Ui.Row(
-                name, Ui.Text($"{Format.CompactTokens((long)row.TokensPerMin)}/min", 11, 0.75)));
-        }
-
-        return panel;
-    }
+    private FrameworkElement? BuildTrace(DashboardModel.Snapshot snapshot) =>
+        Ui.TraceRows(
+            snapshot.Trace,
+            _selectedSet,
+            AppSettings.Store.GetBool("tokenbar.trace.detailed", false));
 
     private FrameworkElement BuildStreaks(DashboardModel.Snapshot snapshot)
     {
