@@ -143,10 +143,13 @@ macOS 的預覽欄**不隨分頁變化**，永遠顯示同樣三塊。Windows �
 | **S5** | General / Discord 分節 + Rich Presence | S1 | Discord 狀態列顯示用量 |
 | **S6** | Usage attribution 分頁 + 歸因邏輯 | S1 | 側邊欄出現第五頁 |
 | **S7** | Monthly lens 移植（macOS `MonthlyView.swift`，275 行） | — | flyout 分頁列出現 Monthly，且可在 View tabs 中隱藏 |
+| **S8** | flyout 快捷鍵 parity 修正 | — | `Ctrl+[` / `Ctrl+]` 實際可觸發，且與 `Ctrl+1..9` 一致地操作 macOS 所綁的那一排 |
 
 S4 排在 S5 之前，因為 i18n 會碰到每一個字串；先做 Discord 等於保證之後要再改一次 Discord 的所有文案。
 
-> **S3 discovery 的發現：** macOS `AppView` 有**七個** case（`overview, models, monthly, daily, hourly, stats, agents`），Windows 只有六個——`monthly` 從未移植。原本的 parity 盤點誤信了 `DashboardView` 那句「the six lenses from the macOS AppView router」註解，而那句話本身就是錯的。S7 因此獨立登記，不併入 S3；它不相依 S1，只是排在後面。
+> **S3 discovery 的發現（快捷鍵）：** 兩個既有問題，都不是 S3 引入。其一，macOS 的 ⌘1-9 與 ⌘[ ⌘] 操作的是 **client tabs**（`PopoverView.swift:693-702`，`clientTab.wrappedValue = tabs[...]`），Windows 卻綁到 **lenses**——綁錯了那一排。其二，`Ctrl+[` / `Ctrl+]` 實測無反應：`AddAccel` 機制本身正常（`Ctrl+1..6` 用同一條路徑且有效），差別在 `VirtualKey.Number1` 是具名成員，而 `(VirtualKey)0xDB` / `0xDD`（`VK_OEM_4` / `VK_OEM_6`）是硬轉型的未定義值、且佈局相依；macOS 用 `charactersIgnoringModifiers` 比對字元，與佈局無關。修法牽涉「該綁哪一排」的產品決定，故登記為 S8 而非併入 S3。
+
+> **S3 discovery 的發現（lens 數量）：** macOS `AppView` 有**七個** case（`overview, models, monthly, daily, hourly, stats, agents`），Windows 只有六個——`monthly` 從未移植。原本的 parity 盤點誤信了 `DashboardView` 那句「the six lenses from the macOS AppView router」註解，而那句話本身就是錯的。S7 因此獨立登記，不併入 S3；它不相依 S1，只是排在後面。
 
 ### S1 範圍細節
 
