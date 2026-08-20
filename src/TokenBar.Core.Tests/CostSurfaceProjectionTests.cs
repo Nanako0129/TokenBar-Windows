@@ -43,7 +43,10 @@ public class CostSurfaceProjectionTests
     [InlineData(PricingMode.LocalOnly, CostCoverage.Complete, false)]
     [InlineData(PricingMode.LocalOnly, CostCoverage.Partial, false)]
     [InlineData(PricingMode.LocalOnly, CostCoverage.None, false)]
-    [InlineData(PricingMode.BestEffort, CostCoverage.Partial, false)]
+    // Partial is authoritative: the engine folds unpriced messages in at zero,
+    // so the total is real, just incomplete — and it is a terminal state, not a
+    // loading one, so withholding it showed "Checking" forever.
+    [InlineData(PricingMode.BestEffort, CostCoverage.Partial, true)]
     [InlineData(PricingMode.BestEffort, CostCoverage.None, false)]
     [InlineData(PricingMode.BestEffort, CostCoverage.Complete, true)]
     public void MetadataMatrixIsTheOnlyCostAuthority(

@@ -167,7 +167,6 @@ public class GraphConsumerStateTests
     [InlineData(PricingMode.LocalOnly, CostCoverage.Complete)]
     [InlineData(PricingMode.LocalOnly, CostCoverage.Partial)]
     [InlineData(PricingMode.LocalOnly, CostCoverage.None)]
-    [InlineData(PricingMode.BestEffort, CostCoverage.Partial)]
     [InlineData(PricingMode.BestEffort, CostCoverage.None)]
     public void NonAuthoritativeMetadataStaysChecking(
         PricingMode pricing, CostCoverage coverage)
@@ -180,6 +179,25 @@ public class GraphConsumerStateTests
             id, Payload(pricing, coverage), GraphPublicationStage.LocalFirst));
         Assert.True(state.LocalAccepted);
         Assert.False(state.CostAuthoritative);
+    }
+
+    /// <summary>Partial priced at least one message and folded the rest in at
+    /// zero, so the total is real. It is also terminal, not a loading step —
+    /// withholding it left the cost surface reading "Checking" forever on any
+    /// profile holding one unpriced model.</summary>
+    [Fact]
+    public void PartialCoverageIsCostAuthoritative()
+    {
+        var state = new GraphConsumerState();
+        var id = Id(null, 1);
+        state.Begin(id);
+
+        Assert.True(state.TryAcceptGraph(
+            id,
+            Payload(PricingMode.BestEffort, CostCoverage.Partial),
+            GraphPublicationStage.Richer));
+        Assert.True(state.LocalAccepted);
+        Assert.True(state.CostAuthoritative);
     }
 
     [Fact]
