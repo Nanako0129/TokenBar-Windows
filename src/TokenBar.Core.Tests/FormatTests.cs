@@ -36,6 +36,16 @@ public class FormatTests
     public void MonthDay(string iso, string expected) =>
         Assert.Equal(expected, Format.MonthDay(iso));
 
+    [Theory]
+    [InlineData("2026-06", "Jun 2026")]
+    [InlineData("2026-01", "Jan 2026")]
+    [InlineData("2026-12", "Dec 2026")]
+    [InlineData("2026-13", "2026-13")]
+    [InlineData("2026-06-10", "2026-06-10")]
+    [InlineData("garbage", "garbage")]
+    public void MonthYear(string ym, string expected) =>
+        Assert.Equal(expected, Format.MonthYear(ym));
+
     [Fact]
     public void MmddSplits() => Assert.Equal("06/10", Format.Mmdd("2026-06-10"));
 

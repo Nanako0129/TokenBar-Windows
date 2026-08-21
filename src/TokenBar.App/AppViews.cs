@@ -3,12 +3,12 @@ using TokenBar.Core;
 namespace TokenBar.App;
 
 /// <summary>The flyout's lenses, ported from the macOS AppView router. macOS
-/// has seven; Monthly is not ported here, so this enum is deliberately one
-/// short rather than merely out of date.</summary>
+/// order matches macOS, so the number-key positions line up with it.</summary>
 public enum AppView
 {
     Overview,
     Models,
+    Monthly,
     Daily,
     Hourly,
     Stats,
