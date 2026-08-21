@@ -77,6 +77,30 @@ public class LocalizationTests
         }
     }
 
+    // System.Text.Json deserializes a JSON null into a non-nullable string
+    // value without complaint, so a hand-edited or generated table can carry
+    // one. Reading .Length on it would crash the UI it was meant to render.
+    [Fact]
+    public void NullEntryFallsBackInsteadOfThrowing()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(
+            Path.Combine(dir, "strings.zh-Hant.json"),
+            """{"Language":null,"Menu bar":"選單列"}""");
+        try
+        {
+            Localization.Load("zh-Hant", dir);
+            Assert.Equal("Language", "Language".Localized());
+            Assert.Equal("選單列", "Menu bar".Localized());
+        }
+        finally
+        {
+            Localization.Load("en", dir);
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
     [Fact]
     public void PresentEntryIsUsedAndBlankEntryFallsBack()
     {

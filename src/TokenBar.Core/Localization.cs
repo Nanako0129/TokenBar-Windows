@@ -65,8 +65,14 @@ public static class Localization
     {
         lock (Gate)
         {
-            return _table is not null && _table.TryGetValue(source, out var value)
-                && value.Length > 0
+            // IsNullOrEmpty, not Length: the dictionary is declared with a
+            // non-nullable value type, but that is an annotation — System.Text
+            // .Json will happily deserialize a JSON null into it, and reading
+            // .Length on that would throw. A table entry must never be able to
+            // take the UI down; English is always a correct rendering.
+            return _table is not null
+                && _table.TryGetValue(source, out var value)
+                && !string.IsNullOrEmpty(value)
                 ? value
                 : source;
         }
