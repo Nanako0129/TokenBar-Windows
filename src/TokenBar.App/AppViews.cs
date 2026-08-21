@@ -33,6 +33,10 @@ public static class AppViews
 
     public static string Id(AppView view) => view.ToString().ToLowerInvariant();
 
+    /// <summary>Display name for a lens. The enum name is the translation key,
+    /// matching what macOS persists and shows for the same seven lenses.</summary>
+    public static string Label(AppView view) => view.ToString().Localized();
+
     /// <summary>Lenses to show in the tab row. Only <see cref="Toggleable"/>
     /// lenses can ever be dropped, so even a hand-edited settings file cannot
     /// remove Overview and leave the fallback target missing.</summary>

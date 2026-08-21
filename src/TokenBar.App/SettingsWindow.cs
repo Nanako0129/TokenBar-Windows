@@ -294,8 +294,8 @@ public sealed class SettingsWindow : Window
                 store.SetBool("tokenbar.tray.animate", animate.IsOn);
             icon.Children.Add(ToggleRow("Animate with token rate".Localized(), animate));
             icon.Children.Add(Hint(
-                "Idle purrs at 2 fps; a heavy session sprints. Shown only in " +
-                "the icon-only tray mode."));
+                ("Idle purrs at 2 fps; a heavy session sprints. Shown only in "
+                    + "the icon-only tray mode.").Localized()));
         }
         else
         {
@@ -309,7 +309,8 @@ public sealed class SettingsWindow : Window
                 store.GetString("tokenbar.icon.coloring", "warning") ?? "warning",
                 raw => store.SetString("tokenbar.icon.coloring", raw)));
             icon.Children.Add(Hint(
-                "Battery-icon behavior: the gauge picks up color under 25% left."));
+                "Battery-icon behavior: the gauge picks up color under 25% left."
+                .Localized()));
         }
 
         panel.Children.Add(Section("Tray icon".Localized(), icon));
@@ -320,7 +321,7 @@ public sealed class SettingsWindow : Window
         var payload = _quota();
         var selection = QuotaSelectionPolicy.EffectiveSelection(
             payload, persistedSelection);
-        var choices = new List<(string, string)> { (QuotaResolver.Auto, "Auto (tightest window)") };
+        var choices = new List<(string, string)> { (QuotaResolver.Auto, "Auto (tightest window)".Localized()) };
         if (payload is not null)
         {
             foreach (var agent in payload.Agents.Where(a => a.Error is null))
@@ -339,7 +340,7 @@ public sealed class SettingsWindow : Window
             "quota.source", choices, selection,
             raw => store.SetString("tokenbar.quota.source", raw)));
         quotaGroup.Children.Add(Hint(
-            "Feeds the gauge icon and the Quota left tray mode."));
+            "Feeds the gauge icon and the Quota left tray mode.".Localized()));
         panel.Children.Add(Section("Quota source".Localized(), quotaGroup));
 
         return panel;
@@ -379,8 +380,9 @@ public sealed class SettingsWindow : Window
                 store.GetString("tokenbar.limits.paceMode", "historical") ?? "historical",
                 raw => store.SetString("tokenbar.limits.paceMode", raw)));
             limits.Children.Add(Hint(
-                "The deficit/reserve marker. Historical learns your weekly " +
-                "usage curve; Linear paces evenly by the clock; Off hides it."));
+                ("The deficit/reserve marker. Historical learns your weekly "
+                    + "usage curve; Linear paces evenly by the clock; Off hides it.")
+                .Localized()));
         }
 
         panel.Children.Add(Section("Agent limits".Localized(), limits));
@@ -413,10 +415,14 @@ public sealed class SettingsWindow : Window
         var workDips = area.Height / dipScale;
         var height = store.GetDouble("tokenbar.popover.height", 0);
         var sizeRow = new StackPanel { Spacing = 8 };
-        var sizeLabel = Ui.Text(height <= 0 ? "Height · Auto" : $"Height · {height:F0}px", 12);
+        var sizeLabel = Ui.Text(
+            height <= 0
+                ? "Height · Auto".Localized()
+                : "Height · {0}px".Localized($"{height:F0}"),
+            12);
         var auto = new Button
         {
-            Content = "Auto",
+            Content = "Auto".Localized(),
             FontSize = 11,
             Padding = new Thickness(8, 2, 8, 3),
             HorizontalAlignment = HorizontalAlignment.Right,
@@ -436,7 +442,7 @@ public sealed class SettingsWindow : Window
             if (e.NewValue > 0)
             {
                 store.SetDouble("tokenbar.popover.height", e.NewValue);
-                sizeLabel.Text = $"Height · {e.NewValue:F0}px";
+                sizeLabel.Text = "Height · {0}px".Localized($"{e.NewValue:F0}");
                 auto.Visibility = Visibility.Visible;
             }
         };
@@ -482,15 +488,15 @@ public sealed class SettingsWindow : Window
         refresh.Children.Add(RadioGroup(
             "refresh.interval",
             [
-                ("1", "Every minute"), ("5", "Every 5 minutes"),
-                ("15", "Every 15 minutes"), ("30", "Every 30 minutes"),
-                ("60", "Every hour"),
+                ("1", "Every minute".Localized()), ("5", "Every 5 minutes".Localized()),
+                ("15", "Every 15 minutes".Localized()), ("30", "Every 30 minutes".Localized()),
+                ("60", "Every hour".Localized()),
             ],
             Math.Max(1, store.GetInt("tokenbar.refresh.intervalMin", 30)).ToString(),
             raw => store.SetInt("tokenbar.refresh.intervalMin", int.Parse(raw))));
         refresh.Children.Add(Hint(
-            "How often the tray forces a full log re-read; cached reads stay " +
-            "continuous either way."));
+            ("How often the tray forces a full log re-read; cached reads stay "
+                + "continuous either way.").Localized()));
         panel.Children.Add(Section("Data refresh".Localized(), refresh));
 
         // ── Language ───────────────────────────────────────────────────
@@ -537,9 +543,9 @@ public sealed class SettingsWindow : Window
                     ?.InformationalVersion ?? "dev",
                 12)));
         about.Children.Add(Hint(
-            "Shared parsing engine from tokscale-core, originally derived " +
-            "from tokscale by junhoyeo; menu-bar concept from " +
-            "handlecusion's tokcat."));
+            ("Shared parsing engine from tokscale-core, originally derived "
+                + "from tokscale by junhoyeo; menu-bar concept from "
+                + "handlecusion's tokcat.").Localized()));
         panel.Children.Add(Section("About".Localized(), about));
 
         return panel;
@@ -561,7 +567,7 @@ public sealed class SettingsWindow : Window
         footer.Children.Add(FooterLink(
             "GitHub", "https://github.com/Nanako0129/TokenBar-Windows"));
         footer.Children.Add(FooterLink(
-            "Sponsor", "https://www.patreon.com/cw/Nanako0129/membership"));
+            "Sponsor".Localized(), "https://www.patreon.com/cw/Nanako0129/membership"));
         return footer;
     }
 
@@ -627,12 +633,12 @@ public sealed class SettingsWindow : Window
 
                 store.SetString(AppViews.HiddenKey, string.Join(',', next));
             };
-            panel.Children.Add(ToggleRow(view.ToString(), toggle));
+            panel.Children.Add(ToggleRow(AppViews.Label(view), toggle));
         }
 
         panel.Children.Add(Hint(
-            "Off removes a tab from the flyout's tab row. "
-            + "Cost and token data are unaffected."));
+            ("Off removes a tab from the flyout's tab row. "
+                + "Cost and token data are unaffected.").Localized()));
         return panel;
     }
 
@@ -721,8 +727,8 @@ public sealed class SettingsWindow : Window
             shown.Toggled += (_, _) => SetClientTabVisible(store, id, shown.IsOn);
             Grid.SetColumn(shown, 3);
             row.Children.Add(shown);
-            HoverTip.Attach(up, () => $"Move {ClientRegistry.ShortName(id)} up");
-            HoverTip.Attach(down, () => $"Move {ClientRegistry.ShortName(id)} down");
+            HoverTip.Attach(up, () => "Move {0} up".Localized(ClientRegistry.ShortName(id)));
+            HoverTip.Attach(down, () => "Move {0} down".Localized(ClientRegistry.ShortName(id)));
             HoverTip.Attach(shown, () => shown.IsOn ? "Shown in client tabs" : "Hidden from client tabs");
             panel.Children.Add(row);
         }
