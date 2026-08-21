@@ -38,7 +38,8 @@
              Assets\syrtis.ico
 
          The 920-inside-1024 inset is load-bearing. The SVG carries only ~3%
-         margin, and at that scale the disc's bounding box IS the canvas below
+         horizontal and ~3.9% vertical margin (the canvas is square while the
+         disc is squashed), and at that scale its bounding box IS the canvas below
          64px: antialiasing has nowhere to finish and any container that scales
          or rounds the icon cuts into the shape. Omitting it reproduces the
          flush-to-edge icon this was changed away from. -->

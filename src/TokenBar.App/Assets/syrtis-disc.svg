@@ -2,7 +2,8 @@
   <!-- syrtis sediment disc, no star. squash=0.98, centred on its own
        bounds with a 3% margin. Do NOT reuse the logo placement:
        there the disc is offset to balance the star. -->
-  <g transform="translate(16,125.49) scale(1,0.98)">
+  <g transform="translate(0,588.500) scale(1,0.98) translate(0,-588.500)">
+  <g transform="translate(16,116)">
     <g transform="translate(0.000000,948.000000) scale(0.100000,-0.100000)"
 fill="#BD9F5F" stroke="none">
 <path d="M4335 9359 c-55 -4 -136 -13 -180 -19 -44 -6 -127 -18 -185 -25 -129
@@ -71,5 +72,6 @@ fill="#BD9F5F" stroke="none">
 57 24 13 0 278 138 385 200 415 243 672 442 993 769 217 221 248 260 226 287
 -13 16 -732 18 -959 3z"/>
 </g>
+  </g>
   </g>
 </svg>
