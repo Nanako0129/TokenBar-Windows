@@ -139,6 +139,19 @@ public sealed class SettingsWindow : Window
         root.Children.Add(_preview);
         Content = root;
 
+        // ApplicationIcon only reaches the executable; the title bar reads its
+        // icon from the window. Fail soft — a missing asset should leave the
+        // default icon, not take the settings window down with it.
+        try
+        {
+            AppWindow.SetIcon(Path.Combine(
+                AppContext.BaseDirectory, "Assets", "syrtis.ico"));
+        }
+        catch (Exception ex)
+        {
+            DevLog.Write($"settings icon: {ex.Message}");
+        }
+
         var presenter = (OverlappedPresenter)AppWindow.Presenter;
         presenter.IsResizable = false;
         presenter.IsMaximizable = false;

@@ -65,7 +65,7 @@ public class LocalizationTests
     {
         var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "strings.zh-Hant.json"), "{ not json");
+        File.WriteAllText(Path.Combine(dir, "strings-zh-Hant.json"), "{ not json");
         try
         {
             Localization.Load("zh-Hant", dir);
@@ -86,7 +86,7 @@ public class LocalizationTests
         var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(dir);
         File.WriteAllText(
-            Path.Combine(dir, "strings.zh-Hant.json"),
+            Path.Combine(dir, "strings-zh-Hant.json"),
             """{"Language":null,"Menu bar":"選單列"}""");
         try
         {
@@ -107,7 +107,7 @@ public class LocalizationTests
         var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(dir);
         File.WriteAllText(
-            Path.Combine(dir, "strings.zh-Hant.json"),
+            Path.Combine(dir, "strings-zh-Hant.json"),
             """{"Menu bar":"選單列","Dashboard":""}""");
         try
         {

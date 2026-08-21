@@ -42,7 +42,11 @@ public static class Localization
 
             try
             {
-                var path = Path.Combine(assetDirectory, $"strings.{tag}.json");
+                // Dash, not dot: WinAppSDK's PRI generator reads dot-separated
+                // filename segments as resource qualifiers, and "zh-Hant" is not
+                // a valid one — strings.zh-Hant.json produced a PRI249 warning
+                // on every build.
+                var path = Path.Combine(assetDirectory, $"strings-{tag}.json");
                 if (!File.Exists(path))
                 {
                     return; // fail soft: every key renders as its English source
