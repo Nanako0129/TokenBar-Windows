@@ -17,18 +17,20 @@ public class AppLanguageTests
     public void ExplicitChoiceResolvesToAShippedTable(string stored, string expected) =>
         Assert.Equal(expected, AppLanguage.Resolve(stored));
 
-    // Re-selecting the current value, or a value we do not ship, must not
-    // prompt the user to relaunch for nothing.
+    // The notice is a standing state indicator, not a one-shot event: it must
+    // read correctly when the page is rebuilt, and clear when the user selects
+    // their way back to whatever this process actually loaded.
     [Theory]
-    [InlineData("system", "en", true)]
+    [InlineData("zh-Hant", "en", true)]
     [InlineData("en", "zh-Hant", true)]
+    [InlineData("zh-TW", "en", true)]
     [InlineData("en", "en", false)]
-    [InlineData("system", "system", false)]
-    [InlineData("en", "fr", false)]
-    [InlineData("en", "", false)]
-    public void RelaunchIsPromptedOnlyForARealChange(
-        string current, string next, bool expected) =>
-        Assert.Equal(expected, AppLanguage.RequiresRelaunch(current, next));
+    [InlineData("zh-Hant", "zh-Hant", false)]
+    [InlineData("zh-HK", "zh-Hant", false)]
+    [InlineData("fr", "en", false)]
+    public void RelaunchIsNeededOnlyWhenTheResolvedTagDiffers(
+        string stored, string activeTag, bool expected) =>
+        Assert.Equal(expected, AppLanguage.NeedsRelaunch(stored, activeTag));
 
     [Fact]
     public void OptionsNameEachLanguageInItsOwnLanguage()

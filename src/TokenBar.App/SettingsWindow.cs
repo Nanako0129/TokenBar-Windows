@@ -485,25 +485,23 @@ public sealed class SettingsWindow : Window
             ?? AppLanguage.System;
         var language = new StackPanel { Spacing = 2 };
         var relaunchNotice = Hint("Restart to apply the new language.".Localized());
-        relaunchNotice.Visibility = Visibility.Collapsed;
+        void SyncRelaunchNotice() =>
+            relaunchNotice.Visibility = AppLanguage.NeedsRelaunch(
+                store.GetString(AppLanguage.StorageKey, AppLanguage.System)
+                    ?? AppLanguage.System,
+                Localization.CurrentTag)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+        SyncRelaunchNotice();
         language.Children.Add(RadioGroup(
             "language",
             AppLanguage.Options.Select(option => (option.Value, option.Label)),
             languageStored,
             picked =>
             {
-                // Read the stored value again rather than closing over the one
-                // captured when the page was built: the panel is rebuilt on
-                // settings writes, and a stale capture would mis-decide whether
-                // this is a real change.
-                var current = store.GetString(AppLanguage.StorageKey, AppLanguage.System)
-                    ?? AppLanguage.System;
-                var changed = AppLanguage.RequiresRelaunch(current, picked);
                 store.SetString(AppLanguage.StorageKey, picked);
-                if (changed)
-                {
-                    relaunchNotice.Visibility = Visibility.Visible;
-                }
+                SyncRelaunchNotice();
             }));
         language.Children.Add(relaunchNotice);
         panel.Children.Add(Section("Language".Localized(), language));

@@ -27,10 +27,15 @@ public static class AppLanguage
         (TraditionalChinese, "繁體中文"),
     ];
 
-    /// <summary>Selecting the current value again, or a malformed one, must not
-    /// prompt for a relaunch.</summary>
-    public static bool RequiresRelaunch(string current, string next) =>
-        current != next && Options.Any(option => option.Value == next);
+    /// <summary>Whether the stored choice differs from the table this process
+    /// actually loaded. A state comparison, not an event: the notice is a
+    /// standing "this needs a restart" indicator, so it has to be correct when
+    /// the settings page is rebuilt — which happens on every show — and it has
+    /// to clear when the user selects their way back to the active language.
+    /// Comparing resolved tags also means picking a language we do not ship,
+    /// or re-picking the current one, never asks for a pointless restart.</summary>
+    public static bool NeedsRelaunch(string stored, string activeTag) =>
+        Resolve(stored) != activeTag;
 
     /// <summary>Resolve `system` against the OS UI language. Anything other than
     /// a language we ship falls back to English, whose keys need no table.</summary>
