@@ -449,7 +449,7 @@ public sealed class SettingsWindow : Window
         auto.Click += (_, _) =>
         {
             store.SetDouble("tokenbar.popover.height", 0);
-            sizeLabel.Text = "Height · Auto";
+            sizeLabel.Text = "Height · Auto".Localized();
             auto.Visibility = Visibility.Collapsed;
         };
         var labelRow = new Grid();
@@ -729,12 +729,15 @@ public sealed class SettingsWindow : Window
             row.Children.Add(shown);
             HoverTip.Attach(up, () => "Move {0} up".Localized(ClientRegistry.ShortName(id)));
             HoverTip.Attach(down, () => "Move {0} down".Localized(ClientRegistry.ShortName(id)));
-            HoverTip.Attach(shown, () => shown.IsOn ? "Shown in client tabs" : "Hidden from client tabs");
+            HoverTip.Attach(shown, () => (shown.IsOn
+                ? "Shown in client tabs"
+                : "Hidden from client tabs").Localized());
             panel.Children.Add(row);
         }
 
         panel.Children.Add(Hint(
-            "Overview includes every shown client. Hidden clients stay available in this list."));
+            "Overview includes every shown client. Hidden clients stay available in this list."
+            .Localized()));
         return panel;
     }
 
