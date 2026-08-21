@@ -265,7 +265,7 @@ public sealed class SettingsWindow : Window
         var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
 
         // ── Menubar title (tray value) ─────────────────────────────────
-        panel.Children.Add(Section("Tray shows", RadioGroup(
+        panel.Children.Add(Section("Tray shows".Localized(), RadioGroup(
             "tray.mode",
             TrayModes.All.Select(m => (m.RawValue(), m.Label())),
             TrayModes.Parse(store.GetString(TrayModes.StorageKey)).RawValue(),
@@ -277,8 +277,8 @@ public sealed class SettingsWindow : Window
         icon.Children.Add(RadioGroup(
             "tray.style",
             [
-                ("cat", "Cat"), ("parrot", "Parrot"), ("bars", "Signal bars"),
-                ("ring", "Ring gauge"), ("popsicle", "Melting popsicle"),
+                ("cat", "Cat".Localized()), ("parrot", "Parrot".Localized()), ("bars", "Signal bars".Localized()),
+                ("ring", "Ring gauge".Localized()), ("popsicle", "Melting popsicle".Localized()),
             ],
             styleRaw,
             raw => store.SetString("tokenbar.tray.animationStyle", raw)));
@@ -292,7 +292,7 @@ public sealed class SettingsWindow : Window
             };
             animate.Toggled += (_, _) =>
                 store.SetBool("tokenbar.tray.animate", animate.IsOn);
-            icon.Children.Add(ToggleRow("Animate with token rate", animate));
+            icon.Children.Add(ToggleRow("Animate with token rate".Localized(), animate));
             icon.Children.Add(Hint(
                 "Idle purrs at 2 fps; a heavy session sprints. Shown only in " +
                 "the icon-only tray mode."));
@@ -302,9 +302,9 @@ public sealed class SettingsWindow : Window
             icon.Children.Add(RadioGroup(
                 "icon.coloring",
                 [
-                    ("warning", "Color on warning only"),
-                    ("always", "Always colored"),
-                    ("never", "Never colored"),
+                    ("warning", "Color on warning only".Localized()),
+                    ("always", "Always colored".Localized()),
+                    ("never", "Never colored".Localized()),
                 ],
                 store.GetString("tokenbar.icon.coloring", "warning") ?? "warning",
                 raw => store.SetString("tokenbar.icon.coloring", raw)));
@@ -312,7 +312,7 @@ public sealed class SettingsWindow : Window
                 "Battery-icon behavior: the gauge picks up color under 25% left."));
         }
 
-        panel.Children.Add(Section("Tray icon", icon));
+        panel.Children.Add(Section("Tray icon".Localized(), icon));
 
         // ── Quota source ───────────────────────────────────────────────
         var persistedSelection = store.GetString(
@@ -340,7 +340,7 @@ public sealed class SettingsWindow : Window
             raw => store.SetString("tokenbar.quota.source", raw)));
         quotaGroup.Children.Add(Hint(
             "Feeds the gauge icon and the Quota left tray mode."));
-        panel.Children.Add(Section("Quota source", quotaGroup));
+        panel.Children.Add(Section("Quota source".Localized(), quotaGroup));
 
         return panel;
     }
@@ -359,12 +359,12 @@ public sealed class SettingsWindow : Window
             OffContent = null,
         };
         asUsed.Toggled += (_, _) => store.SetBool("tokenbar.limits.asUsed", asUsed.IsOn);
-        limits.Children.Add(ToggleRow("Show as used", asUsed));
-        limits.Children.Add(Hint("Bars count up (used) instead of down (left)."));
+        limits.Children.Add(ToggleRow("Show as used".Localized(), asUsed));
+        limits.Children.Add(Hint("Bars count up (used) instead of down (left).".Localized()));
         var layoutRaw = store.GetString("tokenbar.limits.layout", "full") ?? "full";
         limits.Children.Add(RadioGroup(
             "limits.layout",
-            [("full", "Full (pace + run-out)"), ("classic", "Classic (compact)")],
+            [("full", "Full (pace + run-out)".Localized()), ("classic", "Classic (compact)".Localized())],
             layoutRaw,
             raw => store.SetString("tokenbar.limits.layout", raw)));
         if (layoutRaw != "classic")
@@ -372,9 +372,9 @@ public sealed class SettingsWindow : Window
             limits.Children.Add(RadioGroup(
                 "limits.paceMode",
                 [
-                    ("historical", "Historical pace"),
-                    ("linear", "Linear pace"),
-                    ("off", "Pace off"),
+                    ("historical", "Historical pace".Localized()),
+                    ("linear", "Linear pace".Localized()),
+                    ("off", "Pace off".Localized()),
                 ],
                 store.GetString("tokenbar.limits.paceMode", "historical") ?? "historical",
                 raw => store.SetString("tokenbar.limits.paceMode", raw)));
@@ -383,13 +383,13 @@ public sealed class SettingsWindow : Window
                 "usage curve; Linear paces evenly by the clock; Off hides it."));
         }
 
-        panel.Children.Add(Section("Agent limits", limits));
+        panel.Children.Add(Section("Agent limits".Localized(), limits));
 
         // ── View tabs ──────────────────────────────────────────────────
-        panel.Children.Add(Section("View tabs", BuildViewTabs(store)));
+        panel.Children.Add(Section("View tabs".Localized(), BuildViewTabs(store)));
 
         // ── Client tabs ────────────────────────────────────────────────
-        panel.Children.Add(Section("Client tabs", BuildClientTabs(store)));
+        panel.Children.Add(Section("Client tabs".Localized(), BuildClientTabs(store)));
 
         // ── Live trace ─────────────────────────────────────────────────
         var detailed = new ToggleSwitch
@@ -401,9 +401,9 @@ public sealed class SettingsWindow : Window
         detailed.Toggled += (_, _) =>
             store.SetBool("tokenbar.trace.detailed", detailed.IsOn);
         var trace = new StackPanel { Spacing = 8 };
-        trace.Children.Add(ToggleRow("Detailed rows", detailed));
-        trace.Children.Add(Hint("One row per agent and model instead of per app."));
-        panel.Children.Add(Section("Live trace", trace));
+        trace.Children.Add(ToggleRow("Detailed rows".Localized(), detailed));
+        trace.Children.Add(Hint("One row per agent and model instead of per app.".Localized()));
+        panel.Children.Add(Section("Live trace".Localized(), trace));
 
         // ── Flyout size ────────────────────────────────────────────────
         var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
@@ -451,7 +451,7 @@ public sealed class SettingsWindow : Window
         labelRow.Children.Add(auto);
         sizeRow.Children.Add(labelRow);
         sizeRow.Children.Add(slider);
-        panel.Children.Add(Section("Flyout size", sizeRow));
+        panel.Children.Add(Section("Flyout size".Localized(), sizeRow));
 
         return panel;
     }
@@ -475,7 +475,7 @@ public sealed class SettingsWindow : Window
                 autostart.IsOn = AutostartService.IsEnabled; // stay honest
             }
         };
-        panel.Children.Add(Section("Startup", ToggleRow("Launch at login", autostart)));
+        panel.Children.Add(Section("Startup".Localized(), ToggleRow("Launch at login".Localized(), autostart)));
 
         // ── Data refresh ───────────────────────────────────────────────
         var refresh = new StackPanel { Spacing = 8 };
@@ -491,7 +491,7 @@ public sealed class SettingsWindow : Window
         refresh.Children.Add(Hint(
             "How often the tray forces a full log re-read; cached reads stay " +
             "continuous either way."));
-        panel.Children.Add(Section("Data refresh", refresh));
+        panel.Children.Add(Section("Data refresh".Localized(), refresh));
 
         // ── Language ───────────────────────────────────────────────────
         var languageStored = store.GetString(AppLanguage.StorageKey, AppLanguage.System)
@@ -517,7 +517,7 @@ public sealed class SettingsWindow : Window
                 SyncRelaunchNotice();
             }));
         language.Children.Add(relaunchNotice);
-        panel.Children.Add(Section("Language".Localized(), language));
+        panel.Children.Add(Section("Language".Localized().Localized(), language));
 
         return panel;
     }
@@ -530,7 +530,7 @@ public sealed class SettingsWindow : Window
         // ── About ──────────────────────────────────────────────────────
         var about = new StackPanel { Spacing = 4 };
         about.Children.Add(Ui.Row(
-            Ui.Text("Version", 12),
+            Ui.Text("Version".Localized(), 12),
             Ui.Dim(
                 typeof(SettingsWindow).Assembly
                     .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
@@ -540,7 +540,7 @@ public sealed class SettingsWindow : Window
             "Shared parsing engine from tokscale-core, originally derived " +
             "from tokscale by junhoyeo; menu-bar concept from " +
             "handlecusion's tokcat."));
-        panel.Children.Add(Section("About", about));
+        panel.Children.Add(Section("About".Localized(), about));
 
         return panel;
     }
@@ -647,7 +647,7 @@ public sealed class SettingsWindow : Window
         var ordered = ClientRegistry.OrderedClients(present, store);
         if (ordered.Count == 0)
         {
-            panel.Children.Add(Hint("No usage clients discovered yet."));
+            panel.Children.Add(Hint("No usage clients discovered yet.".Localized()));
             return panel;
         }
 
@@ -779,7 +779,7 @@ public sealed class SettingsWindow : Window
     {
         var store = AppSettings.Store;
         _preview.Children.Clear();
-        _preview.Children.Add(Ui.Text("PREVIEW", 10, 0.55, bold: true));
+        _preview.Children.Add(Ui.Text("PREVIEW".Localized(), 10, 0.55, bold: true));
 
         var mode = TrayModes.Parse(store.GetString(TrayModes.StorageKey));
         var styleRaw = store.GetString("tokenbar.tray.animationStyle", "cat") ?? "cat";
@@ -846,7 +846,7 @@ public sealed class SettingsWindow : Window
 
         // Agent limits preview: mock windows through the real bar pipeline,
         // so asUsed/layout/paceMode picks show their effect immediately.
-        _preview.Children.Add(Ui.Text("AGENT LIMITS", 10, 0.55, bold: true));
+        _preview.Children.Add(Ui.Text("AGENT LIMITS".Localized(), 10, 0.55, bold: true));
         var asUsed = store.GetBool("tokenbar.limits.asUsed", false);
         var classic = store.GetString("tokenbar.limits.layout", "full") == "classic";
         var paceMode = store.GetString("tokenbar.limits.paceMode", "historical") switch
@@ -937,7 +937,7 @@ public sealed class SettingsWindow : Window
         var detailed = store.GetBool("tokenbar.trace.detailed", false);
         if (Ui.TraceRows(_trace(), selected, detailed) is { } rows)
         {
-            _preview.Children.Add(Ui.Text("LIVE SESSION", 10, 0.55, bold: true));
+            _preview.Children.Add(Ui.Text("LIVE SESSION".Localized(), 10, 0.55, bold: true));
             _preview.Children.Add(rows);
         }
     }

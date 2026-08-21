@@ -3,7 +3,62 @@
   "Dashboard": "儀表板",
   "General": "一般",
   "About": "關於",
+
+  "Tray shows": "選單列標題",
+  "Today's tokens (50M)": "今日 tokens (50M)",
+  "Today's cost ($5.20)": "今日花費 ($5.20)",
+  "Total tokens (1.5B)": "累計 tokens (1.5B)",
+  "Total cost ($889)": "累計花費 ($889)",
+  "Tokens / min (12.4K/m)": "每分鐘 tokens (12.4K/m)",
+  "Quota left (57%)": "剩餘額度 (57%)",
+  "Icon only": "只顯示圖示",
+
+  "Today's tokens": "今日 tokens",
+  "Today's cost": "今日花費",
+  "Total tokens": "累計 tokens",
+  "Total cost": "累計花費",
+  "Tokens / min": "每分鐘 tokens",
+  "Quota left": "剩餘額度",
+
+  "Tray icon": "選單列圖示",
+  "Cat": "旋轉貓",
+  "Parrot": "派對鸚鵡",
+  "Signal bars": "訊號格",
+  "Ring gauge": "環形儀表",
+  "Melting popsicle": "融化冰棒",
+  "Animate with token rate": "依 token 用量調整動畫速度",
+  "Color on warning only": "僅在警告時上色",
+  "Always colored": "一律上色",
+  "Never colored": "從不上色",
+
+  "Quota source": "額度來源",
+  "View tabs": "檢視分頁",
+  "Client tabs": "用戶端分頁",
+  "Agent limits": "Agent 額度",
+  "Show as used": "顯示已用量",
+  "Full (pace + run-out)": "完整（配速＋耗盡預估）",
+  "Classic (compact)": "經典（精簡）",
+  "Historical pace": "歷史配速",
+  "Linear pace": "線性配速",
+  "Pace off": "關閉配速",
+  "Bars count up (used) instead of down (left).": "長條由零往上累加（已用），而非從滿格往下遞減（剩餘）。",
+
+  "Live trace": "即時追蹤",
+  "Detailed rows": "詳細列",
+  "One row per agent and model instead of per app.": "每個 agent 與模型各一列，而非每個應用程式一列。",
+  "No usage clients discovered yet.": "尚未偵測到任何用量來源。",
+
+  "Flyout size": "面板尺寸",
+  "Startup": "開機",
+  "Launch at login": "登入時啟動",
+  "Data refresh": "資料更新",
+
   "Language": "語言",
   "System": "系統",
-  "Restart to apply the new language.": "重新啟動後套用新語言。"
+  "Restart to apply the new language.": "重新啟動後套用新語言。",
+
+  "PREVIEW": "即時預覽",
+  "AGENT LIMITS": "AGENT 額度",
+  "LIVE SESSION": "目前工作階段",
+  "Version": "版本"
 }
