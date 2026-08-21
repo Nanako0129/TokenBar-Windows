@@ -226,6 +226,15 @@ S1 動工前必須先更新 checkout：本地 `main` 落後 `origin/main` 一週
 
 > **注意：** `SettingsWindow.ApplySize()` 上方那段既有註解（「Something in the show path renormalizes the size on a non-96-DPI monitor」）記的是同一族問題的另一個面向。`Activated += ApplySize` 是當時的補救，它處理得了首次顯示，處理不了「app 執行期間系統縮放改變」。
 
+### 快捷鍵與開啟中的 popup
+
+| 行為 | 現況 | 判定 |
+|---|---|---|
+| `Ctrl+[` `Ctrl+]` `Ctrl+,` 在 year menu 開啟時不作用 | S8 的 `KeyDown` handler 走 routed event，`MenuFlyout` 的 popup 是獨立 visual tree | **刻意**。macOS 的 shortcut 是 popover 上的 event monitor（`PopoverView.swift:689`），開啟中的 `NSMenu` 會先吃掉按鍵，所以 ⌘[ 在同一情境也不作用。本 app 對 Esc 已有相同模式（`DashboardView.xaml.cs:119-129` 偵測 popup 並讓路） |
+| `Ctrl+1..9` 在 year menu 開啟時**仍會**切 lens | `KeyboardAccelerator` 的作用域是整個 XamlRoot，不受 popup 影響 | **既有偏離**，非刻意設計。使用者正在選年份時，背後的 lens 會被切走。要修的是讓這些 accelerator 也具 popup 感知，方向與「把 handler 提升到 window 層級」相反 |
+
+> **注意：** 這兩列合起來才是完整的圖像。單看第一列會以為 S8 造成了退步——實際上那三個鍵在 S8 之前根本不會觸發，而第二列描述的才是真正需要決定的既有行為。
+
 ## 未決事項
 
 | 項目 | 問題 | 需要誰決定 |
