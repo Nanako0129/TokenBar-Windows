@@ -143,11 +143,13 @@ macOS 的預覽欄**不隨分頁變化**，永遠顯示同樣三塊。Windows �
 | **S5** | General / Discord 分節 + Rich Presence | S1 | Discord 狀態列顯示用量 |
 | **S6** | Usage attribution 分頁 + 歸因邏輯 | S1 | 側邊欄出現第五頁 |
 | **S7** | Monthly lens 移植（macOS `MonthlyView.swift`，275 行） | — | flyout 分頁列出現 Monthly，且可在 View tabs 中隱藏 |
-| **S8** | flyout 快捷鍵 parity 修正 | — | `Ctrl+[` / `Ctrl+]` 實際可觸發，且與 `Ctrl+1..9` 一致地操作 macOS 所綁的那一排 |
+| **S8** | flyout OEM 快捷鍵修正 | — | `Ctrl+[`、`Ctrl+]`、`Ctrl+,` 實際可觸發 |
 
 S4 排在 S5 之前，因為 i18n 會碰到每一個字串；先做 Discord 等於保證之後要再改一次 Discord 的所有文案。
 
-> **S3 discovery 的發現（快捷鍵）：** 兩個既有問題，都不是 S3 引入。其一，macOS 的 ⌘1-9 與 ⌘[ ⌘] 操作的是 **client tabs**（`PopoverView.swift:693-702`，`clientTab.wrappedValue = tabs[...]`），Windows 卻綁到 **lenses**——綁錯了那一排。其二，`Ctrl+[` / `Ctrl+]` 實測無反應：`AddAccel` 機制本身正常（`Ctrl+1..6` 用同一條路徑且有效），差別在 `VirtualKey.Number1` 是具名成員，而 `(VirtualKey)0xDB` / `0xDD`（`VK_OEM_4` / `VK_OEM_6`）是硬轉型的未定義值、且佈局相依；macOS 用 `charactersIgnoringModifiers` 比對字元，與佈局無關。修法牽涉「該綁哪一排」的產品決定，故登記為 S8 而非併入 S3。
+> **S3 discovery 的發現（快捷鍵）：** 兩個既有問題，都不是 S3 引入。其一，macOS 的 ⌘1-9 與 ⌘[ ⌘] 操作的是 **client tabs**（`PopoverView.swift:693-702`，`clientTab.wrappedValue = tabs[...]`），Windows 卻綁到 **lenses**——綁錯了那一排。其二，`Ctrl+[` / `Ctrl+]` 實測無反應：`AddAccel` 機制本身正常（`Ctrl+1..6` 用同一條路徑且有效），差別在 `VirtualKey.Number1` 是具名成員，而 `(VirtualKey)0xDB` / `0xDD`（`VK_OEM_4` / `VK_OEM_6`）是硬轉型的未定義值、且佈局相依；macOS 用 `charactersIgnoringModifiers` 比對字元，與佈局無關。故登記為 S8 而非併入 S3。
+
+> **S8 的決定與結果：** 「該綁哪一排」經評估後**維持 Windows 現況**——數字鍵與 `[` `]` 都操作 lenses。macOS 把數字鍵給 client tabs 是因為 client 數量可變且最多九個，而 Windows 的 lens 固定六個、client tabs 另有上排可點；把使用者已在使用的綁定換掉，代價高於 parity 的收益。這個差異因此是**刻意的平台差異，不是缺陷**。S8 只修「按不動」：`VirtualKey` 沒有 OEM 成員，硬轉型的值 `KeyboardAccelerator` 永遠不匹配，改用 `KeyDown` 比對原始 Win32 虛擬鍵碼。連帶修好同病的 `Ctrl+,`（`VK_OEM_COMMA`），它同樣一直沒作用。
 
 > **S3 discovery 的發現（lens 數量）：** macOS `AppView` 有**七個** case（`overview, models, monthly, daily, hourly, stats, agents`），Windows 只有六個——`monthly` 從未移植。原本的 parity 盤點誤信了 `DashboardView` 那句「the six lenses from the macOS AppView router」註解，而那句話本身就是錯的。S7 因此獨立登記，不併入 S3；它不相依 S1，只是排在後面。
 
@@ -223,6 +225,15 @@ S1 動工前必須先更新 checkout：本地 `main` 落後 `origin/main` 一週
 | 系統縮放切換後（實測 150% ↔ 200%），未重啟 app 的情況下，**設定視窗與 popover 第一次開啟都卡在舊尺寸**，關掉再開才正確 | 2026-08-17 於 `192.168.123.188` 實測。`SettingsWindow.ApplySize()` 與 `FlyoutWindow` 用同一個模式：`GetDpiForWindow` → `× scale` → `AppWindow.Resize`。兩個視窗都是單例、隱藏而非銷毀，縮放改變時收不到 DPI 變更通知，第一次 `Show` 仍用舊 DPI 計算。`SettingsWindow` 另有 `if (AppWindow.Size == size) return;`，會讓它靜默跳過 resize | popover 同樣症狀，而 S1 的 diff 只含 `SettingsWindow.cs`——修一半沒有意義。正確修法是監聽 DPI 變更事件並在兩處共用，屬獨立 scope |
 
 > **注意：** `SettingsWindow.ApplySize()` 上方那段既有註解（「Something in the show path renormalizes the size on a non-96-DPI monitor」）記的是同一族問題的另一個面向。`Activated += ApplySize` 是當時的補救，它處理得了首次顯示，處理不了「app 執行期間系統縮放改變」。
+
+### 快捷鍵與開啟中的 popup
+
+| 行為 | 現況 | 判定 |
+|---|---|---|
+| `Ctrl+[` `Ctrl+]` `Ctrl+,` 在 year menu 開啟時不作用 | S8 的 `KeyDown` handler 走 routed event，`MenuFlyout` 的 popup 是獨立 visual tree | **刻意**。macOS 的 shortcut 是 popover 上的 event monitor（`PopoverView.swift:689`），開啟中的 `NSMenu` 會先吃掉按鍵，所以 ⌘[ 在同一情境也不作用。本 app 對 Esc 已有相同模式（`DashboardView.xaml.cs:119-129` 偵測 popup 並讓路） |
+| `Ctrl+1..9` 在 year menu 開啟時**仍會**切 lens | `KeyboardAccelerator` 的作用域是整個 XamlRoot，不受 popup 影響 | **既有偏離**，非刻意設計。使用者正在選年份時，背後的 lens 會被切走。要修的是讓這些 accelerator 也具 popup 感知，方向與「把 handler 提升到 window 層級」相反 |
+
+> **注意：** 這兩列合起來才是完整的圖像。單看第一列會以為 S8 造成了退步——實際上那三個鍵在 S8 之前根本不會觸發，而第二列描述的才是真正需要決定的既有行為。
 
 ## 未決事項
 

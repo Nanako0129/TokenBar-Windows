@@ -141,9 +141,6 @@ public sealed partial class DashboardView : UserControl
             });
         AddAccel(Windows.System.VirtualKey.G, Windows.System.VirtualKeyModifiers.Control,
             ToggleChartView);
-        AddAccel((Windows.System.VirtualKey)0xBC /* comma */,
-            Windows.System.VirtualKeyModifiers.Control,
-            () => TrayService.OpenSettings?.Invoke());
         AddAccel(Windows.System.VirtualKey.Q, Windows.System.VirtualKeyModifiers.Control,
             () => TrayService.QuitApp?.Invoke());
         var lenses = Enum.GetValues<AppView>();
@@ -154,10 +151,17 @@ public sealed partial class DashboardView : UserControl
                 Windows.System.VirtualKeyModifiers.Control, () => SwitchTo(view));
         }
 
-        AddAccel((Windows.System.VirtualKey)0xDB /* [ */,
-            Windows.System.VirtualKeyModifiers.Control, () => CycleLens(-1));
-        AddAccel((Windows.System.VirtualKey)0xDD /* ] */,
-            Windows.System.VirtualKeyModifiers.Control, () => CycleLens(1));
+        // WinRT's VirtualKey enum has no OEM members, so casting VK_OEM_4 /
+        // VK_OEM_6 / VK_OEM_COMMA into it hands KeyboardAccelerator a value it
+        // never matches — which is exactly why Ctrl+1..9 worked (Number1 is a
+        // real member) while Ctrl+[ , Ctrl+] and Ctrl+, silently did nothing.
+        // KeyDown carries the raw Win32 virtual-key code, so compare the
+        // underlying integer instead. handledEventsToo keeps this working even
+        // if a child control has already marked the event handled.
+        AddHandler(
+            KeyDownEvent,
+            new Microsoft.UI.Xaml.Input.KeyEventHandler(OnOemShortcut),
+            handledEventsToo: true);
 
         ActualThemeChanged += (_, _) => UpdateGraph3DData(_snapshot);
     }
@@ -268,6 +272,43 @@ public sealed partial class DashboardView : UserControl
         var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         DevLog.Write($"graph3d: toggle view={(use3D ? "3d" : "2d")} "
             + $"elapsed={elapsed:F1}ms");
+    }
+
+    /// <summary>Ctrl shortcuts whose key has no VirtualKey member: [ and ]
+    /// cycle lenses, comma opens Settings. Kept as raw virtual-key codes
+    /// rather than characters, so the binding follows the physical key the
+    /// same way the accelerator-based shortcuts do.</summary>
+    private void OnOemShortcut(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
+    {
+        const int VkOem4 = 0xDB;  // [
+        const int VkOem6 = 0xDD;  // ]
+        const int VkOemComma = 0xBC;
+
+        var ctrl = Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Control)
+            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+        if (!ctrl)
+        {
+            return;
+        }
+
+        switch ((int)e.Key)
+        {
+            case VkOem4:
+                CycleLens(-1);
+                break;
+            case VkOem6:
+                CycleLens(1);
+                break;
+            case VkOemComma:
+                TrayService.OpenSettings?.Invoke();
+                break;
+            default:
+                return;
+        }
+
+        e.Handled = true;
+        DevLog.Write($"oem shortcut: key=0x{(int)e.Key:X2}");
     }
 
     private void AddAccel(
