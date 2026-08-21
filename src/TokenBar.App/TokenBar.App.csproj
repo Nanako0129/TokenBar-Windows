@@ -23,7 +23,7 @@
          square on purpose — the macOS .icns bakes in a squircle and its inset,
          and Windows applies no mask of its own, so copying that would render
          as a rounded tile floating in the taskbar rather than as the app's own
-         shape. Generated from Assets\syrtis-brandmark.pdf, kept beside it. -->
+         shape. Generated from Assets\syrtis-disc.svg, kept beside it. -->
     <ApplicationIcon>Assets\syrtis.ico</ApplicationIcon>
     <!-- Phase 11: Program.cs replaces the generated entry point so Velopack's
          install/update/uninstall hooks run before any WinUI initialisation.
