@@ -30,6 +30,13 @@ public partial class App : Application
         // startup we let it propagate so a broken launch stays visible.
         UnhandledException += OnUnhandledException;
 
+        // Before any view is built: macOS reads its language once per launch
+        // and requires a relaunch to change it, and this port keeps that
+        // contract rather than rebuilding every view against a swapped table.
+        AppLanguage.Apply(
+            AppSettings.Store,
+            System.IO.Path.Combine(AppContext.BaseDirectory, "Assets"));
+
         var startupSmoke = ParseStartupSmokeArguments();
         _startupSmokeRequested = startupSmoke.Requested;
         _startupSmokePath = startupSmoke.Path;

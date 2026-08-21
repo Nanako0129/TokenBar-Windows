@@ -51,6 +51,10 @@
          Resources (anim-cat2 48x48 ×5, anim-parrot 48x36 ×10, plus -light
          variants for a light taskbar). -->
     <Content Include="Assets\**\*.png" CopyToOutputDirectory="PreserveNewest" />
+    <!-- UI string tables. A missing or unreadable file renders every key as its
+         English source, so shipping one is an improvement rather than a
+         dependency. -->
+    <Content Include="Assets\strings.*.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <Target Name="CopyAppWinUiAssetsAfterPublish" AfterTargets="Publish">

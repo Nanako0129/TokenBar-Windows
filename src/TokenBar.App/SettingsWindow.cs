@@ -67,10 +67,10 @@ public sealed class SettingsWindow : Window
         // the content column at its pre-existing ~380.
         OpenPaneLength = 180,
     };
-    private readonly NavigationViewItem _menuBarItem = new() { Content = "Menu bar", Tag = "menubar" };
-    private readonly NavigationViewItem _dashboardItem = new() { Content = "Dashboard", Tag = "dashboard" };
-    private readonly NavigationViewItem _generalItem = new() { Content = "General", Tag = "general" };
-    private readonly NavigationViewItem _aboutItem = new() { Content = "About", Tag = "about" };
+    private readonly NavigationViewItem _menuBarItem = new() { Content = "Menu bar".Localized(), Tag = "menubar" };
+    private readonly NavigationViewItem _dashboardItem = new() { Content = "Dashboard".Localized(), Tag = "dashboard" };
+    private readonly NavigationViewItem _generalItem = new() { Content = "General".Localized(), Tag = "general" };
+    private readonly NavigationViewItem _aboutItem = new() { Content = "About".Localized(), Tag = "about" };
     private readonly Dictionary<string, StackPanel> _pages = new(StringComparer.Ordinal);
     private string _selectedTag = "menubar";
 
@@ -479,6 +479,34 @@ public sealed class SettingsWindow : Window
             "How often the tray forces a full log re-read; cached reads stay " +
             "continuous either way."));
         panel.Children.Add(Section("Data refresh", refresh));
+
+        // ── Language ───────────────────────────────────────────────────
+        var languageStored = store.GetString(AppLanguage.StorageKey, AppLanguage.System)
+            ?? AppLanguage.System;
+        var language = new StackPanel { Spacing = 2 };
+        var relaunchNotice = Hint("Restart to apply the new language.".Localized());
+        relaunchNotice.Visibility = Visibility.Collapsed;
+        language.Children.Add(RadioGroup(
+            "language",
+            AppLanguage.Options.Select(option => (option.Value, option.Label)),
+            languageStored,
+            picked =>
+            {
+                // Read the stored value again rather than closing over the one
+                // captured when the page was built: the panel is rebuilt on
+                // settings writes, and a stale capture would mis-decide whether
+                // this is a real change.
+                var current = store.GetString(AppLanguage.StorageKey, AppLanguage.System)
+                    ?? AppLanguage.System;
+                var changed = AppLanguage.RequiresRelaunch(current, picked);
+                store.SetString(AppLanguage.StorageKey, picked);
+                if (changed)
+                {
+                    relaunchNotice.Visibility = Visibility.Visible;
+                }
+            }));
+        language.Children.Add(relaunchNotice);
+        panel.Children.Add(Section("Language".Localized(), language));
 
         return panel;
     }
