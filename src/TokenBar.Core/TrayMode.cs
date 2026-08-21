@@ -54,26 +54,26 @@ public static class TrayModes
     /// <summary>Settings-UI copy (macOS TrayMode.label).</summary>
     public static string Label(this TrayMode mode) => mode switch
     {
-        TrayMode.TodayTokens => "Today's tokens (50M)",
-        TrayMode.TodayCost => "Today's cost ($5.20)",
-        TrayMode.TotalTokens => "Total tokens (1.5B)",
-        TrayMode.TotalCost => "Total cost ($889)",
-        TrayMode.TokensPerMin => "Tokens / min (12.4K/m)",
-        TrayMode.QuotaLeft => "Quota left (57%)",
-        _ => "Icon only",
+        TrayMode.TodayTokens => "Today's tokens (50M)".Localized(),
+        TrayMode.TodayCost => "Today's cost ($5.20)".Localized(),
+        TrayMode.TotalTokens => "Total tokens (1.5B)".Localized(),
+        TrayMode.TotalCost => "Total cost ($889)".Localized(),
+        TrayMode.TokensPerMin => "Tokens / min (12.4K/m)".Localized(),
+        TrayMode.QuotaLeft => "Quota left (57%)".Localized(),
+        _ => "Icon only".Localized(),
     };
 
     /// <summary>Short mode name for the tray tooltip's "layer b" of the
     /// removed-native-text substitution.</summary>
     public static string ShortLabel(this TrayMode mode) => mode switch
     {
-        TrayMode.TodayTokens => "Today's tokens",
-        TrayMode.TodayCost => "Today's cost",
-        TrayMode.TotalTokens => "Total tokens",
-        TrayMode.TotalCost => "Total cost",
-        TrayMode.TokensPerMin => "Tokens / min",
-        TrayMode.QuotaLeft => "Quota left",
-        _ => "TokenBar",
+        TrayMode.TodayTokens => "Today's tokens".Localized(),
+        TrayMode.TodayCost => "Today's cost".Localized(),
+        TrayMode.TotalTokens => "Total tokens".Localized(),
+        TrayMode.TotalCost => "Total cost".Localized(),
+        TrayMode.TokensPerMin => "Tokens / min".Localized(),
+        TrayMode.QuotaLeft => "Quota left".Localized(),
+        _ => "TokenBar".Localized(),
     };
 
     /// <summary>The icon-sized short form of a title (parity table #1's
