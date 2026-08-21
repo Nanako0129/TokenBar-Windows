@@ -13,9 +13,8 @@ using Grid = Microsoft.UI.Xaml.Controls.Grid;
 namespace TokenBar.App;
 
 /// <summary>
-/// The dashboard shell: global header, lens switch, and the lenses of the
-/// macOS AppView router, each built in code from the current snapshot. Six of
-/// the seven are ported; Monthly is not (see AppView).
+/// The dashboard shell: global header, lens switch, and the seven lenses of
+/// the macOS AppView router, each built in code from the current snapshot.
 /// </summary>
 public sealed partial class DashboardView : UserControl
 {
@@ -30,6 +29,7 @@ public sealed partial class DashboardView : UserControl
     private string _activeClientTab = ClientRegistry.OverviewTab;
     private string _clientTabsSignature = "";
     private string? _expandedDay; // Daily drill-down state
+    private string? _expandedMonth; // Monthly drill-down state
     private bool _hourlyProfileMode;
     private int _hourlyWindow = 48; // Timeline rows shown; +48 per "Show more"
     // Chart toggles, persisted with the macOS rawValue strings.
@@ -699,6 +699,7 @@ public sealed partial class DashboardView : UserControl
         UIElement content = _view switch
         {
             AppView.Models => BuildModels(_snapshot),
+            AppView.Monthly => BuildMonthly(_snapshot),
             AppView.Daily => BuildDaily(_snapshot),
             AppView.Hourly => BuildHourly(_snapshot),
             AppView.Stats => BuildStats(_snapshot),
@@ -1291,6 +1292,64 @@ public sealed partial class DashboardView : UserControl
 
     // ── Daily lens ───────────────────────────────────────────────────────
 
+    /// <summary>One model stripe inside an expanded Daily or Monthly card:
+    /// provider-tinted disc, model and client name, tokens and cost, with the
+    /// disc and the row outline lighting together on hover so the rich tooltip
+    /// points at an unambiguous row. Shared so the two lenses cannot drift —
+    /// the hover/glow/tooltip wiring is the fiddly part, and a copy of it is
+    /// exactly where a divergence would hide.</summary>
+    private FrameworkElement ModelStripeRow(
+        ContributionClient client, ModelColorMap colors, bool authoritative)
+    {
+        var name = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            Margin = new Thickness(12, 0, 0, 0),
+        };
+        var (subDiscHost, subDiscGlow) =
+            GlowingDisc(colors.Color(client.ProviderId, client.ModelId), 6);
+        name.Children.Add(subDiscHost);
+        name.Children.Add(Ui.Text(
+            $"{client.ModelId} · {ClientRegistry.ShortName(client.Client)}", 10, 0.85));
+        var row = Ui.Row(
+            name,
+            Ui.Text(
+                $"{Format.CompactTokens(client.Tokens.Total)} · "
+                    + CostSurfaceProjection.CostText(client.Cost, authoritative),
+                10,
+                0.7));
+
+        // Highlight the sub-row itself, not the card enclosing it: the tooltip
+        // describes this model, and lighting the whole card points at the
+        // wrong thing.
+        var rowGlow = new Border
+        {
+            BorderBrush = new SolidColorBrush(Colors.Transparent),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(3),
+            IsHitTestVisible = false,
+            Opacity = 0,
+        };
+        var rowHost = new Grid();
+        rowHost.Children.Add(row);
+        rowHost.Children.Add(rowGlow);
+        AttachHoverOutline(rowHost, hovered =>
+        {
+            if (hovered)
+            {
+                var accent = HoverOutlineBrush();
+                subDiscGlow.Stroke = accent;
+                rowGlow.BorderBrush = accent;
+            }
+
+            subDiscGlow.Opacity = hovered ? 1 : 0;
+            rowGlow.Opacity = hovered ? 0.55 : 0;
+        });
+        HoverTip.AttachRich(rowHost, () => ModelTip(client, colors, authoritative));
+        return rowHost;
+    }
+
     private UIElement BuildDaily(DashboardModel.Snapshot snapshot)
     {
         var panel = new StackPanel { Spacing = 6 };
@@ -1330,59 +1389,8 @@ public sealed partial class DashboardView : UserControl
                 foreach (var client in CostSurfaceProjection.OrderContributionClients(
                     selectedDay.Clients, snapshot.CostAuthoritative))
                 {
-                    var name = new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 6,
-                        Margin = new Thickness(12, 0, 0, 0),
-                    };
-                    var (subDiscHost, subDiscGlow) =
-                        GlowingDisc(colors.Color(client.ProviderId, client.ModelId), 6);
-                    name.Children.Add(subDiscHost);
-                    name.Children.Add(Ui.Text(
-                        $"{client.ModelId} · {ClientRegistry.ShortName(client.Client)}", 10, 0.85));
-                    var row = Ui.Row(
-                        name,
-                        Ui.Text(
-                            $"{Format.CompactTokens(client.Tokens.Total)} · "
-                                + CostSurfaceProjection.CostText(
-                                    client.Cost, snapshot.CostAuthoritative),
-                            10,
-                            0.7));
-                    var capturedClient = client;
-                    // Same treatment as the Models lens: the disc lights up with
-                    // the card, so the row the card describes is unambiguous.
-                    // Highlight the sub-row itself, not the day card that
-                    // encloses it: the card the tooltip describes is this model,
-                    // and lighting the whole day would point at the wrong thing.
-                    var rowGlow = new Border
-                    {
-                        BorderBrush = new SolidColorBrush(Colors.Transparent),
-                        BorderThickness = new Thickness(1),
-                        CornerRadius = new CornerRadius(3),
-                        IsHitTestVisible = false,
-                        Opacity = 0,
-                    };
-                    var rowHost = new Grid();
-                    rowHost.Children.Add(row);
-                    rowHost.Children.Add(rowGlow);
-                    AttachHoverOutline(rowHost, hovered =>
-                    {
-                        if (hovered)
-                        {
-                            var accent = HoverOutlineBrush();
-                            subDiscGlow.Stroke = accent;
-                            rowGlow.BorderBrush = accent;
-                        }
-
-                        subDiscGlow.Opacity = hovered ? 1 : 0;
-                        rowGlow.Opacity = hovered ? 0.55 : 0;
-                    });
-                    HoverTip.AttachRich(
-                        rowHost,
-                        () => ModelTip(
-                            capturedClient, colors, snapshot.CostAuthoritative));
-                    block.Children.Add(rowHost);
+                    block.Children.Add(ModelStripeRow(
+                        client, colors, snapshot.CostAuthoritative));
                 }
             }
 
@@ -1397,6 +1405,74 @@ public sealed partial class DashboardView : UserControl
             card.Tapped += (_, _) =>
             {
                 _expandedDay = _expandedDay == date ? null : date;
+                RenderContent(animated: false);
+            };
+
+            panel.Children.Add(card);
+        }
+
+        return panel;
+    }
+
+    // ── Monthly lens ─────────────────────────────────────────────────────
+
+    /// <summary>"Monthly" lens: one card per calendar month, most recent
+    /// first, expanding to the model stripes folded across that month's days.
+    /// Structurally a sibling of BuildDaily rather than a generalisation of it
+    /// — macOS keeps DailyView and MonthlyView separate too — but the stripe
+    /// row itself is shared so the drill-downs cannot drift.</summary>
+    private UIElement BuildMonthly(DashboardModel.Snapshot snapshot)
+    {
+        var panel = new StackPanel { Spacing = 6 };
+        var colors = new ModelColorMap(snapshot.Models, snapshot.CostAuthoritative);
+        var months = MonthlyRows.Build(snapshot.Graph, _selectedClients);
+        if (months.Count == 0)
+        {
+            panel.Children.Add(Ui.Dim("No usage in this range."));
+        }
+
+        foreach (var month in months)
+        {
+            var block = new StackPanel { Spacing = 4 };
+            var summary = $"{month.Messages} msgs";
+            if (month.Turns is { } turns)
+            {
+                var scope = month.TurnClients.Count switch
+                {
+                    1 => $"{ClientRegistry.ShortName(month.TurnClients[0])} only",
+                    > 1 => $"{string.Join(" + ", month.TurnClients.Select(ClientRegistry.ShortName))} only",
+                    _ => "selected clients",
+                };
+                summary += $" · {turns} turns · {scope}";
+            }
+
+            summary += $" · {Format.CompactTokens(month.Tokens)} · "
+                + CostSurfaceProjection.CostText(month.Cost, snapshot.CostAuthoritative);
+            block.Children.Add(Ui.Row(
+                Ui.Text(Format.MonthYear(month.Month), 12, bold: true),
+                Ui.Text(summary, 11, 0.8)));
+
+            if (_expandedMonth == month.Month)
+            {
+                foreach (var client in CostSurfaceProjection.OrderContributionClients(
+                    month.Clients, snapshot.CostAuthoritative))
+                {
+                    block.Children.Add(ModelStripeRow(
+                        client, colors, snapshot.CostAuthoritative));
+                }
+            }
+
+            var card = new Border
+            {
+                Background = (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(10, 8, 10, 8),
+                Child = block,
+            };
+            var key = month.Month;
+            card.Tapped += (_, _) =>
+            {
+                _expandedMonth = _expandedMonth == key ? null : key;
                 RenderContent(animated: false);
             };
 

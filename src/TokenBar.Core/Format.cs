@@ -85,6 +85,23 @@ public static class Format
         return $"{MonthsShort[month - 1]} {day}";
     }
 
+    /// <summary>"2026-06" → "Jun 2026". Same shape as <see cref="MonthDay"/>:
+    /// anything that does not parse as year-month comes back unchanged rather
+    /// than being guessed at.</summary>
+    public static string MonthYear(string ym)
+    {
+        var parts = ym.Split('-', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 2 ||
+            !int.TryParse(parts[0], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var year) ||
+            !int.TryParse(parts[1], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var month) ||
+            month is < 1 or > 12)
+        {
+            return ym;
+        }
+
+        return $"{MonthsShort[month - 1]} {year}";
+    }
+
     /// <summary>"2026-06-10" → "06/10".</summary>
     public static string Mmdd(string iso)
     {
