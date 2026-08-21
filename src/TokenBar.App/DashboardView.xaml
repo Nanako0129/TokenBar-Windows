@@ -82,10 +82,21 @@
                     Orientation="Horizontal"
                     Spacing="4" />
             </ScrollViewer>
-            <StackPanel
-                x:Name="TabsPanel"
-                Orientation="Horizontal"
-                Spacing="4" />
+            <!-- Same treatment as the client row above. Seven lenses at 400
+                 DIP already sit close to the available width, and Windows text
+                 scaling widens every button, so the trailing tabs would be
+                 clipped by the window edge and unclickable rather than
+                 reachable. -->
+            <ScrollViewer
+                HorizontalScrollBarVisibility="Auto"
+                HorizontalScrollMode="Enabled"
+                VerticalScrollBarVisibility="Disabled"
+                VerticalScrollMode="Disabled">
+                <StackPanel
+                    x:Name="TabsPanel"
+                    Orientation="Horizontal"
+                    Spacing="4" />
+            </ScrollViewer>
         </StackPanel>
 
         <!-- Lens content -->
