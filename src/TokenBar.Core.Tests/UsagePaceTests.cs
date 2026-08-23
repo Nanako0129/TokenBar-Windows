@@ -9,6 +9,12 @@ namespace TokenBar.Core.Tests;
 // paceStatus contract; WindowMinutes is only the compatibility mirror.
 public class UsagePaceTests
 {
+    // Localization.Load installs one process-wide table. English assertions in
+    // this class used to hold only because every test that loads zh-Hant
+    // restores it in a finally — a convention every future test would have to
+    // remember. Establishing the precondition here makes it a mechanism: xUnit
+    // constructs the class before each test.
+    public UsagePaceTests() => Localization.Load("en", AppContext.BaseDirectory);
     private static readonly DateTimeOffset Now = DateTimeOffset.FromUnixTimeSeconds(1_750_000_000);
 
     private static UsageWindow Window(

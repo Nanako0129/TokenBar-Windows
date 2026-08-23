@@ -6,6 +6,12 @@ namespace TokenBar.Core.Tests;
 // (cross-checked by the Phase 3 fixture pass).
 public class FormatTests
 {
+    // Localization.Load installs one process-wide table. English assertions in
+    // this class used to hold only because every test that loads zh-Hant
+    // restores it in a finally — a convention every future test would have to
+    // remember. Establishing the precondition here makes it a mechanism: xUnit
+    // constructs the class before each test.
+    public FormatTests() => Localization.Load("en", AppContext.BaseDirectory);
     [Theory]
     [InlineData(0, "0")]
     [InlineData(999, "999")]

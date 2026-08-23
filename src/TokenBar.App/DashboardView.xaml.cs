@@ -81,10 +81,10 @@ public sealed partial class DashboardView : UserControl
             _model?.RefreshForce();
             UpdateRefreshControl();
         };
-        HoverTip.Attach(RefreshButton, () => "Refresh usage data");
+        HoverTip.Attach(RefreshButton, () => "Refresh usage data".Localized());
 
         SettingsButton.Click += (_, _) => TrayService.OpenSettings?.Invoke();
-        HoverTip.Attach(SettingsButton, () => "Settings");
+        HoverTip.Attach(SettingsButton, () => "Settings".Localized());
         QuitButton.Click += (_, _) => TrayService.QuitApp?.Invoke();
 
         // Limits/trace settings re-render the open flyout live (the macOS
@@ -432,7 +432,7 @@ public sealed partial class DashboardView : UserControl
         TotalValue.Text = "—";
         RateValue.Text = "—";
         CostLine.Text = CostSurfaceProjection.Checking;
-        FooterText.Text = "loading usage…";
+        FooterText.Text = "loading usage…".Localized();
         UpdateYearPicker();
 
         _displayClients = [];
@@ -504,7 +504,9 @@ public sealed partial class DashboardView : UserControl
         RateValue.Text = Format.CompactTokens((long)rate);
         CostLine.Text = CostSurfaceProjection.HeaderCostLine(
             today?.Cost ?? 0, stats, snapshot.CostAuthoritative);
-        FooterText.Text = $"updated {snapshot.FetchedAt:HH:mm:ss}";
+        FooterText.Text = "updated {0}".Localized(
+            snapshot.FetchedAt.ToString(
+                "HH:mm:ss", System.Globalization.CultureInfo.CurrentCulture));
     }
 
     private string _yearPickerSignature = "";
@@ -530,9 +532,9 @@ public sealed partial class DashboardView : UserControl
         }
 
         _yearPickerSignature = signature;
-        YearButton.Content = model.Year ?? "All";
+        YearButton.Content = model.Year?.ToString() ?? "All".Localized();
         var flyout = new MenuFlyout();
-        AddYearItem(flyout, "All years", null, model);
+        AddYearItem(flyout, "All years".Localized(), null, model);
         foreach (var year in years)
         {
             AddYearItem(flyout, year, year, model);
@@ -691,7 +693,7 @@ public sealed partial class DashboardView : UserControl
 
         _clientTabsSignature = signature;
         ClientTabsPanel.Children.Clear();
-        AddClientTab(ClientRegistry.OverviewTab, "Overview");
+        AddClientTab(ClientRegistry.OverviewTab, "Overview".Localized());
         foreach (var id in _displayClients)
         {
             AddClientTab(id, ClientRegistry.ShortName(id));
@@ -779,15 +781,15 @@ public sealed partial class DashboardView : UserControl
     {
         var stack = new StackPanel { Spacing = 10 };
         stack.Children.Add(BuildUsageChartCard(snapshot));
-        stack.Children.Add(Ui.Card("Agent limits", BuildLimits(snapshot)));
+        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot)));
         var trace = BuildTrace(snapshot);
         if (trace is not null)
         {
-            stack.Children.Add(Ui.Card("Live session", trace));
+            stack.Children.Add(Ui.Card("Live session".Localized(), trace));
         }
 
-        stack.Children.Add(Ui.Card("Models", BuildModelRows(snapshot, maxRows: 8)));
-        stack.Children.Add(Ui.Card("Streaks", BuildStreaks(snapshot)));
+        stack.Children.Add(Ui.Card("Models".Localized(), BuildModelRows(snapshot, maxRows: 8)));
+        stack.Children.Add(Ui.Card("Streaks".Localized(), BuildStreaks(snapshot)));
         return stack;
     }
 
@@ -797,9 +799,9 @@ public sealed partial class DashboardView : UserControl
     /// lifecycle path in both lenses.</summary>
     private Border BuildUsageChartCard(DashboardModel.Snapshot snapshot) =>
         Ui.Card(
-            "Token Usage",
+            "Token Usage".Localized(),
             BuildChart(snapshot),
-            _chartView3D ? "Full year" : "30 days",
+            (_chartView3D ? "Full year" : "30 days").Localized(),
             BuildChartViewToggle());
 
     private FrameworkElement BuildChartViewToggle()
@@ -822,7 +824,7 @@ public sealed partial class DashboardView : UserControl
     {
         if (_selectedClients.Count == 0)
         {
-            return Ui.Dim("No visible client usage.");
+            return Ui.Dim("No visible client usage.".Localized());
         }
 
         if (_chartView3D)
@@ -840,11 +842,11 @@ public sealed partial class DashboardView : UserControl
             HorizontalAlignment = HorizontalAlignment.Right,
             Margin = new Thickness(0, 6, 0, 0),
         };
-        var byModel = LensPill("Model", _chartStackBy == StackBy.Model);
-        var byAgent = LensPill("Agent", _chartStackBy == StackBy.Agent);
+        var byModel = LensPill("Model".Localized(), _chartStackBy == StackBy.Model);
+        var byAgent = LensPill("Agent".Localized(), _chartStackBy == StackBy.Agent);
         byModel.Click += (_, _) => SetStackBy(StackBy.Model);
         byAgent.Click += (_, _) => SetStackBy(StackBy.Agent);
-        var byTokens = LensPill("Tokens", _chartMetric == ChartMetric.Tokens);
+        var byTokens = LensPill("Tokens".Localized(), _chartMetric == ChartMetric.Tokens);
         var costEnabled = CostSurfaceProjection.CanUseCost(
             snapshot.CostAuthoritative);
         var byCost = LensPill(
@@ -1056,12 +1058,12 @@ public sealed partial class DashboardView : UserControl
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Top,
         };
-        var fit = LensPill("Fit", false);
-        var reset = LensPill("Reset", false);
+        var fit = LensPill("Fit".Localized(), false);
+        var reset = LensPill("Reset".Localized(), false);
         fit.Click += (_, _) => panel.FitToContent();
         reset.Click += (_, _) => panel.ResetCamera();
-        HoverTip.Attach(fit, () => "Frame active days");
-        HoverTip.Attach(reset, () => "Reset the saved 3D camera");
+        HoverTip.Attach(fit, () => "Frame active days".Localized());
+        HoverTip.Attach(reset, () => "Reset the saved 3D camera".Localized());
         controls.Children.Add(fit);
         controls.Children.Add(reset);
         root.Children.Add(controls);
@@ -1074,7 +1076,7 @@ public sealed partial class DashboardView : UserControl
         var agents = snapshot.Quota?.Agents ?? [];
         if (agents.Count == 0)
         {
-            panel.Children.Add(Ui.Dim("No quota data yet."));
+            panel.Children.Add(Ui.Dim("No quota data yet.".Localized()));
             return panel;
         }
 
@@ -1131,11 +1133,11 @@ public sealed partial class DashboardView : UserControl
     {
         var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 24 };
-        row.Children.Add(Metric($"{stats.Streaks.Current}d", "current"));
-        row.Children.Add(Metric($"{stats.Streaks.Longest}d", "longest"));
+        row.Children.Add(Metric("{0}d".Localized(stats.Streaks.Current), "current".Localized()));
+        row.Children.Add(Metric("{0}d".Localized(stats.Streaks.Longest), "longest".Localized()));
         row.Children.Add(Metric(
             CostSurfaceProjection.BestDayText(
-                stats.BestDay, snapshot.CostAuthoritative), "best day"));
+                stats.BestDay, snapshot.CostAuthoritative), "best day".Localized()));
         return row;
     }
 
@@ -1153,7 +1155,7 @@ public sealed partial class DashboardView : UserControl
                 entries, snapshot.CostAuthoritative));
             if (snapshot.CostAuthoritative && report.PricingUpdatedAt is { } ts)
             {
-                subtitleParts.Add($"Prices updated {Format.RelativeTime(ts)}");
+                subtitleParts.Add("Prices updated {0}".Localized(Format.RelativeTime(ts)));
             }
         }
 
@@ -1162,11 +1164,11 @@ public sealed partial class DashboardView : UserControl
         var legend = new WrapRow();
         (string Label, string Color)[] kinds =
         [
-            ("Input", Ui.TokenKinds[0].Color),
-            ("Output", Ui.TokenKinds[1].Color),
-            ("Cache read", Ui.TokenKinds[2].Color),
-            ("Cache write", Ui.TokenKinds[3].Color),
-            ("Reasoning", Ui.TokenKinds[4].Color),
+            ("Input".Localized(), Ui.TokenKinds[0].Color),
+            ("Output".Localized(), Ui.TokenKinds[1].Color),
+            ("Cache read".Localized(), Ui.TokenKinds[2].Color),
+            ("Cache write".Localized(), Ui.TokenKinds[3].Color),
+            ("Reasoning".Localized(), Ui.TokenKinds[4].Color),
         ];
         foreach (var (label, color) in kinds)
         {
@@ -1186,7 +1188,7 @@ public sealed partial class DashboardView : UserControl
 
         content.Children.Add(legend);
         content.Children.Add(BuildModelRows(snapshot, maxRows: null));
-        stack.Children.Add(Ui.Card("Models", content, string.Join(" · ", subtitleParts)));
+        stack.Children.Add(Ui.Card("Models".Localized(), content, string.Join(" · ", subtitleParts)));
         return stack;
     }
 
@@ -1207,7 +1209,7 @@ public sealed partial class DashboardView : UserControl
 
         if (entries.Count == 0)
         {
-            panel.Children.Add(Ui.Dim("No model data yet."));
+            panel.Children.Add(Ui.Dim("No model data yet.".Localized()));
             return panel;
         }
 
@@ -1396,7 +1398,7 @@ public sealed partial class DashboardView : UserControl
         var days = DailyRows.Build(snapshot.Graph, _selectedClients);
         if (days.Count == 0)
         {
-            panel.Children.Add(Ui.Dim("No active days."));
+            panel.Children.Add(Ui.Dim("No active days.".Localized()));
         }
 
         foreach (var selectedDay in days)
@@ -1452,7 +1454,7 @@ public sealed partial class DashboardView : UserControl
         var months = MonthlyRows.Build(snapshot.Graph, _selectedClients);
         if (months.Count == 0)
         {
-            panel.Children.Add(Ui.Dim("No usage in this range."));
+            panel.Children.Add(Ui.Dim("No usage in this range.".Localized()));
         }
 
         foreach (var month in months)
@@ -1500,13 +1502,13 @@ public sealed partial class DashboardView : UserControl
         var stack = new StackPanel { Spacing = 10 };
         if (snapshot.Hourly is not { } hourly)
         {
-            stack.Children.Add(Ui.Card("Hourly", Ui.Dim("Loading hourly data…")));
+            stack.Children.Add(Ui.Card("Hourly".Localized(), Ui.Dim("Loading hourly data…".Localized())));
             return stack;
         }
 
         var toggle = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-        var timelineBtn = LensPill("Timeline", !_hourlyProfileMode);
-        var profileBtn = LensPill("Profile", _hourlyProfileMode);
+        var timelineBtn = LensPill("Timeline".Localized(), !_hourlyProfileMode);
+        var profileBtn = LensPill("Profile".Localized(), _hourlyProfileMode);
         timelineBtn.Click += (_, _) => { _hourlyProfileMode = false; RenderContent(false); };
         profileBtn.Click += (_, _) => { _hourlyProfileMode = true; RenderContent(false); };
         toggle.Children.Add(timelineBtn);
@@ -1546,7 +1548,7 @@ public sealed partial class DashboardView : UserControl
                 panel.Children.Add(row);
             }
 
-            stack.Children.Add(Ui.Card("24h profile", panel));
+            stack.Children.Add(Ui.Card("24h profile".Localized(), panel));
         }
         else
         {
@@ -1578,13 +1580,13 @@ public sealed partial class DashboardView : UserControl
 
             if (entries.Count > _hourlyWindow)
             {
-                var more = LensPill($"Show more ({entries.Count - _hourlyWindow} left)", false);
+                var more = LensPill("Show more ({0} left)".Localized(entries.Count - _hourlyWindow), false);
                 more.HorizontalAlignment = HorizontalAlignment.Center;
                 more.Click += (_, _) => { _hourlyWindow += 48; RenderContent(false); };
                 panel.Children.Add(more);
             }
 
-            stack.Children.Add(Ui.Card("Timeline", panel, $"{hourly.Entries.Count} slots"));
+            stack.Children.Add(Ui.Card("Timeline".Localized(), panel, "{0} slots".Localized(hourly.Entries.Count)));
         }
 
         return stack;
@@ -1609,13 +1611,13 @@ public sealed partial class DashboardView : UserControl
         (string Value, string Label)[] metrics =
         [
             (CostSurfaceProjection.CostText(
-                stats.TotalCost, snapshot.CostAuthoritative), "total spend"),
-            (Format.CompactTokens(stats.TotalTokens), "tokens"),
-            ($"{stats.ActiveDays}", "active days"),
+                stats.TotalCost, snapshot.CostAuthoritative), "total spend".Localized()),
+            (Format.CompactTokens(stats.TotalTokens), "tokens".Localized()),
+            ($"{stats.ActiveDays}", "active days".Localized()),
             (CostSurfaceProjection.CostText(
-                stats.AveragePerDay, snapshot.CostAuthoritative), "avg/day"),
+                stats.AveragePerDay, snapshot.CostAuthoritative), "avg/day".Localized()),
             (CostSurfaceProjection.BestDayText(
-                stats.BestDay, snapshot.CostAuthoritative), "best day"),
+                stats.BestDay, snapshot.CostAuthoritative), "best day".Localized()),
         ];
         for (var i = 0; i < metrics.Length; i++)
         {
@@ -1628,13 +1630,13 @@ public sealed partial class DashboardView : UserControl
         // Favorite model gets a full-width row — long model ids don't fit a
         // third of the card.
         grid.RowDefinitions.Add(new RowDefinition());
-        var favoriteCell = Metric(favorite?.Model ?? "—", "favorite model");
+        var favoriteCell = Metric(favorite?.Model ?? "—", "favorite model".Localized());
         Grid.SetRow(favoriteCell, 2);
         Grid.SetColumnSpan(favoriteCell, 3);
         grid.Children.Add(favoriteCell);
 
-        stack.Children.Add(Ui.Card("Stats", grid));
-        stack.Children.Add(Ui.Card("Streaks", BuildStreaks(snapshot)));
+        stack.Children.Add(Ui.Card("Stats".Localized(), grid));
+        stack.Children.Add(Ui.Card("Streaks".Localized(), BuildStreaks(snapshot)));
         return stack;
     }
 
@@ -1645,7 +1647,7 @@ public sealed partial class DashboardView : UserControl
         var stack = new StackPanel { Spacing = 10 };
         if (snapshot.Agents is not { } agents)
         {
-            stack.Children.Add(Ui.Card("Agents", Ui.Dim("Loading agent data…")));
+            stack.Children.Add(Ui.Card("Agents".Localized(), Ui.Dim("Loading agent data…".Localized())));
             return stack;
         }
 
@@ -1660,7 +1662,8 @@ public sealed partial class DashboardView : UserControl
             block.Children.Add(Ui.Row(
                 Ui.Text(entry.Agent, 11, bold: true),
                 Ui.Text(
-                    $"{entry.Messages} msgs · {Format.CompactTokens(entry.Total)} · "
+                    "{0} msgs".Localized(entry.Messages)
+                        + $" · {Format.CompactTokens(entry.Total)} · "
                         + CostSurfaceProjection.CostText(
                             entry.Cost, snapshot.CostAuthoritative),
                     10,
@@ -1676,13 +1679,13 @@ public sealed partial class DashboardView : UserControl
 
         if (entries.Count == 0)
         {
-            panel.Children.Add(Ui.Dim("No sub-agent usage recorded."));
+            panel.Children.Add(Ui.Dim("No sub-agent usage recorded.".Localized()));
         }
 
         stack.Children.Add(Ui.Card(
             CostSurfaceProjection.AgentsTitle(snapshot.CostAuthoritative),
             panel,
-            $"{agents.TotalMessages} messages"));
+            "{0} messages".Localized(agents.TotalMessages)));
         return stack;
     }
 
@@ -1765,7 +1768,7 @@ public sealed partial class DashboardView : UserControl
         var panel = new StackPanel { Spacing = 5, MinWidth = 200 };
         panel.Children.Add(TipText(Format.MonthDay(bar.Date), 12, bold: true));
         panel.Children.Add(TipRow(
-            TipText($"{Format.ExactTokens(bar.TotalTokens)} tokens", 11, 0.9),
+            TipText("{0} tokens".Localized(Format.ExactTokens(bar.TotalTokens)), 11, 0.9),
             CostSurfaceProjection.DayTipCost(bar.TotalCost, costAuthoritative), 0.9));
         var ordered = CostSurfaceProjection.OrderDaySegments(
             bar.Segments, costAuthoritative, _chartMetric);
@@ -1825,16 +1828,16 @@ public sealed partial class DashboardView : UserControl
         panel.Children.Add(TipText(
             $"{ClientRegistry.ShortName(entry.Client)} · {entry.Provider}", 10, 0.6));
         panel.Children.Add(TipRow(
-            TipText($"{Format.CompactTokens(entry.Total)} tokens", 11, 0.9),
+            TipText("{0} tokens".Localized(Format.CompactTokens(entry.Total)), 11, 0.9),
             CostSurfaceProjection.ModelTipCost(
                 entry.Cost, costAuthoritative), 0.9));
         (string Label, string Color)[] kinds =
         [
-            ("Input", Ui.TokenKinds[0].Color),
-            ("Output", Ui.TokenKinds[1].Color),
-            ("Cache read", Ui.TokenKinds[2].Color),
-            ("Cache write", Ui.TokenKinds[3].Color),
-            ("Reasoning", Ui.TokenKinds[4].Color),
+            ("Input".Localized(), Ui.TokenKinds[0].Color),
+            ("Output".Localized(), Ui.TokenKinds[1].Color),
+            ("Cache read".Localized(), Ui.TokenKinds[2].Color),
+            ("Cache write".Localized(), Ui.TokenKinds[3].Color),
+            ("Reasoning".Localized(), Ui.TokenKinds[4].Color),
         ];
         for (var i = 0; i < values.Length; i++)
         {
@@ -2075,7 +2078,9 @@ public sealed partial class DashboardView : UserControl
         if (expectedUsedPercent is { } expected && double.IsFinite(expected))
         {
             var expectedUsed = Math.Clamp(expected, 0, 100);
-            HoverTip.Attach(marker, () => $"Expected {expectedUsed:F0}% used by now");
+            HoverTip.Attach(marker, () =>
+            "Expected {0}% used by now".Localized(expectedUsed.ToString(
+                    "F0", System.Globalization.CultureInfo.CurrentCulture)));
         }
 
         return holder;
