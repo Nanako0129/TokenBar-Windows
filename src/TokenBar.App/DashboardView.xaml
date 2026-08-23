@@ -74,7 +74,7 @@
         <StackPanel Grid.Row="1" Spacing="6">
             <ScrollViewer
                 x:Name="ClientTabsScroll"
-                HorizontalScrollBarVisibility="Auto"
+                HorizontalScrollBarVisibility="Hidden"
                 HorizontalScrollMode="Enabled"
                 VerticalScrollBarVisibility="Disabled"
                 VerticalScrollMode="Disabled">
@@ -90,7 +90,7 @@
                  reachable. -->
             <ScrollViewer
                 x:Name="TabsScroll"
-                HorizontalScrollBarVisibility="Auto"
+                HorizontalScrollBarVisibility="Hidden"
                 HorizontalScrollMode="Enabled"
                 VerticalScrollBarVisibility="Disabled"
                 VerticalScrollMode="Disabled">
