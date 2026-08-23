@@ -6,6 +6,12 @@ namespace TokenBar.Core.Tests;
 
 public class CostSurfaceProjectionTests
 {
+    // Localization.Load installs one process-wide table. English assertions in
+    // this class used to hold only because every test that loads zh-Hant
+    // restores it in a finally — a convention every future test would have to
+    // remember. Establishing the precondition here makes it a mechanism: xUnit
+    // constructs the class before each test.
+    public CostSurfaceProjectionTests() => Localization.Load("en", AppContext.BaseDirectory);
     private static readonly ModelReportEntry ExpensiveFewTokens =
         new("claude", "model-a", "anthropic", 1, 0, 0, 0, 0, 1, 1, 100);
 

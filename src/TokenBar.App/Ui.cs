@@ -11,6 +11,11 @@ namespace TokenBar.App;
 /// <summary>Small element factories shared by every lens.</summary>
 public static class Ui
 {
+    /// <summary>Legend keys. The labels stay English abbreviations in every
+    /// language on purpose: they have to fit a legend chip, and Chinese has no
+    /// two-character shortening of 快取讀取 that still reads. The same five
+    /// concepts appear as full words — and are translated — in the Models card
+    /// and the tooltips, which is the split English already makes.</summary>
     public static readonly (string Key, string Label, string Color)[] TokenKinds =
     [
         ("input", "In", "#3b82f6"),
@@ -166,7 +171,8 @@ public static class Ui
             name.Children.Add(Disc(ClientRegistry.Style(row.Client).Color));
             name.Children.Add(Text($"{ClientRegistry.ShortName(row.Client)} · {row.Model}", 11));
             panel.Children.Add(Row(
-                name, Text($"{Format.CompactTokens((long)row.TokensPerMin)}/min", 11, 0.75)));
+                name, Text("{0}/min".Localized(
+                    Format.CompactTokens((long)row.TokensPerMin)), 11, 0.75)));
         }
 
         return panel;
