@@ -1402,21 +1402,7 @@ public sealed partial class DashboardView : UserControl
         foreach (var selectedDay in days)
         {
             var block = new StackPanel { Spacing = 4 };
-            var summary = $"{selectedDay.Messages} msgs";
-            if (selectedDay.Turns is { } turns)
-            {
-                var scope = selectedDay.TurnClients.Count switch
-                {
-                    1 => $"{ClientRegistry.ShortName(selectedDay.TurnClients[0])} only",
-                    > 1 => $"{string.Join(" + ", selectedDay.TurnClients.Select(ClientRegistry.ShortName))} only",
-                    _ => "selected clients",
-                };
-                summary += $" · {turns} turns · {scope}";
-            }
-
-            summary += $" · {Format.CompactTokens(selectedDay.Tokens)} · "
-                + CostSurfaceProjection.CostText(
-                    selectedDay.Cost, snapshot.CostAuthoritative);
+            var summary = DrillDownSummary.Text(selectedDay, snapshot.CostAuthoritative);
             var head = Ui.Row(
                 Ui.Text(Format.MonthDay(selectedDay.Date), 12, bold: true),
                 Ui.Text(summary, 11, 0.8));
@@ -1472,20 +1458,7 @@ public sealed partial class DashboardView : UserControl
         foreach (var month in months)
         {
             var block = new StackPanel { Spacing = 4 };
-            var summary = $"{month.Messages} msgs";
-            if (month.Turns is { } turns)
-            {
-                var scope = month.TurnClients.Count switch
-                {
-                    1 => $"{ClientRegistry.ShortName(month.TurnClients[0])} only",
-                    > 1 => $"{string.Join(" + ", month.TurnClients.Select(ClientRegistry.ShortName))} only",
-                    _ => "selected clients",
-                };
-                summary += $" · {turns} turns · {scope}";
-            }
-
-            summary += $" · {Format.CompactTokens(month.Tokens)} · "
-                + CostSurfaceProjection.CostText(month.Cost, snapshot.CostAuthoritative);
+            var summary = DrillDownSummary.Text(month, snapshot.CostAuthoritative);
             block.Children.Add(Ui.Row(
                 Ui.Text(Format.MonthYear(month.Month), 12, bold: true),
                 Ui.Text(summary, 11, 0.8)));

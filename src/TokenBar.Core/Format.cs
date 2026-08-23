@@ -62,6 +62,7 @@ public static class Format
         return graph.Contributions.LastOrDefault(c => c.Date == today)?.Totals.Cost ?? 0;
     }
 
+    /// <summary>English month names, which double as their own lookup keys.</summary>
     private static readonly string[] MonthsShort =
     [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -69,7 +70,12 @@ public static class Format
     ];
 
     /// <summary>"2026-06-10" → "Jun 10". RemoveEmptyEntries + all-three-parsed
-    /// mirrors Swift's `split(separator:)` + `compactMap { Int($0) }`.</summary>
+    /// mirrors Swift's `split(separator:)` + `compactMap { Int($0) }`.
+    ///
+    /// The field order comes from the table, not from this code: zh-Hant
+    /// renders "6月10日", and format.monthYear goes further and *swaps* its two
+    /// arguments ("2026年6月"). Translating only the month names would produce
+    /// "6月 2026". Ported from Format.swift, which keys the same two templates.</summary>
     public static string MonthDay(string iso)
     {
         var parts = iso.Split('-', StringSplitOptions.RemoveEmptyEntries);
@@ -82,7 +88,8 @@ public static class Format
             return iso;
         }
 
-        return $"{MonthsShort[month - 1]} {day}";
+        return "format.monthDay".LocalizedKey(
+            "{0} {1}", MonthsShort[month - 1].Localized(), day);
     }
 
     /// <summary>"2026-06" → "Jun 2026". Same shape as <see cref="MonthDay"/>:
@@ -99,7 +106,8 @@ public static class Format
             return ym;
         }
 
-        return $"{MonthsShort[month - 1]} {year}";
+        return "format.monthYear".LocalizedKey(
+            "{0} {1}", MonthsShort[month - 1].Localized(), year);
     }
 
     /// <summary>"2026-06-10" → "06/10".</summary>
@@ -119,9 +127,9 @@ public static class Format
     {
         var nowSecs = (now ?? DateTimeOffset.Now).ToUnixTimeSeconds();
         var diff = Math.Max(0, nowSecs - (long)epochSecs);
-        if (diff < 60) { return "just now"; }
-        if (diff < 3600) { return $"{diff / 60}m ago"; }
-        if (diff < 86400) { return $"{diff / 3600}h ago"; }
-        return $"{diff / 86400}d ago";
+        if (diff < 60) { return "just now".Localized(); }
+        if (diff < 3600) { return "{0}m ago".Localized(diff / 60); }
+        if (diff < 86400) { return "{0}h ago".Localized(diff / 3600); }
+        return "{0}d ago".Localized(diff / 86400);
     }
 }

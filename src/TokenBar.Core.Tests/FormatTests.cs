@@ -64,4 +64,64 @@ public class FormatTests
         var epoch = (ulong)(1_750_000_000 - ageSecs);
         Assert.Equal(expected, Format.RelativeTime(epoch, now));
     }
+
+    // ---- i18n ----------------------------------------------------------
+    //
+    // Exact strings, not "differs from English": these lines are composed from
+    // more than one table entry, and one entry resolving is enough to make the
+    // whole line differ. Exact assertions also pin argument *position*, which
+    // format.monthYear reverses.
+
+    private static void InChinese(Action body)
+    {
+        Localization.Load("zh-Hant", AppContext.BaseDirectory);
+        try
+        {
+            body();
+        }
+        finally
+        {
+            Localization.Load("en", AppContext.BaseDirectory);
+        }
+    }
+
+    [Fact]
+    public void TranslatedMonthTemplatesTakeTheirFieldOrderFromTheTable() => InChinese(() =>
+    {
+        Assert.Equal("6月10日", Format.MonthDay("2026-06-10"));
+        Assert.Equal("12月1日", Format.MonthDay("2026-12-01"));
+        // format.monthYear is "{1}年{0}" — the arguments swap. Translating only
+        // the month names would render "6月 2026".
+        Assert.Equal("2026年6月", Format.MonthYear("2026-06"));
+        Assert.Equal("2026年1月", Format.MonthYear("2026-01"));
+
+        // Unparseable input still comes back untouched rather than being
+        // guessed at, table or no table.
+        Assert.Equal("garbage", Format.MonthDay("garbage"));
+        Assert.Equal("2026-13", Format.MonthYear("2026-13"));
+    });
+
+    [Fact]
+    public void EveryMonthNameIsTranslated() => InChinese(() =>
+    {
+        for (var month = 1; month <= 12; month++)
+        {
+            Assert.Equal(
+                $"{month}月1日", Format.MonthDay($"2026-{month:D2}-01"));
+        }
+    });
+
+    [Fact]
+    public void TranslatedRelativeTimeKeepsChineseWordOrder() => InChinese(() =>
+    {
+        var now = DateTimeOffset.FromUnixTimeSeconds(1_750_000_000);
+        string At(long ageSecs) =>
+            Format.RelativeTime((ulong)(1_750_000_000 - ageSecs), now);
+
+        Assert.Equal("剛剛", At(0));
+        Assert.Equal("剛剛", At(59));
+        Assert.Equal("5 分鐘前", At(300));
+        Assert.Equal("3 小時前", At(10_800));
+        Assert.Equal("2 天前", At(172_800));
+    });
 }
