@@ -93,19 +93,29 @@ public static class Localization
     /// generic to be safe as a table key, so the pace duration text keys on
     /// "duration.now" and supplies its English here.
     ///
-    /// Deliberately not an overload: a <c>Localized(string, string)</c> would
-    /// beat the params form in resolution, and <c>"{0}% left".Localized(text)</c>
-    /// would silently return <paramref name="fallback"/> instead of
-    /// formatting.</summary>
-    public static string LocalizedKey(this string key, string fallback)
+    /// Deliberately not an overload of <see cref="Localized(string)"/>: a
+    /// <c>Localized(string, string)</c> would beat the params form in
+    /// resolution, and <c>"{0}% left".Localized(text)</c> would silently return
+    /// <paramref name="fallback"/> instead of formatting. It is a single
+    /// params method rather than an arity pair for the same reason — there is
+    /// no resolution question to get wrong.</summary>
+    public static string LocalizedKey(
+        this string key, string fallback, params object[] args)
     {
+        string text;
         lock (Gate)
         {
-            return _table is not null
+            text = _table is not null
                 && _table.TryGetValue(key, out var value)
                 && !string.IsNullOrEmpty(value)
                 ? value
                 : fallback;
         }
+
+        // Skip Format entirely with no arguments, so a translation carrying a
+        // literal brace cannot throw on the zero-argument path.
+        return args.Length == 0
+            ? text
+            : string.Format(System.Globalization.CultureInfo.CurrentCulture, text, args);
     }
 }
