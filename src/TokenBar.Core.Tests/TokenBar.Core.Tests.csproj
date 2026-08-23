@@ -48,6 +48,14 @@
     <None Include="..\..\scripts\package-velopack.ps1"
           Link="Fixtures\package-velopack.ps1"
           CopyToOutputDirectory="PreserveNewest" />
+    <!-- The shipped translation table, not a fixture: the i18n tests exist to
+         catch a call site wrapped in Localized() whose key was never added to
+         this file, and against a fixture written next to the test that failure
+         is unreachable. Lands next to the test assembly so AppContext
+         .BaseDirectory is the asset directory Localization.Load wants. -->
+    <None Include="..\TokenBar.App\Assets\strings-zh-Hant.json"
+          Link="strings-zh-Hant.json"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

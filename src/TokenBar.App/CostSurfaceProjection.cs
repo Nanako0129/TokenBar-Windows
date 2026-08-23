@@ -8,8 +8,11 @@ namespace TokenBar.App;
 /// a numeric cost is never used to infer readiness.</summary>
 public static class CostSurfaceProjection
 {
-    public const string Checking = "Checking";
-    public const string ChartChecking = "Checking cost…";
+    // Properties, not consts: a const cannot call Localized(), and the table is
+    // loaded after these would already have been baked into every call site.
+    public static string Checking => "Checking".Localized();
+
+    public static string ChartChecking => "Checking cost…".Localized();
 
     public static bool CanUseCost(bool authoritative) => authoritative;
 
@@ -35,9 +38,9 @@ public static class CostSurfaceProjection
     public static string HeaderCostLine(
         double todayCost, UsageStats stats, bool authoritative) =>
         authoritative
-            ? $"{Format.Usd(todayCost)} today · "
-                + $"{Format.Usd(stats.TotalCost)} all time · {stats.ActiveDays} active days"
-            : $"{Checking} · {stats.ActiveDays} active days";
+            ? "{0} today · {1} all time · {2} active days".Localized(
+                Format.Usd(todayCost), Format.Usd(stats.TotalCost), stats.ActiveDays)
+            : "{0} · {1} active days".Localized(Checking, stats.ActiveDays);
 
     public static string HeaderCostLine(UsageStats stats, bool authoritative) =>
         HeaderCostLine(
@@ -49,8 +52,9 @@ public static class CostSurfaceProjection
 
     public static string ModelsSubtitle(
         IReadOnlyList<ModelReportEntry> entries, bool authoritative) =>
-        $"{entries.Count} models · "
-        + (authoritative ? Format.Usd(entries.Sum(e => e.Cost)) : Checking);
+        "{0} models · {1}".Localized(
+            entries.Count,
+            authoritative ? Format.Usd(entries.Sum(e => e.Cost)) : Checking);
 
     public static IReadOnlyList<ModelReportEntry> OrderModels(
         IEnumerable<ModelReportEntry> entries, bool authoritative)
@@ -86,7 +90,7 @@ public static class CostSurfaceProjection
         authoritative || requested != ChartMetric.Cost ? requested : ChartMetric.Tokens;
 
     public static string ChartCostLabel(bool authoritative) =>
-        authoritative ? "Price" : "Price · Checking";
+        authoritative ? "Price".Localized() : "Price · Checking".Localized();
 
     public static IReadOnlyList<DaySegment> OrderDaySegments(
         IEnumerable<DaySegment> segments,
@@ -122,7 +126,7 @@ public static class CostSurfaceProjection
         authoritative ? FiniteOrZero(entry.Cost) : entry.Total;
 
     public static string AgentsTitle(bool authoritative) =>
-        authoritative ? "Agents by cost" : "Agents by tokens";
+        authoritative ? "Agents by cost".Localized() : "Agents by tokens".Localized();
 
     public static string TrayTitle(
         TrayMode mode,
