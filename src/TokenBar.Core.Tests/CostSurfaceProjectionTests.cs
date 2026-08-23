@@ -200,4 +200,56 @@ public class CostSurfaceProjectionTests
             query2, Payload(), GraphPublicationStage.Richer));
         Assert.True(state.CostAuthoritative);
     }
+
+    // Same English-vs-Chinese contract as UsagePaceTests: render each surface
+    // with no table and with the shipped one, and require them to differ.
+    [Fact]
+    public void EveryCostSurfaceStringHasAShippedTranslation()
+    {
+        var entries = new[] { ExpensiveFewTokens, CheapManyTokens };
+        var stats = new UsageStats(Payload(), new HashSet<string> { "claude" });
+        var surfaces = new (string Name, Func<string> Render)[]
+        {
+            ("Checking", () => CostSurfaceProjection.Checking),
+            ("Checking cost…", () => CostSurfaceProjection.ChartChecking),
+            ("header · authoritative",
+                () => CostSurfaceProjection.HeaderCostLine(stats, true)),
+            ("header · checking",
+                () => CostSurfaceProjection.HeaderCostLine(stats, false)),
+            ("models subtitle",
+                () => CostSurfaceProjection.ModelsSubtitle(entries, true)),
+            ("Price", () => CostSurfaceProjection.ChartCostLabel(true)),
+            ("Price · Checking", () => CostSurfaceProjection.ChartCostLabel(false)),
+            ("Agents by cost", () => CostSurfaceProjection.AgentsTitle(true)),
+            ("Agents by tokens", () => CostSurfaceProjection.AgentsTitle(false)),
+        };
+
+        Localization.Load("en", AppContext.BaseDirectory);
+        var english = surfaces.Select(s => s.Render()).ToArray();
+
+        Localization.Load("zh-Hant", AppContext.BaseDirectory);
+        try
+        {
+            for (var i = 0; i < surfaces.Length; i++)
+            {
+                Assert.True(
+                    surfaces[i].Render() != english[i],
+                    $"no zh-Hant entry for {surfaces[i].Name}: still renders "
+                        + $"\"{english[i]}\"");
+            }
+
+            // The dollar figures and counts must survive into the translation,
+            // which a bare inequality would not catch.
+            Assert.Equal(
+                $"今日 {Format.Usd(5)} · 累計 {Format.Usd(stats.TotalCost)} · "
+                    + $"{stats.ActiveDays} 天有用量",
+                CostSurfaceProjection.HeaderCostLine(5, stats, true));
+            Assert.Equal("2 個模型 · 查詢中",
+                CostSurfaceProjection.ModelsSubtitle(entries, false));
+        }
+        finally
+        {
+            Localization.Load("en", AppContext.BaseDirectory);
+        }
+    }
 }

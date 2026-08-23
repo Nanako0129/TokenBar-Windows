@@ -87,4 +87,25 @@ public static class Localization
     public static string Localized(this string source, params object[] args) =>
         string.Format(
             System.Globalization.CultureInfo.CurrentCulture, source.Localized(), args);
+
+    /// <summary>Lookup for the rare key whose English rendering is not the key
+    /// itself, matching macOS's <c>localized(default:)</c>. Bare "now" is too
+    /// generic to be safe as a table key, so the pace duration text keys on
+    /// "duration.now" and supplies its English here.
+    ///
+    /// Deliberately not an overload: a <c>Localized(string, string)</c> would
+    /// beat the params form in resolution, and <c>"{0}% left".Localized(text)</c>
+    /// would silently return <paramref name="fallback"/> instead of
+    /// formatting.</summary>
+    public static string LocalizedKey(this string key, string fallback)
+    {
+        lock (Gate)
+        {
+            return _table is not null
+                && _table.TryGetValue(key, out var value)
+                && !string.IsNullOrEmpty(value)
+                ? value
+                : fallback;
+        }
+    }
 }

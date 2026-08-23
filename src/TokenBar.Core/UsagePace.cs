@@ -69,11 +69,13 @@ public sealed record UsagePace(
         {
             if (Stage == PaceStage.OnTrack)
             {
-                return "On pace";
+                return "On pace".Localized();
             }
 
             var d = (int)Math.Round(Math.Abs(DeltaPercent), MidpointRounding.AwayFromZero);
-            return Stage.IsDeficit() ? $"{d}% in deficit" : $"{d}% in reserve";
+            return Stage.IsDeficit()
+                ? "{0}% in deficit".Localized(d)
+                : "{0}% in reserve".Localized(d);
         }
     }
 
@@ -85,7 +87,7 @@ public sealed record UsagePace(
         {
             if (WillLastToReset)
             {
-                return "Lasts until reset";
+                return "Lasts until reset".Localized();
             }
 
             if (EtaSeconds is not { } eta)
@@ -94,21 +96,33 @@ public sealed record UsagePace(
             }
 
             var t = DurationText(eta);
-            return t == "now" ? "Projected empty now" : $"Projected empty in {t}";
+            // DurationText is already localized, so compare against the same
+            // localized token rather than the literal "now".
+            return t == NowText
+                ? "Projected empty now".Localized()
+                : "Projected empty in {0}".Localized(t);
         }
     }
+
+    /// <summary>Semantic key: bare "now" is too generic to safely use as a
+    /// lookup key.</summary>
+    public static string NowText => "duration.now".LocalizedKey("now");
 
     public static string DurationText(double seconds)
     {
         var m = (int)Math.Round(seconds / 60, MidpointRounding.AwayFromZero);
-        if (m < 1) { return "now"; }
-        if (m < 60) { return $"{m}m"; }
+        if (m < 1) { return NowText; }
+        if (m < 60) { return "{0}m".Localized(m); }
         var h = m / 60;
         var rem = m % 60;
-        if (h < 24) { return rem > 0 ? $"{h}h {rem}m" : $"{h}h"; }
+        if (h < 24)
+        {
+            return rem > 0 ? "{0}h {1}m".Localized(h, rem) : "{0}h".Localized(h);
+        }
+
         var days = h / 24;
         var hr = h % 24;
-        return hr > 0 ? $"{days}d {hr}h" : $"{days}d";
+        return hr > 0 ? "{0}d {1}h".Localized(days, hr) : "{0}d".Localized(days);
     }
 
     /// <summary>Compute linear pace for a duration-ready v3 window, or null
@@ -199,19 +213,23 @@ public sealed record UsagePace(
 
         var pct = (int)Math.Round(Clamp(probability, 0, 1) * 100,
             MidpointRounding.AwayFromZero);
-        return pct <= 0 ? null : $"≈ {pct}% run-out risk";
+        return pct <= 0 ? null : "≈ {0}% run-out risk".Localized(pct);
     }
 
+    // Each arm is a whole sentence including its " · ", so the separator never
+    // has to survive a lookup; JoinText's separator is language-independent for
+    // the same reason.
     private static string? StatusText(UsageWindow window, PaceMode mode) =>
         window.PaceStatus.State switch
         {
             UsagePaceState.LearningHistory when mode == PaceMode.Historical =>
-                "Learning history · Linear estimate",
-            UsagePaceState.LearningHistory when mode == PaceMode.Linear => "Linear",
-            UsagePaceState.LearningDuration => "Learning reset duration",
-            UsagePaceState.Available when mode == PaceMode.Linear => "Linear",
+                "Learning history · Linear estimate".Localized(),
+            UsagePaceState.LearningHistory when mode == PaceMode.Linear =>
+                "Linear".Localized(),
+            UsagePaceState.LearningDuration => "Learning reset duration".Localized(),
+            UsagePaceState.Available when mode == PaceMode.Linear => "Linear".Localized(),
             UsagePaceState.Available => null,
-            UsagePaceState.LegacyMissing => "Pace unavailable · legacy data",
+            UsagePaceState.LegacyMissing => "Pace unavailable · legacy data".Localized(),
             UsagePaceState.Unavailable => UnavailableStatusText(window.PaceStatus.Reason),
             _ => null,
         };
@@ -219,26 +237,30 @@ public sealed record UsagePace(
     private static string UnavailableStatusText(UsagePaceUnavailableReason? reason) =>
         reason switch
         {
-            null => "Pace unavailable · unavailable reason",
+            null => "Pace unavailable · unavailable reason".Localized(),
             UsagePaceUnavailableReason.WindowIdentity =>
-                "Pace unavailable · unknown quota window",
-            UsagePaceUnavailableReason.MissingReset => "Pace unavailable · missing reset",
+                "Pace unavailable · unknown quota window".Localized(),
+            UsagePaceUnavailableReason.MissingReset =>
+                "Pace unavailable · missing reset".Localized(),
             UsagePaceUnavailableReason.InvalidEvidence =>
-                "Pace unavailable · invalid quota data",
+                "Pace unavailable · invalid quota data".Localized(),
             UsagePaceUnavailableReason.AccountScope =>
-                "Pace unavailable · account identity unavailable",
+                "Pace unavailable · account identity unavailable".Localized(),
             UsagePaceUnavailableReason.StoreCapacity =>
-                "Pace unavailable · history storage full",
-            UsagePaceUnavailableReason.History => "Pace unavailable · history unavailable",
+                "Pace unavailable · history storage full".Localized(),
+            UsagePaceUnavailableReason.History =>
+                "Pace unavailable · history unavailable".Localized(),
             UsagePaceUnavailableReason.NonRecurring =>
-                "Pace unavailable · non-recurring quota",
-            _ => "Pace unavailable · unavailable reason",
+                "Pace unavailable · non-recurring quota".Localized(),
+            _ => "Pace unavailable · unavailable reason".Localized(),
         };
 
     private static string FormatAmount(double amount, bool asUsed)
     {
         var rounded = (int)Math.Round(amount, MidpointRounding.AwayFromZero);
-        return $"{rounded}% {(asUsed ? "used" : "left")}";
+        // Whole-sentence keys, not "{0}% " + a translated word: 剩餘/已用 lead
+        // in Chinese, so a fragment lookup would render "57% 剩餘".
+        return asUsed ? "{0}% used".Localized(rounded) : "{0}% left".Localized(rounded);
     }
 
     private static string? JoinText(params string?[] values)

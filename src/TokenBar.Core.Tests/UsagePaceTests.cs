@@ -518,4 +518,119 @@ public class UsagePaceTests
         Assert.Equal(0, clamped.FillPercent);
         Assert.Equal("0% left", clamped.AmountText);
     }
+
+    // ---- i18n ----------------------------------------------------------
+    //
+    // A pace card shows one status at a time, so no screenshot can prove the
+    // other eleven have table entries; only driving each branch can. These run
+    // against the *shipped* strings-zh-Hant.json (copied to the output by the
+    // csproj) rather than a fixture, because the failure being guarded against
+    // is a wrapped call site whose key was never added to that file — against a
+    // fixture written alongside the test, that failure is unreachable.
+
+    private static void InChinese(Action body)
+    {
+        Localization.Load("zh-Hant", AppContext.BaseDirectory);
+        try
+        {
+            body();
+        }
+        finally
+        {
+            Localization.Load("en", AppContext.BaseDirectory);
+        }
+    }
+
+    // Each surface is rendered twice — once with no table, once with the
+    // shipped one — and the two must differ. Comparing against the English
+    // *key* would not work: a missing entry for "{0}% in deficit" renders
+    // "30% in deficit", which is not equal to its key either, so the check
+    // would pass on exactly the bug it exists to catch.
+    [Fact]
+    public void EveryPaceStringHasAShippedTranslation()
+    {
+        var surfaces = new List<(string Name, Func<string> Render)>
+        {
+            ("On pace", () => UsagePace.Compute(Window(used: 50), Now)!.Label),
+            ("in deficit", () => UsagePace.Compute(Window(used: 80), Now)!.Label),
+            ("in reserve", () => UsagePace.Compute(Window(used: 40), Now)!.Label),
+            ("Lasts until reset", () => UsagePace.Compute(Window(used: 40), Now)!.EtaText!),
+            ("Projected empty in", () => UsagePace.Compute(Window(used: 80), Now)!.EtaText!),
+            // 0.01 points left at ~0.028 points/s → ETA under 30s, which
+            // DurationText rounds to the "now" token.
+            ("Projected empty now",
+                () => UsagePace.Compute(Window(used: 99.99, untilReset: 1), Now)!.EtaText!),
+            ("run-out risk", () => UsagePace.RunOutRiskLabel(Window(
+                used: 50,
+                state: UsagePaceState.Available,
+                historicalPace: new HistoricalPace(50, RunOutProbability: 0.3)))!),
+            ("duration.now", () => UsagePace.DurationText(20)),
+            ("m", () => UsagePace.DurationText(5 * 60)),
+            ("h", () => UsagePace.DurationText(2 * 3600)),
+            ("h m", () => UsagePace.DurationText(130 * 60)),
+            ("d", () => UsagePace.DurationText(48 * 3600)),
+            ("d h", () => UsagePace.DurationText(26 * 3600)),
+            ("% used", () => Amount(asUsed: true)),
+            ("% left", () => Amount(asUsed: false)),
+            ("Learning reset duration",
+                () => Status(Window(used: 50, state: UsagePaceState.LearningDuration))),
+            ("legacy data",
+                () => Status(Window(used: 50, state: UsagePaceState.LegacyMissing))),
+            ("Learning history",
+                () => Status(Window(used: 50, state: UsagePaceState.LearningHistory))),
+            ("Linear",
+                () => Status(
+                    Window(used: 50, state: UsagePaceState.LearningHistory), PaceMode.Linear)),
+        };
+
+        // null covers the defensive arm as well as an Unavailable window that
+        // arrived without a reason.
+        foreach (var reason in Enum.GetValues<UsagePaceUnavailableReason>()
+            .Select(r => (UsagePaceUnavailableReason?)r).Append(null))
+        {
+            var captured = reason;
+            surfaces.Add((
+                $"unavailable · {reason?.ToString() ?? "no reason"}",
+                () => Status(
+                    Window(used: 50, state: UsagePaceState.Unavailable, reason: captured))));
+        }
+
+        Localization.Load("en", AppContext.BaseDirectory);
+        var english = surfaces.Select(s => s.Render()).ToList();
+        InChinese(() =>
+        {
+            for (var i = 0; i < surfaces.Count; i++)
+            {
+                var chinese = surfaces[i].Render();
+                Assert.True(
+                    chinese != english[i],
+                    $"no zh-Hant entry for {surfaces[i].Name}: still renders "
+                        + $"\"{english[i]}\"");
+            }
+        });
+    }
+
+    // NotEqual proves a key resolved; it cannot prove the placeholder landed in
+    // the right place. Chinese leads with the qualifier where English trails it,
+    // so a fragment-wrapped call site would render "57% 剩餘" and still pass.
+    [Fact]
+    public void TranslatedPlaceholdersKeepChineseWordOrder() => InChinese(() =>
+    {
+        Assert.Equal("超前 30%", UsagePace.Compute(Window(used: 80), Now)!.Label);
+        Assert.Equal("保留 10%", UsagePace.Compute(Window(used: 40), Now)!.Label);
+        Assert.Equal("剩餘 88%", Amount(asUsed: false));
+        Assert.Equal("已用 13%", Amount(asUsed: true));
+        Assert.Equal("預計 8分 後用盡", UsagePace.Compute(Window(used: 80), Now)!.EtaText);
+        Assert.Equal("2小時10分", UsagePace.DurationText(130 * 60));
+    });
+
+    private static string Amount(bool asUsed) =>
+        UsagePace.RowPresentation(
+            Window(used: 12.5, state: UsagePaceState.Available,
+                historicalPace: new HistoricalPace(12.5)),
+            PaceMode.Historical, asUsed, classic: false, Now).AmountText;
+
+    private static string Status(UsageWindow window, PaceMode mode = PaceMode.Historical) =>
+        UsagePace.RowPresentation(window, mode, asUsed: false, classic: false, Now)
+            .PaceText!;
 }
