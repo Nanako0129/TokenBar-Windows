@@ -572,10 +572,46 @@ public sealed partial class DashboardView : UserControl
         var rasterScale = XamlRoot?.RasterizationScale ?? 1.0;
         var point = new Windows.Foundation.Point(
             windowPixelX / rasterScale, windowPixelY / rasterScale);
-        if (!TryZoomGraphAt(point, delta))
+        if (!TryZoomGraphAt(point, delta) && !TryScrollTabRowAt(point, delta))
         {
             ScrollBy(-delta);
         }
+    }
+
+    /// <summary>A vertical wheel over either tab row scrolls that row
+    /// horizontally (macOS HorizontalWheelScroll). Returns false when the row
+    /// is already at the end it is being pushed toward, so the wheel falls
+    /// through to the dashboard's vertical scroll instead of dying under the
+    /// cursor.</summary>
+    private bool TryScrollTabRowAt(Windows.Foundation.Point point, int delta)
+    {
+        foreach (var row in new[] { ClientTabsScroll, TabsScroll })
+        {
+            if (row is null || row.Visibility != Visibility.Visible)
+            {
+                continue;
+            }
+
+            var origin = row.TransformToVisual(this)
+                .TransformPoint(new Windows.Foundation.Point(0, 0));
+            if (point.X < origin.X || point.X > origin.X + row.ActualWidth
+                || point.Y < origin.Y || point.Y > origin.Y + row.ActualHeight)
+            {
+                continue;
+            }
+
+            var (offset, moved) = WheelScroll.Clamped(
+                row.HorizontalOffset, delta, row.ScrollableWidth);
+            if (!moved)
+            {
+                return false;
+            }
+
+            row.ChangeView(offset, null, null, disableAnimation: true);
+            return true;
+        }
+
+        return false;
     }
 
     private void OnWheel(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
@@ -589,9 +625,11 @@ public sealed partial class DashboardView : UserControl
         }
 
         var point = e.GetCurrentPoint(this);
-        if (!TryZoomGraphAt(point.Position, point.Properties.MouseWheelDelta))
+        var delta = point.Properties.MouseWheelDelta;
+        if (!TryZoomGraphAt(point.Position, delta)
+            && !TryScrollTabRowAt(point.Position, delta))
         {
-            ScrollBy(-point.Properties.MouseWheelDelta);
+            ScrollBy(-delta);
         }
 
         e.Handled = true;
