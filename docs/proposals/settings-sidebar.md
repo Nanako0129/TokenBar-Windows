@@ -234,7 +234,9 @@ S1 動工前必須先更新 checkout：本地 `main` 落後 `origin/main` 一週
 |---|---|
 | flyout 的水平捲軸（兩排分頁列）與垂直捲軸持續顯示，不淡出 | WinUI 的 `ScrollBarVisibility.Auto` 是「需要時顯示」，不是「滑過才顯示」。系統的 `DynamicScrollbars` 是預設值，所以不是協助工具設定造成 |
 
-> macOS 用 `OverlayScroller.swift` **強制 overlay 樣式**——靜止隱形、捲動時半透明藥丸、開啟時閃一下讓使用者知道可捲。它還得 KVO 監看 `scrollerStyle`，因為 AppKit 會在 layout 後約 0.6s 把 legacy 樣式套回來。Windows 這邊要達到同樣效果需要自訂 `ScrollBar` 樣式，尚未實作。
+> macOS 用 `OverlayScroller.swift` **強制 overlay 樣式**——靜止隱形、捲動時半透明藥丸、開啟時閃一下讓使用者知道可捲。它還得 KVO 監看 `scrollerStyle`，因為 AppKit 會在 layout 後約 0.6s 把 legacy 樣式套回來。
+>
+> **兩排分頁列的水平捲軸已改為 `Hidden`**（不是 `Disabled`——滾輪與拖曳仍可捲）。要做出 macOS 那種淡入淡出需要覆寫整個 `ControlTemplate`，這裡沒做。代價是失去「可捲」的視覺提示，macOS 靠「開啟時閃一下」補償，Windows 目前靠分頁列被截斷本身當提示。**內容區的垂直捲軸維持 `Auto`**，未一併處理。
 
 ### 快捷鍵與開啟中的 popup
 
