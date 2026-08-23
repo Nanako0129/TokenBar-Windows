@@ -73,6 +73,7 @@
         <!-- Client selection above the independent lens switch. -->
         <StackPanel Grid.Row="1" Spacing="6">
             <ScrollViewer
+                x:Name="ClientTabsScroll"
                 HorizontalScrollBarVisibility="Auto"
                 HorizontalScrollMode="Enabled"
                 VerticalScrollBarVisibility="Disabled"
@@ -88,6 +89,7 @@
                  clipped by the window edge and unclickable rather than
                  reachable. -->
             <ScrollViewer
+                x:Name="TabsScroll"
                 HorizontalScrollBarVisibility="Auto"
                 HorizontalScrollMode="Enabled"
                 VerticalScrollBarVisibility="Disabled"

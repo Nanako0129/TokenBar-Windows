@@ -228,6 +228,14 @@ S1 動工前必須先更新 checkout：本地 `main` 落後 `origin/main` 一週
 
 > **注意：** `SettingsWindow.ApplySize()` 上方那段既有註解（「Something in the show path renormalizes the size on a non-96-DPI monitor」）記的是同一族問題的另一個面向。`Activated += ApplySize` 是當時的補救，它處理得了首次顯示，處理不了「app 執行期間系統縮放改變」。
 
+### 捲軸不會自動隱藏
+
+| 行為 | 現況 |
+|---|---|
+| flyout 的水平捲軸（兩排分頁列）與垂直捲軸持續顯示，不淡出 | WinUI 的 `ScrollBarVisibility.Auto` 是「需要時顯示」，不是「滑過才顯示」。系統的 `DynamicScrollbars` 是預設值，所以不是協助工具設定造成 |
+
+> macOS 用 `OverlayScroller.swift` **強制 overlay 樣式**——靜止隱形、捲動時半透明藥丸、開啟時閃一下讓使用者知道可捲。它還得 KVO 監看 `scrollerStyle`，因為 AppKit 會在 layout 後約 0.6s 把 legacy 樣式套回來。Windows 這邊要達到同樣效果需要自訂 `ScrollBar` 樣式，尚未實作。
+
 ### 快捷鍵與開啟中的 popup
 
 | 行為 | 現況 | 判定 |
