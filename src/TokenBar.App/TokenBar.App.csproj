@@ -19,11 +19,30 @@
     <AssemblyName>$(TbProductName).App</AssemblyName>
     <RootNamespace>TokenBar.App</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <!-- The Syrtis brandmark: gold sediment disc, no star, centred. Full-bleed
-         square on purpose — the macOS .icns bakes in a squircle and its inset,
-         and Windows applies no mask of its own, so copying that would render
-         as a rounded tile floating in the taskbar rather than as the app's own
-         shape. Generated from Assets\syrtis-brandmark.pdf, kept beside it. -->
+    <!-- The Syrtis brandmark: gold sediment disc, no star, deliberately
+         squashed to 0.98 vertical. Full-bleed square on purpose — the macOS
+         .icns bakes in a squircle and its inset, and Windows applies no mask
+         of its own, so copying that would render as a rounded tile floating in
+         the taskbar rather than as the app's own shape.
+
+         Regenerate from Assets\syrtis-disc.svg with ImageMagick. Two steps,
+         not one pipeline: routing through the intermediate PNG is what makes
+         the result reproducible, and a single chained command produces a
+         different file.
+
+           magick -background none -density 600 Assets\syrtis-disc.svg \
+             -resize 3066x3066 disc.png
+           magick disc.png -background none -resize 920x920 \
+             -gravity center -extent 1024x1024 \
+             -define icon:auto-resize=256,128,96,64,48,40,32,24,20,16 \
+             Assets\syrtis.ico
+
+         The 920-inside-1024 inset is load-bearing. The SVG carries only ~3%
+         horizontal and ~3.9% vertical margin (the canvas is square while the
+         disc is squashed), and at that scale its bounding box IS the canvas below
+         64px: antialiasing has nowhere to finish and any container that scales
+         or rounds the icon cuts into the shape. Omitting it reproduces the
+         flush-to-edge icon this was changed away from. -->
     <ApplicationIcon>Assets\syrtis.ico</ApplicationIcon>
     <!-- Phase 11: Program.cs replaces the generated entry point so Velopack's
          install/update/uninstall hooks run before any WinUI initialisation.
