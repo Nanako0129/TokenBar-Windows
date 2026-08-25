@@ -18,9 +18,13 @@ public class FormatTests
     [InlineData(1_000, "1K")]
     [InlineData(12_345, "12.3K")]
     [InlineData(100_000, "100K")]
-    [InlineData(999_950, "1000K")] // matches Swift: <1M stays in the K band
+    [InlineData(999_499, "999K")] // last value the K band keeps
+    [InlineData(999_500, "1M")] // F0 would carry 999.5 to "1000K", so the unit is promoted
+    [InlineData(999_950, "1M")] // matches Swift
     [InlineData(1_234_567, "1.2M")]
     [InlineData(1_250_000, "1.2M")] // exact binary half → round-half-even, like printf
+    [InlineData(999_499_999, "999M")] // last value the M band keeps
+    [InlineData(999_500_000, "1B")] // same carry, one tier up
     [InlineData(1_000_000_000, "1B")]
     [InlineData(1_500_000_000, "1.5B")]
     public void CompactTokensMatchesSwift(long count, string expected) =>

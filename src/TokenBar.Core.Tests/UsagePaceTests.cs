@@ -93,7 +93,7 @@ public class UsagePaceTests
         Assert.Equal(PaceStage.Behind, pace.Stage);
         Assert.Equal("10% in reserve", pace.Label);
         Assert.True(pace.WillLastToReset);
-        Assert.Equal("Lasts until reset", pace.EtaText);
+        Assert.Equal("On average: lasts until reset", pace.EtaText);
     }
 
     [Fact]
@@ -205,7 +205,7 @@ public class UsagePaceTests
         var pace = UsagePace.Compute(window, PaceMode.Historical, Now);
         Assert.NotNull(pace);
         Assert.False(pace.IsHistoricalDeficit);
-        Assert.Equal("Lasts until reset", pace.EtaText);
+        Assert.Equal("Historically: lasts until reset", pace.EtaText);
 
         var presentation = UsagePace.Presentation(window, PaceMode.Historical, pace);
         Assert.Null(presentation.EtaText);
@@ -418,7 +418,7 @@ public class UsagePaceTests
             Now);
 
         Assert.Equal("Linear · On pace", row.PaceText);
-        Assert.Equal("Lasts until reset", row.ProjectionText);
+        Assert.Equal("On average: lasts until reset", row.ProjectionText);
         Assert.DoesNotContain("risk", row.ProjectionText ?? "");
     }
 
@@ -560,7 +560,20 @@ public class UsagePaceTests
             ("On pace", () => UsagePace.Compute(Window(used: 50), Now)!.Label),
             ("in deficit", () => UsagePace.Compute(Window(used: 80), Now)!.Label),
             ("in reserve", () => UsagePace.Compute(Window(used: 40), Now)!.Label),
-            ("Lasts until reset", () => UsagePace.Compute(Window(used: 40), Now)!.EtaText!),
+            ("On average: lasts until reset",
+                () => UsagePace.Compute(Window(used: 40), Now)!.EtaText!),
+            ("Historically: lasts until reset",
+                () => UsagePace.Compute(
+                    Window(
+                        used: 50,
+                        state: UsagePaceState.Available,
+                        historicalPace: new HistoricalPace(
+                            ExpectedUsedPercent: 80,
+                            EtaSeconds: null,
+                            WillLastToReset: true,
+                            RunOutProbability: 0.2)),
+                    PaceMode.Historical,
+                    Now)!.EtaText!),
             ("Projected empty in", () => UsagePace.Compute(Window(used: 80), Now)!.EtaText!),
             // 0.01 points left at ~0.028 points/s → ETA under 30s, which
             // DurationText rounds to the "now" token.

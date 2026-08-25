@@ -14,10 +14,28 @@ diagnostic only because serializer formatting and line endings differ by host.
 |---|---|
 | Legacy `usage-pace.json` and `format.json` | macOS commit `2ed256ee` |
 | Provider quota pace v3 | CORE-X1N Native consumer baseline `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea` |
+| Swift oracle actually run | macOS `63084b2addad85a90763a6ef7226763dfda90640` (the `ref:` in `crosscheck-swift`) |
 
-Run the Swift side from a clean recursive clone or worktree at the exact tested
-provider-v3 merged SHA, with its submodules initialized. Do not use an
-unrelated dirty macOS checkout as the reference.
+The first two rows are where each fixture was authored. The third is the macOS
+commit whose shipping Swift produces the expected outputs, and it advances
+whenever a cross-checked behavior is corrected on the authoritative side: this
+port is a per-file port of `Sources/TokenBarCore`, so a Swift correction makes
+the C# wrong until it follows. Pinning the oracle at the authoring baseline
+instead would freeze the gate against a macOS that no longer exists and hide
+every later divergence.
+
+Run the Swift side from a clean recursive clone or worktree at that oracle SHA,
+with its submodules initialized. Do not use an unrelated dirty macOS checkout as
+the reference.
+
+`format.json` no longer matches `2ed256ee` byte for byte: two case *names* were
+corrected when the `compactTokens` tier promotion landed (macOS
+[TokenBar#244](https://github.com/Nanako0129/TokenBar/pull/244)). The inputs and
+the case count are unchanged — `compact-999999-thousandK` and
+`compact-999999999-thousandM` were named after a string neither port produces
+any more, and are now `compact-999999-promotes-to-1M` and
+`compact-999999999-promotes-to-1B`. The fingerprint row below is the
+post-rename value.
 
 Canonical fixture fingerprints:
 
@@ -25,9 +43,14 @@ Canonical fixture fingerprints:
 |---|---:|---|
 | `fixtures/provider-quota-pace-v3.json` | 7,625 | `412f6ffd05f23f00266820c243376f265d29024d9e419217e55f8e1559b36c50` |
 | `fixtures/usage-pace.json` | 13,532 | `9a83616ea5053b2073dcfbcfb975c923d8597c0c41ddd5877ac0ddd8a9b7806c` |
-| `fixtures/format.json` | 7,573 | `eff7638ba5c1826ae2dff3a24055f907d718b15eba801db30b3066db1efb9d6d` |
+| `fixtures/format.json` | 7,583 | `6f67a77af7ba85c451a07a2099a5334bb292ca5b1c1d842e9990fa16cd1d6eb3` |
 
-Observed provider-v3 output fingerprints at the reconciliation gate:
+Observed provider-v3 output fingerprints at the CORE-X1N reconciliation gate,
+recorded against the `704426e8` oracle. They are a dated record of that run,
+not a current expectation: the oracle has since advanced and `etaText` now
+names its basis, so all three differ today. Acceptance is the `diff.py` verdict
+either way — these hashes were always diagnostic, since serializer formatting
+and line endings differ by host.
 
 | Runner | SHA-256 |
 |---|---|
@@ -167,8 +190,8 @@ projection differences.
 ## Running
 
 Set `TOKENBAR_MAC_CANONICAL` to a clean recursive clone or worktree at the
-CORE-X1N Native baseline
-`704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea`. A Git archive is insufficient
+Swift oracle SHA
+`63084b2addad85a90763a6ef7226763dfda90640`. A Git archive is insufficient
 because it does not contain submodule contents.
 
 `Package.swift` links `target/release/libtb_core_ffi.a` by a path relative to
@@ -178,7 +201,7 @@ unrelated checkout's `target/` artifact.
 
 ```bash
 export TOKENBAR_WINDOWS="$(pwd)"
-export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-704426e8"
+export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-63084b2a"
 
 (
   cd "$TOKENBAR_MAC_CANONICAL"

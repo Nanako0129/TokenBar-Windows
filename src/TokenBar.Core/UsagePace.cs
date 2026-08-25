@@ -79,15 +79,28 @@ public sealed record UsagePace(
         }
     }
 
-    /// <summary>Right-hand projection: "Lasts until reset" /
-    /// "Projected empty in 2h 10m".</summary>
+    /// <summary>Right-hand projection: "Historically: lasts until reset" /
+    /// "On average: lasts until reset" / "Projected empty in 2h 10m".
+    ///
+    /// The lasts-until-reset phrasing names its basis, because it is the one
+    /// variant that can contradict the recent-trend indicator beside it. That
+    /// indicator extrapolates the last few samples and can say the window runs
+    /// out while this one, reading a whole-window average or a historical
+    /// profile, says it lasts — both true about different spans, and read as a
+    /// self-contradiction when each is stated bare. The other variants agree
+    /// with the indicator whenever it is showing, so they are left alone.
+    ///
+    /// Linear reaches this too, so the label follows Basis rather than
+    /// assuming the historical one.</summary>
     public string? EtaText
     {
         get
         {
             if (WillLastToReset)
             {
-                return "Lasts until reset".Localized();
+                return Basis == UsagePaceBasis.Historical
+                    ? "Historically: lasts until reset".Localized()
+                    : "On average: lasts until reset".Localized();
             }
 
             if (EtaSeconds is not { } eta)
