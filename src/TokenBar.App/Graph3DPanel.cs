@@ -568,7 +568,7 @@ internal sealed class Graph3DPanel : SwapChainPanel
         var panel = new StackPanel { Spacing = 4, MinWidth = 150 };
         panel.Children.Add(TooltipText(Format.MonthDay(cell.Date), 12, bold: true));
         panel.Children.Add(TooltipText(
-            $"{Format.ExactTokens(cell.Tokens)} tokens", 11, 0.9));
+            "{0} tokens".Localized(Format.ExactTokens(cell.Tokens)), 11, 0.9));
         panel.Children.Add(TooltipText(
             CostSurfaceProjection.CostText(cell.Cost, _costAuthoritative), 11, 0.9));
         return panel;

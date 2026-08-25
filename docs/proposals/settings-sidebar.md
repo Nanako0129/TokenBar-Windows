@@ -141,13 +141,23 @@ macOS 的預覽欄**不隨分頁變化**，永遠顯示同樣三塊。Windows �
 | **S1** | `NavigationView` 骨架、四個分頁、十個現有分節歸位、視窗放寬至 900×640、重建保留選中分頁、`PaneFooter` 兩個連結 | — | 見 [S1 驗收](#s1-驗收) |
 | **S2** | 預覽欄補 Live session card 與淺色 menu bar mock | S1 | 預覽欄三塊齊備，與 macOS 截圖同構 |
 | **S3** | Dashboard / View tabs 分節（`tokenbar.views.hidden`） | S1 | 隱藏的 lens 不出現在 flyout 分頁列 |
-| **S4** | General / Language 分節 + i18n 基礎建設 | S1 | 全 UI 字串可切換語言 |
+| **S4** | General / Language 分節 + i18n 基礎建設 | S1 | 全 UI 字串可切換語言 |  ✅ |
 | **S5** | General / Discord 分節 + Rich Presence | S1 | Discord 狀態列顯示用量 |
 | **S6** | Usage attribution 分頁 + 歸因邏輯 | S1 | 側邊欄出現第五頁 |
 | **S7** | Monthly lens 移植（macOS `MonthlyView.swift`，275 行） | — | flyout 分頁列出現 Monthly，且可在 View tabs 中隱藏 |  ✅ |
 | **S8** | flyout OEM 快捷鍵修正 | — | `Ctrl+[`、`Ctrl+]`、`Ctrl+,` 實際可觸發 |
 
 S4 排在 S5 之前，因為 i18n 會碰到每一個字串；先做 Discord 等於保證之後要再改一次 Discord 的所有文案。
+
+> **S4 實際切成六片**（表格保留一列，因為相依與驗收沒變）：S4a i18n 機制（`Localization`／`AppLanguage`／`strings-zh-Hant.json`），S4b 設定視窗 83 條，S4c-1 `UsagePace`＋`CostSurfaceProjection` 37 條，S4c-2a `Format`＋抽出下鑽摘要 22 條，S4c-2b `DashboardView`＋`Ui.cs` 49 條，S4c-3 `TrayService` 等 11 條。出貨的表共 202 條。
+>
+> **key 的形狀不能跨平台共用**：macOS 用 `%lld`／`%@`，C# 用 `{0}`。譯文內容照抄 macOS，避免同一個產品兩套詞彙；沒有 macOS 對應的 Windows 專屬畫面以同樣語域書寫。
+>
+> **刻意不翻的三類**：`ClientRegistry` 的用戶端名稱（品牌名）、`Ui.TokenKinds` 的圖例縮寫 `In`／`Out`／`CR`／`CW`／`R`（要塞進 chip，中文沒有可讀的兩字縮寫；同樣五個概念在模型卡與 tooltip 是完整詞且有翻）、`UpdateFlow` 全部 18 條 exception message（被 `LogUpdateFailure` 寫進 DevLog，到不了使用者；翻了會讓 log 搜不到）。
+
+> **S4c-3 discovery 的發現（wire text）：** `UsageWindow.Label` 與 `UsageWindow.ResetText` 是引擎產生的英文字串，Windows 直接渲染（`DashboardView.xaml.cs:1901,1928`、`TrayService.cs:303,363`），因此翻不動——設定預覽欄的 mock（`Label: "Session"`、`ResetText: "Resets in 1h 35m"`）也就必須維持英文，否則預覽會與真實 flyout 不符。
+>
+> macOS 不是這樣做的。`AgentLimitsCard.swift:469-474` 註明 `resetText` 是「a compatibility field produced in English by Rust」，並優先採用 `UsagePace.resetText(for:)` 從結構化時間戳本地算出的在地化倒數，wire text 只是時間戳缺失時的退路。**Windows 從未移植 `UsagePace.resetText`。** 這是移植缺口而非 i18n 問題，修好可同時解決在地化與跨平台一致性；另立切片，不併入 S4。
 
 > **S3 discovery 的發現（快捷鍵）：** 兩個既有問題，都不是 S3 引入。其一，macOS 的 ⌘1-9 與 ⌘[ ⌘] 操作的是 **client tabs**（`PopoverView.swift:693-702`，`clientTab.wrappedValue = tabs[...]`），Windows 卻綁到 **lenses**——綁錯了那一排。其二，`Ctrl+[` / `Ctrl+]` 實測無反應：`AddAccel` 機制本身正常（`Ctrl+1..6` 用同一條路徑且有效），差別在 `VirtualKey.Number1` 是具名成員，而 `(VirtualKey)0xDB` / `0xDD`（`VK_OEM_4` / `VK_OEM_6`）是硬轉型的未定義值、且佈局相依；macOS 用 `charactersIgnoringModifiers` 比對字元，與佈局無關。故登記為 S8 而非併入 S3。
 

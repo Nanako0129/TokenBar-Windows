@@ -148,7 +148,7 @@ public sealed class TrayService : IDisposable
             {
                 _icon.ShowNotification(
                     title: ProductIdentity.Name,
-                    message: $"Update to v{version}",
+                    message: "Update to v{0}".Localized(version),
                     icon: NotificationIcon.Info,
                     sound: false,
                     respectQuietTime: true);
@@ -236,21 +236,21 @@ public sealed class TrayService : IDisposable
         var menu = new Microsoft.UI.Xaml.Controls.MenuFlyout();
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
         {
-            Text = $"Open {ProductIdentity.Name}",
+            Text = "Open {0}".Localized(ProductIdentity.Name),
             Command = new RelayCommand(_flyout.ShowFlyout),
         });
         if (_pendingUpdate.Peek() is { } updateVersion)
         {
             menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
             {
-                Text = $"Update to v{updateVersion}",
+                Text = "Update to v{0}".Localized(updateVersion),
                 Command = new RelayCommand(InvokePendingUpdate),
             });
         }
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
 
         // Menu bar shows — the seven TrayModes as a radio group.
-        var modes = new Microsoft.UI.Xaml.Controls.MenuFlyoutSubItem { Text = "Menu bar shows" };
+        var modes = new Microsoft.UI.Xaml.Controls.MenuFlyoutSubItem { Text = "Menu bar shows".Localized() };
         var current = TrayModes.Parse(AppSettings.Store.GetString(TrayModes.StorageKey));
         foreach (var mode in TrayModes.All)
         {
@@ -268,18 +268,20 @@ public sealed class TrayService : IDisposable
 
         // Quota source — macOS showQuotaMenu: Auto plus every error-free
         // agent's windows with live remaining percentages.
-        var source = new Microsoft.UI.Xaml.Controls.MenuFlyoutSubItem { Text = "Quota source" };
+        var source = new Microsoft.UI.Xaml.Controls.MenuFlyoutSubItem { Text = "Quota source".Localized() };
         var persistedSelection = AppSettings.Store.GetString(
             "tokenbar.quota.source", QuotaResolver.Auto) ?? QuotaResolver.Auto;
         var payload = _feed.Quota;
         var selection = QuotaSelectionPolicy.EffectiveSelection(
             payload, persistedSelection);
-        AddQuotaChoice(source, "Auto (tightest window)", QuotaResolver.Auto, selection);
+        AddQuotaChoice(
+            source, "Auto (tightest window)".Localized(),
+            QuotaResolver.Auto, selection);
         if (payload is null)
         {
             source.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
             {
-                Text = "Loading quotas…",
+                Text = "Loading quotas…".Localized(),
                 IsEnabled = false,
             });
         }
@@ -300,7 +302,7 @@ public sealed class TrayService : IDisposable
                         Math.Clamp(window.RemainingPercent, 0, 100),
                         MidpointRounding.AwayFromZero);
                     AddQuotaChoice(
-                        source, $"{window.Label} — {left}% left",
+                        source, "{0} — {1}% left".Localized(window.Label, left),
                         QuotaResolver.Selection(agent.ClientId, window.CardId), selection);
                 }
             }
@@ -310,12 +312,12 @@ public sealed class TrayService : IDisposable
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
         {
-            Text = "Settings",
+            Text = "Settings".Localized(),
             Command = new RelayCommand(ShowSettings),
         });
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
         {
-            Text = "Quit",
+            Text = "Quit".Localized(),
             Command = new RelayCommand(() => QuitApp?.Invoke()),
         });
         _icon.ContextFlyout = menu;
@@ -342,15 +344,17 @@ public sealed class TrayService : IDisposable
     {
         if (_feed.VisibleTotals is not { } totals)
         {
-            return $"{ProductIdentity.Name} — loading…";
+            return "{0} — loading…".Localized(ProductIdentity.Name);
         }
 
         var lines = new List<string>
         {
             ProductIdentity.Name,
-            $"Today {Format.CompactTokens(totals.TodayTokens)} · "
+            "Today {0}".Localized(Format.CompactTokens(totals.TodayTokens))
+                + " · "
                 + CostSurfaceProjection.CostText(totals.TodayCost, _feed.CostAuthoritative),
-            $"All time {Format.CompactTokens(totals.TotalTokens)} · "
+            "All time {0}".Localized(Format.CompactTokens(totals.TotalTokens))
+                + " · "
                 + CostSurfaceProjection.CostText(totals.TotalCost, _feed.CostAuthoritative),
         };
         var persistedSelection = AppSettings.Store.GetString(
@@ -360,7 +364,10 @@ public sealed class TrayService : IDisposable
             is { } pick)
         {
             var left = Math.Clamp(pick.Window.RemainingPercent, 0, 100);
-            lines.Add($"{ClientRegistry.ShortName(pick.ClientId)} {pick.Window.Label} {left:F0}% left");
+            lines.Add("{0} {1} {2}% left".Localized(
+                ClientRegistry.ShortName(pick.ClientId),
+                pick.Window.Label,
+                left.ToString("F0", System.Globalization.CultureInfo.CurrentCulture)));
         }
 
         return string.Join("\n", lines);

@@ -103,7 +103,7 @@ public sealed class SettingsWindow : Window
         _quota = quota;
         _graph = graph;
         _trace = trace;
-        Title = $"{ProductIdentity.Name} Settings";
+        Title = "{0} Settings".Localized(ProductIdentity.Name);
         SystemBackdrop = new MicaBackdrop();
         var root = new Grid();
         root.ColumnDefinitions.Add(new ColumnDefinition
