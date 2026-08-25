@@ -15,8 +15,15 @@ public static class Format
         var value = (double)count;
         double scaled;
         string suffix;
-        if (value >= 1_000_000_000) { (scaled, suffix) = (value / 1_000_000_000, "B"); }
-        else if (value >= 1_000_000) { (scaled, suffix) = (value / 1_000_000, "M"); }
+        // Tier boundaries sit at the ROUNDING boundary, not at the unit: the
+        // >= 100 arm below prints F0, so 999_500_000 scales to 999.5 and
+        // carries to "1000M" — a mantissa that has left its own tier. Promoting
+        // at 999_500 / 999_500_000 renders those bands as "1M" / "1B" instead.
+        // Every value outside the two half-unit bands picks the same tier it
+        // always did. (The top of the B tier has nowhere to promote to, so
+        // 999.5B still prints "1000B".)
+        if (value >= 999_500_000) { (scaled, suffix) = (value / 1_000_000_000, "B"); }
+        else if (value >= 999_500) { (scaled, suffix) = (value / 1_000_000, "M"); }
         else if (value >= 1_000) { (scaled, suffix) = (value / 1_000, "K"); }
         else { return count.ToString(CultureInfo.InvariantCulture); }
 
