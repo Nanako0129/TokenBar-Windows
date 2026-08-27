@@ -63,6 +63,19 @@ public class ClientRegistryTests : IDisposable
         Assert.Equal(ids.OrderBy(x => x, StringComparer.Ordinal), ids);
     }
 
+    // Both carry the same grey the unregistered fallback uses, so Style()
+    // alone cannot tell a registered "junie" from an unregistered one. The
+    // display name can: the fallback only upper-cases the first letter, so an
+    // unregistered "opencodereview" would render "Opencodereview".
+    [Theory]
+    [InlineData("junie", "Junie")]
+    [InlineData("opencodereview", "OpenCodeReview")]
+    public void NewClientsAreRegisteredWithTheirOwnCasing(string id, string expected)
+    {
+        Assert.Contains(id, ClientRegistry.AllIds);
+        Assert.Equal(expected, ClientRegistry.Style(id).DisplayName);
+    }
+
     [Theory]
     [InlineData("claude-code", "claude")]
     [InlineData("codex-cli", "codex")]

@@ -27,6 +27,13 @@ public static class ClientRegistry
         ["hermes"] = ("Hermes", "#a78bfa"),
         ["pi"] = ("Pi", "#f472b6"),
         ["kimi"] = ("Kimi CLI", "#fbbf24"),
+        // Both take the same neutral grey the unregistered fallback uses, so
+        // "junie" already rendered correctly by accident. Registering them is
+        // still not a no-op: AllIds is the canonical universe demo fixtures
+        // draw from, and RegisteredNames guards ShortName from collapsing one
+        // client's name onto another's.
+        ["junie"] = ("Junie", "#6b7280"),
+        ["opencodereview"] = ("OpenCodeReview", "#6b7280"),
         ["qwen"] = ("Qwen CLI", "#7c3aed"),
         ["roocode"] = ("Roo Code", "#ef4444"),
         ["kilocode"] = ("KiloCode", "#f97316"),
