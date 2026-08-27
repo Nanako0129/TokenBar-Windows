@@ -986,6 +986,10 @@ public class UpdateFlowTests : IDisposable
                     target.SHA1,
                     target.SHA256,
                     target.Size,
+                    // Notes ride the feed, before any download. Without this
+                    // the fixture could not reach BoundNotes at all, which is
+                    // why that path had no test.
+                    target.NotesMarkdown,
                 },
             },
         });
@@ -1077,5 +1081,62 @@ public class UpdateFlowTests : IDisposable
         {
             Localization.Load("en", AppContext.BaseDirectory);
         }
+    }
+
+    // ---- release notes bounding -------------------------------------------
+    //
+    // Notes arrive with the feed *before* any download, so ValidateTarget and
+    // ValidateNuspec — which protect the package — never see them. BoundNotes
+    // is the only thing between the feed and the dialog, and a violation must
+    // drop the notes while keeping the update: failing the candidate instead
+    // would make an oversized notes field a lever for denying updates.
+    //
+    // This path had no test at all until the outcome verifier said so, even
+    // though UpdateFlow.cs is already in the test project's compile set.
+
+    [Fact]
+    public async Task OversizedNotesAreDroppedAndTheUpdateSurvives()
+    {
+        var fixture = CreateFixture(mutateTarget: target =>
+            target.NotesMarkdown = new string('x', ReleaseNotesMarkdown.MaxInputChars + 1));
+
+        var candidate = await fixture.Flow.CheckForUpdatesAsync();
+
+        Assert.NotNull(candidate);
+        Assert.Null(candidate!.Notes);
+    }
+
+    [Fact]
+    public async Task NotesWithinTheBoundReachTheCandidate()
+    {
+        const string notes = "## Fixed\n\n- A thing that was broken.";
+        var fixture = CreateFixture(mutateTarget: target => target.NotesMarkdown = notes);
+
+        var candidate = await fixture.Flow.CheckForUpdatesAsync();
+
+        Assert.NotNull(candidate);
+        Assert.Equal(notes, candidate!.Notes);
+    }
+
+    // The packaging script embeds release notes in the nuspec and asserts the
+    // result fits what this client accepts. That limit is stated in two places
+    // in two languages; a silent divergence would ship packages every client
+    // rejects, and packaging would still succeed. Same shape as
+    // PackageIdMatchesPackagingScript.
+    [Fact]
+    public void NuspecMaxBytesMatchesPackagingScript()
+    {
+        var script = File.ReadAllText(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "package-velopack.ps1"));
+
+        // Both constants, because ValidateNuspec's condition is three checks and
+        // the script must mirror all of them: a first pass implemented only the
+        // size check, and notes that compress well pass that while failing the
+        // ratio the client applies independently.
+        Assert.Contains("$maxNuspecBytes = 65536", script, StringComparison.Ordinal);
+        Assert.Contains("$maxCompressionRatio = 100", script, StringComparison.Ordinal);
+        Assert.Contains("entryCompressed", script, StringComparison.Ordinal);
+        Assert.Equal(65_536, UpdateFlow.MaxNuspecBytes);
+        Assert.Equal(100L, UpdateFlow.MaxCompressionRatio);
     }
 }

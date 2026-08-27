@@ -287,6 +287,24 @@ if ($DeploymentMode -eq "Lite") {
 $releasesRoot = Join-Path $outputRootResolved "releases"
 New-Item -ItemType Directory -Path $releasesRoot -Force | Out-Null
 
+# Release notes are baked into the nuspec at pack time and cannot be
+# backfilled, so a version with no notes file packs exactly as it did before
+# this existed -- "no notes" is a first-class state, not an error path, and
+# every version published so far is in it.
+#
+# The path is derived here rather than passed in. This script is invoked with
+# the same three arguments by ci.yml on every push and by release.yml on a tag,
+# and neither passes a tag; deriving from $packProperties.SemanticVersion, which
+# this script already computes, is what keeps the two workflows from drifting.
+$releaseNotesPath = Join-Path $repoRoot (".github\release-notes\v{0}.md" -f $packProperties.SemanticVersion)
+$hasReleaseNotes = Test-Path -LiteralPath $releaseNotesPath -PathType Leaf
+if ($hasReleaseNotes) {
+    Write-Output "Release notes found: $releaseNotesPath"
+}
+else {
+    Write-Output "No release notes file for $($packProperties.SemanticVersion); packing without --releaseNotes."
+}
+
 Push-Location $repoRoot
 try {
     Invoke-Captured -Command "dotnet" -Arguments @(
@@ -307,6 +325,9 @@ try {
     if ($DeploymentMode -eq "Lite") {
         $vpkArgs += @("--framework", $frameworkSpec)
     }
+    if ($hasReleaseNotes) {
+        $vpkArgs += @("--releaseNotes", $releaseNotesPath)
+    }
 
     Invoke-Captured -Command "dotnet" -Arguments $vpkArgs -FailureMessage "Velopack pack failed"
 }
@@ -321,6 +342,96 @@ Assert-VelopackPackage -PackagePath $packagePath -PackId $packId `
     -SemanticVersion $packProperties.SemanticVersion -MainExe $appExecutableName `
     -MachineArchitecture $machineArchitecture -Channel $channel `
     -DeploymentMode $DeploymentMode -ExpectedRuntimeDependency $frameworkSpec
+
+# Stated conditionally, beside the pack-id/version/mainExe/architecture/channel
+# assertions above: IF a notes file was found for this version, the produced
+# feed must carry non-empty notes for it. The client reads
+# releases.{channel}.json from the release assets -- NOT the GitHub release
+# body, which release.yml feeds to `gh release --notes-file` and which
+# Velopack's GithubSource never reads -- so this is the only place the dialog's
+# changelog can come from. Red the moment --releaseNotes stops reaching vpk
+# pack, on every PR rather than only at tag time.
+if ($hasReleaseNotes) {
+    $feedPath = Join-Path $releasesRoot ("releases.{0}.json" -f $channel)
+    if (-not (Test-Path -LiteralPath $feedPath -PathType Leaf)) {
+        throw "Velopack release feed is missing: $feedPath"
+    }
+
+    $feed = Get-Content -LiteralPath $feedPath -Raw | ConvertFrom-Json
+    $feedAssets = @($feed.Assets | Where-Object {
+            $_.Version -ceq $packProperties.SemanticVersion -and $_.Type -ceq "Full"
+        })
+    if ($feedAssets.Count -ne 1) {
+        throw "Expected exactly one Full asset for $($packProperties.SemanticVersion) in $feedPath, found $($feedAssets.Count)."
+    }
+
+    $feedNotes = $feedAssets[0].NotesMarkdown
+    if ([string]::IsNullOrWhiteSpace($feedNotes)) {
+        throw "Release notes were supplied from '$releaseNotesPath' but '$feedPath' carries no notesMarkdown for $($packProperties.SemanticVersion)."
+    }
+
+    Write-Output ("Release feed notes verified: {0} characters in {1}" -f $feedNotes.Length, (Split-Path -Leaf $feedPath))
+
+    # vpk embeds the notes in the package's nuspec, and every client rejects a
+    # nuspec larger than UpdateFlow.MaxNuspecBytes (UpdateFlow.cs:307-311).
+    # Those two limits are both 65,536 and they are NOT the same limit: the
+    # parser's is characters of notes, the client's is bytes of the whole
+    # nuspec including XML escaping. A release body approaching the first
+    # therefore produces packages no client will install -- and packaging would
+    # still succeed, so the failure would appear only on users' machines, as an
+    # update that downloads and then silently does nothing.
+    #
+    # Assert the real constraint rather than guessing a margin for the notes.
+    # NuspecMaxBytesMatchesUpdateFlow pins this constant against the C# one.
+    $maxNuspecBytes = 65536
+    $maxCompressionRatio = 100
+    $nupkg = @(Get-ChildItem -LiteralPath $releasesRoot -File -Filter "*-full.nupkg")
+    if ($nupkg.Count -ne 1) {
+        throw "Expected exactly one full nupkg in $releasesRoot, found $($nupkg.Count)."
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg[0].FullName)
+    try {
+        $nuspec = @($zip.Entries | Where-Object { $_.FullName -like "*.nuspec" })
+        if ($nuspec.Count -ne 1) {
+            throw "Expected exactly one nuspec in $($nupkg[0].Name), found $($nuspec.Count)."
+        }
+
+        # Mirror ValidateNuspec's condition WHOLE. It is three checks, not one:
+        # uncompressed size, compressed size, and a compression ratio. A first
+        # pass here implemented only the size check, and highly compressible
+        # notes -- repeated or generated text -- pass that while blowing the
+        # ratio, so packaging succeeded and every client discarded the download.
+        # Roughly 60 KB of repeated text compresses to under 600 bytes.
+        $entryLength = $nuspec[0].Length
+        $entryCompressed = $nuspec[0].CompressedLength
+        $reason = $null
+        if ($entryLength -lt 1 -or $entryLength -gt $maxNuspecBytes) {
+            $reason = "uncompressed size $entryLength is outside 1..$maxNuspecBytes"
+        }
+        elseif ($entryCompressed -lt 1 -or $entryCompressed -gt $maxNuspecBytes) {
+            $reason = "compressed size $entryCompressed is outside 1..$maxNuspecBytes"
+        }
+        elseif ($entryLength -gt $entryCompressed * $maxCompressionRatio) {
+            $reason = ("compression ratio {0:N1} exceeds $maxCompressionRatio " -f
+                ($entryLength / $entryCompressed))
+        }
+
+        if ($null -ne $reason) {
+            throw ("The packaged nuspec is one the client rejects: $reason. " +
+                "The release notes are embedded in it, so shorten or vary " +
+                "'$releaseNotesPath'. Every client would download this package " +
+                "and then discard it.")
+        }
+
+        Write-Output ("Nuspec verified: {0} bytes, {1} compressed, ratio {2:N1} of {3}" -f
+            $entryLength, $entryCompressed, ($entryLength / $entryCompressed), $maxCompressionRatio)
+    }
+    finally {
+        $zip.Dispose()
+    }
+}
 
 $releaseFiles = @(Get-ChildItem -LiteralPath $releasesRoot -File | Sort-Object Name)
 Write-Output "Phase 11 Velopack package verified: $packageName"

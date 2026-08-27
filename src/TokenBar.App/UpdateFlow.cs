@@ -66,8 +66,14 @@ internal class UpdateFlow
     /// $(TbProductName): a future product rename must not move it by
     /// accident. PackageIdMatchesPackagingScript pins the two together.</summary>
     internal const string PackageId = "Nyanako.Syrtis";
-    private const int MaxNuspecBytes = 65_536;
-    private const long MaxCompressionRatio = 100;
+    /// <summary>Internal rather than private so NuspecMaxBytesMatchesPackagingScript
+    /// can pin it against the packaging script, which embeds release notes into
+    /// the nuspec and must not produce one this rejects.</summary>
+    internal const int MaxNuspecBytes = 65_536;
+    /// <summary>Internal for the same reason as <see cref="MaxNuspecBytes"/>:
+    /// the packaging script mirrors ValidateNuspec's whole condition, and a
+    /// test pins both constants against it.</summary>
+    internal const long MaxCompressionRatio = 100;
 
     /// <summary>
     /// Exact Velopack channels accepted for installed products. Full and Lite
@@ -221,10 +227,30 @@ internal class UpdateFlow
             update,
             target,
             version,
+            installation.Version.ToNormalizedString(),
+            BoundNotes(target.NotesMarkdown),
             installation.Channel,
             installation.Architecture,
             Path.Combine(installation.PackagesDirectory, fileName));
     }
+
+    /// <summary>Release notes are the one part of the feed that reaches the
+    /// user <em>before</em> any download, and nothing else in this class
+    /// covers them: the checks above and <see cref="ValidateNuspec"/> protect
+    /// the package — hash, filename, nuspec fields — and a candidate that
+    /// would ultimately fail the nuspec check has already had its notes
+    /// rendered in front of the user. So the size bound belongs here, in the
+    /// established failure shape, and <see cref="UpdateCandidate"/> only ever
+    /// carries a value the dialog can safely take.
+    ///
+    /// <para><b>Drop the notes, keep the update.</b> Failing the candidate on
+    /// over-long notes would make the notes field a lever for denying updates
+    /// entirely — a publisher, or anyone who can serve that feed, could stop
+    /// every client from updating by padding one string.</para></summary>
+    private static string? BoundNotes(string? notes) =>
+        notes is null || notes.Length > ReleaseNotesMarkdown.MaxInputChars
+            ? null
+            : notes;
 
     private Installation GetInstallation()
     {
@@ -376,10 +402,19 @@ internal class UpdateFlow
         string PackagesDirectory);
 }
 
+/// <summary><paramref name="InstalledVersion"/> and <paramref name="Notes"/>
+/// exist for the update dialog: its version line names both versions, and its
+/// middle band is the only thing it has that a tray notification does not.
+/// Both are display-only — nothing in the download or hand-off path reads
+/// them — and <c>ValidateCandidate</c>'s "nothing moved" comparison
+/// deliberately still covers only the fields that decide what gets installed.
+/// </summary>
 internal sealed record UpdateCandidate(
     UpdateInfo Update,
     VelopackAsset Target,
     string Version,
+    string InstalledVersion,
+    string? Notes,
     string Channel,
     string Architecture,
     string PackagePath);

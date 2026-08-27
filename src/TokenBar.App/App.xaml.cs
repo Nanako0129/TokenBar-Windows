@@ -92,6 +92,17 @@ public partial class App : Application
                     $"size={_flyout.AppWindow.Size.Width}x{_flyout.AppWindow.Size.Height}");
             }
 
+            // Debug flag, same convention as --settings / --open-flyout /
+            // --graph3d. The update dialog is otherwise unreachable without a
+            // Velopack-installed build AND a newer published release, which
+            // makes its layout and its changelog rendering impossible to
+            // inspect. The action published here only writes a log line: this
+            // path cannot download, verify or hand off anything.
+            if (Environment.GetCommandLineArgs().Contains("--update-dialog-demo"))
+            {
+                PublishDemoUpdate(_tray);
+            }
+
             _started = true;
 
             // The opt-in startup probe deliberately runs through one
@@ -135,8 +146,8 @@ public partial class App : Application
 
         try
         {
-            TrayService.CheckForUpdates = CheckForUpdatesAsync;
-            _ = Task.Run(() => CheckForUpdatesAsync());
+            TrayService.CheckForUpdates = () => CheckForUpdatesAsync(userInitiated: true);
+            _ = Task.Run(() => CheckForUpdatesAsync(userInitiated: false));
         }
         catch (Exception ex)
         {
@@ -157,20 +168,61 @@ public partial class App : Application
     /// pending action. Guarding the publisher only covers the window after an
     /// action is taken; a concurrent check has to be prevented before it
     /// starts, which is what returning the in-flight task does.</summary>
-    private Task<UpdateCheckResult> CheckForUpdatesAsync()
+    /// <param name="userInitiated">Whether a person asked. A skipped version is
+    /// withheld from the automatic check and offered again to a manual one —
+    /// Sparkle does exactly this, applying the skipped version only when the
+    /// check is a background one (SUAppcastDriver.m:228,
+    /// <c>background ? skippedUpdateForHost : nil</c>). Skip means "stop
+    /// nagging me", not "never show me this again": without the distinction a
+    /// mis-clicked Skip leaves no way back except editing settings.json.
+    ///
+    /// <para>A user-initiated call that joins an in-flight background check
+    /// still re-offers, because the offer decision is made per caller after
+    /// the shared check resolves, not inside it.</para></param>
+    private Task<UpdateCheckResult> CheckForUpdatesAsync(bool userInitiated)
     {
+        Task<UpdateCheckResult> shared;
         lock (_updateCheckGate)
         {
-            if (_updateCheckInFlight is { IsCompleted: false } running)
-            {
-                return running;
-            }
-
-            var started = RunUpdateCheckAsync();
-            _updateCheckInFlight = started;
-            return started;
+            shared = _updateCheckInFlight is { IsCompleted: false } running
+                ? running
+                : _updateCheckInFlight = RunUpdateCheckAsync();
         }
+
+        // Only a manual caller needs a second pass: the background one already
+        // published under its own rules inside RunUpdateCheckAsync.
+        return userInitiated ? ReofferIfSkippedAsync(shared) : shared;
     }
+
+    private async Task<UpdateCheckResult> ReofferIfSkippedAsync(
+        Task<UpdateCheckResult> shared)
+    {
+        var result = await shared.ConfigureAwait(true);
+        if (result.State != UpdateCheckState.Available
+            || _lastCandidate is not { } pending
+            || !string.Equals(pending.Candidate.Version, result.Version, StringComparison.Ordinal))
+        {
+            return result;
+        }
+
+        // Only when the shared check's own publish was suppressed by the skip.
+        // Republishing unconditionally would offer every manual check twice —
+        // two notifications, and the second bumping the generation, which
+        // invalidates a dialog opened from the first.
+        if (PendingUpdateAction.ShouldOffer(
+            pending.Candidate.Version,
+            AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey),
+            userInitiated: false))
+        {
+            return result;
+        }
+
+        _ = QueueUpdateUi(() =>
+            PublishUpdate(pending.Flow, pending.Candidate, userInitiated: true));
+        return result;
+    }
+
+    private (UpdateFlow Flow, UpdateCandidate Candidate)? _lastCandidate;
 
     private async Task<UpdateCheckResult> RunUpdateCheckAsync()
     {
@@ -181,20 +233,38 @@ public partial class App : Application
             if (candidate is null)
             {
                 DevLog.Write("update-check: none");
+                _lastCandidate = null;
                 return UpdateCheckResult.UpToDate;
             }
 
+            // Retained so a manual caller that joined this check can re-offer a
+            // skipped version without running a second UpdateFlow.
+            _lastCandidate = (flow, candidate);
             _ = QueueUpdateUi(() => PublishUpdate(flow, candidate));
             return UpdateCheckResult.Available(candidate.Version);
         }
         catch (Exception ex)
         {
             LogUpdateFailure("update-check", ex);
+            _lastCandidate = null;
             return UpdateCheckResult.Failed;
         }
     }
 
-    private void PublishUpdate(UpdateFlow flow, UpdateCandidate candidate)
+    /// <summary>Where the app decides <b>whether to offer</b> a found update.
+    ///
+    /// <para>The skip gate belongs here and nowhere else. Putting it in
+    /// <see cref="RunUpdateCheckAsync"/> would suppress
+    /// <c>UpdateCheckResult.Available</c>, and <c>CheckForUpdatesAsync</c> is
+    /// the single entry shared by the startup check and Settings' "Check now" —
+    /// so Settings would report "You are up to date." while an update existed,
+    /// the exact shape <c>.github/release-notes/v0.2.2.md</c> describes as a
+    /// bug. Putting it in <c>TrayService.PublishUpdate</c> would conflate
+    /// "skipped" with "already downloading". A skipped version still reports
+    /// honestly to a manual check; it is only not <em>offered</em>.</para>
+    /// </summary>
+    private void PublishUpdate(
+        UpdateFlow flow, UpdateCandidate candidate, bool userInitiated = false)
     {
         try
         {
@@ -204,8 +274,18 @@ public partial class App : Application
                 return;
             }
 
-            if (tray.PublishUpdate(
+            if (!PendingUpdateAction.ShouldOffer(
                 candidate.Version,
+                AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey),
+                userInitiated))
+            {
+                DevLog.Write($"update-available: v{candidate.Version} skipped by user");
+                return;
+            }
+
+            if (tray.PublishUpdate(
+                new UpdateOffer(
+                    candidate.Version, candidate.InstalledVersion, candidate.Notes),
                 () => StartUpdateDownload(flow, candidate)))
             {
                 DevLog.Write($"update-available: v{candidate.Version}");
@@ -214,6 +294,67 @@ public partial class App : Application
         catch (Exception ex)
         {
             LogUpdateFailure("update-check", ex);
+        }
+    }
+
+    /// <summary>--update-dialog-demo. Publishes a synthetic offer through the
+    /// real tray path and opens the dialog on it, so the three buttons act on a
+    /// genuine PendingUpdateAction — Later leaves the menu item, Skip removes it
+    /// and writes the skip key, Install takes the action — while the action
+    /// itself does nothing but log.</summary>
+    private static void PublishDemoUpdate(TrayService tray)
+    {
+        const string notes = """
+            # What's new
+
+            **This build is a demo of the update dialog.** Nothing here is real, and *Install Update* only writes a log line. This paragraph is deliberately long enough to wrap, and it is hard-wrapped in the source to exercise the soft-wrap join.
+            The second source line of the same paragraph.
+
+            ## Fixed
+
+            - A `RichTextBlock` no longer renders `#39` as a heading
+            - Ordered lists render as bullets, with the numbering lost
+            - [Links keep their text](https://example.invalid/discarded) and lose the URL
+
+            1. First
+            2. Second
+
+            ## Known issues
+
+            **Unsigned.** Windows SmartScreen will warn on first run. Choose
+            *More info* → *Run anyway*.
+
+            | Machine | File |
+            |---|---|
+            | x64 | Setup.exe |
+            """;
+        try
+        {
+            // The same gate the real path applies, so a Skip taken in the demo
+            // is observable on the next launch: no dialog, no menu item, one
+            // log line. Clear tokenbar.update.skippedVersion from settings.json
+            // to get the offer back.
+            // Background semantics, so a Skip taken in the demo is observable
+            // on the next launch the way a real one would be.
+            if (!PendingUpdateAction.ShouldOffer(
+                "9.9.9",
+                AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey),
+                userInitiated: false))
+            {
+                DevLog.Write("update-dialog-demo: v9.9.9 skipped by user");
+                return;
+            }
+
+            if (tray.PublishUpdate(
+                new UpdateOffer("9.9.9", "0.0.0", notes),
+                () => DevLog.Write("update-dialog-demo: install invoked")))
+            {
+                _ = tray.TryOpenUpdateDialog();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogUpdateFailure("update-dialog-demo", ex);
         }
     }
 
