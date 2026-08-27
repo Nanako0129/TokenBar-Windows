@@ -1,11 +1,62 @@
 using System.IO.Compression;
 using System.Xml;
 using System.Xml.Linq;
+using TokenBar.Core;
 using Velopack;
 using Velopack.Locators;
 using Velopack.Sources;
 
 namespace TokenBar.App;
+
+/// <summary>What a manual "Check now" produced, and the line the settings page
+/// shows for it.
+///
+/// This is the *check* half only. ALIGN-2 in the approved plan commits to a
+/// Sparkle-style dialog carrying version, changelog, Update, Remind me later
+/// and Skip; that is still to build, and this does not stand in for it.
+///
+/// Reporting the check in place is right on its own terms — a button that runs
+/// for a few seconds and then shows nothing when you are already current reads
+/// as broken, and gets pressed again. What it does not cover is what happens
+/// after a version IS found, which is where the dialog belongs.
+///
+/// Lives beside UpdateFlow because the text mapping is pure and this file is
+/// already compiled into TokenBar.Core.Tests; SettingsWindow.cs is not.</summary>
+internal enum UpdateCheckState
+{
+    Checking,
+    UpToDate,
+    Available,
+    Failed,
+}
+
+internal readonly record struct UpdateCheckResult(UpdateCheckState State, string? Version)
+{
+    internal static UpdateCheckResult Checking => new(UpdateCheckState.Checking, null);
+
+    internal static UpdateCheckResult UpToDate => new(UpdateCheckState.UpToDate, null);
+
+    internal static UpdateCheckResult Failed => new(UpdateCheckState.Failed, null);
+
+    /// <summary>The only intended way to reach <see cref="UpdateCheckState
+    /// .Available"/>, and it refuses an empty version: ValidateTarget has
+    /// already rejected those, so an empty string here means a caller bypassed
+    /// it rather than a release that genuinely has no version. Reporting a
+    /// failure is honest; rendering "Update available: v" is not.</summary>
+    internal static UpdateCheckResult Available(string version) =>
+        string.IsNullOrEmpty(version)
+            ? Failed
+            : new(UpdateCheckState.Available, version);
+
+    internal string Text() => State switch
+    {
+        UpdateCheckState.Checking => "Checking for updates…".Localized(),
+        UpdateCheckState.UpToDate => "You are up to date.".Localized(),
+        UpdateCheckState.Available =>
+            "Update available: v{0}".Localized(Version ?? string.Empty),
+        _ => "Could not check for updates.".Localized(),
+    };
+}
 
 internal class UpdateFlow
 {

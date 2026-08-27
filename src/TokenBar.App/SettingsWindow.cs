@@ -528,8 +528,67 @@ public sealed class SettingsWindow : Window
         return panel;
     }
 
+    // ── Manual update check ───────────────────────────────────────────────
+    //
+    // The check outlives the controls that started it. Present() rebuilds every
+    // page, and so does any settings change, so a continuation that captured
+    // its own TextBlock would write the result into a detached control and the
+    // reopened page would show a fresh, enabled button — letting a second check
+    // start while the first is still running. The state lives on the window and
+    // each rebuilt page binds to it.
+    private Task<UpdateCheckResult>? _updateCheck;
+    private UpdateCheckResult? _updateCheckResult;
+    private TextBlock? _updateStatus;
+    private Button? _updateButton;
+
+    private void SyncUpdateCheck()
+    {
+        if (_updateStatus is not { } status || _updateButton is not { } button)
+        {
+            return;
+        }
+
+        var running = _updateCheck is { IsCompleted: false };
+        button.IsEnabled = !running;
+        var result = running ? UpdateCheckResult.Checking : _updateCheckResult;
+        status.Visibility = result is null ? Visibility.Collapsed : Visibility.Visible;
+        status.Text = result?.Text() ?? string.Empty;
+    }
+
+    private void StartUpdateCheck()
+    {
+        if (_updateCheck is { IsCompleted: false }
+            || TrayService.CheckForUpdates is not { } run)
+        {
+            return;
+        }
+
+        _updateCheckResult = null;
+        var check = run();
+        _updateCheck = check;
+        SyncUpdateCheck();
+        _ = check.ContinueWith(
+            completed =>
+            {
+                // Only the newest check may publish a result: an older one
+                // finishing late must not overwrite it.
+                if (!ReferenceEquals(_updateCheck, completed))
+                {
+                    return;
+                }
+
+                _updateCheckResult = completed.Status == TaskStatus.RanToCompletion
+                    ? completed.Result
+                    : UpdateCheckResult.Failed;
+                SyncUpdateCheck();
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.None,
+            TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
     // ── About page: About ─────────────────────────────────────────────────
-    private static StackPanel BuildAboutPage()
+    private StackPanel BuildAboutPage()
     {
         var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
 
@@ -547,6 +606,30 @@ public sealed class SettingsWindow : Window
                 + "from tokscale by junhoyeo; menu-bar concept from "
                 + "handlecusion's tokcat.").Localized()));
         panel.Children.Add(Section("About".Localized(), about));
+
+        // ── Check for updates ──────────────────────────────────────────
+        // The check reports in place; the Sparkle-style dialog ALIGN-2 commits
+        // to (version, changelog, Update / Remind me later / Skip) is separate
+        // and still to build, so a found update still only reaches the tray.
+        // The button disables itself for the duration: the check takes a few
+        // seconds and a second press would start a second flow against the
+        // same release feed.
+        var updates = new StackPanel { Spacing = 4 };
+        _updateStatus = Ui.Dim(string.Empty, 12);
+        _updateButton = new Button
+        {
+            Content = "Check Now".Localized(),
+            Padding = new Thickness(10, 3, 10, 4),
+            FontSize = 12,
+        };
+        _updateButton.Click += (_, _) => StartUpdateCheck();
+        updates.Children.Add(
+            Ui.Row(Ui.Text("Check for updates".Localized(), 12), _updateButton));
+        updates.Children.Add(_updateStatus);
+        // Re-attach to whatever this rebuild produced: a check started before
+        // the rebuild is still running and still owns the button.
+        SyncUpdateCheck();
+        panel.Children.Add(Section("Updates".Localized(), updates));
 
         return panel;
     }

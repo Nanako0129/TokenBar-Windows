@@ -129,14 +129,30 @@ public sealed class TrayService : IDisposable
     /// the view layer never sees the tray feed.</summary>
     public static Action? OpenSettings { get; private set; }
 
+    /// <summary>Settings' manual "Check now" reaches the update flow through
+    /// here. Unlike the two neighbours this is set by App, which owns the
+    /// flow — the tray only already owns the update surface (PublishUpdate),
+    /// so this is where the view layer looks for it.</summary>
+    internal static Func<Task<UpdateCheckResult>>? CheckForUpdates { get; set; }
+
     public void ShowSettings() => SettingsWindow.Present(
         () => _feed.Quota, () => _feed.Graph, () => _feed.Trace);
 
     internal bool CanHandoff => !Volatile.Read(ref _disposed);
 
+    /// <summary>Offer an update in the tray. Refuses while one is already
+    /// being downloaded: PendingUpdateAction.Publish overwrites unconditionally,
+    /// so republishing would re-expose "Update to v…" while _activeUpdate is
+    /// still running, and taking it would start a second UpdateFlow against the
+    /// same package path — each flow's failure path calls CleanAllPackages, so
+    /// the two can destroy each other's download. The automatic check has the
+    /// same shape and only escaped because it runs once at startup; the manual
+    /// check made it reachable at any moment, so the guard belongs here rather
+    /// than at either caller.</summary>
     internal bool PublishUpdate(string version, Action action)
     {
-        if (_disposed || !_pendingUpdate.Publish(version, action))
+        if (_disposed || _activeUpdate is not null
+            || !_pendingUpdate.Publish(version, action))
         {
             return false;
         }

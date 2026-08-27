@@ -135,7 +135,8 @@ public partial class App : Application
 
         try
         {
-            _ = Task.Run(CheckForUpdatesOnceAsync);
+            TrayService.CheckForUpdates = CheckForUpdatesAsync;
+            _ = Task.Run(() => CheckForUpdatesAsync());
         }
         catch (Exception ex)
         {
@@ -143,7 +144,35 @@ public partial class App : Application
         }
     }
 
-    private async Task CheckForUpdatesOnceAsync()
+    private readonly object _updateCheckGate = new();
+    private Task<UpdateCheckResult>? _updateCheckInFlight;
+
+    /// <summary>The single update check. Startup fires it and drops the
+    /// result; settings' "Check now" awaits it for the line it shows.
+    ///
+    /// One entry point rather than two, because two produced three separate
+    /// races: opening settings during the startup check ran a second
+    /// UpdateFlow against the same feed, and if both found a version both
+    /// published — two notifications, and the second replacing the first's
+    /// pending action. Guarding the publisher only covers the window after an
+    /// action is taken; a concurrent check has to be prevented before it
+    /// starts, which is what returning the in-flight task does.</summary>
+    private Task<UpdateCheckResult> CheckForUpdatesAsync()
+    {
+        lock (_updateCheckGate)
+        {
+            if (_updateCheckInFlight is { IsCompleted: false } running)
+            {
+                return running;
+            }
+
+            var started = RunUpdateCheckAsync();
+            _updateCheckInFlight = started;
+            return started;
+        }
+    }
+
+    private async Task<UpdateCheckResult> RunUpdateCheckAsync()
     {
         try
         {
@@ -152,17 +181,16 @@ public partial class App : Application
             if (candidate is null)
             {
                 DevLog.Write("update-check: none");
-                return;
+                return UpdateCheckResult.UpToDate;
             }
 
-            if (!QueueUpdateUi(() => PublishUpdate(flow, candidate)))
-            {
-                throw new InvalidOperationException();
-            }
+            _ = QueueUpdateUi(() => PublishUpdate(flow, candidate));
+            return UpdateCheckResult.Available(candidate.Version);
         }
         catch (Exception ex)
         {
             LogUpdateFailure("update-check", ex);
+            return UpdateCheckResult.Failed;
         }
     }
 
