@@ -140,9 +140,19 @@ public sealed class TrayService : IDisposable
 
     internal bool CanHandoff => !Volatile.Read(ref _disposed);
 
+    /// <summary>Offer an update in the tray. Refuses while one is already
+    /// being downloaded: PendingUpdateAction.Publish overwrites unconditionally,
+    /// so republishing would re-expose "Update to v…" while _activeUpdate is
+    /// still running, and taking it would start a second UpdateFlow against the
+    /// same package path — each flow's failure path calls CleanAllPackages, so
+    /// the two can destroy each other's download. The automatic check has the
+    /// same shape and only escaped because it runs once at startup; the manual
+    /// check made it reachable at any moment, so the guard belongs here rather
+    /// than at either caller.</summary>
     internal bool PublishUpdate(string version, Action action)
     {
-        if (_disposed || !_pendingUpdate.Publish(version, action))
+        if (_disposed || _activeUpdate is not null
+            || !_pendingUpdate.Publish(version, action))
         {
             return false;
         }
