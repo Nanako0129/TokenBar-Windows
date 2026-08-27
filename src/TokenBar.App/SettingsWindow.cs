@@ -330,7 +330,7 @@ public sealed class SettingsWindow : Window
                 {
                     choices.Add((
                         QuotaResolver.Selection(agent.ClientId, window.CardId),
-                        $"{ClientRegistry.ShortName(agent.ClientId)} · {window.Label}"));
+                        $"{ClientRegistry.ShortName(agent.ClientId)} · {window.Label.Localized()}"));
                 }
             }
         }

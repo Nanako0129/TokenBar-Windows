@@ -153,11 +153,17 @@ S4 排在 S5 之前，因為 i18n 會碰到每一個字串；先做 Discord 等�
 >
 > **key 的形狀不能跨平台共用**：macOS 用 `%lld`／`%@`，C# 用 `{0}`。譯文內容照抄 macOS，避免同一個產品兩套詞彙；沒有 macOS 對應的 Windows 專屬畫面以同樣語域書寫。
 >
+> **掃描方法的兩個洞（兩者都是驗收後才發現的）：** S4b 漏掉六種字串形狀後，改用「抽出檔案裡每一個字串常值再逐一分類」取代 grep pattern。那補掉了「形狀太窄」，卻留下兩個洞。其一，**輸入太窄**——三片切片都只掃 `**/*.cs`，`DashboardView.xaml` 的 `today`／`total`／`tok/min`／`Quit`／`All` 五個屬性值從未進入視野，是使用者截圖抓到的。其二，**有些文案沒有字串常值**——`DashboardView.xaml.cs:60` 用 `view.ToString()` 建 lens 分頁，繞過既有的 `AppViews.Label`，抽常值的方法在那裡什麼都抽不到（Codex 抓到）。XAML 屬性值無法呼叫 `Localized()`，改為在 constructor 指派；用 `x:Uid`／PRI 會等於在 JSON 表旁再開一套平行系統，五條字串不值得。
+
 > **刻意不翻的三類**：`ClientRegistry` 的用戶端名稱（品牌名）、`Ui.TokenKinds` 的圖例縮寫 `In`／`Out`／`CR`／`CW`／`R`（要塞進 chip，中文沒有可讀的兩字縮寫；同樣五個概念在模型卡與 tooltip 是完整詞且有翻）、`UpdateFlow` 全部 18 條 exception message（被 `LogUpdateFailure` 寫進 DevLog，到不了使用者；翻了會讓 log 搜不到）。
 
-> **S4c-3 discovery 的發現（wire text）：** `UsageWindow.Label` 與 `UsageWindow.ResetText` 是引擎產生的英文字串，Windows 直接渲染（`DashboardView.xaml.cs:1901,1928`、`TrayService.cs:303,363`），因此翻不動——設定預覽欄的 mock（`Label: "Session"`、`ResetText: "Resets in 1h 35m"`）也就必須維持英文，否則預覽會與真實 flyout 不符。
+> **~~S4c-3 discovery 的發現（wire text）~~：這條原本的結論是錯的，S4c-4 已修正。** 原文主張 `UsageWindow.Label` 與 `UsageWindow.ResetText` 是引擎產生的英文 wire text、因此翻不動。兩半都錯，而且是使用者截圖指出「Resets in 5d 17h 還是英文」才發現的——這一輪的任何檢查都看不到它。
 >
-> macOS 不是這樣做的。`AgentLimitsCard.swift:469-474` 註明 `resetText` 是「a compatibility field produced in English by Rust」，並優先採用 `UsagePace.resetText(for:)` 從結構化時間戳本地算出的在地化倒數，wire text 只是時間戳缺失時的退路。**Windows 從未移植 `UsagePace.resetText`。** 這是移植缺口而非 i18n 問題，修好可同時解決在地化與跨平台一致性；另立切片，不併入 S4。
+> 正確的規則不是「wire text 不能翻」，是**「顯示點翻，比對點不能碰」**。macOS `AgentLimitsCard.swift:481-483` 明寫：`Text(window.label.localized)` 加註解「Display only — the payload's `label` stays untranslated so QuotaResolver's legacy-selection matching still works」。而 `resetText` macOS 也不直接渲染：`UsagePace.resetText(for:now:)`（`UsagePace.swift:98-104`）從結構化的 `resetsAt` 時間戳算出在地化倒數，wire text 只是時間戳無法解析時的退路。Windows 從未移植那個函式，我把「Windows 沒有這個能力」讀成了「這件事做不到」。
+>
+> **S4c-4 的處置**：移植 `UsagePace.ResetText`（floor 秒數→ceil 到整分→`DurationText`，兩層 rounding 都是合約的一部分；一秒要顯示成一分鐘而不是「現在」）；四個顯示點翻譯 `window.Label`（`QuotaRow`、`TrayService` 選單與 tooltip、設定的額度來源選項），`QuotaResolver.cs:52` 的比對維持原字。那條比對路徑由 `LegacyLabelSelectionStillResolvesUnderATranslatedUi` 釘住——把 `.Localized()` 加到比對邊，該測試立刻紅，`Actual: "codex|Weekly"`（legacy selection 沒能遷移到 card id，正是使用者切換語言後額度選擇失效的症狀）。
+>
+> **方法論**：一條需要區分的規則被簡化成一刀切的規則之後，就不再有人去分辨了。
 
 > **S3 discovery 的發現（快捷鍵）：** 兩個既有問題，都不是 S3 引入。其一，macOS 的 ⌘1-9 與 ⌘[ ⌘] 操作的是 **client tabs**（`PopoverView.swift:693-702`，`clientTab.wrappedValue = tabs[...]`），Windows 卻綁到 **lenses**——綁錯了那一排。其二，`Ctrl+[` / `Ctrl+]` 實測無反應：`AddAccel` 機制本身正常（`Ctrl+1..6` 用同一條路徑且有效），差別在 `VirtualKey.Number1` 是具名成員，而 `(VirtualKey)0xDB` / `0xDD`（`VK_OEM_4` / `VK_OEM_6`）是硬轉型的未定義值、且佈局相依；macOS 用 `charactersIgnoringModifiers` 比對字元，與佈局無關。故登記為 S8 而非併入 S3。
 

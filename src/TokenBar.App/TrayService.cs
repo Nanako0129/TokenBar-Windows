@@ -302,7 +302,7 @@ public sealed class TrayService : IDisposable
                         Math.Clamp(window.RemainingPercent, 0, 100),
                         MidpointRounding.AwayFromZero);
                     AddQuotaChoice(
-                        source, "{0} — {1}% left".Localized(window.Label, left),
+                        source, "{0} — {1}% left".Localized(window.Label.Localized(), left),
                         QuotaResolver.Selection(agent.ClientId, window.CardId), selection);
                 }
             }
@@ -366,7 +366,7 @@ public sealed class TrayService : IDisposable
             var left = Math.Clamp(pick.Window.RemainingPercent, 0, 100);
             lines.Add("{0} {1} {2}% left".Localized(
                 ClientRegistry.ShortName(pick.ClientId),
-                pick.Window.Label,
+                pick.Window.Label.Localized(),
                 left.ToString("F0", System.Globalization.CultureInfo.CurrentCulture)));
         }
 
