@@ -526,6 +526,22 @@ internal sealed class UpdateDialog : Window
 
             for (var c = 0; c < cells.Count && c < columns; c++)
             {
+                // An empty cell gets no control, which is what bounds this
+                // loop. MaxCells caps a row at 12 and MaxBlocks caps the
+                // document at 500, but their product is 6 000 controls on the
+                // UI thread and no parser bound stands in the way: an empty
+                // cell costs no runs, so `|x|||||||||||` × 500 passes every
+                // one of them. Skipping empties makes every control cost at
+                // least one run, so the document-wide total is bounded by
+                // MaxRuns. A Grid cell with no child is empty space and an
+                // Auto column with no content collapses, so nothing shifts —
+                // and a row whose cells are all empty never reaches here, the
+                // parser drops it.
+                if (cells[c].Count == 0)
+                {
+                    continue;
+                }
+
                 var text = new TextBlock
                 {
                     FontSize = 12,
