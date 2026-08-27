@@ -76,6 +76,27 @@ internal sealed class UpdateDialog : Window
     private readonly Button _later = new();
     private readonly Button _install = new();
 
+    // Progress replaces the notes box in place rather than opening a second
+    // window as Sparkle's SUStatus does. Sparkle needs one because its alert
+    // closes on Install; this window does not have to close, and inventing a
+    // second window's layout from a xib — with no rendered reference to check
+    // it against — is how the rest of this feature's mistakes were made.
+    private readonly ProgressBar _progress = new()
+    {
+        IsIndeterminate = true,
+        Margin = new Thickness(0, 14, 0, 0),
+    };
+
+    private readonly StackPanel _progressHost = new()
+    {
+        Visibility = Visibility.Collapsed,
+        VerticalAlignment = VerticalAlignment.Center,
+    };
+
+    private Border? _notesBox;
+    private Grid? _footer;
+    private static UpdateDialog? _active;
+
     // Rebound on every Present, so the buttons always act on the offer that is
     // on screen right now rather than on whatever the first Present captured.
     private Func<bool> _onInstall = () => true;
@@ -116,12 +137,15 @@ internal sealed class UpdateDialog : Window
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
         root.Children.Add(BuildHeader());
-        var notesBox = BuildNotesBox();
-        Grid.SetRow(notesBox, 1);
-        root.Children.Add(notesBox);
-        var footer = BuildFooter();
-        Grid.SetRow(footer, 2);
-        root.Children.Add(footer);
+        _notesBox = BuildNotesBox();
+        Grid.SetRow(_notesBox, 1);
+        root.Children.Add(_notesBox);
+        _progressHost.Children.Add(_progress);
+        Grid.SetRow(_progressHost, 1);
+        root.Children.Add(_progressHost);
+        _footer = BuildFooter();
+        Grid.SetRow(_footer, 2);
+        root.Children.Add(_footer);
         Content = root;
 
         // ApplicationIcon only reaches the executable; the title bar reads its
@@ -283,10 +307,66 @@ internal sealed class UpdateDialog : Window
         _onInstall = install;
         _onLater = later;
         _onSkip = skip;
+        _active = this;
+        ShowOffer();
         _headline.Text = UpdateDialogText.Headline(ProductIdentity.Name);
         _versionLine.Text = UpdateDialogText.VersionLine(
             ProductIdentity.Name, offer.Version, offer.InstalledVersion);
         RenderNotes(ReleaseNotesMarkdown.Parse(offer.NotesMarkdown));
+    }
+
+    private void ShowOffer()
+    {
+        if (_notesBox is not null) { _notesBox.Visibility = Visibility.Visible; }
+        if (_footer is not null) { _footer.Visibility = Visibility.Visible; }
+        _progressHost.Visibility = Visibility.Collapsed;
+        _progress.IsIndeterminate = true;
+    }
+
+    /// <summary>Switch this window from offering the update to reporting on it.
+    ///
+    /// <para>Pressing Install used to close the dialog and leave nothing: a
+    /// download of unknown length, then the process exiting for around a minute
+    /// while Velopack applies the update. The first person to try it reasonably
+    /// concluded the app had died.</para>
+    ///
+    /// <para>The three buttons go rather than being disabled — none of them
+    /// means anything once the download has started. The close box still works
+    /// and only hides the window; the download is owned by App and continues.
+    /// There is no Cancel: Sparkle has one, but adding a second exit path to a
+    /// flow that has already produced four concurrency defects buys less than
+    /// it costs, and the window can simply be closed.</para></summary>
+    private void ShowProgress(string phase, int? percent)
+    {
+        _headline.Text = phase;
+        _versionLine.Text = percent is { } p
+            ? UpdateDialogText.Percent(p)
+            : UpdateDialogText.RestartNotice();
+        if (_notesBox is not null) { _notesBox.Visibility = Visibility.Collapsed; }
+        if (_footer is not null) { _footer.Visibility = Visibility.Collapsed; }
+        _progressHost.Visibility = Visibility.Visible;
+        if (percent is { } value)
+        {
+            _progress.IsIndeterminate = false;
+            _progress.Value = Math.Clamp(value, 0, 100);
+        }
+        else
+        {
+            _progress.IsIndeterminate = true;
+        }
+    }
+
+    /// <summary>Called by App as the download runs. A no-op when the window was
+    /// never opened or has been closed — the download does not depend on it.</summary>
+    internal static void Report(string phase, int? percent)
+    {
+        var dialog = _active;
+        if (dialog is null)
+        {
+            return;
+        }
+
+        _ = dialog.DispatcherQueue.TryEnqueue(() => dialog.ShowProgress(phase, percent));
     }
 
     /// <summary>Turn the parsed block list into paragraphs. Everything that

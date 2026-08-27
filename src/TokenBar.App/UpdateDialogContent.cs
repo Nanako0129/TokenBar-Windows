@@ -463,4 +463,20 @@ internal static class UpdateDialogText
     internal static string Later() => "Remind Me Later".Localized();
 
     internal static string Install() => "Install Update".Localized();
+
+    // Progress copy. The phases are what this app can actually report: the
+    // download reports percent, verification is brief and indeterminate, and
+    // the restart happens after the process exits, so all it can do is say so
+    // in advance.
+    internal static string Downloading() => "Downloading update…".Localized();
+
+    internal static string Verifying() => "Verifying update…".Localized();
+
+    internal static string Restarting() => "Installing update…".Localized();
+
+    internal static string Percent(int percent) =>
+        "{0}%".Localized(Math.Clamp(percent, 0, 100));
+
+    internal static string RestartNotice() =>
+        "{0} will close and reopen.".Localized(ProductIdentity.Name);
 }

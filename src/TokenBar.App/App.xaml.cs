@@ -376,10 +376,20 @@ public partial class App : Application
         UpdateCandidate candidate)
     {
         DevLog.Write($"update-download: start v{candidate.Version}");
+        UpdateDialog.Report(UpdateDialogText.Downloading(), 0);
         try
         {
-            await flow.DownloadAndVerifyAsync(candidate).ConfigureAwait(false);
+            await flow.DownloadAndVerifyAsync(
+                candidate,
+                new Progress<int>(p => UpdateDialog.Report(UpdateDialogText.Downloading(), p)))
+                .ConfigureAwait(false);
             DevLog.Write($"update-download: verified v{candidate.Version}");
+            // Verification and the nuspec check are already done by the line
+            // above; what remains is the hand-off, which ends this process for
+            // roughly a minute while Velopack applies the update. Nothing this
+            // process draws survives that, so the only honest thing it can do
+            // is say so before it goes.
+            UpdateDialog.Report(UpdateDialogText.Restarting(), null);
             if (!QueueUpdateUi(() => HandoffUpdate(flow, candidate)))
             {
                 throw new InvalidOperationException();
