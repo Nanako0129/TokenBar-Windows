@@ -193,9 +193,25 @@ internal static class ReleaseNotesMarkdown
     /// in a changelog table — and losing content is a worse failure than
     /// rendering a row of dashes.</para>
     ///
-    /// <para>Known ceiling: <c>\|</c> is not an escape here, so a literal pipe
-    /// inside a cell splits it. GitHub's own tables allow it; a changelog that
-    /// uses one gets an extra column rather than a wrong render.</para>
+    /// <para>One hyphen is enough for a delimiter cell, which was checked
+    /// against the renderer that actually produces this input rather than
+    /// argued from the spec: <c>POST /markdown</c> with mode <c>gfm</c> turns
+    /// <c>| Name | Value |\n| - | - |</c> into a thead and an empty tbody, so
+    /// GitHub consumes that row. Requiring three would render a row GitHub
+    /// does not — the raw-pipe defect this whole type exists to fix. The GFM
+    /// spec names no minimum either.</para>
+    ///
+    /// <para>Known ceiling 1: <c>\|</c> is not an escape here, so a literal
+    /// pipe inside a cell splits it. GitHub's own tables allow it; a changelog
+    /// that uses one gets an extra column rather than a wrong render.</para>
+    ///
+    /// <para>Known ceiling 2: GFM makes a table out of a header row only when
+    /// a delimiter row follows it, so GitHub renders a lone <c>|:---|---:|</c>
+    /// as a paragraph with its pipes intact. This parser has no lookahead —
+    /// bound 4 is a single linear pass — so it renders any pipe-led line as a
+    /// row, and that one comes out as two cells. Content survives either way;
+    /// only the delimiters are lost, and no changelog in the feed so far has a
+    /// pipe-led line that is not part of a real table.</para>
     /// </summary>
     private static void AppendTableRow(
         string line, List<NotesBlock> blocks, ref int budget, bool allowSeparator)
