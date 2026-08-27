@@ -118,7 +118,14 @@ internal static class ReleaseNotesMarkdown
             }
 
             var kind = Classify(ref cleaned);
-            if (kind == NotesBlockKind.Paragraph)
+            // A table row is prose once its pipes are stripped, but it is not a
+            // soft-wrapped continuation of the row above it. Joining them
+            // collapses a whole table into one unreadable line: the spec's
+            // degradation table says "Table -> plain text", not "-> one
+            // paragraph". It still emits a Paragraph block, so the renderer is
+            // unchanged; it only refuses to be merged.
+            var joinable = kind == NotesBlockKind.Paragraph && cleaned[0] != '|';
+            if (joinable)
             {
                 if (paragraph.Length > 0)
                 {

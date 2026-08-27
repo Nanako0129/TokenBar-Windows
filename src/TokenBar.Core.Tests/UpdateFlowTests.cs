@@ -986,6 +986,10 @@ public class UpdateFlowTests : IDisposable
                     target.SHA1,
                     target.SHA256,
                     target.Size,
+                    // Notes ride the feed, before any download. Without this
+                    // the fixture could not reach BoundNotes at all, which is
+                    // why that path had no test.
+                    target.NotesMarkdown,
                 },
             },
         });
@@ -1077,5 +1081,40 @@ public class UpdateFlowTests : IDisposable
         {
             Localization.Load("en", AppContext.BaseDirectory);
         }
+    }
+
+    // ---- release notes bounding -------------------------------------------
+    //
+    // Notes arrive with the feed *before* any download, so ValidateTarget and
+    // ValidateNuspec — which protect the package — never see them. BoundNotes
+    // is the only thing between the feed and the dialog, and a violation must
+    // drop the notes while keeping the update: failing the candidate instead
+    // would make an oversized notes field a lever for denying updates.
+    //
+    // This path had no test at all until the outcome verifier said so, even
+    // though UpdateFlow.cs is already in the test project's compile set.
+
+    [Fact]
+    public async Task OversizedNotesAreDroppedAndTheUpdateSurvives()
+    {
+        var fixture = CreateFixture(mutateTarget: target =>
+            target.NotesMarkdown = new string('x', ReleaseNotesMarkdown.MaxInputChars + 1));
+
+        var candidate = await fixture.Flow.CheckForUpdatesAsync();
+
+        Assert.NotNull(candidate);
+        Assert.Null(candidate!.Notes);
+    }
+
+    [Fact]
+    public async Task NotesWithinTheBoundReachTheCandidate()
+    {
+        const string notes = "## Fixed\n\n- A thing that was broken.";
+        var fixture = CreateFixture(mutateTarget: target => target.NotesMarkdown = notes);
+
+        var candidate = await fixture.Flow.CheckForUpdatesAsync();
+
+        Assert.NotNull(candidate);
+        Assert.Equal(notes, candidate!.Notes);
     }
 }

@@ -268,13 +268,47 @@ public class ReleaseNotesMarkdownTests
         Assert.True(Assert.Single(block.Runs).Bold);
     }
 
+    // The cap tests below feed a fixture larger than the cap, so they fail when
+    // a cap is deleted but not when it is widened: MaxBlocks = 4_000 leaves the
+    // whole suite green, and four thousand Paragraphs is precisely the hazard
+    // the cap exists for. Nothing automated can reach the real cost — the
+    // RichTextBlock measure pass — because no test project compiles XAML, so
+    // the value itself is pinned here.
+    [Fact]
+    public void CapConstantsStayWithinTheRangeTheUiCanRender()
+    {
+        Assert.True(
+            ReleaseNotesMarkdown.MaxBlocks <= 1_000,
+            $"MaxBlocks is {ReleaseNotesMarkdown.MaxBlocks}; thousands of "
+                + "Paragraphs hang the UI thread and no try/catch reaches it");
+        Assert.True(
+            ReleaseNotesMarkdown.MaxRuns <= 5_000,
+            $"MaxRuns is {ReleaseNotesMarkdown.MaxRuns}");
+    }
+
+    // A table's rows are prose once their pipes are stripped, but they are not
+    // soft-wrapped continuations of each other. Joining them turned both tables
+    // in the real v0.2.2 notes into one unreadable line, and Assert.Single
+    // pinned that as if it were the specification.
+    [Fact]
+    public void TableRowsKeepTheirLineSeparation()
+    {
+        var blocks = ReleaseNotesMarkdown.Parse(
+            "| Machine | File |\n|---|---|\n| x64 | Setup.exe |");
+        Assert.Equal(3, blocks.Count);
+        Assert.All(blocks, b => Assert.Equal(NotesBlockKind.Paragraph, b.Kind));
+    }
+
     [Fact]
     public void TablesDegradeToPlainText()
     {
-        var block = Single("| Machine | File |\n|---|---|\n| x64 | Setup.exe |");
-        Assert.Equal(NotesBlockKind.Paragraph, block.Kind);
-        Assert.Contains("Machine", block.PlainText, StringComparison.Ordinal);
-        Assert.Contains("Setup.exe", block.PlainText, StringComparison.Ordinal);
+        var plain = Plain(ReleaseNotesMarkdown.Parse(
+            "| Machine | File |\n|---|---|\n| x64 | Setup.exe |"));
+        Assert.Contains("Machine", plain, StringComparison.Ordinal);
+        Assert.Contains("Setup.exe", plain, StringComparison.Ordinal);
+        // The pipes survive. "Table -> plain text" in the spec means the row
+        // renders as its own text, not that the delimiters are stripped;
+        // stripping them would be scope invented at verification time.
     }
 
     // Markdown's soft wrap. Without this a hard-wrapped changelog renders every
@@ -364,9 +398,16 @@ public class ReleaseNotesMarkdownTests
     [Fact]
     public void InputBeyondTheByteCapIsNotParsed()
     {
-        var markdown = new string('x', ReleaseNotesMarkdown.MaxInputChars) + "\ncanary";
+        // The canary is a bullet, not prose. As prose the soft-wrap join merged
+        // it into the 65 536-character paragraph above and Cap truncated it
+        // away, so the assertion held with bound 1 deleted — it was verifying
+        // the line-length cap instead. A bullet is never joined, so it survives
+        // truncation and disappears only because the input was cut short.
+        var markdown = new string('x', ReleaseNotesMarkdown.MaxInputChars) + "\n- canary";
         var blocks = ReleaseNotesMarkdown.Parse(markdown);
         Assert.DoesNotContain("canary", Plain(blocks), StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            NotesBlockKind.Bullet, blocks.Select(b => b.Kind));
     }
 
     /// <summary>Bound 2, and the one that matters most. Thousands of
