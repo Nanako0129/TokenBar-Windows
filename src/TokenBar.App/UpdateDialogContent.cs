@@ -18,6 +18,7 @@ internal enum NotesBlockKind
     Paragraph,
     Heading,
     Bullet,
+    TableRow,
 }
 
 /// <summary>One styled span of a line. Styles are flags rather than a nested
@@ -28,7 +29,17 @@ internal readonly record struct NotesRun(
     bool Italic,
     bool Code);
 
-internal sealed record NotesBlock(NotesBlockKind Kind, IReadOnlyList<NotesRun> Runs)
+/// <summary>A block of the changelog. <paramref name="Runs"/> is the whole
+/// block's text in order, which is what every kind but
+/// <see cref="NotesBlockKind.TableRow"/> renders; a table row additionally
+/// carries <paramref name="Cells"/>, the same runs split at the column
+/// boundaries. Keeping both means the flat model still describes a table
+/// without a nested block tree, and <see cref="PlainText"/> stays meaningful
+/// for every kind.</summary>
+internal sealed record NotesBlock(
+    NotesBlockKind Kind,
+    IReadOnlyList<NotesRun> Runs,
+    IReadOnlyList<IReadOnlyList<NotesRun>>? Cells = null)
 {
     internal string PlainText =>
         string.Concat(Runs.Select(run => run.Text));
@@ -117,15 +128,17 @@ internal static class ReleaseNotesMarkdown
                 continue;
             }
 
+            if (cleaned[0] == '|')
+            {
+                // A table interrupts a soft-wrapped paragraph rather than
+                // continuing it, so flush before the row is emitted.
+                FlushParagraph(paragraph, blocks, ref runBudget);
+                AppendTableRow(cleaned, blocks, ref runBudget);
+                continue;
+            }
+
             var kind = Classify(ref cleaned);
-            // A table row is prose once its pipes are stripped, but it is not a
-            // soft-wrapped continuation of the row above it. Joining them
-            // collapses a whole table into one unreadable line: the spec's
-            // degradation table says "Table -> plain text", not "-> one
-            // paragraph". It still emits a Paragraph block, so the renderer is
-            // unchanged; it only refuses to be merged.
-            var joinable = kind == NotesBlockKind.Paragraph && cleaned[0] != '|';
-            if (joinable)
+            if (kind == NotesBlockKind.Paragraph)
             {
                 if (paragraph.Length > 0)
                 {
@@ -152,6 +165,96 @@ internal static class ReleaseNotesMarkdown
 
         FlushParagraph(paragraph, blocks, ref runBudget);
         return blocks.Count == 0 ? None : blocks;
+    }
+
+    /// <summary>Bound 7: a pathological row of thousands of pipes is thousands
+    /// of Grid columns, which the run budget alone does not catch — an empty
+    /// cell costs no runs. Real tables are two or three columns wide.</summary>
+    internal const int MaxCells = 12;
+
+    /// <summary>A pipe-delimited row becomes one <see cref="NotesBlockKind.TableRow"/>
+    /// block carrying its cells; the <c>|---|---|</c> alignment row is dropped
+    /// entirely, so the renderer can treat the first row of a run of table rows
+    /// as its header without looking for a marker.
+    ///
+    /// <para>Known ceiling: <c>\|</c> is not an escape here, so a literal pipe
+    /// inside a cell splits it. GitHub's own tables allow it; a changelog that
+    /// uses one gets an extra column rather than a wrong render.</para>
+    /// </summary>
+    private static void AppendTableRow(
+        string line, List<NotesBlock> blocks, ref int budget)
+    {
+        var fields = line.Split('|');
+        var cells = new List<IReadOnlyList<NotesRun>>();
+        var runs = new List<NotesRun>();
+        var separator = true;
+        var empty = true;
+        // Skip index 0: the text before the leading pipe, always empty. A
+        // trailing pipe likewise yields a final empty field, which is kept only
+        // if the row genuinely ends without one.
+        var last = fields.Length - 1;
+        if (last > 0 && fields[last].Trim().Length == 0)
+        {
+            last--;
+        }
+
+        for (var i = 1; i <= last && cells.Count < MaxCells && budget > 0; i++)
+        {
+            var cell = fields[i].Trim();
+            if (cell.Length > 0)
+            {
+                empty = false;
+                separator &= IsAlignmentCell(cell);
+            }
+            else
+            {
+                separator = false;
+            }
+
+            runs.Clear();
+            ScanInline(cell, runs, ref budget);
+            cells.Add(runs.ToArray());
+        }
+
+        if (empty || separator || cells.Count == 0
+            || blocks.Count >= MaxBlocks)
+        {
+            return;
+        }
+
+        // The flat run list is what PlainText and every non-table consumer
+        // reads, so the column boundaries survive in it as spaces rather than
+        // running "Machine" and "File" together.
+        var flat = new List<NotesRun>();
+        foreach (var cell in cells)
+        {
+            if (flat.Count > 0)
+            {
+                flat.Add(new NotesRun(" ", false, false, false));
+            }
+
+            flat.AddRange(cell);
+        }
+
+        blocks.Add(new NotesBlock(NotesBlockKind.TableRow, flat, cells));
+    }
+
+    private static bool IsAlignmentCell(string cell)
+    {
+        var dashes = 0;
+        foreach (var c in cell)
+        {
+            if (c == '-')
+            {
+                dashes++;
+            }
+            else if (c != ':')
+            {
+                return false;
+            }
+        }
+
+        return dashes > 0;
     }
 
     private static void FlushParagraph(

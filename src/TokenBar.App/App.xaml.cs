@@ -347,7 +347,7 @@ public partial class App : Application
 
             if (tray.PublishUpdate(
                 new UpdateOffer("9.9.9", "0.0.0", notes),
-                () => DevLog.Write("update-dialog-demo: install invoked")))
+                RunDemoProgress))
             {
                 _ = tray.TryOpenUpdateDialog();
             }
@@ -356,6 +356,33 @@ public partial class App : Application
         {
             LogUpdateFailure("update-dialog-demo", ex);
         }
+    }
+
+    /// <summary>--update-dialog-demo's Install. Walks the progress states with
+    /// no download, so the phase copy and the in-place switch can be looked at
+    /// on a dev build — the real path needs an installed Velopack build and a
+    /// published newer version, which is a fifteen-minute round trip per look.
+    ///
+    /// <para>Nothing is downloaded, verified or applied; the app does not
+    /// quit.</para></summary>
+    private static void RunDemoProgress()
+    {
+        DevLog.Write("update-dialog-demo: install invoked");
+        _ = Task.Run(async () =>
+        {
+            for (var percent = 0; percent <= 100; percent += 10)
+            {
+                UpdateDialog.Report(UpdateDialogText.Downloading(), percent);
+                await Task.Delay(250).ConfigureAwait(false);
+            }
+
+            UpdateDialog.Report(UpdateDialogText.Restarting(), null);
+            // The real path stays on this phase until the process exits, which
+            // in a demo is indistinguishable from a hang. Close instead.
+            await Task.Delay(1500).ConfigureAwait(false);
+            DevLog.Write("update-dialog-demo: the real path would restart here");
+            UpdateDialog.CloseIfOpen();
+        });
     }
 
     private void StartUpdateDownload(UpdateFlow flow, UpdateCandidate candidate)

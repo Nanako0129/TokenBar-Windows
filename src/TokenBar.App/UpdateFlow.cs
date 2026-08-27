@@ -168,9 +168,12 @@ internal class UpdateFlow
             return false;
         }
 
+        // silent, because the dialog is still on screen showing "Installing
+        // update…" when this runs. Velopack's own apply UI would be the second
+        // window this whole slice exists to remove.
         WaitExitThenApplyUpdates(
             validated.Target,
-            silent: false,
+            silent: true,
             restart: true,
             Array.Empty<string>());
         quit();
