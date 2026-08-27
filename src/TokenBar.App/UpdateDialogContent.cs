@@ -113,6 +113,11 @@ internal static class ReleaseNotesMarkdown
         // whole document already is, and capped again at flush.
         var paragraph = new StringBuilder();
         var start = 0;
+        // Lines seen in the table currently being read, counting the alignment
+        // row whether or not it was kept. Only line 1 — directly under the
+        // header — may be a delimiter; see AppendTableRow. Anything that is not
+        // a table row, blank line included, ends the table and resets this.
+        var tableLine = 0;
         // Bound 4: one linear pass over lines, no recursion anywhere. A future
         // nested list adds an explicit depth counter rather than a call.
         while (start <= text.Length && blocks.Count < MaxBlocks && runBudget > 0)
@@ -125,6 +130,7 @@ internal static class ReleaseNotesMarkdown
             if (cleaned.Length == 0)
             {
                 FlushParagraph(paragraph, blocks, ref runBudget);
+                tableLine = 0;
                 continue;
             }
 
@@ -133,10 +139,13 @@ internal static class ReleaseNotesMarkdown
                 // A table interrupts a soft-wrapped paragraph rather than
                 // continuing it, so flush before the row is emitted.
                 FlushParagraph(paragraph, blocks, ref runBudget);
-                AppendTableRow(cleaned, blocks, ref runBudget);
+                AppendTableRow(
+                    cleaned, blocks, ref runBudget, allowSeparator: tableLine == 1);
+                tableLine++;
                 continue;
             }
 
+            tableLine = 0;
             var kind = Classify(ref cleaned);
             if (kind == NotesBlockKind.Paragraph)
             {
@@ -173,16 +182,23 @@ internal static class ReleaseNotesMarkdown
     internal const int MaxCells = 12;
 
     /// <summary>A pipe-delimited row becomes one <see cref="NotesBlockKind.TableRow"/>
-    /// block carrying its cells; the <c>|---|---|</c> alignment row is dropped
+    /// block carrying its cells. The <c>|---|---|</c> alignment row is dropped
     /// entirely, so the renderer can treat the first row of a run of table rows
     /// as its header without looking for a marker.
+    ///
+    /// <para><paramref name="allowSeparator"/> is why the caller counts lines:
+    /// a delimiter row means "this is a table" only directly under the header.
+    /// Testing every row for the shape independently would silently delete a
+    /// data row of <c>| - | - |</c> — a perfectly ordinary way to write "none"
+    /// in a changelog table — and losing content is a worse failure than
+    /// rendering a row of dashes.</para>
     ///
     /// <para>Known ceiling: <c>\|</c> is not an escape here, so a literal pipe
     /// inside a cell splits it. GitHub's own tables allow it; a changelog that
     /// uses one gets an extra column rather than a wrong render.</para>
     /// </summary>
     private static void AppendTableRow(
-        string line, List<NotesBlock> blocks, ref int budget)
+        string line, List<NotesBlock> blocks, ref int budget, bool allowSeparator)
     {
         var fields = line.Split('|');
         var cells = new List<IReadOnlyList<NotesRun>>();
@@ -216,7 +232,7 @@ internal static class ReleaseNotesMarkdown
             cells.Add(runs.ToArray());
         }
 
-        if (empty || separator || cells.Count == 0
+        if (empty || (separator && allowSeparator) || cells.Count == 0
             || blocks.Count >= MaxBlocks)
         {
             return;

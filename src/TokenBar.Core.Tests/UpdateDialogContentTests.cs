@@ -363,11 +363,42 @@ public class ReleaseNotesMarkdownTests
             $"{row.Cells.Count} cells");
     }
 
-    // An alignment row on its own is not a table, and must not leave an empty
-    // block behind that renders as a stray gap.
+    // A delimiter row means "this is a table" only directly under the header.
+    // Testing every row for the shape independently silently deleted a data row
+    // of "| - | - |" — an ordinary way to write "none" in a changelog table —
+    // and losing content is a worse failure than rendering a row of dashes.
     [Fact]
-    public void AnAlignmentRowAloneProducesNothing() =>
-        Assert.Empty(ReleaseNotesMarkdown.Parse("|:---|---:|"));
+    public void OnlyTheRowUnderTheHeaderIsADelimiter()
+    {
+        var blocks = ReleaseNotesMarkdown.Parse(
+            "| Machine | File |\n|---|---|\n| x64 | Setup.exe |\n| - | - |");
+        Assert.Equal(3, blocks.Count);
+        Assert.Equal(["Machine", "File"], Cells(blocks[0]));
+        Assert.Equal(["x64", "Setup.exe"], Cells(blocks[1]));
+        Assert.Equal(["-", "-"], Cells(blocks[2]));
+    }
+
+    // The first line of a table is its header, so it is never a delimiter — a
+    // lone "|:---|---:|" is content, and dropping it would delete it.
+    [Fact]
+    public void TheFirstRowIsNeverADelimiter() =>
+        Assert.Equal(
+            [":---", "---:"],
+            Cells(Assert.Single(ReleaseNotesMarkdown.Parse("|:---|---:|"))));
+
+    // A blank line ends the table, so the delimiter slot is not carried across
+    // it into the next one.
+    [Fact]
+    public void ABlankLineRestartsTheDelimiterPosition()
+    {
+        var blocks = ReleaseNotesMarkdown.Parse(
+            "| A |\n|---|\n| x |\n\n| B |\n|---|\n| y |");
+        Assert.Equal(4, blocks.Count);
+        Assert.Equal(["A"], Cells(blocks[0]));
+        Assert.Equal(["x"], Cells(blocks[1]));
+        Assert.Equal(["B"], Cells(blocks[2]));
+        Assert.Equal(["y"], Cells(blocks[3]));
+    }
 
     private static string[] Cells(NotesBlock block)
     {
