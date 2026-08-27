@@ -146,8 +146,8 @@ public partial class App : Application
 
         try
         {
-            TrayService.CheckForUpdates = CheckForUpdatesAsync;
-            _ = Task.Run(() => CheckForUpdatesAsync());
+            TrayService.CheckForUpdates = () => CheckForUpdatesAsync(userInitiated: true);
+            _ = Task.Run(() => CheckForUpdatesAsync(userInitiated: false));
         }
         catch (Exception ex)
         {
@@ -168,20 +168,48 @@ public partial class App : Application
     /// pending action. Guarding the publisher only covers the window after an
     /// action is taken; a concurrent check has to be prevented before it
     /// starts, which is what returning the in-flight task does.</summary>
-    private Task<UpdateCheckResult> CheckForUpdatesAsync()
+    /// <param name="userInitiated">Whether a person asked. A skipped version is
+    /// withheld from the automatic check and offered again to a manual one —
+    /// Sparkle does exactly this, applying the skipped version only when the
+    /// check is a background one (SUAppcastDriver.m:228,
+    /// <c>background ? skippedUpdateForHost : nil</c>). Skip means "stop
+    /// nagging me", not "never show me this again": without the distinction a
+    /// mis-clicked Skip leaves no way back except editing settings.json.
+    ///
+    /// <para>A user-initiated call that joins an in-flight background check
+    /// still re-offers, because the offer decision is made per caller after
+    /// the shared check resolves, not inside it.</para></param>
+    private Task<UpdateCheckResult> CheckForUpdatesAsync(bool userInitiated)
     {
+        Task<UpdateCheckResult> shared;
         lock (_updateCheckGate)
         {
-            if (_updateCheckInFlight is { IsCompleted: false } running)
-            {
-                return running;
-            }
-
-            var started = RunUpdateCheckAsync();
-            _updateCheckInFlight = started;
-            return started;
+            shared = _updateCheckInFlight is { IsCompleted: false } running
+                ? running
+                : _updateCheckInFlight = RunUpdateCheckAsync();
         }
+
+        // Only a manual caller needs a second pass: the background one already
+        // published under its own rules inside RunUpdateCheckAsync.
+        return userInitiated ? ReofferIfSkippedAsync(shared) : shared;
     }
+
+    private async Task<UpdateCheckResult> ReofferIfSkippedAsync(
+        Task<UpdateCheckResult> shared)
+    {
+        var result = await shared.ConfigureAwait(true);
+        if (result.State == UpdateCheckState.Available
+            && _lastCandidate is { } pending
+            && string.Equals(pending.Candidate.Version, result.Version, StringComparison.Ordinal))
+        {
+            _ = QueueUpdateUi(() =>
+                PublishUpdate(pending.Flow, pending.Candidate, userInitiated: true));
+        }
+
+        return result;
+    }
+
+    private (UpdateFlow Flow, UpdateCandidate Candidate)? _lastCandidate;
 
     private async Task<UpdateCheckResult> RunUpdateCheckAsync()
     {
@@ -192,15 +220,20 @@ public partial class App : Application
             if (candidate is null)
             {
                 DevLog.Write("update-check: none");
+                _lastCandidate = null;
                 return UpdateCheckResult.UpToDate;
             }
 
+            // Retained so a manual caller that joined this check can re-offer a
+            // skipped version without running a second UpdateFlow.
+            _lastCandidate = (flow, candidate);
             _ = QueueUpdateUi(() => PublishUpdate(flow, candidate));
             return UpdateCheckResult.Available(candidate.Version);
         }
         catch (Exception ex)
         {
             LogUpdateFailure("update-check", ex);
+            _lastCandidate = null;
             return UpdateCheckResult.Failed;
         }
     }
@@ -217,7 +250,8 @@ public partial class App : Application
     /// "skipped" with "already downloading". A skipped version still reports
     /// honestly to a manual check; it is only not <em>offered</em>.</para>
     /// </summary>
-    private void PublishUpdate(UpdateFlow flow, UpdateCandidate candidate)
+    private void PublishUpdate(
+        UpdateFlow flow, UpdateCandidate candidate, bool userInitiated = false)
     {
         try
         {
@@ -229,7 +263,8 @@ public partial class App : Application
 
             if (!PendingUpdateAction.ShouldOffer(
                 candidate.Version,
-                AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey)))
+                AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey),
+                userInitiated))
             {
                 DevLog.Write($"update-available: v{candidate.Version} skipped by user");
                 return;
@@ -286,9 +321,12 @@ public partial class App : Application
             // is observable on the next launch: no dialog, no menu item, one
             // log line. Clear tokenbar.update.skippedVersion from settings.json
             // to get the offer back.
+            // Background semantics, so a Skip taken in the demo is observable
+            // on the next launch the way a real one would be.
             if (!PendingUpdateAction.ShouldOffer(
                 "9.9.9",
-                AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey)))
+                AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey),
+                userInitiated: false))
             {
                 DevLog.Write("update-dialog-demo: v9.9.9 skipped by user");
                 return;

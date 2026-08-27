@@ -11,13 +11,26 @@ public class UpdateSkipRuleTests
 {
     // Item 1. Both sides go through UpdateCandidate.Version as it travelled
     // through PublishUpdate; the dialog's display text is never read back.
+    // Sparkle applies the skipped version only to a background check
+    // (SUAppcastDriver.m:228). Skip means "stop nagging me", not "never show me
+    // this again": without this a mis-clicked Skip leaves no way back but
+    // editing settings.json, because the tray stops offering and the manual
+    // check can report the version but not act on it.
+    [Fact]
+    public void AUserInitiatedCheckReoffersASkippedVersion()
+    {
+        // The same inputs, differing only in who asked.
+        Assert.False(PendingUpdateAction.ShouldOffer("0.2.3", "0.2.3", userInitiated: false));
+        Assert.True(PendingUpdateAction.ShouldOffer("0.2.3", "0.2.3", userInitiated: true));
+    }
+
     [Fact]
     public void SkipSuppressesExactlyOneVersion()
     {
-        Assert.False(PendingUpdateAction.ShouldOffer("0.2.3", "0.2.3"));
-        Assert.True(PendingUpdateAction.ShouldOffer("0.2.4", "0.2.3"));
-        Assert.True(PendingUpdateAction.ShouldOffer("0.2.2", "0.2.3"));
-        Assert.True(PendingUpdateAction.ShouldOffer("0.10.0", "0.9.0"));
+        Assert.False(PendingUpdateAction.ShouldOffer("0.2.3", "0.2.3", userInitiated: false));
+        Assert.True(PendingUpdateAction.ShouldOffer("0.2.4", "0.2.3", userInitiated: false));
+        Assert.True(PendingUpdateAction.ShouldOffer("0.2.2", "0.2.3", userInitiated: false));
+        Assert.True(PendingUpdateAction.ShouldOffer("0.10.0", "0.9.0", userInitiated: false));
     }
 
     // Item 2. Anything that is not a well-formed version resolves to *offer*:
@@ -41,14 +54,14 @@ public class UpdateSkipRuleTests
     [InlineData("0.2.3\r\n")]
     public void BadOrUnrelatedStoredValuesStillOffer(string? stored)
     {
-        Assert.True(PendingUpdateAction.ShouldOffer("0.2.3", stored));
+        Assert.True(PendingUpdateAction.ShouldOffer("0.2.3", stored, userInitiated: false));
     }
 
     [Fact]
     public void OverLongStoredValueStillOffers()
     {
         var stored = new string('9', PendingUpdateAction.MaxVersionLength + 1);
-        Assert.True(PendingUpdateAction.ShouldOffer("0.2.3", stored));
+        Assert.True(PendingUpdateAction.ShouldOffer("0.2.3", stored, userInitiated: false));
         Assert.False(PendingUpdateAction.TryValidateVersion(stored));
     }
 
@@ -63,7 +76,7 @@ public class UpdateSkipRuleTests
             null, "", " ", "*", "\u202E0.2.3", "0.2.3", "9".PadLeft(4096, '9'),
         })
         {
-            _ = PendingUpdateAction.ShouldOffer("0.2.3", stored);
+            _ = PendingUpdateAction.ShouldOffer("0.2.3", stored, userInitiated: false);
             _ = PendingUpdateAction.TryValidateVersion(stored);
         }
     }

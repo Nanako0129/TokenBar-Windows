@@ -170,8 +170,17 @@ internal sealed class PendingUpdateAction : IDisposable
     /// <para>Anything that is not a well-formed version resolves to
     /// <c>true</c>: a corrupt or absent key must fail towards offering the
     /// update, not towards hiding it.</para></summary>
-    internal static bool ShouldOffer(string candidateVersion, string? storedSkipped) =>
-        !TryValidateVersion(storedSkipped)
+    /// <param name="userInitiated">A person asked, so the skip does not apply.
+    /// Sparkle reads the skipped version only for a background check
+    /// (SUAppcastDriver.m:228, <c>background ? skippedUpdateForHost : nil</c>):
+    /// Skip means "stop nagging me", not "never show me this again". Without
+    /// the distinction a mis-clicked Skip leaves no way back but editing
+    /// settings.json — the tray stops offering and the manual check, while it
+    /// reports the version honestly, cannot act on it.</param>
+    internal static bool ShouldOffer(
+        string candidateVersion, string? storedSkipped, bool userInitiated) =>
+        userInitiated
+        || !TryValidateVersion(storedSkipped)
         || !string.Equals(candidateVersion, storedSkipped, StringComparison.Ordinal);
 
     internal sealed class PendingAction

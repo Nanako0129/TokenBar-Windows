@@ -137,6 +137,21 @@ closes.
 | What is stored | `UpdateCandidate.Version` verbatim — it comes from `target.Version.ToNormalizedString()` and has already passed length, control-character and non-prerelease checks. **Never** a string read back out of the dialog's own display text |
 | How it compares | **Exact ordinal equality.** A rule containing `<` or `<=` is the wrong rule: `"999.0.0"` under an ordering rule permanently and silently suppresses every future update. Sparkle's semantics are skip *this* version, and "a newer version is still offered" then holds for free |
 | On read | Anything that is not a well-formed version — null, empty, over-long, `"*"`, containing control characters — resolves to **offer the update** |
+| **Who is asking** | A skip suppresses the **automatic** check only. A user-initiated check re-offers a skipped version |
+
+> **The last row was wrong in the first implementation, and a user found it.**
+> The gate applied unconditionally, so a mis-clicked Skip left no way back
+> except editing `settings.json`: the tray stopped offering, and Settings'
+> "Check now" reported the version honestly but could not act on it.
+>
+> Sparkle reads the skipped version **only for a background check** —
+> `SUAppcastDriver.m:228`, `background ? [SPUSkippedUpdate skippedUpdateForHost:_host] : nil`.
+> Skip means "stop nagging me", not "never show me this again". This spec had
+> already written "Sparkle's semantics are skip *this* version" and then
+> implemented something stricter than Sparkle.
+>
+> `ShouldOffer` takes `userInitiated` so the distinction lives in the layer the
+> tests compile, not in `App.xaml.cs` where it would have none.
 
 `PendingUpdateAction.ValidateVersion` is `private static void` and throws, so it
 **cannot be called from outside that class as written**. This slice owns
