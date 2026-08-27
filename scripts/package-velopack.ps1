@@ -371,6 +371,43 @@ if ($hasReleaseNotes) {
     }
 
     Write-Output ("Release feed notes verified: {0} characters in {1}" -f $feedNotes.Length, (Split-Path -Leaf $feedPath))
+
+    # vpk embeds the notes in the package's nuspec, and every client rejects a
+    # nuspec larger than UpdateFlow.MaxNuspecBytes (UpdateFlow.cs:307-311).
+    # Those two limits are both 65,536 and they are NOT the same limit: the
+    # parser's is characters of notes, the client's is bytes of the whole
+    # nuspec including XML escaping. A release body approaching the first
+    # therefore produces packages no client will install -- and packaging would
+    # still succeed, so the failure would appear only on users' machines, as an
+    # update that downloads and then silently does nothing.
+    #
+    # Assert the real constraint rather than guessing a margin for the notes.
+    # NuspecMaxBytesMatchesUpdateFlow pins this constant against the C# one.
+    $maxNuspecBytes = 65536
+    $nupkg = @(Get-ChildItem -LiteralPath $releasesRoot -File -Filter "*-full.nupkg")
+    if ($nupkg.Count -ne 1) {
+        throw "Expected exactly one full nupkg in $releasesRoot, found $($nupkg.Count)."
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg[0].FullName)
+    try {
+        $nuspec = @($zip.Entries | Where-Object { $_.FullName -like "*.nuspec" })
+        if ($nuspec.Count -ne 1) {
+            throw "Expected exactly one nuspec in $($nupkg[0].Name), found $($nuspec.Count)."
+        }
+
+        if ($nuspec[0].Length -gt $maxNuspecBytes) {
+            throw ("Nuspec is $($nuspec[0].Length) bytes, over the $maxNuspecBytes " +
+                "the client accepts. The release notes are too long to embed: " +
+                "shorten '$releaseNotesPath'. Every client would reject this package.")
+        }
+
+        Write-Output ("Nuspec size verified: {0} of {1} bytes" -f $nuspec[0].Length, $maxNuspecBytes)
+    }
+    finally {
+        $zip.Dispose()
+    }
 }
 
 $releaseFiles = @(Get-ChildItem -LiteralPath $releasesRoot -File | Sort-Object Name)

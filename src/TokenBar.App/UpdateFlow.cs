@@ -66,7 +66,10 @@ internal class UpdateFlow
     /// $(TbProductName): a future product rename must not move it by
     /// accident. PackageIdMatchesPackagingScript pins the two together.</summary>
     internal const string PackageId = "Nyanako.Syrtis";
-    private const int MaxNuspecBytes = 65_536;
+    /// <summary>Internal rather than private so NuspecMaxBytesMatchesPackagingScript
+    /// can pin it against the packaging script, which embeds release notes into
+    /// the nuspec and must not produce one this rejects.</summary>
+    internal const int MaxNuspecBytes = 65_536;
     private const long MaxCompressionRatio = 100;
 
     /// <summary>

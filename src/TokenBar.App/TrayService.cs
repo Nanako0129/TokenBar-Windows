@@ -223,9 +223,16 @@ public sealed class TrayService : IDisposable
             return false;
         }
 
+        // Captured before the dialog opens. The version alone is not identity:
+        // Settings' "Check now" can republish the *same* version while the
+        // dialog is open, and Publish overwrites the action unconditionally, so
+        // a same-version republish whose notes or checksum moved would pass a
+        // string comparison while Install ran a different action.
+        var shownGeneration = _pendingUpdate.PeekGeneration();
+
         UpdateDialog.Present(
             offer,
-            install: () => ActOnShownOffer(version, InvokePendingUpdate),
+            install: () => ActOnShownOffer(shownGeneration, version, InvokePendingUpdate),
             later: () =>
             {
                 // Nothing to undo: nothing was taken. The pending action stays,
@@ -234,7 +241,7 @@ public sealed class TrayService : IDisposable
                     $"update-dialog: later v{version} active={_activeUpdate is not null}");
                 return true;
             },
-            skip: () => ActOnShownOffer(version, () => SkipUpdate(offer)));
+            skip: () => ActOnShownOffer(shownGeneration, version, () => SkipUpdate(offer)));
         return true;
     }
 
@@ -247,14 +254,18 @@ public sealed class TrayService : IDisposable
     /// this check the dialog would show vX's notes while Install took vY —
     /// installing a different version than the one described — and Skip would
     /// record vX while clearing vY's pending action.</para></summary>
-    private bool ActOnShownOffer(string shownVersion, Action act)
+    private bool ActOnShownOffer(int? shownGeneration, string shownVersion, Action act)
     {
         if (_disposed)
         {
             return true;
         }
 
-        if (!string.Equals(_pendingUpdate.Peek(), shownVersion, StringComparison.Ordinal))
+        // Generation first: it distinguishes two offers of the same version,
+        // which the string cannot. The version is still compared so the DevLog
+        // line names something a human can read.
+        if (_pendingUpdate.PeekGeneration() != shownGeneration
+            || !string.Equals(_pendingUpdate.Peek(), shownVersion, StringComparison.Ordinal))
         {
             DevLog.Write($"update-dialog: offer moved off v{shownVersion}");
             // Re-present against whatever is pending now; if nothing is, close.

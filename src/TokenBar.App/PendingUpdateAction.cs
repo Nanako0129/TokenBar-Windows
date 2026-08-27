@@ -33,6 +33,18 @@ internal sealed class PendingUpdateAction : IDisposable
         }
     }
 
+    /// <summary>The generation of the current pending action, or null when
+    /// there is none. Publish overwrites unconditionally and bumps this, so two
+    /// offers of the *same version* are still distinguishable — which the
+    /// version string alone cannot do, and Take() would consume.</summary>
+    internal int? PeekGeneration()
+    {
+        lock (_gate)
+        {
+            return _pending is null ? null : _generation;
+        }
+    }
+
     internal string? Peek()
     {
         lock (_gate)

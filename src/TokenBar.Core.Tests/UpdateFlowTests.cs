@@ -1117,4 +1117,19 @@ public class UpdateFlowTests : IDisposable
         Assert.NotNull(candidate);
         Assert.Equal(notes, candidate!.Notes);
     }
+
+    // The packaging script embeds release notes in the nuspec and asserts the
+    // result fits what this client accepts. That limit is stated in two places
+    // in two languages; a silent divergence would ship packages every client
+    // rejects, and packaging would still succeed. Same shape as
+    // PackageIdMatchesPackagingScript.
+    [Fact]
+    public void NuspecMaxBytesMatchesPackagingScript()
+    {
+        var script = File.ReadAllText(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "package-velopack.ps1"));
+
+        Assert.Contains("$maxNuspecBytes = 65536", script, StringComparison.Ordinal);
+        Assert.Equal(65_536, UpdateFlow.MaxNuspecBytes);
+    }
 }
