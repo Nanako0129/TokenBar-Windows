@@ -198,14 +198,27 @@ public partial class App : Application
         Task<UpdateCheckResult> shared)
     {
         var result = await shared.ConfigureAwait(true);
-        if (result.State == UpdateCheckState.Available
-            && _lastCandidate is { } pending
-            && string.Equals(pending.Candidate.Version, result.Version, StringComparison.Ordinal))
+        if (result.State != UpdateCheckState.Available
+            || _lastCandidate is not { } pending
+            || !string.Equals(pending.Candidate.Version, result.Version, StringComparison.Ordinal))
         {
-            _ = QueueUpdateUi(() =>
-                PublishUpdate(pending.Flow, pending.Candidate, userInitiated: true));
+            return result;
         }
 
+        // Only when the shared check's own publish was suppressed by the skip.
+        // Republishing unconditionally would offer every manual check twice —
+        // two notifications, and the second bumping the generation, which
+        // invalidates a dialog opened from the first.
+        if (PendingUpdateAction.ShouldOffer(
+            pending.Candidate.Version,
+            AppSettings.Store.GetString(PendingUpdateAction.SkippedVersionKey),
+            userInitiated: false))
+        {
+            return result;
+        }
+
+        _ = QueueUpdateUi(() =>
+            PublishUpdate(pending.Flow, pending.Candidate, userInitiated: true));
         return result;
     }
 
