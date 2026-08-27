@@ -70,7 +70,10 @@ internal class UpdateFlow
     /// can pin it against the packaging script, which embeds release notes into
     /// the nuspec and must not produce one this rejects.</summary>
     internal const int MaxNuspecBytes = 65_536;
-    private const long MaxCompressionRatio = 100;
+    /// <summary>Internal for the same reason as <see cref="MaxNuspecBytes"/>:
+    /// the packaging script mirrors ValidateNuspec's whole condition, and a
+    /// test pins both constants against it.</summary>
+    internal const long MaxCompressionRatio = 100;
 
     /// <summary>
     /// Exact Velopack channels accepted for installed products. Full and Lite

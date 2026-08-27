@@ -384,6 +384,7 @@ if ($hasReleaseNotes) {
     # Assert the real constraint rather than guessing a margin for the notes.
     # NuspecMaxBytesMatchesUpdateFlow pins this constant against the C# one.
     $maxNuspecBytes = 65536
+    $maxCompressionRatio = 100
     $nupkg = @(Get-ChildItem -LiteralPath $releasesRoot -File -Filter "*-full.nupkg")
     if ($nupkg.Count -ne 1) {
         throw "Expected exactly one full nupkg in $releasesRoot, found $($nupkg.Count)."
@@ -397,13 +398,35 @@ if ($hasReleaseNotes) {
             throw "Expected exactly one nuspec in $($nupkg[0].Name), found $($nuspec.Count)."
         }
 
-        if ($nuspec[0].Length -gt $maxNuspecBytes) {
-            throw ("Nuspec is $($nuspec[0].Length) bytes, over the $maxNuspecBytes " +
-                "the client accepts. The release notes are too long to embed: " +
-                "shorten '$releaseNotesPath'. Every client would reject this package.")
+        # Mirror ValidateNuspec's condition WHOLE. It is three checks, not one:
+        # uncompressed size, compressed size, and a compression ratio. A first
+        # pass here implemented only the size check, and highly compressible
+        # notes -- repeated or generated text -- pass that while blowing the
+        # ratio, so packaging succeeded and every client discarded the download.
+        # Roughly 60 KB of repeated text compresses to under 600 bytes.
+        $entryLength = $nuspec[0].Length
+        $entryCompressed = $nuspec[0].CompressedLength
+        $reason = $null
+        if ($entryLength -lt 1 -or $entryLength -gt $maxNuspecBytes) {
+            $reason = "uncompressed size $entryLength is outside 1..$maxNuspecBytes"
+        }
+        elseif ($entryCompressed -lt 1 -or $entryCompressed -gt $maxNuspecBytes) {
+            $reason = "compressed size $entryCompressed is outside 1..$maxNuspecBytes"
+        }
+        elseif ($entryLength -gt $entryCompressed * $maxCompressionRatio) {
+            $reason = ("compression ratio {0:N1} exceeds $maxCompressionRatio " -f
+                ($entryLength / $entryCompressed))
         }
 
-        Write-Output ("Nuspec size verified: {0} of {1} bytes" -f $nuspec[0].Length, $maxNuspecBytes)
+        if ($null -ne $reason) {
+            throw ("The packaged nuspec is one the client rejects: $reason. " +
+                "The release notes are embedded in it, so shorten or vary " +
+                "'$releaseNotesPath'. Every client would download this package " +
+                "and then discard it.")
+        }
+
+        Write-Output ("Nuspec verified: {0} bytes, {1} compressed, ratio {2:N1} of {3}" -f
+            $entryLength, $entryCompressed, ($entryLength / $entryCompressed), $maxCompressionRatio)
     }
     finally {
         $zip.Dispose()

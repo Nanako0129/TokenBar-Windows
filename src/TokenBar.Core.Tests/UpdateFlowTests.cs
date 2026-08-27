@@ -1129,7 +1129,14 @@ public class UpdateFlowTests : IDisposable
         var script = File.ReadAllText(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "package-velopack.ps1"));
 
+        // Both constants, because ValidateNuspec's condition is three checks and
+        // the script must mirror all of them: a first pass implemented only the
+        // size check, and notes that compress well pass that while failing the
+        // ratio the client applies independently.
         Assert.Contains("$maxNuspecBytes = 65536", script, StringComparison.Ordinal);
+        Assert.Contains("$maxCompressionRatio = 100", script, StringComparison.Ordinal);
+        Assert.Contains("entryCompressed", script, StringComparison.Ordinal);
         Assert.Equal(65_536, UpdateFlow.MaxNuspecBytes);
+        Assert.Equal(100L, UpdateFlow.MaxCompressionRatio);
     }
 }
