@@ -1034,4 +1034,48 @@ public class UpdateFlowTests : IDisposable
     {
         public override SemanticVersion? CurrentlyInstalledVersion => null;
     }
+
+    // ---- manual check status ---------------------------------------------
+    //
+    // The four states are what the settings line renders; SettingsWindow.cs is
+    // not compiled by any test project, so this is the only place the mapping
+    // can be asserted.
+
+    [Fact]
+    public void ManualCheckStatesRenderTheirOwnLine()
+    {
+        Localization.Load("en", AppContext.BaseDirectory);
+        Assert.Equal("Checking for updates…", UpdateCheckResult.Checking.Text());
+        Assert.Equal("You are up to date.", UpdateCheckResult.UpToDate.Text());
+        Assert.Equal("Update available: v1.2.3", UpdateCheckResult.Available("1.2.3").Text());
+        Assert.Equal("Could not check for updates.", UpdateCheckResult.Failed.Text());
+    }
+
+    // ValidateTarget already rejects an empty version, so Available("") means a
+    // caller went around it. Reporting failure is honest; "Update available: v"
+    // is not.
+    [Fact]
+    public void AvailableWithoutAVersionReportsFailureRatherThanAnEmptyVersion()
+    {
+        Localization.Load("en", AppContext.BaseDirectory);
+        Assert.Equal(UpdateCheckState.Failed, UpdateCheckResult.Available("").State);
+        Assert.Equal("Could not check for updates.", UpdateCheckResult.Available("").Text());
+    }
+
+    [Fact]
+    public void ManualCheckStatesAreTranslated()
+    {
+        Localization.Load("zh-Hant", AppContext.BaseDirectory);
+        try
+        {
+            Assert.Equal("正在檢查更新…", UpdateCheckResult.Checking.Text());
+            Assert.Equal("已是最新版本。", UpdateCheckResult.UpToDate.Text());
+            Assert.Equal("有可用更新：v1.2.3", UpdateCheckResult.Available("1.2.3").Text());
+            Assert.Equal("無法檢查更新。", UpdateCheckResult.Failed.Text());
+        }
+        finally
+        {
+            Localization.Load("en", AppContext.BaseDirectory);
+        }
+    }
 }

@@ -135,11 +135,38 @@ public partial class App : Application
 
         try
         {
+            TrayService.CheckForUpdates = CheckForUpdatesManuallyAsync;
             _ = Task.Run(CheckForUpdatesOnceAsync);
         }
         catch (Exception ex)
         {
             LogUpdateFailure("update-check", ex);
+        }
+    }
+
+    /// <summary>Settings' "Check now". Shares CheckForUpdatesOnceAsync's flow
+    /// and its PublishUpdate hand-off, so a manual find lands in the tray the
+    /// same way an automatic one does; the return value only drives the line
+    /// the settings page shows.</summary>
+    private async Task<UpdateCheckResult> CheckForUpdatesManuallyAsync()
+    {
+        try
+        {
+            var flow = new UpdateFlow();
+            var candidate = await flow.CheckForUpdatesAsync().ConfigureAwait(false);
+            if (candidate is null)
+            {
+                DevLog.Write("update-check-manual: none");
+                return UpdateCheckResult.UpToDate;
+            }
+
+            _ = QueueUpdateUi(() => PublishUpdate(flow, candidate));
+            return UpdateCheckResult.Available(candidate.Version);
+        }
+        catch (Exception ex)
+        {
+            LogUpdateFailure("update-check-manual", ex);
+            return UpdateCheckResult.Failed;
         }
     }
 

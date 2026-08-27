@@ -129,6 +129,12 @@ public sealed class TrayService : IDisposable
     /// the view layer never sees the tray feed.</summary>
     public static Action? OpenSettings { get; private set; }
 
+    /// <summary>Settings' manual "Check now" reaches the update flow through
+    /// here. Unlike the two neighbours this is set by App, which owns the
+    /// flow — the tray only already owns the update surface (PublishUpdate),
+    /// so this is where the view layer looks for it.</summary>
+    internal static Func<Task<UpdateCheckResult>>? CheckForUpdates { get; set; }
+
     public void ShowSettings() => SettingsWindow.Present(
         () => _feed.Quota, () => _feed.Graph, () => _feed.Trace);
 

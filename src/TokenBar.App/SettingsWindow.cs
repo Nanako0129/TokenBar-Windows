@@ -548,6 +548,45 @@ public sealed class SettingsWindow : Window
                 + "handlecusion's tokcat.").Localized()));
         panel.Children.Add(Section("About".Localized(), about));
 
+        // ── Check for updates ──────────────────────────────────────────
+        // The check reports in place; the Sparkle-style dialog ALIGN-2 commits
+        // to (version, changelog, Update / Remind me later / Skip) is separate
+        // and still to build, so a found update still only reaches the tray.
+        // The button disables itself for the duration: the check takes a few
+        // seconds and a second press would start a second flow against the
+        // same release feed.
+        var updates = new StackPanel { Spacing = 4 };
+        var status = Ui.Dim(string.Empty, 12);
+        status.Visibility = Visibility.Collapsed;
+        var check = new Button
+        {
+            Content = "Check Now".Localized(),
+            Padding = new Thickness(10, 3, 10, 4),
+            FontSize = 12,
+        };
+        check.Click += async (_, _) =>
+        {
+            if (TrayService.CheckForUpdates is not { } run)
+            {
+                return;
+            }
+
+            check.IsEnabled = false;
+            status.Visibility = Visibility.Visible;
+            status.Text = UpdateCheckResult.Checking.Text();
+            try
+            {
+                status.Text = (await run()).Text();
+            }
+            finally
+            {
+                check.IsEnabled = true;
+            }
+        };
+        updates.Children.Add(Ui.Row(Ui.Text("Check for updates".Localized(), 12), check));
+        updates.Children.Add(status);
+        panel.Children.Add(Section("Updates".Localized(), updates));
+
         return panel;
     }
 
