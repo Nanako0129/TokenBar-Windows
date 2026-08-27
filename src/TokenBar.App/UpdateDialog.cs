@@ -345,6 +345,16 @@ internal sealed class UpdateDialog : Window
         if (_notesBox is not null) { _notesBox.Visibility = Visibility.Collapsed; }
         if (_footer is not null) { _footer.Visibility = Visibility.Collapsed; }
         _progressHost.Visibility = Visibility.Visible;
+        // The window must be on screen for any of this to mean anything. Install
+        // used to return "close" from its handler, which hid the window before
+        // the first report arrived, so every phase rendered into a hidden
+        // dialog — the exact no-feedback behaviour progress exists to remove.
+        // The handler no longer does that; this is the second line of defence.
+        if (!AppWindow.IsVisible)
+        {
+            AppWindow.Show();
+        }
+
         if (percent is { } value)
         {
             _progress.IsIndeterminate = false;
