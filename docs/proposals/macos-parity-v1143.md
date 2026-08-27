@@ -78,11 +78,26 @@ git archive origin/main Sources | tar -x -C <scratch>/macos-v1143
 
 | 能力 | Windows 現況 |
 |---|---|
-| Discord Rich Presence | 全 repo **0** 個 `discord` 字樣；macOS 1674 行三個檔 |
+| Discord Rich Presence | 原始碼零實作；macOS 1674 行三個檔 |
 | 用量歸因整頁 | 零實作；macOS 是設定的第五頁 |
 | 「立即檢查更新」按鈕 | 設定裡沒有任何更新入口 |
 | Beta 更新通道 | `UpdateFlow.cs:43` 寫死 `prerelease: false` |
 | Individual tray items | **明列非目標**，不計入落差 |
+
+> **落差的查證指令**（範圍要寫清楚，否則讀者重跑得到不同結果）：
+>
+> ```bash
+> # Discord：限定原始碼，不含 docs——docs/proposals/settings-sidebar.md
+> # 本來就有四處提到它（第 7、104、145、150 行），全 repo 搜尋不會是零。
+> grep -rni "discord" src/ --include=*.cs --include=*.xaml   # → 0
+>
+> # 更新入口
+> grep -n "prerelease" src/TokenBar.App/UpdateFlow.cs        # → :43 prerelease: false
+>
+> # 客戶端差集
+> # macOS Sources/TokenBarCore/ClientRegistry.swift 34 筆 vs
+> # src/TokenBar.Core/ClientRegistry.cs 32 筆
+> ```
 
 ### 客戶端註冊表
 
