@@ -287,6 +287,24 @@ if ($DeploymentMode -eq "Lite") {
 $releasesRoot = Join-Path $outputRootResolved "releases"
 New-Item -ItemType Directory -Path $releasesRoot -Force | Out-Null
 
+# Release notes are baked into the nuspec at pack time and cannot be
+# backfilled, so a version with no notes file packs exactly as it did before
+# this existed -- "no notes" is a first-class state, not an error path, and
+# every version published so far is in it.
+#
+# The path is derived here rather than passed in. This script is invoked with
+# the same three arguments by ci.yml on every push and by release.yml on a tag,
+# and neither passes a tag; deriving from $packProperties.SemanticVersion, which
+# this script already computes, is what keeps the two workflows from drifting.
+$releaseNotesPath = Join-Path $repoRoot (".github\release-notes\v{0}.md" -f $packProperties.SemanticVersion)
+$hasReleaseNotes = Test-Path -LiteralPath $releaseNotesPath -PathType Leaf
+if ($hasReleaseNotes) {
+    Write-Output "Release notes found: $releaseNotesPath"
+}
+else {
+    Write-Output "No release notes file for $($packProperties.SemanticVersion); packing without --releaseNotes."
+}
+
 Push-Location $repoRoot
 try {
     Invoke-Captured -Command "dotnet" -Arguments @(
@@ -307,6 +325,9 @@ try {
     if ($DeploymentMode -eq "Lite") {
         $vpkArgs += @("--framework", $frameworkSpec)
     }
+    if ($hasReleaseNotes) {
+        $vpkArgs += @("--releaseNotes", $releaseNotesPath)
+    }
 
     Invoke-Captured -Command "dotnet" -Arguments $vpkArgs -FailureMessage "Velopack pack failed"
 }
@@ -321,6 +342,36 @@ Assert-VelopackPackage -PackagePath $packagePath -PackId $packId `
     -SemanticVersion $packProperties.SemanticVersion -MainExe $appExecutableName `
     -MachineArchitecture $machineArchitecture -Channel $channel `
     -DeploymentMode $DeploymentMode -ExpectedRuntimeDependency $frameworkSpec
+
+# Stated conditionally, beside the pack-id/version/mainExe/architecture/channel
+# assertions above: IF a notes file was found for this version, the produced
+# feed must carry non-empty notes for it. The client reads
+# releases.{channel}.json from the release assets -- NOT the GitHub release
+# body, which release.yml feeds to `gh release --notes-file` and which
+# Velopack's GithubSource never reads -- so this is the only place the dialog's
+# changelog can come from. Red the moment --releaseNotes stops reaching vpk
+# pack, on every PR rather than only at tag time.
+if ($hasReleaseNotes) {
+    $feedPath = Join-Path $releasesRoot ("releases.{0}.json" -f $channel)
+    if (-not (Test-Path -LiteralPath $feedPath -PathType Leaf)) {
+        throw "Velopack release feed is missing: $feedPath"
+    }
+
+    $feed = Get-Content -LiteralPath $feedPath -Raw | ConvertFrom-Json
+    $feedAssets = @($feed.Assets | Where-Object {
+            $_.Version -ceq $packProperties.SemanticVersion -and $_.Type -ceq "Full"
+        })
+    if ($feedAssets.Count -ne 1) {
+        throw "Expected exactly one Full asset for $($packProperties.SemanticVersion) in $feedPath, found $($feedAssets.Count)."
+    }
+
+    $feedNotes = $feedAssets[0].NotesMarkdown
+    if ([string]::IsNullOrWhiteSpace($feedNotes)) {
+        throw "Release notes were supplied from '$releaseNotesPath' but '$feedPath' carries no notesMarkdown for $($packProperties.SemanticVersion)."
+    }
+
+    Write-Output ("Release feed notes verified: {0} characters in {1}" -f $feedNotes.Length, (Split-Path -Leaf $feedPath))
+}
 
 $releaseFiles = @(Get-ChildItem -LiteralPath $releasesRoot -File | Sort-Object Name)
 Write-Output "Phase 11 Velopack package verified: $packageName"

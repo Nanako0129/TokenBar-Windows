@@ -29,6 +29,13 @@ public sealed class TrayService : IDisposable
     private readonly Action<string> _onStoreChanged;
     private readonly PendingUpdateAction _pendingUpdate = new();
     private PendingUpdateAction.PendingAction? _activeUpdate;
+    /// <summary>What the dialog displays for the currently pending action.
+    /// PendingUpdateAction carries only a version string; the dialog also needs
+    /// the installed version and the release notes, and this is the cheaper of
+    /// the two ways the plan allowed — the tray holds the display record beside
+    /// the pending action rather than PendingUpdateAction growing a payload it
+    /// has no opinion about.</summary>
+    private UpdateOffer? _pendingOffer;
     private string _iconSignature = "";
     private nint _hicon;
     private bool _disposed;
@@ -50,7 +57,7 @@ public sealed class TrayService : IDisposable
         {
             if (eventArgs.MouseEvent == MouseEvent.BalloonToolTipClicked)
             {
-                InvokePendingUpdate();
+                _ = TryOpenUpdateDialog();
             }
         };
         _icon.NoLeftClickDelay = true;
@@ -149,14 +156,17 @@ public sealed class TrayService : IDisposable
     /// same shape and only escaped because it runs once at startup; the manual
     /// check made it reachable at any moment, so the guard belongs here rather
     /// than at either caller.</summary>
-    internal bool PublishUpdate(string version, Action action)
+    internal bool PublishUpdate(UpdateOffer offer, Action action)
     {
+        ArgumentNullException.ThrowIfNull(offer);
+        var version = offer.Version;
         if (_disposed || _activeUpdate is not null
             || !_pendingUpdate.Publish(version, action))
         {
             return false;
         }
 
+        _pendingOffer = offer;
         try
         {
             RebuildMenu();
@@ -181,9 +191,105 @@ public sealed class TrayService : IDisposable
         catch
         {
             _pendingUpdate.Clear();
+            _pendingOffer = null;
             RebuildMenu();
             throw;
         }
+    }
+
+    /// <summary>Open the Sparkle-style dialog for the pending update.
+    ///
+    /// <para><b>This is what the menu item and the balloon click do now — the
+    /// dialog is opened <em>before</em> the pending action is taken, never from
+    /// inside it.</b> That ordering is the whole design.
+    /// <see cref="InvokePendingUpdate"/> does <c>Take()</c> and sets
+    /// <c>_activeUpdate</c> before running the action, so a dialog opened from
+    /// inside the published action would be looking at an update that has
+    /// already been taken: Remind Me Later's "the pending action stays" would
+    /// be false, and Skip would leave <c>_activeUpdate</c> non-null, whose
+    /// guard in <see cref="PublishUpdate"/> then refuses <em>every</em> future
+    /// offer for the life of the process — skipping 0.2.3 would silently
+    /// suppress 0.2.4.</para>
+    ///
+    /// <para>Returns false when there is nothing to show, which is also how a
+    /// stale handler learns to close instead of re-presenting.</para></summary>
+    internal bool TryOpenUpdateDialog()
+    {
+        if (_disposed
+            || _pendingUpdate.Peek() is not { } version
+            || _pendingOffer is not { } offer
+            || !string.Equals(offer.Version, version, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        UpdateDialog.Present(
+            offer,
+            install: () => ActOnShownOffer(version, InvokePendingUpdate),
+            later: () =>
+            {
+                // Nothing to undo: nothing was taken. The pending action stays,
+                // so the tray still offers it and the next check offers it again.
+                DevLog.Write(
+                    $"update-dialog: later v{version} active={_activeUpdate is not null}");
+                return true;
+            },
+            skip: () => ActOnShownOffer(version, () => SkipUpdate(offer)));
+        return true;
+    }
+
+    /// <summary>Run a dialog action only if the update it was shown for is
+    /// still the pending one.
+    ///
+    /// <para><c>_activeUpdate</c> is null while the dialog is open, so
+    /// <see cref="PublishUpdate"/> lets a newer candidate through and
+    /// <c>PendingUpdateAction.Publish</c> overwrites unconditionally. Without
+    /// this check the dialog would show vX's notes while Install took vY —
+    /// installing a different version than the one described — and Skip would
+    /// record vX while clearing vY's pending action.</para></summary>
+    private bool ActOnShownOffer(string shownVersion, Action act)
+    {
+        if (_disposed)
+        {
+            return true;
+        }
+
+        if (!string.Equals(_pendingUpdate.Peek(), shownVersion, StringComparison.Ordinal))
+        {
+            DevLog.Write($"update-dialog: offer moved off v{shownVersion}");
+            // Re-present against whatever is pending now; if nothing is, close.
+            return !TryOpenUpdateDialog();
+        }
+
+        act();
+        return true;
+    }
+
+    /// <summary>Skip This Version: record it, stop offering it, and leave
+    /// <c>_activeUpdate</c> null — nothing was taken.
+    ///
+    /// <para><c>Clear()</c> is the right primitive and the other two are not:
+    /// <c>RestoreUpdateAction</c> restores an action that was <em>taken</em>,
+    /// and <c>CompleteUpdateAction</c> clears after a successful hand-off. What
+    /// is new here is only the menu rebuild and the settings write.</para>
+    ///
+    /// <para>The version written is <c>UpdateCandidate.Version</c> as it
+    /// travelled through <see cref="PublishUpdate"/> — never a string read back
+    /// out of the dialog's own display text.</para></summary>
+    private void SkipUpdate(UpdateOffer offer)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        AppSettings.Store.SetString(
+            PendingUpdateAction.SkippedVersionKey, offer.Version);
+        _pendingUpdate.Clear();
+        _pendingOffer = null;
+        RebuildMenu();
+        DevLog.Write(
+            $"update-dialog: skip v{offer.Version} active={_activeUpdate is not null}");
     }
 
     internal void RestoreUpdateAction()
@@ -209,8 +315,21 @@ public sealed class TrayService : IDisposable
 
         _activeUpdate = null;
         _pendingUpdate.Clear();
+        _pendingOffer = null;
     }
 
+    /// <summary>Takes the pending action and runs it. Reached only from the
+    /// dialog's Install button now: it is what the menu item used to do
+    /// directly.
+    ///
+    /// <para>Install must come through here rather than calling
+    /// <c>UpdateFlow.DownloadAndVerifyAsync</c> itself.
+    /// <c>UpdateFlow._downloadActive</c> is per instance and every check builds
+    /// a new flow, so <c>_activeUpdate</c> is the only cross-flow guard there
+    /// is. Bypassing it would leave "Update to v…" live during the download,
+    /// and invoking it again would start a second flow against the same package
+    /// path — either flow's failure calls <c>CleanAllPackages</c>, so the two
+    /// destroy each other's work.</para></summary>
     private void InvokePendingUpdate()
     {
         if (_disposed || _pendingUpdate.Take() is not { } pending)
@@ -219,6 +338,7 @@ public sealed class TrayService : IDisposable
         }
 
         _activeUpdate = pending;
+        DevLog.Write($"update-dialog: install v{pending.Version} active=True");
         RebuildMenu();
         try
         {
@@ -260,7 +380,7 @@ public sealed class TrayService : IDisposable
             menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutItem
             {
                 Text = "Update to v{0}".Localized(updateVersion),
-                Command = new RelayCommand(InvokePendingUpdate),
+                Command = new RelayCommand(() => TryOpenUpdateDialog()),
             });
         }
         menu.Items.Add(new Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator());
@@ -678,6 +798,7 @@ public sealed class TrayService : IDisposable
         _readyTcs = null;
         _pendingUpdate.Dispose();
         _activeUpdate = null;
+        _pendingOffer = null;
         AppSettings.Store.Changed -= _onStoreChanged;
         _feed.Dispose(); // stop polling before the icon it feeds goes away
         _animator.Stop();

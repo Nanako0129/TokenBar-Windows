@@ -25,6 +25,11 @@
     <Compile Include="..\TokenBar.App\ProductIdentity.cs" Link="ProductIdentity.cs" />
     <Compile Include="..\TokenBar.App\TrayForceCreatePolicy.cs" Link="TrayForceCreatePolicy.cs" />
     <Compile Include="..\TokenBar.App\UpdateFlow.cs" Link="UpdateFlow.cs" />
+    <!-- The update dialog's whole content layer: the Markdown-subset parser
+         runs on the UI thread on text that arrives with the update feed, and
+         the dialog's copy is a set of format strings. Neither is testable from
+         UpdateDialog.cs, which no test project can compile. -->
+    <Compile Include="..\TokenBar.App\UpdateDialogContent.cs" Link="UpdateDialogContent.cs" />
     <Compile Include="..\TokenBar.App\GraphRequestCoordinator.cs" Link="GraphRequestCoordinator.cs" />
     <Compile Include="..\TokenBar.App\GraphConsumerState.cs" Link="GraphConsumerState.cs" />
     <Compile Include="..\TokenBar.App\CostSurfaceProjection.cs" Link="CostSurfaceProjection.cs" />
@@ -48,6 +53,13 @@
          client accepts. -->
     <None Include="..\..\scripts\package-velopack.ps1"
           Link="Fixtures\package-velopack.ps1"
+          CopyToOutputDirectory="PreserveNewest" />
+    <!-- The real release bodies, not a fixture, for the same reason as the
+         translation table below: the changelog renderer's job is to survive
+         the markdown this repository actually publishes. Every file, not one
+         pinned name, so a new release body is covered the day it is written. -->
+    <None Include="..\..\.github\release-notes\*.md"
+          Link="Fixtures\release-notes\%(Filename)%(Extension)"
           CopyToOutputDirectory="PreserveNewest" />
     <!-- The shipped translation table, not a fixture: the i18n tests exist to
          catch a call site wrapped in Localized() whose key was never added to
