@@ -398,6 +398,19 @@ public partial class App : Application
         }
     }
 
+    /// <summary>How long "Installing update…" is held on screen before the
+    /// hand-off ends this process.
+    ///
+    /// <para>Not cosmetic padding. The hand-off is queued on the same
+    /// dispatcher as the phase switch and tears the process down in the next
+    /// callback, so without a pause the text is set and never reaches a frame:
+    /// the first real round trip logged the two one millisecond apart, and the
+    /// phase was invisible. What follows it is several seconds with no window
+    /// at all — this process is gone and Velopack is applying — so this line is
+    /// the only account the user gets of that gap, and it has to be seen.</para>
+    /// </summary>
+    private static readonly TimeSpan RestartingDwell = TimeSpan.FromMilliseconds(900);
+
     private async Task DownloadUpdateAsync(
         UpdateFlow flow,
         UpdateCandidate candidate)
@@ -412,11 +425,12 @@ public partial class App : Application
                 .ConfigureAwait(false);
             DevLog.Write($"update-download: verified v{candidate.Version}");
             // Verification and the nuspec check are already done by the line
-            // above; what remains is the hand-off, which ends this process for
-            // roughly a minute while Velopack applies the update. Nothing this
-            // process draws survives that, so the only honest thing it can do
-            // is say so before it goes.
+            // above; what remains is the hand-off, which ends this process
+            // while Velopack applies the update. Nothing this process draws
+            // survives that, so the only honest thing it can do is say so
+            // before it goes.
             UpdateDialog.Report(UpdateDialogText.Restarting(), null);
+            await Task.Delay(RestartingDwell).ConfigureAwait(false);
             if (!QueueUpdateUi(() => HandoffUpdate(flow, candidate)))
             {
                 throw new InvalidOperationException();
