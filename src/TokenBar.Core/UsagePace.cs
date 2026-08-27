@@ -121,6 +121,37 @@ public sealed record UsagePace(
     /// lookup key.</summary>
     public static string NowText => "duration.now".LocalizedKey("now");
 
+    /// <summary>Localized countdown matching the Rust <c>resetText</c> rounding
+    /// contract, ported from Format.swift's resetText(for:now:). The payload's
+    /// own <c>resetText</c> is a compatibility field the engine renders in
+    /// English; deriving the visible text from the structured timestamp instead
+    /// is what lets the quota card follow the selected UI language. Returns
+    /// null when the timestamp will not parse, so provider metadata that is not
+    /// a countdown keeps its own text.
+    ///
+    /// Two roundings, both load-bearing: floor on the raw seconds, then a
+    /// ceiling to whole minutes before DurationText applies its own
+    /// away-from-zero rounding. One second remaining must read as a minute, not
+    /// as "now".</summary>
+    public static string? ResetText(string resetsAt, DateTimeOffset now)
+    {
+        if (ParseRfc3339(resetsAt) is not { } reset)
+        {
+            return null;
+        }
+
+        var seconds = Math.Floor(UnixSeconds(reset) - UnixSeconds(now));
+        if (seconds <= 0)
+        {
+            return "Resets now".Localized();
+        }
+
+        // Truncation toward zero is the ceiling here because seconds > 0,
+        // matching Swift's Int((seconds + 59) / 60) on a positive Double.
+        var minutes = (int)((seconds + 59) / 60);
+        return "Resets in {0}".Localized(DurationText(minutes * 60d));
+    }
+
     public static string DurationText(double seconds)
     {
         var m = (int)Math.Round(seconds / 60, MidpointRounding.AwayFromZero);

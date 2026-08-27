@@ -103,7 +103,7 @@ public sealed class SettingsWindow : Window
         _quota = quota;
         _graph = graph;
         _trace = trace;
-        Title = $"{ProductIdentity.Name} Settings";
+        Title = "{0} Settings".Localized(ProductIdentity.Name);
         SystemBackdrop = new MicaBackdrop();
         var root = new Grid();
         root.ColumnDefinitions.Add(new ColumnDefinition
@@ -330,7 +330,7 @@ public sealed class SettingsWindow : Window
                 {
                     choices.Add((
                         QuotaResolver.Selection(agent.ClientId, window.CardId),
-                        $"{ClientRegistry.ShortName(agent.ClientId)} · {window.Label}"));
+                        $"{ClientRegistry.ShortName(agent.ClientId)} · {window.Label.Localized()}"));
                 }
             }
         }
@@ -866,6 +866,12 @@ public sealed class SettingsWindow : Window
         };
         var now = DateTimeOffset.Now;
         var card = new StackPanel { Spacing = 5 };
+        // Every label here is app-authored, so every one needs a table entry —
+        // unlike a real payload's label, which may legitimately have none and
+        // fall back to English. The ResetText values are unreachable: these
+        // ResetsAt timestamps parse, so QuotaRow always prefers the countdown
+        // derived from them. They stay because they still describe the shape
+        // of the field the engine sends.
         UsageWindow[] mocks =
         [
             new(

@@ -38,6 +38,33 @@ public class QuotaResolverTests
         ]}
         """, new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
 
+    public QuotaResolverTests() => Localization.Load("en", AppContext.BaseDirectory);
+
+    // The hazard S4c-4 introduces. Quota window labels are now translated where
+    // they are displayed, but a persisted legacy selection is matched against
+    // the raw payload label (QuotaResolver.cs:52). Localizing that side would
+    // strand every user who selected a quota before switching language — the
+    // same shape as the S4b near-miss with TrayMode.RawValue().
+    [Fact]
+    public void LegacyLabelSelectionStillResolvesUnderATranslatedUi()
+    {
+        Localization.Load("zh-Hant", AppContext.BaseDirectory);
+        try
+        {
+            // "Weekly" has a zh-Hant entry, so a localized matching path would
+            // compare 每週 against the payload's "Weekly" and find nothing.
+            Assert.Equal("每週", "Weekly".Localized());
+            Assert.Equal(
+                "codex|weekly.v1", QuotaResolver.CanonicalSelection(Payload, "codex|Weekly"));
+            Assert.Equal(
+                "weekly.v1", QuotaResolver.Resolve(Payload, "codex|Weekly")!.Window.CardId);
+        }
+        finally
+        {
+            Localization.Load("en", AppContext.BaseDirectory);
+        }
+    }
+
     [Fact]
     public void AutoResolvesTheTightestHealthyWindow()
     {

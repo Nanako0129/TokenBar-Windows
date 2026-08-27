@@ -525,6 +525,48 @@ public class UsagePaceTests
         Assert.Equal("0% left", clamped.AmountText);
     }
 
+    // ---- ResetText ------------------------------------------------------
+    //
+    // Ported from Format.swift's resetText(for:now:). Two roundings stack —
+    // floor on the raw seconds, then a ceiling to whole minutes — so the
+    // boundaries are asserted individually rather than sampled.
+
+    private static string ResetIn(double seconds) =>
+        UsagePace.ResetText(ResetAt(seconds), Now)!;
+
+    [Fact]
+    public void ResetTextReturnsNullWhenTheTimestampWillNotParse()
+    {
+        Assert.Null(UsagePace.ResetText("garbage", Now));
+        Assert.Null(UsagePace.ResetText("2026-07-10T15:00:00", Now)); // no zone
+    }
+
+    [Theory]
+    [InlineData(0, "Resets now")]
+    [InlineData(-1, "Resets now")]
+    [InlineData(-86_400, "Resets now")]
+    // One second left is a minute, not "now": the ceiling runs after the floor.
+    [InlineData(1, "Resets in 1m")]
+    [InlineData(59, "Resets in 1m")]
+    [InlineData(60, "Resets in 1m")]
+    [InlineData(61, "Resets in 2m")]
+    [InlineData(120, "Resets in 2m")]
+    [InlineData(3_600, "Resets in 1h")]
+    [InlineData(7_800, "Resets in 2h 10m")]
+    // The case from the report: a five-day weekly window.
+    [InlineData(5 * 86_400 + 17 * 3_600, "Resets in 5d 17h")]
+    public void ResetTextRoundsAtEveryBoundary(double seconds, string expected) =>
+        Assert.Equal(expected, ResetIn(seconds));
+
+    [Fact]
+    public void TranslatedResetTextKeepsChineseWordOrder() => InChinese(() =>
+    {
+        Assert.Equal("現在重置", ResetIn(0));
+        Assert.Equal("1分 後重置", ResetIn(1));
+        Assert.Equal("5天17小時 後重置", ResetIn(5 * 86_400 + 17 * 3_600));
+        Assert.Equal("2小時10分 後重置", ResetIn(7_800));
+    });
+
     // ---- i18n ----------------------------------------------------------
     //
     // A pace card shows one status at a time, so no screenshot can prove the

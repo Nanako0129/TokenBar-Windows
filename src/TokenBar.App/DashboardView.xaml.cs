@@ -57,7 +57,9 @@ public sealed partial class DashboardView : UserControl
         {
             var button = new Button
             {
-                Content = view.ToString(),
+                // AppViews.Label, not view.ToString(): the settings page already
+                // routes through it, and the enum name alone renders English.
+                Content = AppViews.Label(view),
                 FontSize = 11,
                 Padding = new Thickness(8, 4, 8, 4),
                 Background = new SolidColorBrush(Colors.Transparent),
@@ -75,6 +77,16 @@ public sealed partial class DashboardView : UserControl
             PointerWheelChangedEvent,
             new Microsoft.UI.Xaml.Input.PointerEventHandler(OnWheel),
             handledEventsToo: true);
+
+        // XAML attribute values cannot call Localized(), and adding x:Uid/PRI
+        // resources for five strings would mean shipping a second translation
+        // system beside the JSON table. They are assigned here instead, at
+        // construction, before the control is ever measured.
+        TodayCaption.Text = "today".Localized();
+        TotalCaption.Text = "total".Localized();
+        RateCaption.Text = "tok/min".Localized();
+        YearButton.Content = "All".Localized();
+        QuitButton.Content = "Quit".Localized();
 
         RefreshButton.Click += (_, _) =>
         {
@@ -1897,11 +1909,20 @@ public sealed partial class DashboardView : UserControl
         UsageWindow window, UsagePaceRowPresentation row, bool classic)
     {
         var root = new StackPanel { Spacing = 3 };
+        // Derive the countdown from the structured timestamp so it follows the
+        // UI language; window.ResetText is the engine's English compatibility
+        // field and only stands in when the timestamp will not parse. Same
+        // precedence as macOS AgentLimitsCard.
+        var resetText = window.ResetsAt is { } resetsAt
+            ? UsagePace.ResetText(resetsAt, DateTimeOffset.Now) ?? window.ResetText
+            : window.ResetText;
         var headerTrailing = Ui.Text(
-            classic ? window.ResetText ?? row.AmountText : window.ResetText ?? "",
+            classic ? resetText ?? row.AmountText : resetText ?? "",
             10, 0.6);
+        // Display only. The raw Label is what QuotaResolver matches a persisted
+        // legacy selection against, so it must never be translated on that path.
         root.Children.Add(Ui.Row(
-            Ui.Text(window.Label, 11, bold: true), headerTrailing));
+            Ui.Text(window.Label.Localized(), 11, bold: true), headerTrailing));
         root.Children.Add(GaugeBar(
             row.FillPercent,
             row.RemainingPercent,
@@ -1925,7 +1946,7 @@ public sealed partial class DashboardView : UserControl
 
         if (classic)
         {
-            if (window.ResetText is not null)
+            if (resetText is not null)
             {
                 root.Children.Add(AmountLabel());
             }
