@@ -232,7 +232,8 @@ public sealed class TrayService : IDisposable
 
         UpdateDialog.Present(
             offer,
-            install: () => ActOnShownOffer(shownGeneration, version, InvokePendingUpdate),
+            install: () => ActOnShownOffer(
+                shownGeneration, version, InvokePendingUpdate, closeAfterActing: false),
             later: () =>
             {
                 // Nothing to undo: nothing was taken. The pending action stays,
@@ -241,7 +242,8 @@ public sealed class TrayService : IDisposable
                     $"update-dialog: later v{version} active={_activeUpdate is not null}");
                 return true;
             },
-            skip: () => ActOnShownOffer(shownGeneration, version, () => SkipUpdate(offer)));
+            skip: () => ActOnShownOffer(
+                shownGeneration, version, () => SkipUpdate(offer), closeAfterActing: true));
         return true;
     }
 
@@ -254,7 +256,13 @@ public sealed class TrayService : IDisposable
     /// this check the dialog would show vX's notes while Install took vY —
     /// installing a different version than the one described — and Skip would
     /// record vX while clearing vY's pending action.</para></summary>
-    private bool ActOnShownOffer(int? shownGeneration, string shownVersion, Action act)
+    /// <param name="closeAfterActing">Whether the dialog should close once the
+    /// action has run. Skip closes; Install does not — it stays open and turns
+    /// into the download's progress report, which is the entire point of having
+    /// progress at all. Returning true here hides the window, and a hidden
+    /// window renders progress nobody can see.</param>
+    private bool ActOnShownOffer(
+        int? shownGeneration, string shownVersion, Action act, bool closeAfterActing)
     {
         if (_disposed)
         {
@@ -273,7 +281,7 @@ public sealed class TrayService : IDisposable
         }
 
         act();
-        return true;
+        return closeAfterActing;
     }
 
     /// <summary>Skip This Version: record it, stop offering it, and leave

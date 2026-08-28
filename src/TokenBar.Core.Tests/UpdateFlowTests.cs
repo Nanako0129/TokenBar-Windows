@@ -455,7 +455,10 @@ public class UpdateFlowTests : IDisposable
         Assert.True(handedOff);
         Assert.Equal(["handoff", "quit"], events);
         Assert.Same(candidate.Target, flow.HandoffTarget);
-        Assert.False(flow.Silent);
+        // Silent: the dialog is still up showing "Installing update…" when the
+        // handoff runs, so Velopack's own apply UI would be a second window on
+        // top of it.
+        Assert.True(flow.Silent);
         Assert.True(flow.Restart);
         Assert.Empty(Assert.IsType<string[]>(flow.RestartArgs));
         Assert.Equal(1, flow.HandoffCalls);

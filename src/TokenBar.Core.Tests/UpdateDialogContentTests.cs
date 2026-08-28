@@ -299,29 +299,112 @@ public class ReleaseNotesMarkdownTests
             $"MaxRuns is {ReleaseNotesMarkdown.MaxRuns}");
     }
 
-    // A table's rows are prose once their pipes are stripped, but they are not
-    // soft-wrapped continuations of each other. Joining them turned both tables
-    // in the real v0.2.2 notes into one unreadable line, and Assert.Single
-    // pinned that as if it were the specification.
+    // The real v0.2.2 notes contain two tables, and they rendered as literal
+    // pipes on screen. A row is now its own block carrying its cells, and the
+    // |---| alignment row is dropped so the renderer can take the first
+    // surviving row as the header without looking for a marker.
     [Fact]
-    public void TableRowsKeepTheirLineSeparation()
+    public void TableRowsBecomeCellsAndTheAlignmentRowIsDropped()
     {
         var blocks = ReleaseNotesMarkdown.Parse(
             "| Machine | File |\n|---|---|\n| x64 | Setup.exe |");
-        Assert.Equal(3, blocks.Count);
-        Assert.All(blocks, b => Assert.Equal(NotesBlockKind.Paragraph, b.Kind));
+        Assert.Equal(2, blocks.Count);
+        Assert.All(blocks, b => Assert.Equal(NotesBlockKind.TableRow, b.Kind));
+        Assert.Equal(["Machine", "File"], Cells(blocks[0]));
+        Assert.Equal(["x64", "Setup.exe"], Cells(blocks[1]));
     }
 
+    // Nothing about a table row is prose, so the pipes must not survive into
+    // the text — that was the whole defect.
     [Fact]
-    public void TablesDegradeToPlainText()
+    public void TableDelimitersDoNotReachTheRenderedText()
     {
         var plain = Plain(ReleaseNotesMarkdown.Parse(
             "| Machine | File |\n|---|---|\n| x64 | Setup.exe |"));
+        Assert.DoesNotContain("|", plain, StringComparison.Ordinal);
+        Assert.DoesNotContain("---", plain, StringComparison.Ordinal);
         Assert.Contains("Machine", plain, StringComparison.Ordinal);
         Assert.Contains("Setup.exe", plain, StringComparison.Ordinal);
-        // The pipes survive. "Table -> plain text" in the spec means the row
-        // renders as its own text, not that the delimiters are stripped;
-        // stripping them would be scope invented at verification time.
+        // The column boundary survives as a space, so PlainText does not read
+        // "MachineFile".
+        Assert.Contains("Machine File", plain, StringComparison.Ordinal);
+    }
+
+    // Inline styling has to keep working inside a cell: `Setup.exe` in the real
+    // notes is code-spanned, and the cells are scanned by the same scanner.
+    [Fact]
+    public void CellsKeepTheirInlineStyling()
+    {
+        var row = Assert.Single(ReleaseNotesMarkdown.Parse("| **x64** | `Setup.exe` |"));
+        Assert.NotNull(row.Cells);
+        Assert.True(Assert.Single(row.Cells[0]).Bold);
+        Assert.True(Assert.Single(row.Cells[1]).Code);
+    }
+
+    // A row without a trailing pipe is still a row, and an empty cell still
+    // holds its column open rather than shifting the ones after it left.
+    [Fact]
+    public void RaggedRowsKeepTheirColumnPositions()
+    {
+        var row = Assert.Single(ReleaseNotesMarkdown.Parse("| a |  | c"));
+        Assert.Equal(["a", string.Empty, "c"], Cells(row));
+    }
+
+    // Bound 7: an empty cell costs no runs, so the run budget cannot catch a
+    // row of thousands of pipes — that would be thousands of Grid columns.
+    [Fact]
+    public void CellCountIsBounded()
+    {
+        var row = Assert.Single(ReleaseNotesMarkdown.Parse(
+            "|end" + new string('|', 5_000)));
+        Assert.NotNull(row.Cells);
+        Assert.True(
+            row.Cells.Count <= ReleaseNotesMarkdown.MaxCells,
+            $"{row.Cells.Count} cells");
+    }
+
+    // A delimiter row means "this is a table" only directly under the header.
+    // Testing every row for the shape independently silently deleted a data row
+    // of "| - | - |" — an ordinary way to write "none" in a changelog table —
+    // and losing content is a worse failure than rendering a row of dashes.
+    [Fact]
+    public void OnlyTheRowUnderTheHeaderIsADelimiter()
+    {
+        var blocks = ReleaseNotesMarkdown.Parse(
+            "| Machine | File |\n|---|---|\n| x64 | Setup.exe |\n| - | - |");
+        Assert.Equal(3, blocks.Count);
+        Assert.Equal(["Machine", "File"], Cells(blocks[0]));
+        Assert.Equal(["x64", "Setup.exe"], Cells(blocks[1]));
+        Assert.Equal(["-", "-"], Cells(blocks[2]));
+    }
+
+    // The first line of a table is its header, so it is never a delimiter — a
+    // lone "|:---|---:|" is content, and dropping it would delete it.
+    [Fact]
+    public void TheFirstRowIsNeverADelimiter() =>
+        Assert.Equal(
+            [":---", "---:"],
+            Cells(Assert.Single(ReleaseNotesMarkdown.Parse("|:---|---:|"))));
+
+    // A blank line ends the table, so the delimiter slot is not carried across
+    // it into the next one.
+    [Fact]
+    public void ABlankLineRestartsTheDelimiterPosition()
+    {
+        var blocks = ReleaseNotesMarkdown.Parse(
+            "| A |\n|---|\n| x |\n\n| B |\n|---|\n| y |");
+        Assert.Equal(4, blocks.Count);
+        Assert.Equal(["A"], Cells(blocks[0]));
+        Assert.Equal(["x"], Cells(blocks[1]));
+        Assert.Equal(["B"], Cells(blocks[2]));
+        Assert.Equal(["y"], Cells(blocks[3]));
+    }
+
+    private static string[] Cells(NotesBlock block)
+    {
+        Assert.NotNull(block.Cells);
+        return [.. block.Cells.Select(cell =>
+            string.Concat(cell.Select(run => run.Text)))];
     }
 
     // Markdown's soft wrap. Without this a hard-wrapped changelog renders every

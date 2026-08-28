@@ -347,7 +347,7 @@ public partial class App : Application
 
             if (tray.PublishUpdate(
                 new UpdateOffer("9.9.9", "0.0.0", notes),
-                () => DevLog.Write("update-dialog-demo: install invoked")))
+                RunDemoProgress))
             {
                 _ = tray.TryOpenUpdateDialog();
             }
@@ -356,6 +356,33 @@ public partial class App : Application
         {
             LogUpdateFailure("update-dialog-demo", ex);
         }
+    }
+
+    /// <summary>--update-dialog-demo's Install. Walks the progress states with
+    /// no download, so the phase copy and the in-place switch can be looked at
+    /// on a dev build — the real path needs an installed Velopack build and a
+    /// published newer version, which is a fifteen-minute round trip per look.
+    ///
+    /// <para>Nothing is downloaded, verified or applied; the app does not
+    /// quit.</para></summary>
+    private static void RunDemoProgress()
+    {
+        DevLog.Write("update-dialog-demo: install invoked");
+        _ = Task.Run(async () =>
+        {
+            for (var percent = 0; percent <= 100; percent += 10)
+            {
+                UpdateDialog.Report(UpdateDialogText.Downloading(), percent);
+                await Task.Delay(250).ConfigureAwait(false);
+            }
+
+            UpdateDialog.Report(UpdateDialogText.Restarting(), null);
+            // The real path stays on this phase until the process exits, which
+            // in a demo is indistinguishable from a hang. Close instead.
+            await Task.Delay(1500).ConfigureAwait(false);
+            DevLog.Write("update-dialog-demo: the real path would restart here");
+            UpdateDialog.CloseIfOpen();
+        });
     }
 
     private void StartUpdateDownload(UpdateFlow flow, UpdateCandidate candidate)
@@ -371,15 +398,39 @@ public partial class App : Application
         }
     }
 
+    /// <summary>How long "Installing update…" is held on screen before the
+    /// hand-off ends this process.
+    ///
+    /// <para>Not cosmetic padding. The hand-off is queued on the same
+    /// dispatcher as the phase switch and tears the process down in the next
+    /// callback, so without a pause the text is set and never reaches a frame:
+    /// the first real round trip logged the two one millisecond apart, and the
+    /// phase was invisible. What follows it is several seconds with no window
+    /// at all — this process is gone and Velopack is applying — so this line is
+    /// the only account the user gets of that gap, and it has to be seen.</para>
+    /// </summary>
+    private static readonly TimeSpan RestartingDwell = TimeSpan.FromMilliseconds(900);
+
     private async Task DownloadUpdateAsync(
         UpdateFlow flow,
         UpdateCandidate candidate)
     {
         DevLog.Write($"update-download: start v{candidate.Version}");
+        UpdateDialog.Report(UpdateDialogText.Downloading(), 0);
         try
         {
-            await flow.DownloadAndVerifyAsync(candidate).ConfigureAwait(false);
+            await flow.DownloadAndVerifyAsync(
+                candidate,
+                new Progress<int>(p => UpdateDialog.Report(UpdateDialogText.Downloading(), p)))
+                .ConfigureAwait(false);
             DevLog.Write($"update-download: verified v{candidate.Version}");
+            // Verification and the nuspec check are already done by the line
+            // above; what remains is the hand-off, which ends this process
+            // while Velopack applies the update. Nothing this process draws
+            // survives that, so the only honest thing it can do is say so
+            // before it goes.
+            UpdateDialog.Report(UpdateDialogText.Restarting(), null);
+            await Task.Delay(RestartingDwell).ConfigureAwait(false);
             if (!QueueUpdateUi(() => HandoffUpdate(flow, candidate)))
             {
                 throw new InvalidOperationException();

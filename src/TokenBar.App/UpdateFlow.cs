@@ -114,8 +114,12 @@ internal class UpdateFlow
         return update is null ? null : ValidateTarget(update);
     }
 
+    /// <param name="progress">Download percent, 0-100. Velopack has always
+    /// offered this; passing null meant Install produced no feedback at all
+    /// until the process exited.</param>
     internal async Task DownloadAndVerifyAsync(
         UpdateCandidate candidate,
+        IProgress<int>? progress = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(candidate);
@@ -129,7 +133,7 @@ internal class UpdateFlow
             var validated = ValidateCandidate(candidate);
             await _manager.DownloadUpdatesAsync(
                 validated.Update,
-                progress: null,
+                progress is null ? null : progress.Report,
                 cancellationToken).ConfigureAwait(false);
 
             validated = ValidateCandidate(candidate);
@@ -164,9 +168,12 @@ internal class UpdateFlow
             return false;
         }
 
+        // silent, because the dialog is still on screen showing "Installing
+        // update…" when this runs. Velopack's own apply UI would be the second
+        // window this whole slice exists to remove.
         WaitExitThenApplyUpdates(
             validated.Target,
-            silent: false,
+            silent: true,
             restart: true,
             Array.Empty<string>());
         quit();

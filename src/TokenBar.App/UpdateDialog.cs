@@ -37,6 +37,13 @@ internal sealed class UpdateDialog : Window
 {
     private const int DialogWidth = 660;
     private const int DialogHeight = 514;
+
+    /// <summary>Usable width inside the notes box, for the one control that
+    /// cannot infer it: DialogWidth less the root padding (24+24), the box
+    /// border (1+1), the scroller padding (14+14) and room for the vertical
+    /// scrollbar. Only <see cref="BuildTable"/> reads it — everything else in
+    /// the box is text, which wraps to whatever width it is given.</summary>
+    private const int NotesContentWidth = DialogWidth - 48 - 2 - 28 - 12;
     private const int IconSize = 64;
 
     private static readonly FontFamily CodeFont = new("Consolas, Cascadia Mono, monospace");
@@ -75,6 +82,27 @@ internal sealed class UpdateDialog : Window
     private readonly Button _skip = new();
     private readonly Button _later = new();
     private readonly Button _install = new();
+
+    // Progress replaces the notes box in place rather than opening a second
+    // window as Sparkle's SUStatus does. Sparkle needs one because its alert
+    // closes on Install; this window does not have to close, and inventing a
+    // second window's layout from a xib — with no rendered reference to check
+    // it against — is how the rest of this feature's mistakes were made.
+    private readonly ProgressBar _progress = new()
+    {
+        IsIndeterminate = true,
+        Margin = new Thickness(0, 14, 0, 0),
+    };
+
+    private readonly StackPanel _progressHost = new()
+    {
+        Visibility = Visibility.Collapsed,
+        VerticalAlignment = VerticalAlignment.Center,
+    };
+
+    private Border? _notesBox;
+    private Grid? _footer;
+    private static UpdateDialog? _active;
 
     // Rebound on every Present, so the buttons always act on the offer that is
     // on screen right now rather than on whatever the first Present captured.
@@ -116,12 +144,15 @@ internal sealed class UpdateDialog : Window
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
         root.Children.Add(BuildHeader());
-        var notesBox = BuildNotesBox();
-        Grid.SetRow(notesBox, 1);
-        root.Children.Add(notesBox);
-        var footer = BuildFooter();
-        Grid.SetRow(footer, 2);
-        root.Children.Add(footer);
+        _notesBox = BuildNotesBox();
+        Grid.SetRow(_notesBox, 1);
+        root.Children.Add(_notesBox);
+        _progressHost.Children.Add(_progress);
+        Grid.SetRow(_progressHost, 1);
+        root.Children.Add(_progressHost);
+        _footer = BuildFooter();
+        Grid.SetRow(_footer, 2);
+        root.Children.Add(_footer);
         Content = root;
 
         // ApplicationIcon only reaches the executable; the title bar reads its
@@ -283,10 +314,88 @@ internal sealed class UpdateDialog : Window
         _onInstall = install;
         _onLater = later;
         _onSkip = skip;
+        _active = this;
+        ShowOffer();
         _headline.Text = UpdateDialogText.Headline(ProductIdentity.Name);
         _versionLine.Text = UpdateDialogText.VersionLine(
             ProductIdentity.Name, offer.Version, offer.InstalledVersion);
         RenderNotes(ReleaseNotesMarkdown.Parse(offer.NotesMarkdown));
+    }
+
+    private void ShowOffer()
+    {
+        if (_notesBox is not null) { _notesBox.Visibility = Visibility.Visible; }
+        if (_footer is not null) { _footer.Visibility = Visibility.Visible; }
+        _progressHost.Visibility = Visibility.Collapsed;
+        _progress.IsIndeterminate = true;
+    }
+
+    /// <summary>Switch this window from offering the update to reporting on it.
+    ///
+    /// <para>Pressing Install used to close the dialog and leave nothing: a
+    /// download of unknown length, then the process exiting for around a minute
+    /// while Velopack applies the update. The first person to try it reasonably
+    /// concluded the app had died.</para>
+    ///
+    /// <para>The three buttons go rather than being disabled — none of them
+    /// means anything once the download has started. The close box still works
+    /// and only hides the window; the download is owned by App and continues.
+    /// There is no Cancel: Sparkle has one, but adding a second exit path to a
+    /// flow that has already produced four concurrency defects buys less than
+    /// it costs, and the window can simply be closed.</para></summary>
+    private void ShowProgress(string phase, int? percent)
+    {
+        DevLog.Write(
+            $"update-dialog: progress phase=\"{phase}\" len={phase.Length} "
+                + $"percent={percent?.ToString() ?? "-"} visible={AppWindow.IsVisible}");
+        _headline.Text = phase;
+        _versionLine.Text = percent is { } p
+            ? UpdateDialogText.Percent(p)
+            : UpdateDialogText.RestartNotice();
+        if (_notesBox is not null) { _notesBox.Visibility = Visibility.Collapsed; }
+        if (_footer is not null) { _footer.Visibility = Visibility.Collapsed; }
+        _progressHost.Visibility = Visibility.Visible;
+        // The window must be on screen for any of this to mean anything. Install
+        // used to return "close" from its handler, which hid the window before
+        // the first report arrived, so every phase rendered into a hidden
+        // dialog — the exact no-feedback behaviour progress exists to remove.
+        // The handler no longer does that; this is the second line of defence.
+        if (!AppWindow.IsVisible)
+        {
+            AppWindow.Show();
+        }
+
+        if (percent is { } value)
+        {
+            _progress.IsIndeterminate = false;
+            _progress.Value = Math.Clamp(value, 0, 100);
+        }
+        else
+        {
+            _progress.IsIndeterminate = true;
+        }
+    }
+
+    /// <summary>Called by App as the download runs. A no-op when the window was
+    /// never opened or has been closed — the download does not depend on it.</summary>
+    internal static void Report(string phase, int? percent)
+    {
+        var dialog = _active;
+        if (dialog is null)
+        {
+            return;
+        }
+
+        _ = dialog.DispatcherQueue.TryEnqueue(() => dialog.ShowProgress(phase, percent));
+    }
+
+    /// <summary>Only --update-dialog-demo uses this. The real flow never closes
+    /// the dialog from the progress side: the process exiting is what takes it
+    /// off screen.</summary>
+    internal static void CloseIfOpen()
+    {
+        var dialog = _active;
+        _ = dialog?.DispatcherQueue.TryEnqueue(() => dialog.AppWindow.Hide());
     }
 
     /// <summary>Turn the parsed block list into paragraphs. Everything that
@@ -306,8 +415,26 @@ internal sealed class UpdateDialog : Window
             return;
         }
 
-        foreach (var block in blocks)
+        for (var i = 0; i < blocks.Count; i++)
         {
+            var block = blocks[i];
+            if (block.Kind == NotesBlockKind.TableRow)
+            {
+                // A run of adjacent rows is one table: the parser drops the
+                // |---| row, so a blank line (or any other block) is the only
+                // thing that ends one.
+                var end = i;
+                while (end + 1 < blocks.Count
+                    && blocks[end + 1].Kind == NotesBlockKind.TableRow)
+                {
+                    end++;
+                }
+
+                _notes.Blocks.Add(WrapInline(BuildTable(blocks, i, end)));
+                i = end;
+                continue;
+            }
+
             var paragraph = new Paragraph
             {
                 Margin = block.Kind switch
@@ -328,32 +455,119 @@ internal sealed class UpdateDialog : Window
                 paragraph.Inlines.Add(new Run { Text = "• " });
             }
 
-            foreach (var run in block.Runs)
-            {
-                // Only the true cases are set: a Run inherits the paragraph's
-                // weight otherwise, and writing Normal explicitly would strip
-                // the bold off every heading.
-                var inline = new Run { Text = run.Text };
-                if (run.Bold)
-                {
-                    inline.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
-                }
-
-                if (run.Italic)
-                {
-                    inline.FontStyle = Windows.UI.Text.FontStyle.Italic;
-                }
-
-                if (run.Code)
-                {
-                    inline.FontFamily = CodeFont;
-                }
-
-                paragraph.Inlines.Add(inline);
-            }
-
+            AppendRuns(paragraph.Inlines, block.Runs);
             _notes.Blocks.Add(paragraph);
         }
+    }
+
+    private static void AppendRuns(InlineCollection target, IReadOnlyList<NotesRun> runs)
+    {
+        foreach (var run in runs)
+        {
+            // Only the true cases are set: a Run inherits the paragraph's
+            // weight otherwise, and writing Normal explicitly would strip
+            // the bold off every heading.
+            var inline = new Run { Text = run.Text };
+            if (run.Bold)
+            {
+                inline.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
+            }
+
+            if (run.Italic)
+            {
+                inline.FontStyle = Windows.UI.Text.FontStyle.Italic;
+            }
+
+            if (run.Code)
+            {
+                inline.FontFamily = CodeFont;
+            }
+
+            target.Add(inline);
+        }
+    }
+
+    /// <summary>A RichTextBlock has no table primitive, so the table is a real
+    /// Grid hosted in a one-inline paragraph.
+    ///
+    /// <para>Every column is Auto and the whole grid is capped at
+    /// <see cref="NotesContentWidth"/> rather than starring the last column: an
+    /// InlineUIContainer does not promise its child a finite available width,
+    /// and a Star column measured against infinity collapses. Auto plus an
+    /// explicit cap behaves the same either way — the table hugs its content,
+    /// and only a table wider than the box makes its cells wrap.</para>
+    /// </summary>
+    private static Grid BuildTable(IReadOnlyList<NotesBlock> blocks, int first, int last)
+    {
+        var columns = 0;
+        for (var r = first; r <= last; r++)
+        {
+            columns = Math.Max(columns, blocks[r].Cells?.Count ?? 0);
+        }
+
+        var grid = new Grid
+        {
+            Margin = new Thickness(0, 2, 0, 10),
+            MaxWidth = NotesContentWidth,
+        };
+        for (var c = 0; c < columns; c++)
+        {
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        }
+
+        for (var r = first; r <= last; r++)
+        {
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            var cells = blocks[r].Cells;
+            if (cells is null)
+            {
+                continue;
+            }
+
+            for (var c = 0; c < cells.Count && c < columns; c++)
+            {
+                // An empty cell gets no control, which is what bounds this
+                // loop. MaxCells caps a row at 12 and MaxBlocks caps the
+                // document at 500, but their product is 6 000 controls on the
+                // UI thread and no parser bound stands in the way: an empty
+                // cell costs no runs, so `|x|||||||||||` × 500 passes every
+                // one of them. Skipping empties makes every control cost at
+                // least one run, so the document-wide total is bounded by
+                // MaxRuns. A Grid cell with no child is empty space and an
+                // Auto column with no content collapses, so nothing shifts —
+                // and a row whose cells are all empty never reaches here, the
+                // parser drops it.
+                if (cells[c].Count == 0)
+                {
+                    continue;
+                }
+
+                var text = new TextBlock
+                {
+                    FontSize = 12,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 3, c == columns - 1 ? 0 : 18, 3),
+                };
+                if (r == first)
+                {
+                    text.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
+                }
+
+                AppendRuns(text.Inlines, cells[c]);
+                Grid.SetRow(text, r - first);
+                Grid.SetColumn(text, c);
+                grid.Children.Add(text);
+            }
+        }
+
+        return grid;
+    }
+
+    private static Paragraph WrapInline(UIElement element)
+    {
+        var paragraph = new Paragraph();
+        paragraph.Inlines.Add(new InlineUIContainer { Child = element });
+        return paragraph;
     }
 
     private void ApplySize()
