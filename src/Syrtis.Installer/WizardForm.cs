@@ -330,16 +330,31 @@ internal sealed class WizardForm : Form
                 return false;
             }
 
-            // Rooted is not the same as fully qualified. "C:" and "C:sub" are
-            // both rooted, and both resolve against that drive's *current
-            // directory* — GetFullPath("C:") returned C:\Users\Nanako on the
-            // test host — so the user reads "C:" as the root of C: and Setup
-            // installs somewhere else entirely. Reject the drive-relative form
-            // specifically: the test is on the root rather than on a separator
-            // so that a UNC path, whose root ("\\srv\share") has no trailing
-            // separator either, still passes.
+            // Rooted is not the same as fully qualified, and there is more than
+            // one way to be rooted without naming a volume. .NET Framework has
+            // no Path.IsPathFullyQualified (that arrived in .NET Core 2.1), so
+            // the test is on the root, and it is a whitelist: the root must
+            // identify a volume. An earlier revision listed the bad shapes
+            // instead and shipped with the second one still open.
+            //
+            // Measured on 4.8.9337.0, process directory C:\Users\Nanako:
+            //
+            //   "C:\ok"          root "C:\"          -> qualified
+            //   "\\srv\share\x"  root "\\srv\share"  -> qualified
+            //   "C:"             root "C:"           -> C:\Users\Nanako
+            //   "\Syrtis"        root "\"            -> C:\Syrtis
+            //   "/Syrtis"        root "\"            -> C:\Syrtis
+            //
+            // The last three are the trap: every one of them passes
+            // IsPathRooted and resolves silently against the process's current
+            // drive or directory, so the user reads an absolute path and Setup
+            // installs somewhere they never named. GetPathRoot normalises "//"
+            // to "\\", so the UNC test needs only the one form.
             var root = Path.GetPathRoot(path);
-            if (root.Length == 2 && root[1] == ':')
+            var namesAVolume =
+                (root.Length >= 3 && root[1] == ':')
+                || root.StartsWith(@"\\", StringComparison.Ordinal);
+            if (!namesAVolume)
             {
                 return false;
             }
