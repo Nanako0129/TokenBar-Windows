@@ -131,6 +131,35 @@ this plan relies on; the window either appears or it does not.
 ARM64 is not a minority case: `win-arm64` and `win-arm64-lite` are 2 of the 4
 published channels and 8 of the 16 release assets.
 
+**Result, 2026-08-28: all three observed, INSTALL-1a accepted.**
+
+A1 and A3 were confirmed by the user at the machines. A2's evidence, from
+`%LocalAppData%\Temp\tokenbar-app.log` after installing to `C:\SyrtisTest\Syrtis`:
+
+```
+14:26:26.423 update-download: verified v0.2.2
+14:26:27.331 update-handoff: start v0.2.2        (+908 ms dwell, as designed)
+14:26:27.491 update-handoff: started v0.2.2
+14:27:30.434 <new process, PID 18764>
+14:27:30.682 launch: tray up
+14:27:31.900 update-check: none
+C:\SyrtisTest\Syrtis -> 0.2.2.0
+```
+
+**`--installto` does not break the updater.** The app installed outside
+`%LocalAppData%` resolved its GitHub feed, downloaded, applied and restarted
+into 0.2.2. The Browse button stays; the risk row below is closed as refuted.
+
+**One finding this produced, outside this slice's scope.** The gap between
+hand-off and restart was **63 seconds** here against 4.5 seconds for the same
+0.2.1-to-0.2.2 update at the default location — 13x, with nothing on screen for
+all of it, because our process is gone by then. The user reasonably read it as
+a hang and reported it as one. #76's PR body describes that window as "several
+seconds"; that is now known to be wrong for at least one real install path. The
+likely cause is Defender scanning a directory outside the usual application
+path, unconfirmed. Tracked separately: it belongs to the update flow, not to
+the wizard, and no change here would fix it.
+
 ### INSTALL-1b — embed and package
 
 `package-velopack.ps1` builds the wizard, embeds Setup.exe as a resource, and
@@ -156,7 +185,7 @@ not close until a packed `win-arm64` wrapped Setup has installed on
 
 | Risk | Handling |
 |---|---|
-| `--installto` breaks the updater | Proven or refuted by A2, before any packaging work exists. If refuted: Browse and the editable path are dropped, the wizard offers only the default location, and the rest of the plan is unaffected. |
+| ~~`--installto` breaks the updater~~ | **Closed 2026-08-28, refuted by A2.** An install at `C:\SyrtisTest\Syrtis` found the feed, updated and restarted into 0.2.2. Browse stays. |
 | .NET Framework 4.8 absent | Windows 10 1903+ and all Windows 11 ship it. The wizard fails to start with a Windows-supplied message. Documented in 1c, not handled. |
 | ARM64 | Split across both slices so neither can skip it: A3 in 1a is launch-and-render; 1b does not close without a real ARM64 install. |
 | A broken wizard blocks every install | `--silent` passthrough keeps scripted installs working; the raw Velopack Setup is still buildable locally. |
