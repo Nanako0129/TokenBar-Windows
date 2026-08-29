@@ -8,7 +8,7 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        var silent = args.Any(a => a.Equals("--silent", StringComparison.OrdinalIgnoreCase));
+        var silent = args.Any(SetupLocator.IsSilentSwitch);
         return silent ? RunSilent(args) : RunGui(args);
     }
 
@@ -88,7 +88,7 @@ internal static class Program
 
     private static string MissingSetupMessage(string[] args)
     {
-        var candidate = args.FirstOrDefault(a => !a.Equals("--silent", StringComparison.OrdinalIgnoreCase));
+        var candidate = args.FirstOrDefault(a => !SetupLocator.IsSilentSwitch(a));
         return string.IsNullOrWhiteSpace(candidate)
             ? Strings.ErrorNoSetupPathArg
             : Strings.ErrorSetupNotFound(candidate);
