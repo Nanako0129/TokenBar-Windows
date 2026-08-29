@@ -151,6 +151,11 @@ internal sealed class WizardForm : Form
         _nextButton.Visible = !showFinish;
         _cancelButton.Visible = !showFinish;
         _finishButton.Visible = showFinish;
+        // AcceptButton has to follow the page, not be set once at construction:
+        // Enter fires the assigned button even when it is hidden, so leaving
+        // Next as the accept button left the Done page with no keyboard route
+        // to the only control on it. Nothing visible would have happened.
+        AcceptButton = showFinish ? _finishButton : _nextButton;
 
         switch (_step)
         {
@@ -306,25 +311,39 @@ internal sealed class WizardForm : Form
     /// filesystem permission check.</summary>
     private static bool IsValidInstallPath(string path)
     {
-        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path))
+        if (string.IsNullOrWhiteSpace(path))
         {
             return false;
         }
 
-        // Rooted is not the same as fully qualified. "C:" and "C:sub" are both
-        // rooted, and both resolve against that drive's *current directory* —
-        // so the user reads "C:" as the root of C: and Setup installs somewhere
-        // else entirely. Reject the drive-relative form specifically; the test
-        // is on the root rather than on a separator so that a UNC path, whose
-        // root has no trailing separator either, still passes.
-        var root = Path.GetPathRoot(path);
-        if (root.Length == 2 && root[1] == ':')
-        {
-            return false;
-        }
-
+        // EVERY System.IO.Path call belongs inside this try. On .NET Framework
+        // — measured, not assumed, on 4.8.9337.0 — IsPathRooted and GetPathRoot
+        // both call CheckInvalidPathChars and throw ArgumentException, so a
+        // single quote in C:\bad" throws from all three of these. This runs
+        // from TextChanged on the UI thread, so one outside the guard is an
+        // unhandled exception on a keystroke rather than the invalid-path hint.
+        // .NET Core stopped throwing from these; that is not the target here.
         try
         {
+            if (!Path.IsPathRooted(path))
+            {
+                return false;
+            }
+
+            // Rooted is not the same as fully qualified. "C:" and "C:sub" are
+            // both rooted, and both resolve against that drive's *current
+            // directory* — GetFullPath("C:") returned C:\Users\Nanako on the
+            // test host — so the user reads "C:" as the root of C: and Setup
+            // installs somewhere else entirely. Reject the drive-relative form
+            // specifically: the test is on the root rather than on a separator
+            // so that a UNC path, whose root ("\\srv\share") has no trailing
+            // separator either, still passes.
+            var root = Path.GetPathRoot(path);
+            if (root.Length == 2 && root[1] == ':')
+            {
+                return false;
+            }
+
             Path.GetFullPath(path);
             return true;
         }
