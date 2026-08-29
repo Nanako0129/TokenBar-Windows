@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Windows.Forms;
 
 namespace Syrtis.Installer;
@@ -8,8 +7,39 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Reject what we do not understand before doing anything with it. The
+        // wizard used to take the first non-switch argument as the setup path
+        // and drop everything else on the floor, so
+        // "--silent setup.exe --installto D:\X" installed to the default
+        // directory and said nothing at all. Slice 1b publishes this under
+        // Setup.exe's own filename, and Setup does support --installto, so a
+        // script carrying one would have been silently disobeyed — the worst
+        // available outcome for an unattended install.
+        var extra = args.Where(a => !SetupLocator.IsSilentSwitch(a)).Skip(1).FirstOrDefault();
+        if (extra != null)
+        {
+            return Fail(Strings.ErrorUnexpectedArg(extra), args);
+        }
+
         var silent = args.Any(SetupLocator.IsSilentSwitch);
         return silent ? RunSilent(args) : RunGui(args);
+    }
+
+    /// <summary>Report a startup problem on whichever surface exists, and
+    /// exit 1. Interactive gets a dialog; anything else gets stderr, which is
+    /// subject to the console limitation documented on RunSilent.</summary>
+    private static int Fail(string message, string[] args)
+    {
+        if (!args.Any(SetupLocator.IsSilentSwitch) && Environment.UserInteractive)
+        {
+            MessageBox.Show(message, Strings.WindowTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        else
+        {
+            Console.Error.WriteLine(message);
+        }
+
+        return 1;
     }
 
     /// <summary>No window at all: runs Setup against the default per-user
@@ -48,16 +78,19 @@ internal static class Program
         // interactive wizard cannot. The GUI path already turns the same
         // failure into its Done page via task.IsFaulted; this is the headless
         // equivalent.
-        //
-        // Win32Exception lives in System.dll, not System.Windows.Forms.dll, so
-        // catching it here does not put a UI type on this path.
         try
         {
             var result = SetupRunner.Run(
                 setupPath, SetupRunner.DefaultInstallDirectory, SetupRunner.DefaultLogPath);
             return result.ExitCode;
         }
-        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+        // Catch breadth deliberately matches the GUI path's task.IsFaulted,
+        // which catches everything. Naming two exception types here left
+        // UnauthorizedAccessException and anything else still exiting
+        // -532462766 — the same crash this branch exists to prevent, narrowed
+        // rather than removed. The contract is a stable exit code, so nothing
+        // Process.Start can raise may escape it.
+        catch (Exception ex)
         {
             Console.Error.WriteLine(Strings.ErrorSetupLaunchFailed(setupPath, ex.Message));
             // -1 rather than 1: 1 already means "we never got as far as

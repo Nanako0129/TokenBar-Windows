@@ -29,6 +29,10 @@ internal static class Strings
         $"Setup file not found: {path}",
         $"找不到安裝檔：{path}");
 
+    internal static string ErrorUnexpectedArg(string arg) => T(
+        $"Unrecognised argument: {arg}\nUsage: Syrtis.Installer.exe [-s|--silent] <path-to-setup.exe>",
+        $"無法辨識的參數：{arg}\n用法：Syrtis.Installer.exe [-s|--silent] <setup.exe 的路徑>");
+
     internal static string ErrorSetupLaunchFailed(string path, string reason) => T(
         $"Could not start the setup file: {path}\n{reason}",
         $"無法啟動安裝檔：{path}\n{reason}");
@@ -83,4 +87,16 @@ internal static class Strings
     internal static string DoneBodyFailure(string productName, int exitCode, string logPath) => T(
         $"{productName} installation failed (exit code {exitCode}).\n\nSee the log file for details:\n{logPath}",
         $"{productName} 安裝失敗（結束代碼 {exitCode}）。\n\n詳情請參閱記錄檔：\n{logPath}");
+
+    /// <summary>Setup ran and failed, but wrote no log. Says so rather than
+    /// naming a path that is absent or left over from an unrelated run.</summary>
+    internal static string DoneBodyFailureNoLog(string productName, int exitCode) => T(
+        $"{productName} installation failed (exit code {exitCode}).\n\nNo log file was written.",
+        $"{productName} 安裝失敗（結束代碼 {exitCode}）。\n\n沒有產生記錄檔。");
+
+    /// <summary>Setup could not be started at all. There is no exit code worth
+    /// showing and no log, so this shows the reason instead.</summary>
+    internal static string DoneBodyLaunchFailed(string productName, string reason) => T(
+        $"The {productName} setup file could not be started.\n\n{reason}",
+        $"無法啟動 {productName} 的安裝檔。\n\n{reason}");
 }

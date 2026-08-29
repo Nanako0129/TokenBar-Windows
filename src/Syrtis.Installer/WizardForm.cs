@@ -406,9 +406,16 @@ internal sealed class WizardForm : Form
         var setupExePath = _setupExePath;
         // Normalise here rather than while the user types — rewriting the box
         // under a caret fights whoever is editing it. What Setup receives is
-        // therefore the resolved path, not the keystrokes: "C:\a\..\b" and a
-        // trailing separator both reach it in one canonical form, and the
-        // directory recorded for the Launch button below is the same one.
+        // therefore the resolved path rather than the keystrokes, and the
+        // directory the Launch button composes against below is the same one.
+        //
+        // GetFullPath folds "C:\a\..\b" to "C:\b" but it does NOT drop a
+        // trailing separator — measured: GetFullPath("C:\foo\") is "C:\foo\".
+        // An earlier version of this comment claimed both, having checked only
+        // the first, and that unchecked half is what hid a P1: a value ending
+        // in a backslash used to break out of its own quotes on the command
+        // line. SetupRunner.Quote handles it now; the point here is that the
+        // string arriving there can still legitimately end in one.
         _installDir = Path.GetFullPath(_installDir);
         var installDir = _installDir;
         var logPath = SetupRunner.DefaultLogPath;
@@ -417,8 +424,16 @@ internal sealed class WizardForm : Form
             .ContinueWith(
                 task =>
                 {
+                    // Carry the reason, not just the code. Discarding
+                    // task.Exception left the Done page able to say only
+                    // "exit code -1" and then send the user to a log Setup
+                    // never opened — the silent path already reports the
+                    // message and the two surfaces have to agree.
                     _result = task.IsFaulted
-                        ? new SetupRunResult(-1, logPath)
+                        ? new SetupRunResult(
+                            Program.LaunchFailedExitCode,
+                            logPath,
+                            Describe(task.Exception))
                         : task.Result;
                     GoToStep(WizardStep.Done);
                 },
@@ -427,7 +442,42 @@ internal sealed class WizardForm : Form
                 TaskScheduler.FromCurrentSynchronizationContext());
     }
 
+    /// <summary>The innermost message of a faulted install task. Task wraps
+    /// everything in AggregateException, whose own message is boilerplate
+    /// about one or more errors — useless on a dialog.</summary>
+    private static string Describe(AggregateException? fault) =>
+        fault?.GetBaseException().Message ?? string.Empty;
+
     // --- Page 4: Done ----------------------------------------------------
+
+    /// <summary>What the Done page says when the install did not succeed.
+    /// Three distinct cases, because they need three different things from the
+    /// user: Setup never started (show why, and do not mention a log), Setup
+    /// ran and failed with a log to read, and Setup ran and failed without one.
+    ///
+    /// <para>The log check is not decoration. DefaultLogPath is a fixed name in
+    /// %TEMP%, so an absent log and a stale log look identical from here — the
+    /// test machine had a two-day-old copy sitting at that exact path — and
+    /// sending someone to a successful install's log to explain a failure is
+    /// worse than saying nothing.</para></summary>
+    private string FailureBody()
+    {
+        if (_result is not { } result)
+        {
+            // Unreachable: Done is only entered from the install continuation,
+            // which always assigns _result first.
+            return Strings.DoneBodyFailureNoLog(_productName, Program.LaunchFailedExitCode);
+        }
+
+        if (!string.IsNullOrEmpty(result.LaunchError))
+        {
+            return Strings.DoneBodyLaunchFailed(_productName, result.LaunchError!);
+        }
+
+        return File.Exists(result.LogPath)
+            ? Strings.DoneBodyFailure(_productName, result.ExitCode, result.LogPath)
+            : Strings.DoneBodyFailureNoLog(_productName, result.ExitCode);
+    }
 
     private Control BuildDonePage()
     {
@@ -444,7 +494,7 @@ internal sealed class WizardForm : Form
 
         var bodyText = succeeded
             ? Strings.DoneBodySuccess(_productName)
-            : Strings.DoneBodyFailure(_productName, _result?.ExitCode ?? -1, _result?.LogPath ?? SetupRunner.DefaultLogPath);
+            : FailureBody();
         layout.Controls.Add(new Label
         {
             Text = bodyText,

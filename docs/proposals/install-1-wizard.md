@@ -54,8 +54,17 @@ about download size and the install chain.
 **A was chosen.** The wizard is published under the existing filename
 `Nyanako.Syrtis-<ch>-Setup.exe`, so no documentation link or release asset
 name changes. Its cost is that the wizard becomes a mandatory link in every
-install; `--silent` passes straight through to keep scripted installs working,
-and Velopack's raw Setup remains buildable locally from the same pack.
+install. `-s` / `--silent` is honoured so scripted installs keep working, and
+Velopack's raw Setup remains buildable locally from the same pack.
+
+An earlier draft said `--silent` "passes straight through", which was never
+true and would have been dangerous once 1b puts this under Setup's filename:
+1a understands only the silent switch and the setup path, and it now **refuses**
+anything else rather than ignoring it. A script carrying `--installto` gets a
+non-zero exit and a message instead of a silent install into the default
+directory. Forwarding the rest of Setup's command line — `-v`, `-l`,
+`-t/--installto` — is 1b's decision, since 1b is where the substitution
+actually happens.
 
 ## 4. Design
 
