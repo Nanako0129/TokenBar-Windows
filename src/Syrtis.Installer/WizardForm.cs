@@ -311,6 +311,18 @@ internal sealed class WizardForm : Form
             return false;
         }
 
+        // Rooted is not the same as fully qualified. "C:" and "C:sub" are both
+        // rooted, and both resolve against that drive's *current directory* —
+        // so the user reads "C:" as the root of C: and Setup installs somewhere
+        // else entirely. Reject the drive-relative form specifically; the test
+        // is on the root rather than on a separator so that a UNC path, whose
+        // root has no trailing separator either, still passes.
+        var root = Path.GetPathRoot(path);
+        if (root.Length == 2 && root[1] == ':')
+        {
+            return false;
+        }
+
         try
         {
             Path.GetFullPath(path);
@@ -358,6 +370,12 @@ internal sealed class WizardForm : Form
     private void StartInstall()
     {
         var setupExePath = _setupExePath;
+        // Normalise here rather than while the user types — rewriting the box
+        // under a caret fights whoever is editing it. What Setup receives is
+        // therefore the resolved path, not the keystrokes: "C:\a\..\b" and a
+        // trailing separator both reach it in one canonical form, and the
+        // directory recorded for the Launch button below is the same one.
+        _installDir = Path.GetFullPath(_installDir);
         var installDir = _installDir;
         var logPath = SetupRunner.DefaultLogPath;
 
