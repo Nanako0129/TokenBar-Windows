@@ -14,7 +14,21 @@ internal static class Program
 
     /// <summary>No window at all: runs Setup against the default per-user
     /// directory and propagates its exit code. Must not construct any UI
-    /// type, so this path never touches System.Windows.Forms.</summary>
+    /// type, so this path never touches System.Windows.Forms.
+    ///
+    /// <para><b>Known limitation, deferred to slice 1b.</b> This assembly is a
+    /// WinExe, so it is a Windows-subsystem process and does not attach the
+    /// parent's console. Standard handles are inherited when they are pipes or
+    /// files — which is why every measurement of these messages has shown them,
+    /// including the ones taken over SSH — but a person typing this in a real
+    /// console window gets the exit code and no text. The contract this branch
+    /// actually makes is the exit code (1 never reached Setup, -1 could not
+    /// start it, anything else is Setup's own), and that holds everywhere; the
+    /// text is a convenience that is present exactly when something is
+    /// capturing it. Making it unconditional means AttachConsole
+    /// (ATTACH_PARENT_PROCESS), which cannot be verified from a remote session
+    /// for the same reason the defect cannot be reproduced there, so it waits
+    /// for 1b and a real console.</para></summary>
     private static int RunSilent(string[] args)
     {
         var setupPath = SetupLocator.Locate(args);

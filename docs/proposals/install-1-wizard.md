@@ -162,6 +162,18 @@ the wizard, and no change here would fix it.
 
 ### INSTALL-1b — embed and package
 
+**Carried in from 1a.** The wizard is a WinExe, so it does not attach the
+parent's console: `--silent`'s diagnostic text reaches a caller that redirects
+(a pipe or file is inherited) but not a person typing in a real console window.
+The exit-code contract holds everywhere — 1 never reached Setup, -1 could not
+start it, anything else is Setup's own — and the text is the part that is
+conditional. Two reviews disagreed about this and the one calling it harmless
+was wrong: both had "measured" it through redirected pipes, which is precisely
+the case that works. It is deferred rather than fixed because the fix
+(`AttachConsole(ATTACH_PARENT_PROCESS)`) cannot be verified from a remote
+session for the same reason the defect cannot be reproduced there, and 1b
+already needs a person at a real console for its ARM64 gate.
+
 `package-velopack.ps1` builds the wizard, embeds Setup.exe as a resource, and
 emits the result under the existing Setup filename. **Both** statements of the
 size budget are updated with measured values. The exactly-one-Setup rule at
