@@ -3,10 +3,14 @@ using System.Diagnostics;
 namespace Syrtis.Installer;
 
 /// <summary>Result of one Setup.exe invocation.</summary>
-internal readonly struct SetupRunResult(int exitCode, string logPath, string? launchError = null)
+internal readonly struct SetupRunResult(int exitCode, string? logPath, string? launchError = null)
 {
     internal int ExitCode { get; } = exitCode;
-    internal string LogPath { get; } = logPath;
+
+    /// <summary>The log this run produced, or null when it produced none.
+    /// Never merely "the path we asked Setup to use" — see
+    /// <see cref="SetupRunner.LogWrittenByThisRun"/>.</summary>
+    internal string? LogPath { get; } = logPath;
 
     /// <summary>Why Setup could not be <em>started</em>, or null when it ran.
     /// The distinction matters to what the Done page may say: when Setup never
@@ -70,9 +74,43 @@ internal static class SetupRunner
             CreateNoWindow = true,
         };
 
+        // Read the clock before starting, not after: anything Setup writes to
+        // the log necessarily happens later, so ">= startedUtc" is exactly the
+        // set of writes this run caused. DateTime.UtcNow is coarse (about 15
+        // ms) but it rounds down, so the reading can only be at or before the
+        // true launch instant, which keeps the comparison safe without a
+        // fudge factor.
+        var startedUtc = DateTime.UtcNow;
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Failed to start Setup.exe.");
         process.WaitForExit();
-        return new SetupRunResult(process.ExitCode, logPath);
+        return new SetupRunResult(process.ExitCode, LogWrittenByThisRun(logPath, startedUtc));
+    }
+
+    /// <summary>The log path when this run wrote it, null otherwise.
+    ///
+    /// <para>An existence check is not enough and was shipped once believing
+    /// it was. <see cref="DefaultLogPath"/> is a fixed name in %TEMP%, so a
+    /// file being there says nothing about which install put it there — the
+    /// test machine had a two-day-old copy at exactly that path. Setup can
+    /// start and fail before opening the log, and the Done page would then
+    /// have offered an unrelated, possibly successful, install's record as the
+    /// explanation for this failure.</para>
+    ///
+    /// <para>Deleting the old file before launching was the alternative. This
+    /// does not touch the user's disk and has no failure mode of its own: if
+    /// the stamp cannot be read at all, the answer is "no log", which is the
+    /// safe direction.</para></summary>
+    private static string? LogWrittenByThisRun(string logPath, DateTime startedUtc)
+    {
+        try
+        {
+            var info = new FileInfo(logPath);
+            return info.Exists && info.LastWriteTimeUtc >= startedUtc ? logPath : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 }

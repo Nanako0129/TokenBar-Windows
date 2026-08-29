@@ -432,7 +432,10 @@ internal sealed class WizardForm : Form
                     _result = task.IsFaulted
                         ? new SetupRunResult(
                             Program.LaunchFailedExitCode,
-                            logPath,
+                            // No log: Setup never ran, so it wrote nothing.
+                            // Carrying the path here would put the same stale
+                            // file back into the result by another door.
+                            logPath: null,
                             Describe(task.Exception))
                         : task.Result;
                     GoToStep(WizardStep.Done);
@@ -455,11 +458,13 @@ internal sealed class WizardForm : Form
     /// user: Setup never started (show why, and do not mention a log), Setup
     /// ran and failed with a log to read, and Setup ran and failed without one.
     ///
-    /// <para>The log check is not decoration. DefaultLogPath is a fixed name in
-    /// %TEMP%, so an absent log and a stale log look identical from here — the
-    /// test machine had a two-day-old copy sitting at that exact path — and
-    /// sending someone to a successful install's log to explain a failure is
-    /// worse than saying nothing.</para></summary>
+    /// <para>Whether there is a log is not decided here. This asks the result,
+    /// and SetupRunner answers by whether the file was written during the run
+    /// it just performed. An earlier version tested File.Exists at this point
+    /// and was wrong in the way that matters: DefaultLogPath is a fixed name in
+    /// %TEMP%, so a leftover from a previous install passes an existence check
+    /// and the page would offer an unrelated run's record — possibly a
+    /// successful one — as the explanation for this failure.</para></summary>
     private string FailureBody()
     {
         if (_result is not { } result)
@@ -474,8 +479,8 @@ internal sealed class WizardForm : Form
             return Strings.DoneBodyLaunchFailed(_productName, result.LaunchError!);
         }
 
-        return File.Exists(result.LogPath)
-            ? Strings.DoneBodyFailure(_productName, result.ExitCode, result.LogPath)
+        return result.LogPath is { } log
+            ? Strings.DoneBodyFailure(_productName, result.ExitCode, log)
             : Strings.DoneBodyFailureNoLog(_productName, result.ExitCode);
     }
 
