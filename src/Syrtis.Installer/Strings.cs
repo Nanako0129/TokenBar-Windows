@@ -29,6 +29,10 @@ internal static class Strings
         $"Setup file not found: {path}",
         $"找不到安裝檔：{path}");
 
+    internal static string ErrorSetupLaunchFailed(string path, string reason) => T(
+        $"Could not start the setup file: {path}\n{reason}",
+        $"無法啟動安裝檔：{path}\n{reason}");
+
     // Window chrome.
     internal static string WindowTitle => T("Syrtis Setup", "Syrtis 安裝精靈");
 
