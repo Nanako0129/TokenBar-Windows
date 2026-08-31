@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Classic Windows install wizard fronting Velopack's Setup.exe. net48
+       WinForms, deliberately not net10: it must run on a machine with no
+       .NET runtime installed at all, before anything this installer places
+       gets a chance to. Not in TokenBar.slnx for the same reason TokenBar.App
+       isn't — that solution is the macOS inner loop, restored in locked mode
+       by scripts/check.sh, and net48 WinForms cannot build there. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <Platforms>AnyCPU</Platforms>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>Syrtis.Installer</AssemblyName>
+    <RootNamespace>Syrtis.Installer</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- The build host has the 4.8.1 runtime but no Visual Studio targeting
+         packs; this reference assembly package is what lets `dotnet build`
+         resolve net48 without one. -->
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Reuse TokenBar.App's brandmark rather than copying the binary: built
+         into this exe's own resources via ApplicationIcon below, and also
+         copied to the output directory (Link, not a physical copy in this
+         directory) so WizardForm can load it at runtime for the Welcome
+         page's large icon. -->
+    <Content Include="..\TokenBar.App\Assets\syrtis.ico" Link="syrtis.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <PropertyGroup>
+    <ApplicationIcon>..\TokenBar.App\Assets\syrtis.ico</ApplicationIcon>
+  </PropertyGroup>
+
+</Project>
