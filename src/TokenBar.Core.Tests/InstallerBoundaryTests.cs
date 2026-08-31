@@ -105,6 +105,74 @@ public class InstallerBoundaryTests
         Assert.Equal("Syrtis", PayloadIdentity.Choose("  Syrtis  ", null, "?"));
     }
 
+    // --- EmbeddedPayload.StreamToNewFile ---------------------------------------
+
+    // FileStream creates the file before a byte is copied, so a failure
+    // part-way leaves up to ~83 MB whose path the caller never received and
+    // therefore cannot delete. In the disk-full case the leftover consumes the
+    // space whose absence caused the failure, and every retry adds another.
+    [Fact]
+    public void StreamToNewFile_removes_the_partial_file_when_the_copy_throws()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var source = new ThrowingStream(failAfterBytes: 8);
+
+        Assert.Throws<IOException>(() => EmbeddedPayload.StreamToNewFile(source, path));
+        Assert.False(File.Exists(path), $"partial file left behind at {path}");
+    }
+
+    [Fact]
+    public void StreamToNewFile_writes_the_whole_stream_when_it_succeeds()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var payload = new byte[4096];
+        new Random(1).NextBytes(payload);
+        try
+        {
+            EmbeddedPayload.StreamToNewFile(new MemoryStream(payload), path);
+
+            Assert.Equal(payload, File.ReadAllBytes(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>Yields some bytes, then fails — the shape of a disk filling
+    /// up rather than of a stream that was never readable.</summary>
+    private sealed class ThrowingStream(int failAfterBytes) : Stream
+    {
+        private int _remaining = failAfterBytes;
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_remaining <= 0)
+            {
+                throw new IOException("simulated mid-copy failure");
+            }
+
+            var n = Math.Min(count, _remaining);
+            Array.Clear(buffer, offset, n);
+            _remaining -= n;
+            return n;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     // --- SetupRunner.NewLogPath -----------------------------------------------
 
     // The log path used to be one fixed name, and two defects came out of that:
