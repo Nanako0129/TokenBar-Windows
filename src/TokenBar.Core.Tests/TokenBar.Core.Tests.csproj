@@ -36,6 +36,23 @@
     <Compile Include="..\TokenBar.App\AppViews.cs" Link="AppViews.cs" />
     <Compile Include="..\TokenBar.App\AppLanguage.cs" Link="AppLanguage.cs" />
     <Compile Include="..\TokenBar.App\DrillDownSummary.cs" Link="DrillDownSummary.cs" />
+    <!-- Syrtis.Installer's boundary logic, pulled in for the same reason as
+         the App sources above: none of these five files references
+         System.Windows.Forms, so they compile as-is under net10. Deliberately
+         NOT included: InstallPath.cs. Its Path.IsPathRooted/GetPathRoot/
+         GetFullPath semantics are net48-specific (they throw on invalid
+         characters there; .NET Core does not) and this suite also runs on
+         macOS, where Path.IsPathRooted("C:\") is false. A test against it here
+         would be green for the wrong reason on Windows or red for the wrong
+         reason on macOS. That surface is covered instead by
+         Syrtis.Installer.exe's hidden self-check switch on the framework
+         that actually ships. See InstallerBoundaryTests.cs for the same
+         note next to the tests. -->
+    <Compile Include="..\Syrtis.Installer\ExitCodes.cs" Link="Installer\ExitCodes.cs" />
+    <Compile Include="..\Syrtis.Installer\InstallRequest.cs" Link="Installer\InstallRequest.cs" />
+    <Compile Include="..\Syrtis.Installer\SetupLocator.cs" Link="Installer\SetupLocator.cs" />
+    <Compile Include="..\Syrtis.Installer\SetupRunner.cs" Link="Installer\SetupRunner.cs" />
+    <Compile Include="..\Syrtis.Installer\Strings.cs" Link="Installer\Strings.cs" />
   </ItemGroup>
 
   <ItemGroup>

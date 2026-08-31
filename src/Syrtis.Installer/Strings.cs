@@ -12,7 +12,7 @@ internal static class Strings
 {
     private static readonly bool IsChinese = DetectChinese(CultureInfo.CurrentUICulture.Name);
 
-    private static bool DetectChinese(string tag) =>
+    internal static bool DetectChinese(string tag) =>
         tag.StartsWith("zh-Hant", StringComparison.OrdinalIgnoreCase)
         || tag.StartsWith("zh-TW", StringComparison.OrdinalIgnoreCase)
         || tag.StartsWith("zh-HK", StringComparison.OrdinalIgnoreCase)

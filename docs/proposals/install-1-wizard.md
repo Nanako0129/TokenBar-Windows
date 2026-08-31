@@ -103,8 +103,18 @@ packaging work exists.
 `src/Syrtis.Installer/` **stays out of `src/TokenBar.slnx`**, for the same
 reason `TokenBar.App` does (`TokenBar.App.csproj:3-5`): the slnx is the macOS
 inner loop, `scripts/check.sh:19-21` restores it `--locked-mode` and builds it,
-and net48 WinForms cannot build there. Keeping it out is also what makes this
-slice's rollback — delete the directory — true.
+and net48 WinForms cannot build there.
+
+**This sentence used to continue "keeping it out is also what makes this
+slice's rollback — delete the directory — true", and INSTALL-1a2 made that
+false.** `TokenBar.Core.Tests` now compiles several installer sources through
+`<Compile Include>`, and a stale include path is a hard build error in a
+project that both the macOS inner loop and CI build. Backing the wizard out
+means removing those include items and the test file in the same change. The
+coupling is accepted deliberately: it is the price of the sources being
+reachable by a test at all. The project itself still stays out of the slnx —
+that part is unchanged, and it is what keeps net48 WinForms off the macOS
+inner loop.
 
 The build policy that reaches it is the repo-root `Directory.Build.props:9-21`;
 there is no `src/Directory.Build.props`. It applies product and version
@@ -168,6 +178,44 @@ seconds"; that is now known to be wrong for at least one real install path. The
 likely cause is Defender scanning a directory outside the usual application
 path, unconfirmed. Tracked separately: it belongs to the update flow, not to
 the wizard, and no change here would fix it.
+
+### INSTALL-1a2 — make the boundary logic testable
+
+Added 2026-08-31, after eight consecutive external review rounds on #77 each
+found a real defect and **five of them were introduced or left incomplete by
+the previous round's fix**. That is not a converging series, and the reason it
+was not converging is structural rather than careless.
+
+**Seven of the eight findings sit at the boundary with Win32** — command-line
+parsing, path parsing, process launch, the filesystem, the console subsystem.
+Only one was wizard flow, and it was the mildest. This project is a thin shim
+over hostile platform semantics, and that shim had no automated coverage at
+all: no test project compiled `src/Syrtis.Installer/`. Every fix was verified
+by a throwaway probe that reflected into the built binary, proved one thing,
+and was deleted — so each round began again from nothing.
+
+**The two surfaces also re-derived shared decisions independently.** Program
+parsed arguments, SetupLocator parsed them again, WizardForm chose the
+directory, SetupRunner formatted the command line, and the Done page re-derived
+whether the log was usable. Findings 4 and 7 were one defect on two surfaces;
+finding 5 was one rule in two files; the whole-directory review found five more
+duplicated rules. The plan for this slice reproduced the disease while
+describing the cure: its own `--self-check` switch would have been swallowed by
+its own round-8 argument fix and reported as a missing setup file. That is the
+strongest available evidence that the fault is the missing single answer to
+"what is this run", not insufficient care.
+
+So: one `InstallRequest` produced by one `Parse`, consumed by all five call
+sites; the pure logic moved where a test can reach it; the nine probes already
+run by hand become tests.
+
+**What cannot be tested there, stated because a silent omission would read as
+coverage.** Windows path semantics stay out of `TokenBar.Core.Tests`: that
+suite also runs on the macOS inner loop, where `Path.IsPathRooted("C:\")` is
+false, and net10 does not throw where net48 does — which is finding 1 itself.
+Those assertions live in a `--self-check` switch that runs them in-process on
+the framework that actually ships, and it is required to fail when an assertion
+is deliberately broken.
 
 ### INSTALL-1b — embed and package
 

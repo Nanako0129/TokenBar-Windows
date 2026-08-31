@@ -53,7 +53,7 @@ internal static class SetupRunner
     /// <para>Only the run of backslashes immediately before the closing quote
     /// is doubled. Interior ones are literal to the parser and doubling them
     /// would corrupt the path.</para></summary>
-    private static string Quote(string value)
+    internal static string Quote(string value)
     {
         var trailing = 0;
         while (trailing < value.Length && value[value.Length - 1 - trailing] == '\\')
@@ -101,7 +101,7 @@ internal static class SetupRunner
     /// does not touch the user's disk and has no failure mode of its own: if
     /// the stamp cannot be read at all, the answer is "no log", which is the
     /// safe direction.</para></summary>
-    private static string? LogWrittenByThisRun(string logPath, DateTime startedUtc)
+    internal static string? LogWrittenByThisRun(string logPath, DateTime startedUtc)
     {
         try
         {

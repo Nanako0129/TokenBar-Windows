@@ -7,30 +7,24 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        // Reject what we do not understand before doing anything with it. The
-        // wizard used to take the first non-switch argument as the setup path
-        // and drop everything else on the floor, so
-        // "--silent setup.exe --installto D:\X" installed to the default
-        // directory and said nothing at all. Slice 1b publishes this under
-        // Setup.exe's own filename, and Setup does support --installto, so a
-        // script carrying one would have been silently disobeyed — the worst
-        // available outcome for an unattended install.
-        var extra = args.Where(a => !SetupLocator.IsSilentSwitch(a)).Skip(1).FirstOrDefault();
-        if (extra != null)
+        var request = InstallRequest.Parse(args);
+        return request.Kind switch
         {
-            return Fail(Strings.ErrorUnexpectedArg(extra), args);
-        }
-
-        var silent = args.Any(SetupLocator.IsSilentSwitch);
-        return silent ? RunSilent(args) : RunGui(args);
+            InstallRequestKind.SelfCheck => SelfCheck.Run(),
+            InstallRequestKind.Refuse => Fail(request),
+            InstallRequestKind.RunSilent => RunSilent(request),
+            InstallRequestKind.RunWizard => RunGui(request),
+            _ => throw new InvalidOperationException($"Unknown request kind: {request.Kind}"),
+        };
     }
 
     /// <summary>Report a startup problem on whichever surface exists, and
     /// exit 1. Interactive gets a dialog; anything else gets stderr, which is
     /// subject to the console limitation documented on RunSilent.</summary>
-    private static int Fail(string message, string[] args)
+    private static int Fail(InstallRequest request)
     {
-        if (!args.Any(SetupLocator.IsSilentSwitch) && Environment.UserInteractive)
+        var message = MissingSetupMessage(request);
+        if (!request.SilentRequested && Environment.UserInteractive)
         {
             MessageBox.Show(message, Strings.WindowTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -39,7 +33,7 @@ internal static class Program
             Console.Error.WriteLine(message);
         }
 
-        return 1;
+        return ExitCodes.BadArguments;
     }
 
     /// <summary>No window at all: runs Setup against the default per-user
@@ -59,16 +53,11 @@ internal static class Program
     /// (ATTACH_PARENT_PROCESS), which cannot be verified from a remote session
     /// for the same reason the defect cannot be reproduced there, so it waits
     /// for 1b and a real console.</para></summary>
-    private static int RunSilent(string[] args)
+    private static int RunSilent(InstallRequest request)
     {
-        var setupPath = SetupLocator.Locate(args);
-        if (setupPath == null)
-        {
-            Console.Error.WriteLine(MissingSetupMessage(args));
-            return 1;
-        }
+        var setupPath = request.SetupPath!;
 
-        // Locate only proves the file is there. Windows can still refuse to
+        // Locate only proved the file is there. Windows can still refuse to
         // run it — quarantined between the check and here, blocked by policy,
         // permissions changed, or simply not an executable — and Process.Start
         // then throws. Measured: --silent against an existing .txt exited
@@ -93,51 +82,32 @@ internal static class Program
         catch (Exception ex)
         {
             Console.Error.WriteLine(Strings.ErrorSetupLaunchFailed(setupPath, ex.Message));
-            // -1 rather than 1: 1 already means "we never got as far as
-            // running it", and Setup's own codes are small positives, so a
-            // caller can tell "Setup failed" from "Setup never started".
-            // Matches the code the GUI path records for a faulted launch.
-            return LaunchFailedExitCode;
+            // LaunchFailed rather than BadArguments: BadArguments already means
+            // "we never got as far as running it", and Setup's own codes are
+            // small positives, so a caller can tell "Setup failed" from "Setup
+            // never started". Matches the code the GUI path records for a
+            // faulted launch.
+            return ExitCodes.LaunchFailed;
         }
     }
 
-    /// <summary>Returned when Setup.exe could not be started at all, as
-    /// opposed to starting and failing. Kept away from 1 (bad or missing
-    /// argument) and from Setup's own small positive codes.</summary>
-    internal const int LaunchFailedExitCode = -1;
-
-    private static int RunGui(string[] args)
+    private static int RunGui(InstallRequest request)
     {
-        var setupPath = SetupLocator.Locate(args);
-        if (setupPath == null)
-        {
-            var message = MissingSetupMessage(args);
-            // MessageBox needs a window station/desktop (Environment.UserInteractive);
-            // without one it throws instead of showing anything, which would
-            // turn "no argument" into a crash. Console is the fallback there.
-            if (Environment.UserInteractive)
-            {
-                MessageBox.Show(message, Strings.WindowTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            else
-            {
-                Console.Error.WriteLine(message);
-            }
-
-            return 1;
-        }
-
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new WizardForm(setupPath));
-        return 0;
+        Application.Run(new WizardForm(request.SetupPath!));
+        return ExitCodes.Ok;
     }
 
-    private static string MissingSetupMessage(string[] args)
+    /// <summary>Renders a Refuse request's reason + token pair into the
+    /// sentence a person reads. Kept separate from InstallRequest itself so
+    /// that parsing never touches Strings, and so a test can assert the
+    /// reason/token pair without going through culture-dependent text.</summary>
+    private static string MissingSetupMessage(InstallRequest request) => request.Reason switch
     {
-        var candidate = args.FirstOrDefault(a => !SetupLocator.IsSilentSwitch(a));
-        return string.IsNullOrWhiteSpace(candidate)
-            ? Strings.ErrorNoSetupPathArg
-            : Strings.ErrorSetupNotFound(candidate);
-    }
+        RefusalReason.NoSetupPath => Strings.ErrorNoSetupPathArg,
+        RefusalReason.SetupNotFound => Strings.ErrorSetupNotFound(request.Token!),
+        RefusalReason.UnexpectedArgument => Strings.ErrorUnexpectedArg(request.Token!),
+        _ => throw new InvalidOperationException($"Unknown refusal reason: {request.Reason}"),
+    };
 }

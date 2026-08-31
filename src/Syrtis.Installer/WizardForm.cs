@@ -166,7 +166,7 @@ internal sealed class WizardForm : Form
                 break;
             case WizardStep.Location:
                 _backButton.Enabled = true;
-                _nextButton.Enabled = IsValidInstallPath(_locationTextBox?.Text ?? string.Empty);
+                _nextButton.Enabled = InstallPath.IsValidInstallPath(_locationTextBox?.Text ?? string.Empty);
                 _cancelButton.Enabled = true;
                 break;
             case WizardStep.Installing:
@@ -282,9 +282,9 @@ internal sealed class WizardForm : Form
             AutoSize = true,
             ForeColor = Color.Firebrick,
             Margin = new Padding(0, 8, 0, 0),
-            Visible = !IsValidInstallPath(_installDir),
+            Visible = !InstallPath.IsValidInstallPath(_installDir),
         };
-        textBox.TextChanged += (_, _) => invalidHint.Visible = !IsValidInstallPath(textBox.Text);
+        textBox.TextChanged += (_, _) => invalidHint.Visible = !InstallPath.IsValidInstallPath(textBox.Text);
         layout.Controls.Add(invalidHint);
 
         return layout;
@@ -295,76 +295,13 @@ internal sealed class WizardForm : Form
         using var dialog = new FolderBrowserDialog
         {
             Description = Strings.BrowseDialogDescription,
-            SelectedPath = IsValidInstallPath(textBox.Text) ? textBox.Text : SetupRunner.DefaultInstallDirectory,
+            SelectedPath = InstallPath.IsValidInstallPath(textBox.Text) ? textBox.Text : SetupRunner.DefaultInstallDirectory,
             ShowNewFolderButton = true,
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
             textBox.Text = dialog.SelectedPath;
         }
-    }
-
-    /// <summary>A "usable absolute directory path": rooted, and syntactically
-    /// well-formed (Path.GetFullPath does not throw). Whether it can actually
-    /// be created is left to Setup.exe, which reports failure through its
-    /// exit code on the Done page — this is user-typing feedback, not a
-    /// filesystem permission check.</summary>
-    private static bool IsValidInstallPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return false;
-        }
-
-        // EVERY System.IO.Path call belongs inside this try. On .NET Framework
-        // — measured, not assumed, on 4.8.9337.0 — IsPathRooted and GetPathRoot
-        // both call CheckInvalidPathChars and throw ArgumentException, so a
-        // single quote in C:\bad" throws from all three of these. This runs
-        // from TextChanged on the UI thread, so one outside the guard is an
-        // unhandled exception on a keystroke rather than the invalid-path hint.
-        // .NET Core stopped throwing from these; that is not the target here.
-        try
-        {
-            if (!Path.IsPathRooted(path))
-            {
-                return false;
-            }
-
-            // Rooted is not the same as fully qualified, and there is more than
-            // one way to be rooted without naming a volume. .NET Framework has
-            // no Path.IsPathFullyQualified (that arrived in .NET Core 2.1), so
-            // the test is on the root, and it is a whitelist: the root must
-            // identify a volume. An earlier revision listed the bad shapes
-            // instead and shipped with the second one still open.
-            //
-            // Measured on 4.8.9337.0, process directory C:\Users\Nanako:
-            //
-            //   "C:\ok"          root "C:\"          -> qualified
-            //   "\\srv\share\x"  root "\\srv\share"  -> qualified
-            //   "C:"             root "C:"           -> C:\Users\Nanako
-            //   "\Syrtis"        root "\"            -> C:\Syrtis
-            //   "/Syrtis"        root "\"            -> C:\Syrtis
-            //
-            // The last three are the trap: every one of them passes
-            // IsPathRooted and resolves silently against the process's current
-            // drive or directory, so the user reads an absolute path and Setup
-            // installs somewhere they never named. GetPathRoot normalises "//"
-            // to "\\", so the UNC test needs only the one form.
-            var root = Path.GetPathRoot(path);
-            var namesAVolume =
-                (root.Length >= 3 && root[1] == ':')
-                || root.StartsWith(@"\\", StringComparison.Ordinal);
-            if (!namesAVolume)
-            {
-                return false;
-            }
-
-            Path.GetFullPath(path);
-            return true;
-        }
-        catch (ArgumentException) { return false; }
-        catch (NotSupportedException) { return false; }
-        catch (PathTooLongException) { return false; }
     }
 
     // --- Page 3: Installing --------------------------------------------------
@@ -431,7 +368,7 @@ internal sealed class WizardForm : Form
                     // message and the two surfaces have to agree.
                     _result = task.IsFaulted
                         ? new SetupRunResult(
-                            Program.LaunchFailedExitCode,
+                            ExitCodes.LaunchFailed,
                             // No log: Setup never ran, so it wrote nothing.
                             // Carrying the path here would put the same stale
                             // file back into the result by another door.
@@ -471,7 +408,7 @@ internal sealed class WizardForm : Form
         {
             // Unreachable: Done is only entered from the install continuation,
             // which always assigns _result first.
-            return Strings.DoneBodyFailureNoLog(_productName, Program.LaunchFailedExitCode);
+            return Strings.DoneBodyFailureNoLog(_productName, ExitCodes.LaunchFailed);
         }
 
         if (!string.IsNullOrEmpty(result.LaunchError))
@@ -581,7 +518,7 @@ internal sealed class WizardForm : Form
                 GoToStep(WizardStep.Location);
                 break;
             case WizardStep.Location:
-                if (IsValidInstallPath(_installDir))
+                if (InstallPath.IsValidInstallPath(_installDir))
                 {
                     GoToStep(WizardStep.Installing);
                     StartInstall();
