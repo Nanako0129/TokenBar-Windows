@@ -338,8 +338,27 @@ pub(crate) struct ExportedSeries {
 /// the user's file to `quota-pace-history-v3.corrupt-{now}.json` on a parse or
 /// validation failure and takes the process plus exclusive file lock, with a
 /// possible `save_store_atomic` on the way out. Renaming the user's history is
-/// not an acceptable cost for drawing a card, so a parse failure is reported as
-/// an error envelope and the file is left exactly as found.
+/// not an acceptable cost for drawing a card, so a failure is reported as an
+/// error envelope and the file's contents, name and mtime are left as found.
+/// One thing does change, stated here rather than implied away: on unix
+/// `secure_open_regular_file` normalizes the mode to 0600, so a store left at
+/// 0644 comes back at 0600. That is the read primitive's pre-existing
+/// hardening, it only tightens, and it is measured by
+/// `export_history_leaves_a_corrupt_store_untouched`.
+///
+/// **Skipping the quarantine is not a licence to skip the validation.** Those
+/// are two separable things that `load_store_at_with_mode` happens to do
+/// together, and taking the whole path out took the check with it: a store that
+/// is syntactically valid JSON but violates the v3 invariants — a foreign
+/// `schema_version`, unordered or invalid series keys, a sample outside its own
+/// cycle bounds — would otherwise be exported as legitimate history and folded
+/// into cycles and heatmap cells that describe nothing. `validate_store` is a
+/// pure predicate over the deserialized value: no clock, no lock, no write.
+///
+/// `validate_store` and not `validate_store_at`: the latter additionally
+/// requires `last_activity_at <= now`, which a clock that has moved backwards
+/// violates through no fault of the data. A skewed clock should not blank the
+/// lens.
 ///
 /// The guarded read primitives are still used — `read_owner_only_with_mode`
 /// (which is `open_existing_owner_only_with_mode` +
@@ -360,6 +379,9 @@ fn export_history_at_with_mode(
         return Ok(Vec::new());
     };
     let store = serde_json::from_slice::<Store>(&bytes).map_err(|_| HistoryError::Read)?;
+    if !validate_store(&store) {
+        return Err(HistoryError::Read);
+    }
     Ok(store
         .series
         .iter()
@@ -6858,6 +6880,68 @@ mod tests {
             export_history_at_with_mode(StorageMode::Generic, &path),
             Ok(Vec::new())
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A foreign `schema_version` parses fine and means nothing this fold can
+    /// read. It is the shape the pending v3-to-v4 migration will actually
+    /// produce, so the export has to refuse it rather than describe it.
+    #[test]
+    fn export_history_refuses_a_store_from_another_schema() {
+        let (directory, path) = temp_path("export-schema");
+        let mut series = SeriesState::new(&key("acct"), 1_800_000_000);
+        series.samples = complete_cycle(1_800_000_000 - 5 * 3_600, 5 * 3_600, 40.0);
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION + 1,
+            series: vec![series],
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert_eq!(
+            export_history_at_with_mode(StorageMode::Generic, &path),
+            Err(HistoryError::Read)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Syntactically valid, semantically nonsense. Exporting this would put a
+    /// sample the writer would never have admitted in front of the fold, where
+    /// it becomes a cycle and a heatmap cell describing usage that never
+    /// happened — and it would do so silently, since nothing downstream
+    /// re-checks what the loader is supposed to have checked.
+    #[test]
+    fn export_history_refuses_a_store_with_an_out_of_range_sample() {
+        let (directory, path) = temp_path("export-invalid-sample");
+        let duration = 5 * 3_600;
+        let reset = 1_800_000_000;
+        let mut series = SeriesState::new(&key("acct"), reset);
+        series.samples = complete_cycle(reset - duration, duration, 40.0);
+        series.samples.push(quota_sample(
+            reset,
+            duration,
+            0.5,
+            250.0,
+            SampleOrigin::LiveV3,
+        ));
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert_eq!(
+            export_history_at_with_mode(StorageMode::Generic, &path),
+            Err(HistoryError::Read)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!fs::read_dir(&directory).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("quota-pace-history-v3.corrupt-")));
         fs::remove_dir_all(directory).unwrap();
     }
 }
