@@ -170,6 +170,38 @@ public class InstallerBoundaryTests
         Assert.Equal("extra", request.Token);
     }
 
+    // The refusal path exists to protect the case where slice 1b puts this
+    // under Setup.exe's own filename and a script arrives carrying Setup's own
+    // options. It used to refuse those correctly but name the wrong token:
+    // "--installto D:\X" reported "D:\X" as the surplus argument, because both
+    // tokens are non-switches to a parser that only knows -s. A lone "-v" was
+    // reported as a missing setup file.
+    [Theory]
+    [InlineData(new[] { "--installto", "D:\\X" }, "--installto")]
+    [InlineData(new[] { "-v" }, "-v")]
+    [InlineData(new[] { "-l", "C:\\some.log" }, "-l")]
+    [InlineData(new[] { "--silent", "--installto", "D:\\X" }, "--installto")]
+    [InlineData(new[] { "setup.exe", "-t", "D:\\X" }, "-t")]
+    public void Parse_names_the_unsupported_switch_not_its_value(string[] args, string expected)
+    {
+        var request = InstallRequest.Parse(args);
+
+        Assert.Equal(InstallRequestKind.Refuse, request.Kind);
+        Assert.Equal(RefusalReason.UnsupportedSwitch, request.Reason);
+        Assert.Equal(expected, request.Token);
+    }
+
+    // A Windows path never begins with '-', so the switch test is unambiguous;
+    // '/x' is a rooted path and must NOT be mistaken for a switch.
+    [Fact]
+    public void Parse_does_not_treat_a_slash_rooted_path_as_a_switch()
+    {
+        var request = InstallRequest.Parse(["/nonexistent/setup.exe"]);
+
+        Assert.Equal(InstallRequestKind.Refuse, request.Kind);
+        Assert.Equal(RefusalReason.SetupNotFound, request.Reason);
+    }
+
     [Theory]
     [InlineData("-s")]
     [InlineData("--silent")]

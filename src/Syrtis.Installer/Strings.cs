@@ -33,6 +33,15 @@ internal static class Strings
         $"Unrecognised argument: {arg}\nUsage: Syrtis.Installer.exe [-s|--silent] <path-to-setup.exe>",
         $"無法辨識的參數：{arg}\n用法：Syrtis.Installer.exe [-s|--silent] <setup.exe 的路徑>");
 
+    /// <summary>A switch this wrapper does not support. Named separately from
+    /// ErrorUnexpectedArg because after slice 1b this runs under Setup.exe's
+    /// own filename, so the script that hits this is likely carrying Setup's
+    /// options — and the useful thing to say is which switch was dropped, not
+    /// that some token was surplus.</summary>
+    internal static string ErrorUnsupportedSwitch(string arg) => T(
+        $"This installer does not support {arg}.\nUsage: Syrtis.Installer.exe [-s|--silent] <path-to-setup.exe>",
+        $"此安裝程式不支援 {arg}。\n用法：Syrtis.Installer.exe [-s|--silent] <setup.exe 的路徑>");
+
     internal static string ErrorSetupLaunchFailed(string path, string reason) => T(
         $"Could not start the setup file: {path}\n{reason}",
         $"無法啟動安裝檔：{path}\n{reason}");

@@ -108,6 +108,7 @@ internal static class Program
         RefusalReason.NoSetupPath => Strings.ErrorNoSetupPathArg,
         RefusalReason.SetupNotFound => Strings.ErrorSetupNotFound(request.Token!),
         RefusalReason.UnexpectedArgument => Strings.ErrorUnexpectedArg(request.Token!),
+        RefusalReason.UnsupportedSwitch => Strings.ErrorUnsupportedSwitch(request.Token!),
         _ => throw new InvalidOperationException($"Unknown refusal reason: {request.Reason}"),
     };
 }

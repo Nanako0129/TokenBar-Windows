@@ -24,6 +24,19 @@ internal enum RefusalReason
     /// <summary>An argument was present that this parser does not recognise:
     /// a second non-switch argument, or anything alongside --self-check.</summary>
     UnexpectedArgument,
+
+    /// <summary>A switch this wrapper does not support — anything beginning
+    /// with '-' that is not -s, --silent or --self-check.
+    ///
+    /// <para>Separate from UnexpectedArgument because the refusal path exists
+    /// to protect exactly the case where slice 1b puts this under Setup.exe's
+    /// own filename and an existing script arrives carrying Setup's options.
+    /// Without this, "--installto D:\X" refused while naming "D:\X" — both
+    /// tokens are non-switches to a parser that only knows -s, so the second
+    /// one looked like the surplus — and a lone "-v" was reported as a missing
+    /// setup file. The right token was refused for the wrong stated reason,
+    /// which is the least useful place to be precise.</para></summary>
+    UnsupportedSwitch,
 }
 
 /// <summary>The single parsed shape of the process's command line, produced
@@ -68,7 +81,8 @@ internal readonly struct InstallRequest
     internal RefusalReason Reason { get; }
 
     /// <summary>The offending argument, when Reason names one
-    /// (SetupNotFound, UnexpectedArgument). Null for NoSetupPath.</summary>
+    /// (SetupNotFound, UnexpectedArgument, UnsupportedSwitch). Null for
+    /// NoSetupPath.</summary>
     internal string? Token { get; }
 
     /// <summary>Whether -s / --silent / -S was present anywhere in the
@@ -94,6 +108,21 @@ internal readonly struct InstallRequest
             var otherToken = args.FirstOrDefault(a => !a.Equals(SelfCheckSwitch, StringComparison.OrdinalIgnoreCase))
                 ?? SelfCheckSwitch;
             return Refuse(RefusalReason.UnexpectedArgument, otherToken, silentRequested);
+        }
+
+        // Before anything positional. A Windows path never begins with '-',
+        // so this is unambiguous, and it is the only test that can tell
+        // "--installto D:\X" (an unsupported switch and its value) from
+        // "setup.exe extra.exe" (two paths). Only '-' is treated as a switch
+        // marker: '/x' is a valid rooted Windows path, and Velopack's own
+        // options are all '-' or '--'.
+        var unsupportedSwitch = args.FirstOrDefault(a =>
+            a.StartsWith("-", StringComparison.Ordinal)
+            && !SetupLocator.IsSilentSwitch(a)
+            && !a.Equals(SelfCheckSwitch, StringComparison.OrdinalIgnoreCase));
+        if (unsupportedSwitch != null)
+        {
+            return Refuse(RefusalReason.UnsupportedSwitch, unsupportedSwitch, silentRequested);
         }
 
         var nonSwitchArgs = args.Where(a => !SetupLocator.IsSilentSwitch(a)).ToArray();
