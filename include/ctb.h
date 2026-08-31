@@ -99,6 +99,20 @@ char *tb_tokens_per_min(void);
 // Network-bound; per-provider failures are reported inside each snapshot.
 char *tb_agent_usage(void);
 
+// Persisted quota-pace history for the quota lens, one entry per stored series:
+// [{providerId, accountScope, windowKey, samples:[{resetAt, durationSeconds,
+//   durationSource, usedPercent, sampledAt, origin, isActiveGroup}]}].
+// Identity is the store's own triple; cardId/label are not in the store and are
+// joined consumer-side on (clientId, paceStatus.windowKey). `isActiveGroup` is
+// always emitted and is the producer's answer to whether the sample belongs to
+// the cycle still running — a consumer cannot derive it, because the series'
+// active reset is the raw provider value while stored samples are normalized.
+// Disk-bound (call off the UI thread) and strictly read-only: unlike the
+// recording path, this never quarantines, locks, or rewrites the store. A
+// missing history file is an empty array; an unparseable one is an error
+// envelope.
+char *tb_quota_history(void);
+
 // Release a string returned by any tb_* entry point.
 void tb_free(char *p);
 

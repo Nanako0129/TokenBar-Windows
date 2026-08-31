@@ -29,6 +29,8 @@ public static class TbCore
             new JsonStringEnumConverter<FilterParityStatus>(allowIntegerValues: false),
             new JsonStringEnumConverter<PricingMode>(allowIntegerValues: false),
             new JsonStringEnumConverter<CostCoverage>(allowIntegerValues: false),
+            new JsonStringEnumConverter<QuotaHistoryDurationSource>(allowIntegerValues: false),
+            new JsonStringEnumConverter<QuotaHistorySampleOrigin>(allowIntegerValues: false),
         },
     };
 
@@ -133,6 +135,13 @@ public static class TbCore
     /// Error, not thrown.</summary>
     public static AgentUsagePayload AgentUsage() =>
         Unwrap<AgentUsagePayload>(NativeMethods.tb_agent_usage());
+
+    /// <summary>Persisted quota-pace history, one entry per stored series.
+    /// Disk-bound (call off the UI thread) and strictly read-only: unlike the
+    /// recording path, this never quarantines, locks, or rewrites the store.
+    /// A missing history file decodes as an empty list.</summary>
+    public static IReadOnlyList<QuotaHistorySeries> QuotaHistory() =>
+        Unwrap<IReadOnlyList<QuotaHistorySeries>>(NativeMethods.tb_quota_history());
 
     /// <summary>
     /// Decodes the standard FFI envelope, returning the payload or throwing

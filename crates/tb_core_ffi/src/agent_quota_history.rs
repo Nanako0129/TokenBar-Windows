@@ -304,6 +304,165 @@ pub(crate) fn production_history_path() -> Option<PathBuf> {
     Some(directory.join(HISTORY_FILE_NAME))
 }
 
+/// One persisted sample as the quota lens consumes it: the stored fields plus
+/// the producer's own answer to "is this the cycle still running".
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExportedSample {
+    pub(crate) reset_at: i64,
+    pub(crate) duration_seconds: i64,
+    pub(crate) duration_source: DurationSource,
+    pub(crate) used_percent: f64,
+    pub(crate) sampled_at: i64,
+    pub(crate) origin: SampleOrigin,
+    /// Never derivable downstream — see `is_active_group_sample`.
+    pub(crate) is_active_group: bool,
+}
+
+/// The store's own identity triple plus its raw samples. `cardId`/`label` are
+/// deliberately absent: they are not in the store, and joining them would turn
+/// a disk read into a network-dependent call. The consumer joins the label on
+/// `(clientId, paceStatus.windowKey)` from the live agent-usage payload.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExportedSeries {
+    pub(crate) provider_id: String,
+    pub(crate) account_scope: String,
+    pub(crate) window_key: String,
+    pub(crate) samples: Vec<ExportedSample>,
+}
+
+/// Read the persisted history for the quota lens, mutating nothing.
+///
+/// Deliberately NOT `load_store_at_with_mode` or its wrapper: that quarantines
+/// the user's file to `quota-pace-history-v3.corrupt-{now}.json` on a parse or
+/// validation failure and takes the process plus exclusive file lock, with a
+/// possible `save_store_atomic` on the way out. Renaming the user's history is
+/// not an acceptable cost for drawing a card, so a failure is reported as an
+/// error envelope and the file's contents, name and mtime are left as found.
+/// One thing does change, stated here rather than implied away: on unix
+/// `secure_open_regular_file` normalizes the mode to 0600, so a store left at
+/// 0644 comes back at 0600. That is the read primitive's pre-existing
+/// hardening, it only tightens, and it is measured by
+/// `export_history_leaves_a_corrupt_store_untouched`.
+///
+/// **`load_store_at_with_mode` carries four responsibilities and only two were
+/// meant to go.** Reaching past it dropped all four at once, and each of the two
+/// that were not supposed to go came back as a separate review finding:
+///
+/// | Responsibility | Intended |
+/// |---|---|
+/// | Quarantines the file on failure | dropped on purpose |
+/// | `save_store_atomic` on the way out | dropped on purpose |
+/// | `validate_store_at` | dropped by accident — see below |
+/// | Mutual exclusion against the writer, via the lock | dropped by accident — see `EXPORT_READ_ATTEMPTS` |
+///
+/// The lesson is worth more than either fix: removing a function because of one
+/// thing it does removes everything else it was doing, and only the reason for
+/// removing it gets thought about. Anything added here later should be checked
+/// against this table first.
+///
+/// **Skipping the quarantine is not a licence to skip the validation.** Those
+/// are two separable things that `load_store_at_with_mode` happens to do
+/// together, and taking the whole path out took the check with it: a store that
+/// is syntactically valid JSON but violates the v3 invariants — a foreign
+/// `schema_version`, unordered or invalid series keys, a sample outside its own
+/// cycle bounds — would otherwise be exported as legitimate history and folded
+/// into cycles and heatmap cells that describe nothing. `validate_store` is a
+/// pure predicate over the deserialized value: no clock, no lock, no write.
+///
+/// `validate_store` and not `validate_store_at`: the latter additionally
+/// requires `last_activity_at <= now`, which a clock that has moved backwards
+/// violates through no fault of the data. A skewed clock should not blank the
+/// lens.
+///
+/// The guarded read primitives are still used — `read_owner_only_with_mode`
+/// (which is `open_existing_owner_only_with_mode` +
+/// `verify_open_regular_file_with_mode`) rather than a plain `fs::read`, so a
+/// substituted reparse point cannot feed whatever it points at into an exported
+/// payload.
+pub(crate) fn export_history() -> Result<Vec<ExportedSeries>, HistoryError> {
+    let path = production_history_path().ok_or(HistoryError::StorageUnavailable)?;
+    export_history_at_with_mode(StorageMode::System, &path)
+}
+
+/// How many times the export re-reads a store that moved underneath it.
+///
+/// `read_owner_only_with_mode` verifies **after** reading that the handle it
+/// read is still the file at the path — `same_file` on unix, `verify_path_identity`
+/// under Windows secure storage. That check is written for a caller holding the
+/// history lock, where no writer can intervene. The export deliberately does not
+/// take the lock, so an ordinary recording transaction, which installs the new
+/// store with an atomic rename, turns a perfectly consistent read of the old
+/// file into an error and blanks the lens at random during normal refreshes.
+///
+/// Three attempts because a transaction replaces the file once; a retry lands on
+/// whichever side of the rename is now settled. This does not weaken the check
+/// it retries: every attempt re-opens and re-verifies from scratch, so a
+/// substituted path has to win the race on every attempt rather than on one.
+///
+/// Any read error retries, not just the identity one. The identity failure is an
+/// `InvalidInput` distinguished from its neighbour only by message text, and a
+/// guard that pins message text is a guard that gets relocated around. A
+/// genuinely persistent error costs two extra opens and then fails exactly as
+/// before.
+const EXPORT_READ_ATTEMPTS: usize = 3;
+
+fn read_store_bytes_with_retry(
+    mut read: impl FnMut() -> io::Result<Option<Vec<u8>>>,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut attempt = 1;
+    loop {
+        match read() {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if attempt >= EXPORT_READ_ATTEMPTS => return Err(error),
+            Err(_) => attempt += 1,
+        }
+    }
+}
+
+fn export_history_at_with_mode(
+    mode: StorageMode,
+    path: &Path,
+) -> Result<Vec<ExportedSeries>, HistoryError> {
+    // No history file yet is an empty lens, not a failure.
+    let Some(bytes) = read_store_bytes_with_retry(|| read_owner_only_with_mode(mode, path))
+        .map_err(|_| HistoryError::Read)?
+    else {
+        return Ok(Vec::new());
+    };
+    let store = serde_json::from_slice::<Store>(&bytes).map_err(|_| HistoryError::Read)?;
+    if !validate_store(&store) {
+        return Err(HistoryError::Read);
+    }
+    Ok(store
+        .series
+        .iter()
+        .map(|series| ExportedSeries {
+            provider_id: series.provider_id.clone(),
+            account_scope: series.account_scope.clone(),
+            window_key: series.window_key.clone(),
+            samples: series
+                .samples
+                .iter()
+                .map(|sample| ExportedSample {
+                    reset_at: sample.reset_at,
+                    duration_seconds: sample.duration_seconds,
+                    duration_source: sample.duration_source,
+                    used_percent: sample.used_percent,
+                    sampled_at: sample.sampled_at,
+                    origin: sample.origin,
+                    // `None` means the window is inside no cycle, so nothing is
+                    // active — not "unknown".
+                    is_active_group: series
+                        .active_reset_at
+                        .is_some_and(|active| is_active_group_sample(active, sample)),
+                })
+                .collect(),
+        })
+        .collect())
+}
+
 /// Import only the legacy Codex records bound to the account ID used by the
 /// successful request. The caller supplies the already-resolved opaque scope;
 /// this API never turns a legacy raw key into a v3 scope.
@@ -1177,6 +1336,21 @@ fn normalize_sample_reset(reset_at: i64, duration_seconds: i64, sampled_at: i64)
         sampled_at,
         sampled_at.saturating_add(duration_seconds.max(1)),
     )
+}
+
+/// Whether a stored sample belongs to the cycle the window is still inside.
+///
+/// Both sides are normalized, and that is the whole point. `series.active_reset_at`
+/// holds the RAW provider value while every stored sample holds
+/// `normalize_sample_reset(...)`, so an exact comparison between them fails
+/// whenever the provider's reset is not already on the quantum — which is the
+/// ordinary case, not the exotic one (codex was off by 62s, grok by 19s). This
+/// predicate is the producer's own answer and is published per point so no
+/// consumer has to re-derive a quantization rule across the FFI boundary.
+pub(crate) fn is_active_group_sample(active_reset_at: i64, sample: &QuotaSample) -> bool {
+    validate_sample(sample)
+        && normalize_reset(sample.reset_at, sample.duration_seconds)
+            == normalize_reset(active_reset_at, sample.duration_seconds)
 }
 
 fn normalize_legacy_reset(reset_at: i64) -> i64 {
@@ -6685,6 +6859,181 @@ mod tests {
             .samples
             .iter()
             .all(|sample| sample.origin == SampleOrigin::ImportedV2));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The whole point of not calling `load_store_at_with_mode`: a store this
+    /// call cannot parse must be left on disk exactly as found, with no
+    /// `quota-pace-history-v3.corrupt-*.json` beside it. This test fails if the
+    /// export is ever pointed back at the loader.
+    #[test]
+    fn export_history_leaves_a_corrupt_store_untouched() {
+        let (directory, path) = temp_path("export-corrupt");
+        fs::write(&path, b"{ not json").unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let result = export_history_at_with_mode(StorageMode::Generic, &path);
+
+        assert_eq!(result, Err(HistoryError::Read));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!fs::read_dir(&directory).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("quota-pace-history-v3.corrupt-")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn export_history_reports_the_running_cycle_per_sample() {
+        let (directory, path) = temp_path("export-active");
+        let duration = 5 * 3_600;
+        // A reset 62s off the quantum — the ordinary case macOS measured, and
+        // the one an exact comparison against `active_reset_at` gets wrong.
+        let raw_reset = 1_800_000_000 + 62;
+        let closed_reset = raw_reset - duration;
+        let mut series = SeriesState::new(&key("acct"), 1_800_000_000);
+        series.active_reset_at = Some(raw_reset);
+        series.samples = complete_cycle(closed_reset, duration, 40.0);
+        series
+            .samples
+            .push(quota_sample(raw_reset, duration, 0.5, 12.0, SampleOrigin::LiveV3));
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let exported = export_history_at_with_mode(StorageMode::Generic, &path).unwrap();
+
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].provider_id, "copilot");
+        assert_eq!(exported[0].account_scope, "acct");
+        assert_eq!(exported[0].window_key, "premium_interactions.v1");
+        let active: Vec<bool> = exported[0]
+            .samples
+            .iter()
+            .map(|sample| sample.is_active_group)
+            .collect();
+        assert_eq!(active.iter().filter(|flag| **flag).count(), 1);
+        assert!(active.last().copied().unwrap());
+        // Serialized under the key the DTO requires.
+        let json = serde_json::to_value(&exported).unwrap();
+        assert!(json[0]["samples"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("isActiveGroup"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn export_history_treats_a_missing_file_as_an_empty_lens() {
+        let (directory, path) = temp_path("export-missing");
+        assert_eq!(
+            export_history_at_with_mode(StorageMode::Generic, &path),
+            Ok(Vec::new())
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The race this stands in for cannot be scheduled deterministically, so the
+    /// retry is tested as the decision it is: the read fails the way a store
+    /// replaced mid-read fails, and the export tries again instead of blanking.
+    #[test]
+    fn export_history_retries_a_store_replaced_underneath_it() {
+        let mut attempts = 0;
+        let result = read_store_bytes_with_retry(|| {
+            attempts += 1;
+            if attempts < EXPORT_READ_ATTEMPTS {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "quota pace artifact changed while opening",
+                ))
+            } else {
+                Ok(Some(b"{}".to_vec()))
+            }
+        });
+
+        assert_eq!(attempts, EXPORT_READ_ATTEMPTS);
+        assert_eq!(result.unwrap(), Some(b"{}".to_vec()));
+    }
+
+    /// The budget has to end. A path that keeps failing is reported, not retried
+    /// until something else times out.
+    #[test]
+    fn export_history_gives_up_after_the_read_attempt_budget() {
+        let mut attempts = 0;
+        let result = read_store_bytes_with_retry(|| {
+            attempts += 1;
+            Err::<Option<Vec<u8>>, io::Error>(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        });
+
+        assert_eq!(attempts, EXPORT_READ_ATTEMPTS);
+        assert!(result.is_err());
+    }
+
+    /// A foreign `schema_version` parses fine and means nothing this fold can
+    /// read. It is the shape the pending v3-to-v4 migration will actually
+    /// produce, so the export has to refuse it rather than describe it.
+    #[test]
+    fn export_history_refuses_a_store_from_another_schema() {
+        let (directory, path) = temp_path("export-schema");
+        let mut series = SeriesState::new(&key("acct"), 1_800_000_000);
+        series.samples = complete_cycle(1_800_000_000 - 5 * 3_600, 5 * 3_600, 40.0);
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION + 1,
+            series: vec![series],
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert_eq!(
+            export_history_at_with_mode(StorageMode::Generic, &path),
+            Err(HistoryError::Read)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Syntactically valid, semantically nonsense. Exporting this would put a
+    /// sample the writer would never have admitted in front of the fold, where
+    /// it becomes a cycle and a heatmap cell describing usage that never
+    /// happened — and it would do so silently, since nothing downstream
+    /// re-checks what the loader is supposed to have checked.
+    #[test]
+    fn export_history_refuses_a_store_with_an_out_of_range_sample() {
+        let (directory, path) = temp_path("export-invalid-sample");
+        let duration = 5 * 3_600;
+        let reset = 1_800_000_000;
+        let mut series = SeriesState::new(&key("acct"), reset);
+        series.samples = complete_cycle(reset - duration, duration, 40.0);
+        series.samples.push(quota_sample(
+            reset,
+            duration,
+            0.5,
+            250.0,
+            SampleOrigin::LiveV3,
+        ));
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert_eq!(
+            export_history_at_with_mode(StorageMode::Generic, &path),
+            Err(HistoryError::Read)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!fs::read_dir(&directory).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("quota-pace-history-v3.corrupt-")));
         fs::remove_dir_all(directory).unwrap();
     }
 }
