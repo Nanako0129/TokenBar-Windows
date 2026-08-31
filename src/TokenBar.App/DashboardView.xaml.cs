@@ -1121,13 +1121,6 @@ public sealed partial class DashboardView : UserControl
         // flight. summary == null alone cannot tell that apart from "asked
         // and nothing reported a window" — QuotaSummaryText.State needs both.
         var attempted = snapshot.Quota is not null;
-        DevLog.Write(
-            $"quota-summary: attempted={attempted} summary={(summary is null ? "null" : "ok")} "
-                + $"others={summary?.OtherWindows.ToString() ?? "-"} "
-                + $"comfortable={summary?.OthersComfortable.ToString() ?? "-"} "
-                + $"paceChecked={summary?.PaceCheckedWindows.ToString() ?? "-"} "
-                + $"burning={(summary?.Burning is null ? "none" : "yes")} "
-                + $"mode={CurrentPaceMode()}");
 
         var stack = new StackPanel { Spacing = 7 };
         switch (QuotaSummaryText.State(summary, attempted))
