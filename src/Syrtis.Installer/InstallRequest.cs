@@ -145,10 +145,18 @@ internal readonly struct InstallRequest
             return Refuse(RefusalReason.UnexpectedArgument, nonSwitchArgs[1], silentRequested);
         }
 
-        var candidate = nonSwitchArgs.FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(candidate))
+        // "No positional argument" and "a positional argument that is blank"
+        // are different things, and only the first may fall through to the
+        // payload. A script written as `Setup.exe "%SETUP_PATH%"` with the
+        // variable unset supplies an empty argument — treating that as "no
+        // argument given" would silently install the embedded payload instead
+        // of the setup that script named, and silently for real with
+        // --silent. That breaks this type's own stated rule: an explicit path
+        // is never replaced by the payload. Tested against Length rather than
+        // against the string, because the string cannot tell them apart.
+        if (nonSwitchArgs.Length == 0)
         {
-            // No explicit path was given: the payload, when embedded, is the
+            // Nothing was asked for: the payload, when embedded, is the
             // default. Without a payload this is unchanged from 1a —
             // NoSetupPath — so a plain 1a-style build still refuses cleanly.
             if (hasEmbeddedPayload)
@@ -157,6 +165,13 @@ internal readonly struct InstallRequest
                 return new InstallRequest(payloadKind, null, default, null, silentRequested);
             }
 
+            return Refuse(RefusalReason.NoSetupPath, null, silentRequested);
+        }
+
+        var candidate = nonSwitchArgs[0];
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            // Present but unusable. Refused whether or not a payload exists.
             return Refuse(RefusalReason.NoSetupPath, null, silentRequested);
         }
 

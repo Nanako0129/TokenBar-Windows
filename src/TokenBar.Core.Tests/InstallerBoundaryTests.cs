@@ -105,6 +105,42 @@ public class InstallerBoundaryTests
         Assert.Equal("Syrtis", PayloadIdentity.Choose("  Syrtis  ", null, "?"));
     }
 
+    // A blank positional argument is an explicit path that happens to be
+    // empty, not the absence of one — `Setup.exe "%SETUP_PATH%"` with the
+    // variable unset. Falling through to the payload would silently install
+    // something other than what the script named, and silently for real under
+    // --silent, breaking the rule that an explicit path is never replaced by
+    // the payload.
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Parse_refuses_a_blank_path_even_with_a_payload(string blank)
+    {
+        var request = InstallRequest.Parse([blank], hasEmbeddedPayload: true);
+
+        Assert.Equal(InstallRequestKind.Refuse, request.Kind);
+        Assert.Equal(RefusalReason.NoSetupPath, request.Reason);
+    }
+
+    [Fact]
+    public void Parse_refuses_a_blank_path_under_silent_with_a_payload()
+    {
+        var request = InstallRequest.Parse(["--silent", ""], hasEmbeddedPayload: true);
+
+        Assert.Equal(InstallRequestKind.Refuse, request.Kind);
+        Assert.Equal(RefusalReason.NoSetupPath, request.Reason);
+    }
+
+    // The row it must not be confused with: genuinely no positional argument.
+    [Fact]
+    public void Parse_uses_the_payload_when_no_argument_is_given()
+    {
+        var request = InstallRequest.Parse([], hasEmbeddedPayload: true);
+
+        Assert.Equal(InstallRequestKind.RunWizard, request.Kind);
+        Assert.Null(request.SetupPath);
+    }
+
     // --- EmbeddedPayload.StreamToNewFile ---------------------------------------
 
     // FileStream creates the file before a byte is copied, so a failure
