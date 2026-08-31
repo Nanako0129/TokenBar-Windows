@@ -279,6 +279,17 @@ the managed assembly `Syrtis.Installer` and carries both resources —
 native Setup can satisfy neither. Extraction of the payload measures 62 ms.
 692 tests pass, up from 677.
 
+**Both human acceptances passed, 2026-08-31**, confirmed by the user at the
+machines. On the x64 host, the packed wrapper double-clicked from a directory
+holding nothing else: the brandmark is there, the Welcome page names the packed
+version, and at 150% scaling the window is correctly sized and uncropped — so
+the PerMonitorV2 trade-off recorded above is accepted on evidence rather than on
+argument, and the two alternatives (two files, or a native wizard) stay unspent.
+On the ARM64 VM, the packed `win-arm64` wrapper launched and installed, and the
+app started afterwards. That closes the gate this slice could not close for
+itself: `win-arm64` and `win-arm64-lite` are half the published channels, and
+every automated check above ran only on x64.
+
 **Evidence status of the SHA-256 guard, stated precisely.** Its logic was
 executed — a deliberately mismatched payload produced the refusal and exit 1 —
 but in a harness mirroring the script's step, not in `package-velopack.ps1`
