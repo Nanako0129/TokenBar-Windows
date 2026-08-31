@@ -219,6 +219,76 @@ is deliberately broken.
 
 ### INSTALL-1b — embed and package
 
+**Mechanism, settled 2026-08-31 over four review rounds and ten blockers.**
+Reading the pipeline first made the slice smaller than this document assumed:
+`write-package-evidence.ps1` validates the Setup.exe by **name and size only**
+— every structural check is on the nupkg — and `deployment-matrix` packages by
+calling `package-velopack.ps1` directly. So keeping the filename and staying
+under budget means neither that script nor CI changes. Full/win-x64 had 7.3 MB
+of headroom against a 450 KB wrapper.
+
+The wrapper replaces the Velopack Setup in `releases\` **before**
+`package-velopack.ps1`'s own budget assertion, so that assertion measures the
+file that ships. An explicit path still wins over the embedded payload, and a
+path that does not exist is still an error rather than being silently replaced
+— the payload is the default, not an override. The payload is materialised to
+a temp file immediately after parsing and before `WizardForm` is constructed,
+because the Welcome page reads the payload's product and version in that
+constructor; extracting any later would put the wrapper's own version on
+screen, which is what `PayloadIdentity` exists to prevent.
+
+**The pack refuses to emit a wrapper whose payload it did not just produce.**
+It reads the resource back out by reflection and compares SHA-256. Nothing
+else in the pipeline could catch a stale or cross-channel payload: the
+Full/win-x64 Setup at 83,721,388 bytes fits under the Full/win-arm64 budget of
+87,104,109, so an arm64-named installer carrying the x64 payload would pass
+every existing gate and reach half the published channels.
+
+**A quality regression taken deliberately: PerMonitorV2 is given up.**
+`App.config` ships as `<exe-name>.exe.config` and its
+`System.Windows.Forms.ApplicationConfigurationSection` entry is what actually
+makes WinForms DPI-aware — the manifest alone opts the *process* in and leaves
+WinForms laying out at 96 DPI. Renaming the wrapper to the Setup filename
+orphans that file even if it were copied, and the shipping form is one file by
+design; net48 has no programmatic substitute, `Application.SetHighDpiMode`
+being .NET Core 3.0+.
+
+Of the three possible outcomes the worst is the one that arrives by doing
+nothing: a DPI-aware process with an unaware WinForms **clips** at 150%. So
+**both** manifest declarations go — `dpiAwareness` (2016 schema) and
+`dpiAware` (2005 schema), the second of which alone keeps the process aware —
+and `gdiScaling` stays, since it is honoured only for a DPI-unaware process
+and is what makes the bitmap-scaled result acceptable. `App.config`'s entry is
+removed too, so the two-file dev build and the one-file shipped build are not
+two different DPI configurations.
+
+The result is soft at 150% but correctly sized and never clipped, which is
+what a great many installers look like. If that is judged unacceptable once
+seen, the honest alternatives are shipping two files or writing the wizard
+native, and both belong to 1c with the measurement in hand rather than to a
+guess now.
+
+**Result, 2026-08-31.** A full `package-velopack.ps1 -Rid win-x64` emits a
+wrapper of 84,596,224 bytes, inside the existing `Full|win-x64|setup` budget of
+91,040,173 with 6.4 MB to spare, so **neither budget map was edited** and
+`write-package-evidence.ps1` ran unmodified against it (exit 0,
+`setupName: Nyanako.Syrtis-win-x64-Setup.exe`, `setupBytes: 84596224`).
+Independently confirmed on the emitted file, without executing it: it loads as
+the managed assembly `Syrtis.Installer` and carries both resources —
+`syrtis.ico` at 419,110 bytes and `payload.setup.exe` at 83,726,516. Velopack's
+native Setup can satisfy neither. Extraction of the payload measures 62 ms.
+692 tests pass, up from 677.
+
+**Evidence status of the SHA-256 guard, stated precisely.** Its logic was
+executed — a deliberately mismatched payload produced the refusal and exit 1 —
+but in a harness mirroring the script's step, not in `package-velopack.ps1`
+itself, because injecting a wrong payload into the real script means editing
+the thing under test. The wiring was confirmed by reading: the hash is taken
+from `$setupPath` before the build, the build is given that same path, the
+resource is read back by reflection and compared, and the replacement and then
+the budget assertion follow. Logic executed, wiring read. That is less than
+end-to-end and is recorded as such rather than described as "the pack refuses".
+
 **Carried in from 1a.** The wizard is a WinExe, so it does not attach the
 parent's console: `--silent`'s diagnostic text reaches a caller that redirects
 (a pipe or file is inherited) but not a person typing in a real console window.

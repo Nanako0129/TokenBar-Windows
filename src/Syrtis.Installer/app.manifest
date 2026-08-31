@@ -19,14 +19,29 @@
     </application>
   </compatibility>
 
-  <!-- Paired with the DpiAwareness entry in App.config's
-       System.Windows.Forms.ApplicationConfigurationSection: WinForms needs
-       both to render crisply under PerMonitorV2 scaling (e.g. 150%) instead
-       of being DPI-virtualized (blurry, GDI-scaled text and controls). -->
+  <!-- Deliberately DPI-unaware, as of slice 1b. PerMonitorV2 needed a second
+       piece to actually take effect in WinForms: App.config's
+       System.Windows.Forms.ApplicationConfigurationSection DpiAwareness
+       entry, read from "<exe-name>.exe.config" next to the exe. The shipping
+       wrapper built by package-velopack.ps1 is renamed to
+       "<packId>-<channel>-Setup.exe" and is one file by design, so that
+       config can never travel with it, and net48 has no programmatic
+       substitute (Application.SetHighDpiMode is .NET Core 3.0+).
+
+       Declaring awareness here without that companion is the worst of the
+       three outcomes: a DPI-aware *process* with DPI-unaware WinForms lays
+       out at 96 DPI and CLIPS at high scaling, which is worse than blurring.
+       Both awareness declarations are therefore removed — dpiAwareness
+       (2016 schema) AND dpiAware (2005 schema); the second alone is enough
+       to make the process per-monitor aware on Windows 8.1+, so dropping
+       only the first still clips.
+
+       gdiScaling stays, and only now does it do anything: it is honoured
+       only for a DPI-unaware process, so GDI text/primitives are redrawn at
+       the higher DPI (soft, not clipped) instead of being bitmap-stretched
+       with nothing at all. -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
       <gdiScaling xmlns="http://schemas.microsoft.com/SMI/2017/WindowsSettings">true</gdiScaling>
     </windowsSettings>
   </application>

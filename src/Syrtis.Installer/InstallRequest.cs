@@ -73,8 +73,13 @@ internal readonly struct InstallRequest
 
     internal InstallRequestKind Kind { get; }
 
-    /// <summary>The resolved, existing setup path. Non-null exactly when
-    /// Kind is RunWizard or RunSilent.</summary>
+    /// <summary>The resolved, existing setup path an explicit argument
+    /// named, or null when Kind is RunWizard/RunSilent by way of the
+    /// embedded payload instead — see <see cref="Parse"/>'s
+    /// <c>hasEmbeddedPayload</c> parameter. Always null when Kind is Refuse
+    /// or SelfCheck. <c>Program</c> resolves the payload case with
+    /// <c>SetupPath ?? EmbeddedPayload.ExtractToTemp()</c> once, immediately
+    /// after Parse.</summary>
     internal string? SetupPath { get; }
 
     /// <summary>Meaningful only when Kind is Refuse.</summary>
@@ -94,7 +99,16 @@ internal readonly struct InstallRequest
     private static InstallRequest Refuse(RefusalReason reason, string? token, bool silentRequested) =>
         new(InstallRequestKind.Refuse, null, reason, token, silentRequested);
 
-    internal static InstallRequest Parse(string[] args)
+    /// <summary><paramref name="hasEmbeddedPayload"/> is a parameter, not an
+    /// ambient read of <see cref="EmbeddedPayload.HasPayload"/>, because the
+    /// net10 test assembly this method is exercised from never carries the
+    /// resource. An ambient check would leave every argument test green while
+    /// describing behaviour the shipping exe no longer has — the same
+    /// "green for the wrong reason" shape earlier findings in this file
+    /// exist to prevent. Only the no-positional-argument row is affected: an
+    /// explicit path, once given, always wins, whether or not a payload is
+    /// embedded.</summary>
+    internal static InstallRequest Parse(string[] args, bool hasEmbeddedPayload)
     {
         var silentRequested = args.Any(SetupLocator.IsSilentSwitch);
 
@@ -134,10 +148,21 @@ internal readonly struct InstallRequest
         var candidate = nonSwitchArgs.FirstOrDefault();
         if (string.IsNullOrWhiteSpace(candidate))
         {
+            // No explicit path was given: the payload, when embedded, is the
+            // default. Without a payload this is unchanged from 1a —
+            // NoSetupPath — so a plain 1a-style build still refuses cleanly.
+            if (hasEmbeddedPayload)
+            {
+                var payloadKind = silentRequested ? InstallRequestKind.RunSilent : InstallRequestKind.RunWizard;
+                return new InstallRequest(payloadKind, null, default, null, silentRequested);
+            }
+
             return Refuse(RefusalReason.NoSetupPath, null, silentRequested);
         }
 
-        // Reuses SetupLocator's own resolution (existence check + GetFullPath)
+        // An explicit path is an instruction and is honoured strictly: found
+        // or not, it is never silently replaced by the payload. Reuses
+        // SetupLocator's own resolution (existence check + GetFullPath)
         // rather than repeating it — the exact duplication this slice exists
         // to remove.
         var setupPath = SetupLocator.Locate(args);

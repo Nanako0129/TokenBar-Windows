@@ -480,6 +480,69 @@ $setupPath = Join-Path $releasesRoot $expectedSetupName
 if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
     throw "Velopack releases missing expected Setup.exe: $expectedSetupName"
 }
+
+# Build the install wizard with THIS INVOCATION's Velopack Setup.exe embedded,
+# and replace the Setup.exe in $releasesRoot with that wrapper -- one file,
+# same name, before the size-budget assertion below, so that assertion
+# measures the file that actually ships. A per-channel intermediate directory
+# keeps this pack's wrapper build isolated from any other channel packed into
+# the same $outputRootResolved.
+#
+# The SHA-256 of the just-produced Velopack Setup.exe is captured BEFORE the
+# build, from $setupPath, which nothing has touched yet.
+$velopackSetupSha256 = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash
+
+$wrapperProject = Join-Path $repoRoot "src\Syrtis.Installer\Syrtis.Installer.csproj"
+$wrapperBuildDir = Join-Path $outputRootResolved ("installer-wrapper\{0}" -f $channel)
+Invoke-Captured -Command "dotnet" -Arguments @(
+    "build", $wrapperProject,
+    "-c", "Release",
+    "-p:SyrtisPayloadPath=$setupPath",
+    "-o", $wrapperBuildDir
+) -FailureMessage "Install wizard wrapper build failed"
+
+$wrapperExePath = Join-Path $wrapperBuildDir "Syrtis.Installer.exe"
+if (-not (Test-Path -LiteralPath $wrapperExePath -PathType Leaf)) {
+    throw "Install wizard wrapper build did not produce: $wrapperExePath"
+}
+
+# Nothing else in the pipeline would catch a stale or cross-channel payload:
+# write-package-evidence.ps1 validates the Setup.exe by name and size only,
+# and (measured) the Full/win-x64 Setup at 83,721,388 bytes fits under the
+# Full/win-arm64 budget of 87,104,109 -- so an arm64-named installer carrying
+# the x64 payload would pass every existing gate. Load the just-built wrapper
+# by reflection, from the intermediate directory (never from $setupPath, so
+# nothing here locks the file this script is about to overwrite), and refuse
+# to ship unless its embedded payload is byte-for-byte this invocation's own
+# Velopack Setup.exe.
+$wrapperAssembly = [Reflection.Assembly]::LoadFrom($wrapperExePath)
+$payloadStream = $wrapperAssembly.GetManifestResourceStream("Syrtis.Installer.payload.setup.exe")
+if ($null -eq $payloadStream) {
+    throw "Install wizard wrapper carries no embedded payload resource: $wrapperExePath"
+}
+try {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $payloadHashBytes = $sha256.ComputeHash($payloadStream)
+        $payloadSha256 = [System.BitConverter]::ToString($payloadHashBytes).Replace("-", "")
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+finally {
+    $payloadStream.Dispose()
+}
+if ($payloadSha256 -ne $velopackSetupSha256) {
+    throw ("Embedded payload SHA-256 mismatch: wrapper carries {0}, this invocation's Velopack Setup.exe is {1}. " -f `
+        $payloadSha256, $velopackSetupSha256) + `
+        "Refusing to ship a stale or cross-channel payload."
+}
+Write-Output ("Embedded payload verified: SHA-256 {0} matches this invocation's Velopack Setup.exe" -f $payloadSha256)
+
+Copy-Item -LiteralPath $wrapperExePath -Destination $setupPath -Force
+Write-Output ("Replaced {0} with the install wizard wrapper ({1} bytes)." -f $expectedSetupName, (Get-Item -LiteralPath $setupPath).Length)
+
 $setupBytes = [int64](Get-Item -LiteralPath $setupPath).Length
 $setupKey = "{0}|{1}|setup" -f $DeploymentMode, $Rid
 if (-not $nupkgSetupBudgetByModeRid.ContainsKey($setupKey)) {

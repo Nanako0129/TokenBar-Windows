@@ -66,10 +66,12 @@ internal sealed class WizardForm : Form
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(500, 360);
-        var iconPath = Path.Combine(AppContext.BaseDirectory, "syrtis.ico");
-        if (File.Exists(iconPath))
+        using (var iconStream = OpenBrandmarkIcon())
         {
-            try { Icon = new Icon(iconPath); } catch (ArgumentException) { /* corrupt/unreadable icon file: keep the default */ }
+            if (iconStream != null)
+            {
+                try { Icon = new Icon(iconStream); } catch (ArgumentException) { /* corrupt/unreadable icon resource: keep the default */ }
+            }
         }
 
         var root = new TableLayoutPanel
@@ -126,6 +128,18 @@ internal sealed class WizardForm : Form
 
         GoToStep(WizardStep.Welcome);
     }
+
+    /// <summary>The brandmark, embedded as a managed resource rather than
+    /// read as a loose <c>syrtis.ico</c> next to the exe. The shipping form
+    /// (built by <c>package-velopack.ps1</c>) is one file, so a loose
+    /// companion would vanish silently the moment the wrapper is renamed and
+    /// dropped alone into <c>releases\</c> — both call sites used to be
+    /// guarded by <see cref="File.Exists(string)"/>, which hid exactly that.
+    /// Null when the resource is somehow missing; callers treat that as "no
+    /// icon" rather than throwing, the same tolerance the old
+    /// <c>File.Exists</c> guard gave a missing loose file.</summary>
+    private static Stream? OpenBrandmarkIcon() =>
+        Assembly.GetExecutingAssembly().GetManifestResourceStream("Syrtis.Installer.syrtis.ico");
 
     /// <summary>Product name and version as declared by the setup file itself.
     /// Either may come back null: a file with no version resource, or an
@@ -222,22 +236,24 @@ internal sealed class WizardForm : Form
     {
         var layout = new TableLayoutPanel { ColumnCount = 1, RowCount = 3, Dock = DockStyle.Fill };
 
-        var iconPath = Path.Combine(AppContext.BaseDirectory, "syrtis.ico");
-        if (File.Exists(iconPath))
+        using (var iconStream = OpenBrandmarkIcon())
         {
-            try
+            if (iconStream != null)
             {
-                using var icon = new Icon(iconPath, new Size(96, 96));
-                var picture = new PictureBox
+                try
                 {
-                    Image = icon.ToBitmap(),
-                    SizeMode = PictureBoxSizeMode.Zoom,
-                    Size = new Size(96, 96),
-                    Margin = new Padding(0, 8, 0, 16),
-                };
-                layout.Controls.Add(picture);
+                    using var icon = new Icon(iconStream, new Size(96, 96));
+                    var picture = new PictureBox
+                    {
+                        Image = icon.ToBitmap(),
+                        SizeMode = PictureBoxSizeMode.Zoom,
+                        Size = new Size(96, 96),
+                        Margin = new Padding(0, 8, 0, 16),
+                    };
+                    layout.Controls.Add(picture);
+                }
+                catch (ArgumentException) { /* corrupt/unreadable icon resource: show no image */ }
             }
-            catch (ArgumentException) { /* corrupt/unreadable icon file: show no image */ }
         }
 
         var heading = new Label

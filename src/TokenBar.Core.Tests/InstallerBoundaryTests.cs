@@ -21,6 +21,18 @@ namespace TokenBar.Core.Tests;
 // No test in this file may read a Strings member whose value depends on
 // ambient culture. Only Strings.DetectChinese(tag) — which takes the tag as a
 // parameter rather than reading CultureInfo.CurrentUICulture — is referenced.
+//
+// InstallRequest.Parse takes "does a payload exist" as a bool parameter
+// rather than reading EmbeddedPayload.HasPayload ambiently, precisely so this
+// suite can cover both worlds — every InlineData/Theory pair marked "payload
+// world" below asserts against a literal true/false, not against this
+// assembly's own resources (which never carries the payload). That makes
+// `dotnet test` green here necessary but NOT evidence that the shipping
+// wrapper's payload is present, correct, or the one this pack run produced:
+// EmbeddedPayload.ExtractToTemp() and the resource itself are proven only on
+// the built artifact, by loading it with Assembly.LoadFrom and comparing its
+// SHA-256 against the Velopack Setup from the same pack invocation (see
+// package-velopack.ps1's post-pack verification step).
 public class InstallerBoundaryTests
 {
     // --- SetupRunner.Quote ---------------------------------------------------
@@ -180,18 +192,22 @@ public class InstallerBoundaryTests
 
     // --- InstallRequest.Parse -------------------------------------------------
 
-    [Fact]
-    public void Parse_self_check_alone_is_self_check_mode()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_self_check_alone_is_self_check_mode(bool hasEmbeddedPayload)
     {
-        var request = InstallRequest.Parse(["--self-check"]);
+        var request = InstallRequest.Parse(["--self-check"], hasEmbeddedPayload);
 
         Assert.Equal(InstallRequestKind.SelfCheck, request.Kind);
     }
 
-    [Fact]
-    public void Parse_self_check_with_anything_else_is_a_refusal()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_self_check_with_anything_else_is_a_refusal(bool hasEmbeddedPayload)
     {
-        var request = InstallRequest.Parse(["--self-check", "extra"]);
+        var request = InstallRequest.Parse(["--self-check", "extra"], hasEmbeddedPayload);
 
         Assert.Equal(InstallRequestKind.Refuse, request.Kind);
         Assert.Equal(RefusalReason.UnexpectedArgument, request.Reason);
@@ -205,14 +221,19 @@ public class InstallerBoundaryTests
     // tokens are non-switches to a parser that only knows -s. A lone "-v" was
     // reported as a missing setup file.
     [Theory]
-    [InlineData(new[] { "--installto", "D:\\X" }, "--installto")]
-    [InlineData(new[] { "-v" }, "-v")]
-    [InlineData(new[] { "-l", "C:\\some.log" }, "-l")]
-    [InlineData(new[] { "--silent", "--installto", "D:\\X" }, "--installto")]
-    [InlineData(new[] { "setup.exe", "-t", "D:\\X" }, "-t")]
-    public void Parse_names_the_unsupported_switch_not_its_value(string[] args, string expected)
+    [InlineData(new[] { "--installto", "D:\\X" }, "--installto", false)]
+    [InlineData(new[] { "-v" }, "-v", false)]
+    [InlineData(new[] { "-l", "C:\\some.log" }, "-l", false)]
+    [InlineData(new[] { "--silent", "--installto", "D:\\X" }, "--installto", false)]
+    [InlineData(new[] { "setup.exe", "-t", "D:\\X" }, "-t", false)]
+    [InlineData(new[] { "--installto", "D:\\X" }, "--installto", true)]
+    [InlineData(new[] { "-v" }, "-v", true)]
+    [InlineData(new[] { "-l", "C:\\some.log" }, "-l", true)]
+    [InlineData(new[] { "--silent", "--installto", "D:\\X" }, "--installto", true)]
+    [InlineData(new[] { "setup.exe", "-t", "D:\\X" }, "-t", true)]
+    public void Parse_names_the_unsupported_switch_not_its_value(string[] args, string expected, bool hasEmbeddedPayload)
     {
-        var request = InstallRequest.Parse(args);
+        var request = InstallRequest.Parse(args, hasEmbeddedPayload);
 
         Assert.Equal(InstallRequestKind.Refuse, request.Kind);
         Assert.Equal(RefusalReason.UnsupportedSwitch, request.Reason);
@@ -220,11 +241,15 @@ public class InstallerBoundaryTests
     }
 
     // A Windows path never begins with '-', so the switch test is unambiguous;
-    // '/x' is a rooted path and must NOT be mistaken for a switch.
-    [Fact]
-    public void Parse_does_not_treat_a_slash_rooted_path_as_a_switch()
+    // '/x' is a rooted path and must NOT be mistaken for a switch. An explicit
+    // path that does not exist is still SetupNotFound in both worlds — it is
+    // never silently replaced by the payload (precedence table row 3).
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_does_not_treat_a_slash_rooted_path_as_a_switch(bool hasEmbeddedPayload)
     {
-        var request = InstallRequest.Parse(["/nonexistent/setup.exe"]);
+        var request = InstallRequest.Parse(["/nonexistent/setup.exe"], hasEmbeddedPayload);
 
         Assert.Equal(InstallRequestKind.Refuse, request.Kind);
         Assert.Equal(RefusalReason.SetupNotFound, request.Reason);
@@ -239,7 +264,7 @@ public class InstallerBoundaryTests
         var setupPath = CreateTempFile();
         try
         {
-            var request = InstallRequest.Parse([silentSwitch, setupPath]);
+            var request = InstallRequest.Parse([silentSwitch, setupPath], hasEmbeddedPayload: false);
 
             Assert.Equal(InstallRequestKind.RunSilent, request.Kind);
         }
@@ -249,30 +274,17 @@ public class InstallerBoundaryTests
         }
     }
 
-    [Fact]
-    public void Parse_silent_switch_before_path_works()
+    // Precedence table row 2: an explicit existing path wins in both worlds,
+    // and the payload plays no part when one is given.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_silent_switch_before_path_works(bool hasEmbeddedPayload)
     {
         var setupPath = CreateTempFile();
         try
         {
-            var request = InstallRequest.Parse(["-s", setupPath]);
-
-            Assert.Equal(InstallRequestKind.RunSilent, request.Kind);
-            Assert.Equal(Path.GetFullPath(setupPath), request.SetupPath);
-        }
-        finally
-        {
-            File.Delete(setupPath);
-        }
-    }
-
-    [Fact]
-    public void Parse_silent_switch_after_path_works()
-    {
-        var setupPath = CreateTempFile();
-        try
-        {
-            var request = InstallRequest.Parse([setupPath, "-s"]);
+            var request = InstallRequest.Parse(["-s", setupPath], hasEmbeddedPayload);
 
             Assert.Equal(InstallRequestKind.RunSilent, request.Kind);
             Assert.Equal(Path.GetFullPath(setupPath), request.SetupPath);
@@ -283,13 +295,36 @@ public class InstallerBoundaryTests
         }
     }
 
-    [Fact]
-    public void Parse_second_non_switch_argument_is_unexpected()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_silent_switch_after_path_works(bool hasEmbeddedPayload)
     {
         var setupPath = CreateTempFile();
         try
         {
-            var request = InstallRequest.Parse([setupPath, "extra-token"]);
+            var request = InstallRequest.Parse([setupPath, "-s"], hasEmbeddedPayload);
+
+            Assert.Equal(InstallRequestKind.RunSilent, request.Kind);
+            Assert.Equal(Path.GetFullPath(setupPath), request.SetupPath);
+        }
+        finally
+        {
+            File.Delete(setupPath);
+        }
+    }
+
+    // Precedence table row 4: two positional arguments is always
+    // UnexpectedArgument, regardless of whether a payload is embedded.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_second_non_switch_argument_is_unexpected(bool hasEmbeddedPayload)
+    {
+        var setupPath = CreateTempFile();
+        try
+        {
+            var request = InstallRequest.Parse([setupPath, "extra-token"], hasEmbeddedPayload);
 
             Assert.Equal(InstallRequestKind.Refuse, request.Kind);
             Assert.Equal(RefusalReason.UnexpectedArgument, request.Reason);
@@ -301,43 +336,76 @@ public class InstallerBoundaryTests
         }
     }
 
+    // Precedence table row 1, "Without" column: no positional argument and no
+    // embedded payload is still NoSetupPath — the 1a-style build (a plain
+    // `dotnet build`, and the entire net10 test assembly) refuses exactly as
+    // slice 1a specified.
     [Fact]
-    public void Parse_no_path_at_all_is_no_setup_path()
+    public void Parse_no_path_at_all_is_no_setup_path_without_a_payload()
     {
-        var request = InstallRequest.Parse([]);
+        var request = InstallRequest.Parse([], hasEmbeddedPayload: false);
 
         Assert.Equal(InstallRequestKind.Refuse, request.Kind);
         Assert.Equal(RefusalReason.NoSetupPath, request.Reason);
     }
 
     [Fact]
-    public void Parse_no_path_with_only_silent_switch_is_no_setup_path()
+    public void Parse_no_path_with_only_silent_switch_is_no_setup_path_without_a_payload()
     {
-        var request = InstallRequest.Parse(["--silent"]);
+        var request = InstallRequest.Parse(["--silent"], hasEmbeddedPayload: false);
 
         Assert.Equal(InstallRequestKind.Refuse, request.Kind);
         Assert.Equal(RefusalReason.NoSetupPath, request.Reason);
     }
 
+    // Precedence table row 1, "With a payload embedded" column: this is the
+    // row that changes behaviour, and it is what makes `--silent` with no
+    // arguments at all work. SetupPath is null here — Program resolves it via
+    // EmbeddedPayload.ExtractToTemp(), which this net10 suite cannot exercise
+    // (see the class remarks: no embedded resource exists in this assembly).
     [Fact]
-    public void Parse_missing_setup_file_is_setup_not_found()
+    public void Parse_no_path_at_all_runs_the_wizard_from_the_payload_when_one_is_embedded()
+    {
+        var request = InstallRequest.Parse([], hasEmbeddedPayload: true);
+
+        Assert.Equal(InstallRequestKind.RunWizard, request.Kind);
+        Assert.Null(request.SetupPath);
+    }
+
+    [Fact]
+    public void Parse_no_path_with_silent_switch_runs_silently_from_the_payload_when_one_is_embedded()
+    {
+        var request = InstallRequest.Parse(["--silent"], hasEmbeddedPayload: true);
+
+        Assert.Equal(InstallRequestKind.RunSilent, request.Kind);
+        Assert.Null(request.SetupPath);
+    }
+
+    // Precedence table row 3: a path that does not exist is still an error in
+    // both worlds — never silently replaced by the payload.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_missing_setup_file_is_setup_not_found(bool hasEmbeddedPayload)
     {
         var missing = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        var request = InstallRequest.Parse([missing]);
+        var request = InstallRequest.Parse([missing], hasEmbeddedPayload);
 
         Assert.Equal(InstallRequestKind.Refuse, request.Kind);
         Assert.Equal(RefusalReason.SetupNotFound, request.Reason);
         Assert.Equal(missing, request.Token);
     }
 
-    [Fact]
-    public void Parse_existing_path_without_silent_switch_is_run_wizard()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Parse_existing_path_without_silent_switch_is_run_wizard(bool hasEmbeddedPayload)
     {
         var setupPath = CreateTempFile();
         try
         {
-            var request = InstallRequest.Parse([setupPath]);
+            var request = InstallRequest.Parse([setupPath], hasEmbeddedPayload);
 
             Assert.Equal(InstallRequestKind.RunWizard, request.Kind);
             Assert.Equal(Path.GetFullPath(setupPath), request.SetupPath);
