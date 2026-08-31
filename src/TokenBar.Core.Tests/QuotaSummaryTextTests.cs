@@ -107,7 +107,7 @@ public class QuotaSummaryTextTests
     [Fact]
     public void OthersTextAllComfortable() =>
         Assert.Equal(
-            "4 other windows, all above 60%",
+            "4 other windows, all at or above 60%",
             QuotaSummaryText.OthersText(Summary(otherWindows: 4, othersComfortable: 4)));
 
     [Fact]
@@ -329,5 +329,27 @@ public class QuotaSummaryTextTests
             Summary(withoutResetsAt: true, resetTextFallback: null), Now);
 
         Assert.DoesNotContain("·", detail, StringComparison.Ordinal);
+    }
+
+    // The boundary is a case, not a curiosity: quota percentages land on whole
+    // numbers routinely. The fold counts v >= ComfortablePercent as
+    // comfortable, so a window sitting exactly on the threshold is counted —
+    // and the sentence has to be true of it.
+    [Fact]
+    public void AWindowExactlyOnTheThresholdIsCountedComfortable()
+    {
+        var others = new[] { QuotaSummaryFold.ComfortablePercent };
+
+        Assert.Single(others.Where(v => v >= QuotaSummaryFold.ComfortablePercent));
+    }
+
+    [Fact]
+    public void OthersTextSaysAtOrAboveRatherThanAbove()
+    {
+        var text = QuotaSummaryText.OthersText(
+            Summary(otherWindows: 4, othersComfortable: 4));
+
+        // The claim must hold for a window sitting exactly on the threshold.
+        Assert.DoesNotContain("all above", text, StringComparison.Ordinal);
     }
 }

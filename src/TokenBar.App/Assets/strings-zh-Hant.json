@@ -212,7 +212,7 @@
   "{0} msgs": "{0} 則訊息",
   "{0} of {1} other windows are below {2}%": "另外 {1} 個時間窗有 {0} 個低於 {2}%",
   "{0} only": "僅計 {0}",
-  "{0} other windows, all above {1}%": "另外 {0} 個時間窗都高於 {1}%",
+  "{0} other windows, all at or above {1}%": "另外 {0} 個時間窗都不低於 {1}%",
   "{0} slots": "{0} 個時段",
   "{0} today · {1} all time · {2} active days": "今日 {0} · 累計 {1} · {2} 天有用量",
   "{0} tokens": "{0} tokens",

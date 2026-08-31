@@ -85,13 +85,21 @@ public static class QuotaSummaryText
         return reset is null ? left : $"{left} · {reset}";
     }
 
-    /// <summary>"N other windows, all above X%" or "N of M other windows are
+    /// <summary>"N other windows, all at or above X%" or "N of M other windows are
     /// below X%" — two distinct forms, never rendered the same, per
     /// QuotaSummary.OthersComfortable's doc comment. Caller must check
     /// summary.OtherWindows &gt; 0 first.</summary>
     public static string OthersText(QuotaSummary summary) =>
         summary.AllOthersComfortable
-            ? "{0} other windows, all above {1}%".Localized(
+            // "at or above", not "above": the fold counts a window as
+            // comfortable at v >= ComfortablePercent, and quota percentages
+            // land on whole numbers often enough that the boundary is a case
+            // rather than a curiosity. QuotaSummary.OthersComfortable's own
+            // comment says "at or above"; this sentence had drifted from the
+            // record it describes, one file away. macOS carries the same
+            // imprecision — its predicate is >= and its string says "above" —
+            // so this is a deliberate divergence, not a port error.
+            ? "{0} other windows, all at or above {1}%".Localized(
                 summary.OtherWindows, (int)QuotaSummaryFold.ComfortablePercent)
             : "{0} of {1} other windows are below {2}%".Localized(
                 summary.OtherWindows - summary.OthersComfortable,
