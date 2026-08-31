@@ -240,6 +240,19 @@ public sealed class DashboardModel
         // visit, then refreshed by the slow lane like everything else.
         public HourlyReport? Hourly { get; init; }
         public AgentsReport? Agents { get; init; }
+
+        /// <summary>Whether a quota fetch has finished, whatever it returned.
+        ///
+        /// <para>A fact about the request, not about the result, and that is
+        /// the whole reason it exists. Inferring it from <c>Quota is not
+        /// null</c> conflates "still asking" with "asked and it failed":
+        /// RefreshQuota publishes nothing when the fetch throws, so a payload
+        /// that never arrives is indistinguishable from one that has not
+        /// arrived yet, and the Overview sat on "Checking agent limits…"
+        /// forever. macOS passes the same signal in as `usageAttempted` rather
+        /// than deriving it; this port had let it degrade into a
+        /// derivation.</para></summary>
+        public bool QuotaAttempted { get; init; }
     }
 
     private volatile bool _hourlyWanted;
@@ -717,7 +730,16 @@ public sealed class DashboardModel
                 if (quota is not null)
                 {
                     _latestQuota = quota;
-                    Publish(s => s with { Quota = quota }, graph: null);
+                    Publish(s => s with { Quota = quota, QuotaAttempted = true }, graph: null);
+                }
+                else
+                {
+                    // Publish the completion even though there is nothing to
+                    // show. Without this the failure is silent in exactly the
+                    // way that matters: Quota stays null, and a surface that
+                    // reads null as "not yet" waits forever for an answer that
+                    // already came back.
+                    Publish(s => s with { QuotaAttempted = true }, graph: null);
                 }
             }
             finally

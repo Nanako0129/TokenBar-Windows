@@ -23,14 +23,33 @@ public enum QuotaSummarySecondRow
 public enum QuotaSummaryState
 {
     Ready,
+    /// <summary>The payload is healthy and the user has hidden every candidate.
+    /// The card is suppressed entirely rather than explained: macOS's own rule
+    /// is that a card absent because the user hid its subject needs no
+    /// placeholder, and telling someone "nothing is reporting" when they chose
+    /// the silence blames the provider for their setting.</summary>
+    AllHidden,
     NoWindowReporting,
     Loading,
 }
 
 public static class QuotaSummaryText
 {
-    public static QuotaSummaryState State(QuotaSummary? summary, bool attempted) =>
+    /// <summary>Which of four things the card is looking at.
+    ///
+    /// <para><paramref name="attempted"/> must be a fact about the request, not
+    /// about the result. Derived from "a payload exists" it cannot separate
+    /// "still asking" from "asked and it failed", and a failed fetch publishes
+    /// no payload — so the loading line stayed on screen for a request that had
+    /// already come back empty.</para>
+    ///
+    /// <para><paramref name="allHidden"/> is checked before the reporting
+    /// state, because a fold that returns null after every candidate was
+    /// excluded looks exactly like one that returned null because nothing
+    /// reported.</para></summary>
+    public static QuotaSummaryState State(QuotaSummary? summary, bool attempted, bool allHidden) =>
         summary is not null ? QuotaSummaryState.Ready
+        : allHidden ? QuotaSummaryState.AllHidden
         : attempted ? QuotaSummaryState.NoWindowReporting
         : QuotaSummaryState.Loading;
 

@@ -29,18 +29,47 @@ public class QuotaSummaryTextTests
             Burning: burning,
             PaceCheckedWindows: paceChecked);
 
-    // 7. Ready / NoWindowReporting / Loading are three distinct states — a
-    // fetch that hasn't returned yet must never render the same as one that
-    // returned and found nothing.
+    // 7. Every state is distinct — a fetch that has not returned must never
+    // render the same as one that returned and found nothing.
+    //
+    // This was written as "three states" and shipped that way. There are four:
+    // review found that a payload hidden entirely by the user arrives as the
+    // same null summary as one nothing reported, and that a failed fetch
+    // arrives as the same null payload as one still in flight. Both collapses
+    // say something untrue — the first blames the provider for the user's
+    // setting, the second waits forever for an answer already returned.
     [Fact]
-    public void ThreeEmptyStatesAreDistinct()
+    public void EveryEmptyStateIsDistinct()
     {
-        Assert.Equal(QuotaSummaryState.Ready, QuotaSummaryText.State(Summary(), attempted: true));
-        Assert.Equal(QuotaSummaryState.Ready, QuotaSummaryText.State(Summary(), attempted: false));
+        var states = new[]
+        {
+            QuotaSummaryText.State(Summary(), attempted: true, allHidden: false),
+            QuotaSummaryText.State(null, attempted: true, allHidden: true),
+            QuotaSummaryText.State(null, attempted: true, allHidden: false),
+            QuotaSummaryText.State(null, attempted: false, allHidden: false),
+        };
+
         Assert.Equal(
-            QuotaSummaryState.NoWindowReporting, QuotaSummaryText.State(null, attempted: true));
-        Assert.Equal(QuotaSummaryState.Loading, QuotaSummaryText.State(null, attempted: false));
+            [
+                QuotaSummaryState.Ready,
+                QuotaSummaryState.AllHidden,
+                QuotaSummaryState.NoWindowReporting,
+                QuotaSummaryState.Loading,
+            ],
+            states);
+        Assert.Equal(states.Length, states.Distinct().Count());
+        // Every declared state is reachable: one that no input produces is a
+        // branch the view carries and nothing can enter.
+        Assert.Empty(Enum.GetValues<QuotaSummaryState>().Except(states));
     }
+
+    // A summary outranks everything: having an answer is not affected by
+    // whether the request has formally completed.
+    [Fact]
+    public void ASummaryIsReadyWhateverTheAttemptSays() =>
+        Assert.Equal(
+            QuotaSummaryState.Ready,
+            QuotaSummaryText.State(Summary(), attempted: false, allHidden: false));
 
     [Fact]
     public void TightestHeadlineNamesClientAndWindow() =>
@@ -190,4 +219,56 @@ public class QuotaSummaryTextTests
                 ? new BurnWarning("codex", null, "Weekly", 12, null, null)
                 : null,
             PaceCheckedWindows: paceChecked);
+
+    // --- State -------------------------------------------------------------
+    //
+    // Four states, and the two that were collapsed are the ones that mislead.
+    // A failed fetch publishes completion with no payload, so deriving
+    // "attempted" from the payload left the loading line on screen for a
+    // request that had already come back. And a fold returning null because
+    // the user hid every client looks identical to one returning null because
+    // nothing reported — which blames the provider for the user's setting.
+
+    [Fact]
+    public void StateIsReadyWhenThereIsASummary() =>
+        Assert.Equal(
+            QuotaSummaryState.Ready,
+            QuotaSummaryText.State(SummaryWith(others: 1, paceChecked: 1, burning: false),
+                attempted: true, allHidden: false));
+
+    [Fact]
+    public void StateIsLoadingBeforeTheFirstAttemptCompletes() =>
+        Assert.Equal(
+            QuotaSummaryState.Loading,
+            QuotaSummaryText.State(null, attempted: false, allHidden: false));
+
+    // The case that was indistinguishable: the fetch finished and produced
+    // nothing. Rendered as Loading, this waited forever.
+    [Fact]
+    public void StateIsNoWindowReportingAfterAFailedOrEmptyAttempt() =>
+        Assert.Equal(
+            QuotaSummaryState.NoWindowReporting,
+            QuotaSummaryText.State(null, attempted: true, allHidden: false));
+
+    [Fact]
+    public void StateIsAllHiddenWhenEveryCandidateIsExcluded() =>
+        Assert.Equal(
+            QuotaSummaryState.AllHidden,
+            QuotaSummaryText.State(null, attempted: true, allHidden: true));
+
+    // AllHidden outranks the reporting state: both arrive as a null summary,
+    // and only one of them is the provider's doing.
+    [Fact]
+    public void AllHiddenIsNotReportedAsNothingReporting() =>
+        Assert.NotEqual(
+            QuotaSummaryState.NoWindowReporting,
+            QuotaSummaryText.State(null, attempted: true, allHidden: true));
+
+    // Hidden before the first answer is still hidden — the user's choice does
+    // not become visible just because a fetch is outstanding.
+    [Fact]
+    public void AllHiddenOutranksLoading() =>
+        Assert.Equal(
+            QuotaSummaryState.AllHidden,
+            QuotaSummaryText.State(null, attempted: false, allHidden: true));
 }

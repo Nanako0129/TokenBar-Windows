@@ -1120,11 +1120,20 @@ public sealed partial class DashboardView : UserControl
         // null on an otherwise-ready snapshot while the first fetch is in
         // flight. summary == null alone cannot tell that apart from "asked
         // and nothing reported a window" — QuotaSummaryText.State needs both.
-        var attempted = snapshot.Quota is not null;
+        // Read from the snapshot rather than inferred from the payload: a
+        // failed fetch publishes completion with no payload, and inferring
+        // would render that as still-in-flight forever.
+        var attempted = snapshot.QuotaAttempted;
+        var allHidden = QuotaResolver.ExcludedAllCandidates(
+            snapshot.Quota, QuotaResolver.Auto, excluding);
 
         var stack = new StackPanel { Spacing = 7 };
-        switch (QuotaSummaryText.State(summary, attempted))
+        switch (QuotaSummaryText.State(summary, attempted, allHidden))
         {
+            case QuotaSummaryState.AllHidden:
+                // No card at all. The user hid these clients; saying so would
+                // be a placeholder for a choice they already made.
+                return new StackPanel();
             case QuotaSummaryState.Ready:
                 BuildQuotaSummaryReady(stack, summary!, snapshot, now);
                 break;
