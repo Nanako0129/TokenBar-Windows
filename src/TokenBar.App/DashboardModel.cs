@@ -32,6 +32,18 @@ public sealed class DashboardModel
     // from it (quota is usually done in ~1s, the cold parse in seconds).
     private volatile AgentUsagePayload? _latestQuota;
 
+    /// <summary>Whether a quota fetch has ever finished, held outside the
+    /// snapshot for the same reason <see cref="_latestQuota"/> is.
+    ///
+    /// <para>Publish drops a graph-less update while Current is null, so on a
+    /// cold start where the quota request fails before the graph lane seeds
+    /// the first snapshot, publishing the completion is not enough — it is
+    /// discarded, and the snapshot the graph then builds carries the record's
+    /// default of false. The loading line therefore survived the very failure
+    /// it was fixed not to survive, until the next 60-second tick. Seeded into
+    /// the baseline below.</para></summary>
+    private volatile bool _quotaAttempted;
+
     // Year filter for every lens (macOS DashboardModel.year); null = all
     // time. Fetch lanes capture it per pass and drop slices fetched for a
     // stale filter, so a late old-year payload can never overwrite the new
@@ -727,6 +739,11 @@ public sealed class DashboardModel
                 var quota = TryFetch(
                     () => AgentUsageFetchCoordinator.Shared.FetchAsync().GetAwaiter().GetResult(),
                     "agentUsage");
+                // Recorded before publishing, and outside the snapshot: the
+                // publish below is dropped entirely if the graph lane has not
+                // seeded Current yet, and this is the only thing that survives
+                // that window.
+                _quotaAttempted = true;
                 if (quota is not null)
                 {
                     _latestQuota = quota;
@@ -814,7 +831,10 @@ public sealed class DashboardModel
                     return; // fast lane cannot seed the snapshot
                 }
 
-                baseline = new Snapshot(graph, null, _latestQuota, 0, [], DateTimeOffset.Now);
+                baseline = new Snapshot(graph, null, _latestQuota, 0, [], DateTimeOffset.Now)
+                {
+                    QuotaAttempted = _quotaAttempted,
+                };
                 DevLog.Write("first snapshot ready"); // cold-parse timing anchor
             }
 
