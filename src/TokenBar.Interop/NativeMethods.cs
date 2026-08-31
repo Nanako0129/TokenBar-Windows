@@ -52,5 +52,8 @@ internal static partial class NativeMethods
     internal static partial nint tb_agent_usage();
 
     [LibraryImport(Lib)]
+    internal static partial nint tb_quota_history();
+
+    [LibraryImport(Lib)]
     internal static partial void tb_free(nint ptr);
 }

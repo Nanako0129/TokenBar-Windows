@@ -662,6 +662,25 @@ pub extern "C" fn tb_agent_usage() -> *mut c_char {
     })
 }
 
+/// Persisted quota-pace history, one entry per stored series:
+/// `[{providerId, accountScope, windowKey, samples: [...]}]`. Each sample is the
+/// stored record plus a producer-computed `isActiveGroup`, which the consumer
+/// cannot re-derive (see `is_active_group_sample`). Disk-bound and read-only:
+/// the store is never quarantined, locked, or saved on this path.
+#[no_mangle]
+pub extern "C" fn tb_quota_history() -> *mut c_char {
+    guarded("tb_quota_history", || {
+        envelope(
+            agent_quota_history::export_history()
+                .map_err(|error| error.to_string())
+                .and_then(|series| {
+                    serde_json::to_value(series)
+                        .map_err(|error| format!("serialize quota history: {error}"))
+                }),
+        )
+    })
+}
+
 /// Release a string returned by any tb_* entry point.
 ///
 /// # Safety
