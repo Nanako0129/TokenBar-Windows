@@ -355,7 +355,7 @@ internal sealed class WizardForm : Form
         // string arriving there can still legitimately end in one.
         _installDir = Path.GetFullPath(_installDir);
         var installDir = _installDir;
-        var logPath = SetupRunner.DefaultLogPath;
+        var logPath = SetupRunner.NewLogPath();
 
         Task.Run(() => SetupRunner.Run(setupExePath, installDir, logPath))
             .ContinueWith(
@@ -398,7 +398,7 @@ internal sealed class WizardForm : Form
     /// <para>Whether there is a log is not decided here. This asks the result,
     /// and SetupRunner answers by whether the file was written during the run
     /// it just performed. An earlier version tested File.Exists at this point
-    /// and was wrong in the way that matters: DefaultLogPath is a fixed name in
+    /// and was wrong in the way that matters: the log path used to be a fixed name in
     /// %TEMP%, so a leftover from a previous install passes an existence check
     /// and the page would offer an unrelated run's record — possibly a
     /// successful one — as the explanation for this failure.</para></summary>

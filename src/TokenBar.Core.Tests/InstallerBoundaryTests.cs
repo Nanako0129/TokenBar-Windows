@@ -55,6 +55,37 @@ public class InstallerBoundaryTests
         Assert.EndsWith("\"", quoted);
     }
 
+    // --- SetupRunner.NewLogPath -----------------------------------------------
+
+    // The log path used to be one fixed name, and two defects came out of that:
+    // a leftover from an earlier install passed an existence check, and two
+    // overlapping wrapper instances wrote the same file, where a timestamp
+    // proves "written after I started" but never "written by my child". No
+    // inference separates those; a name that cannot collide does.
+    [Fact]
+    public void NewLogPath_differs_between_runs()
+    {
+        var first = SetupRunner.NewLogPath();
+        var second = SetupRunner.NewLogPath();
+
+        // Same second, same process: whatever makes these differ has to be
+        // more than the timestamp, or two instances started together collide
+        // exactly when it matters.
+        Assert.NotEqual(first, second);
+    }
+
+    [Fact]
+    public void NewLogPath_is_under_temp_and_recognisable()
+    {
+        var path = SetupRunner.NewLogPath();
+
+        Assert.Equal(
+            Path.GetFullPath(Path.GetTempPath()),
+            Path.GetFullPath(Path.GetDirectoryName(path)!) + Path.DirectorySeparatorChar);
+        Assert.StartsWith("syrtis-install-", Path.GetFileName(path), StringComparison.Ordinal);
+        Assert.EndsWith(".log", path, StringComparison.Ordinal);
+    }
+
     // --- SetupRunner.LogWrittenByThisRun --------------------------------------
 
     [Fact]

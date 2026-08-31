@@ -70,7 +70,7 @@ internal static class Program
         try
         {
             var result = SetupRunner.Run(
-                setupPath, SetupRunner.DefaultInstallDirectory, SetupRunner.DefaultLogPath);
+                setupPath, SetupRunner.DefaultInstallDirectory, SetupRunner.NewLogPath());
             return result.ExitCode;
         }
         // Catch breadth deliberately matches the GUI path's task.IsFaulted,

@@ -29,8 +29,43 @@ internal static class SetupRunner
     internal static string DefaultInstallDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Nyanako.Syrtis");
 
-    internal static string DefaultLogPath =>
-        Path.Combine(Path.GetTempPath(), "syrtis-install.log");
+    /// <summary>A log path belonging to this run and no other.
+    ///
+    /// <para>It used to be a fixed <c>syrtis-install.log</c>, and two separate
+    /// defects came out of that one name. The first was staleness: a leftover
+    /// from an earlier install passes an existence check, so a failure could be
+    /// explained with an unrelated — possibly successful — run's record. That
+    /// was answered with a last-write comparison against the launch instant,
+    /// which was the wrong shape of answer. The second showed why: two wrapper
+    /// instances can overlap, a double-click while an automated
+    /// <c>--silent</c> run is in flight, and then both children write the same
+    /// file. A write by either satisfies the other's timestamp test, because a
+    /// timestamp establishes "written after I started" and never "written by my
+    /// child".</para>
+    ///
+    /// <para>No inference distinguishes those. A name that cannot collide
+    /// does, by construction, and it makes the question unaskable rather than
+    /// answerable — which is the same move as parsing the request once instead
+    /// of deriving it in five places.</para>
+    ///
+    /// <para>Timestamp and process id lead so that someone hunting the file in
+    /// %TEMP% can recognise it, but they are not what makes it unique: the
+    /// first version stopped there, and the test written to pin it failed
+    /// immediately, because two calls in the same second from one process
+    /// produce the same name. Cross-instance uniqueness would have survived on
+    /// the process id alone — which is an argument, and the point of this
+    /// method is not to need one. The random tail settles it outright.</para>
+    ///
+    /// <para><see cref="LogWrittenByThisRun"/> stays, and is now belt to this
+    /// braces: uniqueness settles ownership, the timestamp still answers
+    /// whether Setup got far enough to write anything at all.</para></summary>
+    internal static string NewLogPath() =>
+        Path.Combine(
+            Path.GetTempPath(),
+            $"syrtis-install-{DateTime.UtcNow:yyyyMMdd-HHmmss}"
+                + $"-{Process.GetCurrentProcess().Id}"
+                + $"-{Guid.NewGuid():N}".Substring(0, 9)
+                + ".log");
 
     /// <summary>Wrap one value for a Windows command line.
     ///
@@ -90,12 +125,13 @@ internal static class SetupRunner
     /// <summary>The log path when this run wrote it, null otherwise.
     ///
     /// <para>An existence check is not enough and was shipped once believing
-    /// it was. <see cref="DefaultLogPath"/> is a fixed name in %TEMP%, so a
-    /// file being there says nothing about which install put it there — the
-    /// test machine had a two-day-old copy at exactly that path. Setup can
-    /// start and fail before opening the log, and the Done page would then
-    /// have offered an unrelated, possibly successful, install's record as the
-    /// explanation for this failure.</para>
+    /// it was. Setup can start and fail before it ever opens the log, and an
+    /// existence check cannot see that — the test machine had a two-day-old
+    /// copy at the fixed path this used to use, so the Done page would have
+    /// offered an unrelated run's record as the explanation for a failure.
+    /// <see cref="NewLogPath"/> now removes the ownership half of that
+    /// question; this answers the remaining half, which is whether Setup wrote
+    /// anything at all.</para>
     ///
     /// <para>Deleting the old file before launching was the alternative. This
     /// does not touch the user's disk and has no failure mode of its own: if
