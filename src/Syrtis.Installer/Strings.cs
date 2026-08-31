@@ -42,6 +42,13 @@ internal static class Strings
         $"This installer does not support {arg}.\nUsage: Syrtis.Installer.exe [-s|--silent] <path-to-setup.exe>",
         $"此安裝程式不支援 {arg}。\n用法：Syrtis.Installer.exe [-s|--silent] <setup.exe 的路徑>");
 
+    /// <summary>The embedded payload could not be written out — a full disk, an
+    /// unwritable TEMP. Setup never ran, so this reports the same way a failed
+    /// launch does.</summary>
+    internal static string ErrorPayloadUnavailable(string reason) => T(
+        $"The setup files could not be prepared.\n{reason}",
+        $"無法準備安裝檔案。\n{reason}");
+
     internal static string ErrorSetupLaunchFailed(string path, string reason) => T(
         $"Could not start the setup file: {path}\n{reason}",
         $"無法啟動安裝檔：{path}\n{reason}");

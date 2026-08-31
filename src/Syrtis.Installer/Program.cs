@@ -26,7 +26,26 @@ internal static class Program
             };
         }
 
-        var (setupPath, ownsFile) = ResolveSetupPath(request);
+        string setupPath;
+        bool ownsFile;
+        try
+        {
+            (setupPath, ownsFile) = ResolveSetupPath(request);
+        }
+        catch (Exception ex)
+        {
+            // Extraction writes ~83 MB to %TEMP%, so it can fail for reasons
+            // that have nothing to do with the install: a full disk, a
+            // redirected or read-only TEMP, a policy that blocks writing
+            // executables there. Outside this try it threw past both surfaces'
+            // handlers — the wizard vanished with no dialog and --silent
+            // returned an unhandled CLR code instead of the LaunchFailed it
+            // documents. That is the defect Process.Start already taught this
+            // file, reappearing one layer up because a new step was added
+            // above the handlers rather than inside them.
+            return FailToStart(request, ex);
+        }
+
         try
         {
             return request.Kind == InstallRequestKind.RunSilent
@@ -40,6 +59,25 @@ internal static class Program
                 TryDelete(setupPath);
             }
         }
+    }
+
+    /// <summary>Report a failure that happened before either surface existed,
+    /// on whichever surface the request was headed for, and return the same
+    /// LaunchFailed code a failed Process.Start produces. The two are the same
+    /// thing to a caller: Setup never ran.</summary>
+    private static int FailToStart(InstallRequest request, Exception ex)
+    {
+        var message = Strings.ErrorPayloadUnavailable(ex.Message);
+        if (request.Kind == InstallRequestKind.RunWizard && Environment.UserInteractive)
+        {
+            MessageBox.Show(message, Strings.WindowTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        else
+        {
+            Console.Error.WriteLine(message);
+        }
+
+        return ExitCodes.LaunchFailed;
     }
 
     /// <summary>The path to hand both surfaces: an explicit argument's path
