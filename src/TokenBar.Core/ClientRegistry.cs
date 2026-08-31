@@ -130,6 +130,37 @@ public static class ClientRegistry
         _ => id,
     };
 
+    /// <summary>The client whose quota snapshot a client's usage is served by,
+    /// where the two identities differ. <c>antigravity-cli</c> is a registered
+    /// client in its own right — process identity, tab, icon and preferences all
+    /// stay distinct — but it draws on the <c>antigravity</c> subscription and the
+    /// quota views have always folded it that way. Anything reasoning about which
+    /// subscription a client's tokens consume has to fold it too, or it will
+    /// conclude the CLI owns no subscription at all.</summary>
+    public static string QuotaOwner(string id) => id == "antigravity-cli" ? "antigravity" : id;
+
+    /// <summary>The registered client behind an opencode subscription label.
+    /// opencode reports which providers it is authed against as display labels
+    /// rather than ids (<c>agent_usage.rs</c> builds them in
+    /// <c>subscription_label</c>), so a consumer that needs the id must map them
+    /// back here. These are the four labels <c>subscription_label</c> renames
+    /// outright; everything else it emits is a capitalized provider key, which
+    /// cannot be resolved from this table alone. Kept as data rather than a
+    /// switch so a caller can tell a rename from a passthrough — three of the
+    /// four lowercase to their own id, so comparing the result against
+    /// <c>label.ToLowerInvariant()</c> cannot make that distinction.</summary>
+    public static readonly IReadOnlyDictionary<string, string> SubscriptionLabelAliases =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["Codex"] = "codex",
+            ["Claude"] = "claude",
+            ["Copilot"] = "copilot",
+            ["Gemini"] = "antigravity",
+        };
+
+    public static string ClientIdForSubscriptionLabel(string label) =>
+        SubscriptionLabelAliases.TryGetValue(label, out var alias) ? alias : label.ToLowerInvariant();
+
     /// <summary>Parses the comma-separated id form persisted by the tab
     /// order/hidden defaults into a set, tolerating an empty string. Single
     /// source of the CSV split so callers all agree on the shape.</summary>
