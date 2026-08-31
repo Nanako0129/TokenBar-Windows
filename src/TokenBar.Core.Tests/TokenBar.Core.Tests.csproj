@@ -50,6 +50,7 @@
          note next to the tests. -->
     <Compile Include="..\Syrtis.Installer\ExitCodes.cs" Link="Installer\ExitCodes.cs" />
     <Compile Include="..\Syrtis.Installer\InstallRequest.cs" Link="Installer\InstallRequest.cs" />
+    <Compile Include="..\Syrtis.Installer\PayloadIdentity.cs" Link="Installer\PayloadIdentity.cs" />
     <Compile Include="..\Syrtis.Installer\SetupLocator.cs" Link="Installer\SetupLocator.cs" />
     <Compile Include="..\Syrtis.Installer\SetupRunner.cs" Link="Installer\SetupRunner.cs" />
     <Compile Include="..\Syrtis.Installer\Strings.cs" Link="Installer\Strings.cs" />

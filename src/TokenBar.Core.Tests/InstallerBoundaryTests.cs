@@ -55,6 +55,44 @@ public class InstallerBoundaryTests
         Assert.EndsWith("\"", quoted);
     }
 
+    // --- PayloadIdentity.Choose ------------------------------------------------
+
+    // The Welcome page's sentence — "will install {product} version {version}"
+    // — is entirely about the payload, and both halves used to be read from
+    // this wrapper's own assembly. In slice 1a the setup file is whatever path
+    // was passed in, so the repo version stamped on the wrapper says nothing
+    // about it; the two matched during acceptance only because the same bumped
+    // tree produced both.
+    [Fact]
+    public void Choose_prefers_the_payload()
+    {
+        Assert.Equal("0.2.1", PayloadIdentity.Choose("0.2.1", "0.2.2", "?"));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Choose_falls_back_to_the_wrapper_when_the_payload_is_silent(string? payload)
+    {
+        Assert.Equal("0.2.2", PayloadIdentity.Choose(payload, "0.2.2", "?"));
+    }
+
+    [Fact]
+    public void Choose_falls_back_to_the_constant_when_neither_answers()
+    {
+        Assert.Equal("?", PayloadIdentity.Choose(null, "  ", "?"));
+    }
+
+    // A blank version resource is ordinary in stub executables, and rendering
+    // it would put "version  " on screen, which reads as a bug rather than as
+    // a missing value.
+    [Fact]
+    public void Choose_trims_what_it_returns()
+    {
+        Assert.Equal("Syrtis", PayloadIdentity.Choose("  Syrtis  ", null, "?"));
+    }
+
     // --- SetupRunner.NewLogPath -----------------------------------------------
 
     // The log path used to be one fixed name, and two defects came out of that:

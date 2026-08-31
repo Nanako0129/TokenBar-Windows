@@ -37,9 +37,26 @@ internal sealed class WizardForm : Form
     internal WizardForm(string setupExePath)
     {
         _setupExePath = setupExePath;
-        _productName = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyProductAttribute>()?.Product ?? "Syrtis";
-        _versionText = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
-            ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "?";
+
+        // The Welcome page states what will be installed, so both halves of
+        // that sentence are claims about the payload, not about this wrapper.
+        // They were read from this assembly, which is only correct by accident:
+        // in slice 1a the setup file is whatever path was passed in, and the
+        // repo version stamped on this exe has nothing to do with it. Velopack's
+        // Setup.exe does carry the app's own identity — measured on a packed
+        // 0.2.1 build, FileVersion 0.2.1 and ProductName Syrtis, not Velopack's
+        // own — so ask the file that is about to be run.
+        var payload = ReadPayloadIdentity(setupExePath);
+        var self = Assembly.GetExecutingAssembly();
+        _productName = PayloadIdentity.Choose(
+            payload.Product,
+            self.GetCustomAttribute<AssemblyProductAttribute>()?.Product,
+            "Syrtis");
+        _versionText = PayloadIdentity.Choose(
+            payload.Version,
+            self.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                ?? self.GetName().Version?.ToString(),
+            "?");
 
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScaleDimensions = new SizeF(96f, 96f);
@@ -108,6 +125,23 @@ internal sealed class WizardForm : Form
         };
 
         GoToStep(WizardStep.Welcome);
+    }
+
+    /// <summary>Product name and version as declared by the setup file itself.
+    /// Either may come back null: a file with no version resource, or an
+    /// unreadable one. Never throws — a Welcome page is not worth failing an
+    /// install over.</summary>
+    private static (string? Product, string? Version) ReadPayloadIdentity(string setupExePath)
+    {
+        try
+        {
+            var info = FileVersionInfo.GetVersionInfo(setupExePath);
+            return (info.ProductName, info.ProductVersion ?? info.FileVersion);
+        }
+        catch (Exception)
+        {
+            return (null, null);
+        }
     }
 
     private static Button MakeButton(string text, EventHandler onClick)
