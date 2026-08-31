@@ -122,10 +122,13 @@ macOS 34 筆、Windows 32 筆，差集正好兩筆：
 
 ## 切片順序
 
+> **狀態更新 2026-08-31**：切片 1 與切片 2 的前半已經完成，這份清單在那之前寫成。
+> 重讀時先跑一次查證指令，不要照著表格直接排工作。
+
 | # | 切片 | 理由 |
 |---|---|---|
-| **1** | 兩個新客戶端 | 最小，`ClientRegistry` 加兩筆 |
-| **2** | 更新入口（Check now ＋ Beta 通道） | 小，兩個控制項＋Velopack channel 參數 |
+| ~~**1**~~ | ~~兩個新客戶端~~ | **已完成** — `ClientRegistry.cs:35-36` 已註冊 `junie` 與 `opencodereview` |
+| **2** | ~~Check now~~ ＋ Beta 通道 | **Check now 已完成**（`TrayService.CheckForUpdates`、`SettingsWindow.cs:561`，已中文化）。Beta 通道仍缺：`UpdateFlow.cs:100` 寫死 `prerelease: false` |
 | **3** | Quota 資料出口：FFI 匯出 ＋ C# binding ＋ Overview 摘要行 | **整條鏈的瓶頸**；打通後每張卡都變純 UI |
 | **4** | Quota lens 三張卡 | 依賴 3 |
 | **5** | 多帳號／自訂掃描根目錄 | 碰認證與路徑，需安全審查流程 |

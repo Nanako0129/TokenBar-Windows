@@ -792,16 +792,32 @@ public sealed partial class DashboardView : UserControl
     private UIElement BuildOverview(DashboardModel.Snapshot snapshot)
     {
         var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(BuildUsageChartCard(snapshot));
-        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot)));
-        var trace = BuildTrace(snapshot);
-        if (trace is not null)
+        // Order comes from OverviewCards.RenderOrder, not from the sequence of
+        // these calls, so a test can see it. macOS got this same sequence wrong
+        // once and its pinned order is what caught it; this arrived at the same
+        // mistake independently, with the quota summary built directly above
+        // the limits card and the chart therefore ahead of it.
+        foreach (var card in OverviewCards.RenderOrder)
         {
-            stack.Children.Add(Ui.Card("Live session".Localized(), trace));
+            var element = card switch
+            {
+                OverviewCard.QuotaSummary => BuildQuotaSummary(snapshot),
+                OverviewCard.Chart => BuildUsageChartCard(snapshot),
+                OverviewCard.Limits => Ui.Card("Agent limits".Localized(), BuildLimits(snapshot)),
+                // The only optional one: absent when there is no live session.
+                OverviewCard.Trace => BuildTrace(snapshot) is { } trace
+                    ? Ui.Card("Live session".Localized(), trace)
+                    : null,
+                OverviewCard.Models => Ui.Card("Models".Localized(), BuildModelRows(snapshot, maxRows: 8)),
+                OverviewCard.Streaks => Ui.Card("Streaks".Localized(), BuildStreaks(snapshot)),
+                _ => throw new InvalidOperationException($"Unhandled overview card: {card}"),
+            };
+            if (element is not null)
+            {
+                stack.Children.Add(element);
+            }
         }
 
-        stack.Children.Add(Ui.Card("Models".Localized(), BuildModelRows(snapshot, maxRows: 8)));
-        stack.Children.Add(Ui.Card("Streaks".Localized(), BuildStreaks(snapshot)));
         return stack;
     }
 
@@ -1082,6 +1098,157 @@ public sealed partial class DashboardView : UserControl
         return root;
     }
 
+    /// <summary>The all-agent Overview's opening statement: which
+    /// subscription is closest to running out, whether anything is burning
+    /// faster than its schedule allows, and today's totals. Port of the
+    /// macOS QuotaSummaryLine — its own card, not a titled one, since it is
+    /// prose rather than another labeled section (matches
+    /// BuildUsageChartCard's neighbors only in background/padding, not in
+    /// having a header row).
+    ///
+    /// A three-row label/value grid rather than a flowing sentence: Chinese
+    /// breaks between any two characters, so a paragraph wraps mid-unit
+    /// ("3 小時 23" then "分 後重置"). Short fragments in a fixed-width label
+    /// column are a layout the width cannot break.</summary>
+    private FrameworkElement BuildQuotaSummary(DashboardModel.Snapshot snapshot)
+    {
+        var excluding = ClientRegistry.QuotaExcludedClients(AppSettings.Store);
+        var now = DateTimeOffset.Now;
+        var summary = QuotaSummaryFold.Build(snapshot.Quota, excluding, CurrentPaceMode(), now);
+        // The quota lane publishes its own Snapshot.Quota independently of
+        // the graph lane that seeds the first snapshot, so Quota can still be
+        // null on an otherwise-ready snapshot while the first fetch is in
+        // flight. summary == null alone cannot tell that apart from "asked
+        // and nothing reported a window" — QuotaSummaryText.State needs both.
+        // Read from the snapshot rather than inferred from the payload: a
+        // failed fetch publishes completion with no payload, and inferring
+        // would render that as still-in-flight forever.
+        var attempted = snapshot.QuotaAttempted;
+        var allHidden = QuotaResolver.ExcludedAllCandidates(
+            snapshot.Quota, QuotaResolver.Auto, excluding);
+
+        var stack = new StackPanel { Spacing = 7 };
+        switch (QuotaSummaryText.State(summary, attempted, allHidden))
+        {
+            case QuotaSummaryState.AllHidden:
+                // No card at all. The user hid these clients; saying so would
+                // be a placeholder for a choice they already made.
+                return new StackPanel();
+            case QuotaSummaryState.Ready:
+                BuildQuotaSummaryReady(stack, summary!, snapshot, now);
+                break;
+            case QuotaSummaryState.NoWindowReporting:
+                stack.Children.Add(Ui.Dim(QuotaSummaryText.NoWindowReporting()));
+                break;
+            default: // Loading
+                stack.Children.Add(Ui.Dim(QuotaSummaryText.CheckingLimits()));
+                break;
+        }
+
+        return new Border
+        {
+            Background = (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(12),
+            Child = stack,
+        };
+    }
+
+    private void BuildQuotaSummaryReady(
+        StackPanel stack, QuotaSummary summary, DashboardModel.Snapshot snapshot, DateTimeOffset now)
+    {
+        var tightest = new StackPanel { Spacing = 1 };
+        tightest.Children.Add(Ui.Text(QuotaSummaryText.TightestHeadline(summary), 13, bold: true));
+        tightest.Children.Add(Ui.Text(QuotaSummaryText.TightestDetail(summary, now), 11, 0.6));
+        if (summary.OtherWindows > 0)
+        {
+            tightest.Children.Add(Ui.Text(QuotaSummaryText.OthersText(summary), 10, 0.45));
+        }
+
+        stack.Children.Add(QuotaSummaryRow("Tightest".Localized(), tightest));
+
+        // "Burning fastest" replaces "Pace" whenever there is a burn
+        // warning: a slot that is empty whenever nothing is wrong teaches
+        // the user to ignore it, and on real data it is empty nearly always
+        // — inverting it turns the most reliable fact here into something
+        // worth reading. Gated on PaceCheckedWindows too: with pace off, or
+        // the historical basis still learning, Compute returns null for
+        // every window and Burning is null because nothing was asked, not
+        // because nothing was wrong — printing the reassurance then would
+        // vouch for a check that never ran.
+        switch (QuotaSummaryText.SecondRow(summary))
+        {
+            case QuotaSummarySecondRow.Burning:
+                var burning = summary.Burning!;
+                var burn = new StackPanel { Spacing = 1 };
+                burn.Children.Add(Ui.Text(QuotaSummaryText.BurnHeadline(burning), 11, bold: true));
+                var detail = Ui.Text(QuotaSummaryText.BurnDetail(burning), 10);
+                detail.Foreground = Ui.BrushFromHex(PaceOrange);
+                burn.Children.Add(detail);
+                stack.Children.Add(QuotaSummaryRow("Burning fastest".Localized(), burn));
+                break;
+            case QuotaSummarySecondRow.Reassurance:
+                stack.Children.Add(QuotaSummaryRow(
+                    "Pace".Localized(), Ui.Dim(QuotaSummaryText.PaceReassurance(), 10)));
+                break;
+            case QuotaSummarySecondRow.None:
+                break;
+        }
+
+        // Today's totals mirror the header's own today figure: same PerDayMap
+        // lookup, same cost-authority policy, and — the part this comment
+        // previously claimed and did not deliver — the same treatment of a day
+        // with no entry. The header renders `today?.Tokens ?? 0`, so it commits
+        // to showing a zero; gating this row on TryGetValue made the two
+        // surfaces disagree on exactly the inactive days, six centimetres
+        // apart, while the comment above them asserted they could not.
+        //
+        // macOS omits its row here, and does not face the choice: its Overview
+        // has no separate today field to contradict. Windows does, so agreeing
+        // with the header that already ships beats matching a platform whose
+        // header does not exist.
+        var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
+        stats.PerDayMap.TryGetValue(Format.TodayKey(), out var today);
+        stack.Children.Add(QuotaSummaryRow(
+            "Today".Localized(),
+            Ui.Text(
+                QuotaSummaryText.TodayText(
+                    today?.Tokens ?? 0, today?.Cost ?? 0, snapshot.CostAuthoritative),
+                11,
+                0.85)));
+
+    }
+
+    /// <summary>Label column fixed width so the rows align, matching the
+    /// macOS QuotaSummaryLine's 62pt column (widened slightly here for the
+    /// longer zh-Hant labels this port also ships).</summary>
+    private const double QuotaSummaryLabelWidth = 64;
+
+    private static Grid QuotaSummaryRow(string label, UIElement content)
+    {
+        var grid = new Grid { ColumnSpacing = 8 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(QuotaSummaryLabelWidth) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var labelBlock = Ui.Text(label, 10, 0.6);
+        labelBlock.VerticalAlignment = VerticalAlignment.Top;
+        grid.Children.Add(labelBlock);
+        Grid.SetColumn((FrameworkElement)content, 1);
+        grid.Children.Add(content);
+        return grid;
+    }
+
+    /// <summary>The user's saved pace policy (macOS PaceMode parity), shared
+    /// by the Agent-limits card and the quota summary above it so the two
+    /// surfaces can never disagree about whether a window is ahead of
+    /// schedule.</summary>
+    private static PaceMode CurrentPaceMode() =>
+        AppSettings.Store.GetString("tokenbar.limits.paceMode", "historical") switch
+        {
+            "linear" => PaceMode.Linear,
+            "off" => PaceMode.Off,
+            _ => PaceMode.Historical,
+        };
+
     private static FrameworkElement BuildLimits(DashboardModel.Snapshot snapshot)
     {
         var panel = new StackPanel { Spacing = 10 };
@@ -1095,12 +1262,7 @@ public sealed partial class DashboardView : UserControl
         // macOS windowRow settings: fill direction, density, pace policy.
         var asUsed = AppSettings.Store.GetBool("tokenbar.limits.asUsed", false);
         var classic = AppSettings.Store.GetString("tokenbar.limits.layout", "full") == "classic";
-        var paceMode = AppSettings.Store.GetString("tokenbar.limits.paceMode", "historical") switch
-        {
-            "linear" => PaceMode.Linear,
-            "off" => PaceMode.Off,
-            _ => PaceMode.Historical,
-        };
+        var paceMode = CurrentPaceMode();
 
         var now = DateTimeOffset.Now;
         foreach (var agent in agents)
@@ -1913,9 +2075,7 @@ public sealed partial class DashboardView : UserControl
         // UI language; window.ResetText is the engine's English compatibility
         // field and only stands in when the timestamp will not parse. Same
         // precedence as macOS AgentLimitsCard.
-        var resetText = window.ResetsAt is { } resetsAt
-            ? UsagePace.ResetText(resetsAt, DateTimeOffset.Now) ?? window.ResetText
-            : window.ResetText;
+        var resetText = UsagePace.ResetTextOr(window.ResetsAt, window.ResetText, DateTimeOffset.Now);
         var headerTrailing = Ui.Text(
             classic ? resetText ?? row.AmountText : resetText ?? "",
             10, 0.6);

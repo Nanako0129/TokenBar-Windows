@@ -32,6 +32,18 @@ public sealed class DashboardModel
     // from it (quota is usually done in ~1s, the cold parse in seconds).
     private volatile AgentUsagePayload? _latestQuota;
 
+    /// <summary>Whether a quota fetch has ever finished, held outside the
+    /// snapshot for the same reason <see cref="_latestQuota"/> is.
+    ///
+    /// <para>Publish drops a graph-less update while Current is null, so on a
+    /// cold start where the quota request fails before the graph lane seeds
+    /// the first snapshot, publishing the completion is not enough — it is
+    /// discarded, and the snapshot the graph then builds carries the record's
+    /// default of false. The loading line therefore survived the very failure
+    /// it was fixed not to survive, until the next 60-second tick. Seeded into
+    /// the baseline below.</para></summary>
+    private volatile bool _quotaAttempted;
+
     // Year filter for every lens (macOS DashboardModel.year); null = all
     // time. Fetch lanes capture it per pass and drop slices fetched for a
     // stale filter, so a late old-year payload can never overwrite the new
@@ -240,6 +252,19 @@ public sealed class DashboardModel
         // visit, then refreshed by the slow lane like everything else.
         public HourlyReport? Hourly { get; init; }
         public AgentsReport? Agents { get; init; }
+
+        /// <summary>Whether a quota fetch has finished, whatever it returned.
+        ///
+        /// <para>A fact about the request, not about the result, and that is
+        /// the whole reason it exists. Inferring it from <c>Quota is not
+        /// null</c> conflates "still asking" with "asked and it failed":
+        /// RefreshQuota publishes nothing when the fetch throws, so a payload
+        /// that never arrives is indistinguishable from one that has not
+        /// arrived yet, and the Overview sat on "Checking agent limits…"
+        /// forever. macOS passes the same signal in as `usageAttempted` rather
+        /// than deriving it; this port had let it degrade into a
+        /// derivation.</para></summary>
+        public bool QuotaAttempted { get; init; }
     }
 
     private volatile bool _hourlyWanted;
@@ -580,14 +605,7 @@ public sealed class DashboardModel
             var baseline = Current;
             if (baseline is null)
             {
-                baseline = new Snapshot(
-                    publication.Payload,
-                    null,
-                    _latestQuota,
-                    0,
-                    [],
-                    DateTimeOffset.Now,
-                    _graphState.CostAuthoritative);
+                baseline = CreateBaseline(publication.Payload);
                 DevLog.Write("first snapshot ready");
             }
 
@@ -714,10 +732,24 @@ public sealed class DashboardModel
                 var quota = TryFetch(
                     () => AgentUsageFetchCoordinator.Shared.FetchAsync().GetAwaiter().GetResult(),
                     "agentUsage");
+                // Recorded before publishing, and outside the snapshot: the
+                // publish below is dropped entirely if the graph lane has not
+                // seeded Current yet, and this is the only thing that survives
+                // that window.
+                _quotaAttempted = true;
                 if (quota is not null)
                 {
                     _latestQuota = quota;
-                    Publish(s => s with { Quota = quota }, graph: null);
+                    Publish(s => s with { Quota = quota, QuotaAttempted = true }, graph: null);
+                }
+                else
+                {
+                    // Publish the completion even though there is nothing to
+                    // show. Without this the failure is silent in exactly the
+                    // way that matters: Quota stays null, and a surface that
+                    // reads null as "not yet" waits forever for an answer that
+                    // already came back.
+                    Publish(s => s with { QuotaAttempted = true }, graph: null);
                 }
             }
             finally
@@ -771,6 +803,25 @@ public sealed class DashboardModel
     /// The first slow refresh creates the snapshot; fast-lane results before
     /// that are parked on a placeholder graph-less state (dropped — the slow
     /// lane lands within a second on a warm cache).</summary>
+    /// <summary>The first snapshot, from whichever lane gets there first.
+    ///
+    /// <para>One function because there were two, and they had already drifted:
+    /// the reachable one seeded the quota payload and the cost-authority flag,
+    /// the other seeded the quota payload and the attempt flag, and neither
+    /// seeded all three. The attempt flag was added to the unreachable one —
+    /// every Publish caller passes a null graph, so only OnGraphPublished ever
+    /// builds a baseline — which is why a failed cold-start fetch went on
+    /// rendering as a request still in flight after being "fixed".</para>
+    ///
+    /// <para>Everything held outside the snapshot is seeded here, and nowhere
+    /// else. A second construction site is what let a field be remembered on
+    /// one path and forgotten on the other.</para></summary>
+    private Snapshot CreateBaseline(UsagePayload graph) =>
+        new(graph, null, _latestQuota, 0, [], DateTimeOffset.Now, _graphState.CostAuthoritative)
+        {
+            QuotaAttempted = _quotaAttempted,
+        };
+
     private void Publish(
         Func<Snapshot, Snapshot> update, UsagePayload? graph,
         Func<bool>? stillValid = null)
@@ -792,7 +843,7 @@ public sealed class DashboardModel
                     return; // fast lane cannot seed the snapshot
                 }
 
-                baseline = new Snapshot(graph, null, _latestQuota, 0, [], DateTimeOffset.Now);
+                baseline = CreateBaseline(graph);
                 DevLog.Write("first snapshot ready"); // cold-parse timing anchor
             }
 
