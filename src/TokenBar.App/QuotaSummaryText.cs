@@ -11,6 +11,15 @@ namespace TokenBar.App;
 /// alone cannot tell "still asking" from "asked and nothing reported a
 /// window" — Attempted, from whether the quota lane has produced a payload
 /// yet, is what tells them apart.</summary>
+/// <summary>The card's second row: the burn warning, the reassurance that
+/// replaces it when nothing is burning, or neither.</summary>
+public enum QuotaSummarySecondRow
+{
+    Burning,
+    Reassurance,
+    None,
+}
+
 public enum QuotaSummaryState
 {
     Ready,
@@ -75,6 +84,30 @@ public static class QuotaSummaryText
     /// "every": with four windows and one measurable, the wider wording
     /// would vouch for three nobody looked at.</summary>
     public static string PaceReassurance() => "Every measured window is under its expected pace".Localized();
+
+    /// <summary>Which second row the card shows, decided here rather than in
+    /// the view.
+    ///
+    /// <para>The rule has three arms and only one of them is obvious. A burn
+    /// warning <b>replaces</b> the reassurance rather than joining it: a slot
+    /// that is empty whenever nothing is wrong teaches the reader to ignore
+    /// it, and on real data nothing is wrong nearly always. The reassurance is
+    /// then gated on <c>PaceCheckedWindows</c> as well as on there being other
+    /// windows, because with pace off or the historical basis still learning
+    /// <c>Compute</c> returns null everywhere and <c>Burning</c> is null for
+    /// want of asking, not for want of anything to find — printing it there
+    /// vouches for a check that never ran.</para>
+    ///
+    /// <para>This lives in the text layer because the view lives in
+    /// DashboardView, which no test project compiles. Left inline there, "the
+    /// reassurance appears when nothing is burning and something was measured"
+    /// was a property nothing could assert, and the only way to observe it was
+    /// to catch the live data in that state.</para></summary>
+    public static QuotaSummarySecondRow SecondRow(QuotaSummary summary) =>
+        summary.Burning is not null ? QuotaSummarySecondRow.Burning
+        : summary.OtherWindows > 0 && summary.PaceCheckedWindows > 0
+            ? QuotaSummarySecondRow.Reassurance
+            : QuotaSummarySecondRow.None;
 
     public static string BurnHeadline(BurnWarning burning) =>
         $"{BurnName(burning)} · {burning.Label.Localized()}";

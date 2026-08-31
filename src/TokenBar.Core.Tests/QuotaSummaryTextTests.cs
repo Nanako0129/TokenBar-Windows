@@ -132,4 +132,62 @@ public class QuotaSummaryTextTests
         Assert.Equal("目前沒有訂閱回報使用時間窗。", QuotaSummaryText.NoWindowReporting());
         Assert.Equal("正在查詢 Agent 額度…", QuotaSummaryText.CheckingLimits());
     });
+
+    // --- SecondRow ---------------------------------------------------------
+    //
+    // Added after the reassurance row went missing on a real machine and could
+    // not be explained: the counts said it should render, the row helper was
+    // sound, the translation was present, and the live data flipped to a burn
+    // warning before the question could be settled. The decision was inline in
+    // the view, which no test compiles, so "it appears when nothing is burning
+    // and something was measured" was a property only observable by catching
+    // the data in that state.
+
+    [Fact]
+    public void SecondRowIsTheBurnWarningWhenSomethingIsBurning() =>
+        Assert.Equal(
+            QuotaSummarySecondRow.Burning,
+            QuotaSummaryText.SecondRow(SummaryWith(others: 7, paceChecked: 5, burning: true)));
+
+    // The burn warning REPLACES the reassurance; they never both show.
+    [Fact]
+    public void BurnWarningWinsEvenWhenTheReassuranceWouldAlsoQualify() =>
+        Assert.NotEqual(
+            QuotaSummarySecondRow.Reassurance,
+            QuotaSummaryText.SecondRow(SummaryWith(others: 7, paceChecked: 5, burning: true)));
+
+    [Fact]
+    public void SecondRowIsTheReassuranceWhenNothingIsBurningAndSomethingWasMeasured() =>
+        Assert.Equal(
+            QuotaSummarySecondRow.Reassurance,
+            QuotaSummaryText.SecondRow(SummaryWith(others: 7, paceChecked: 5, burning: false)));
+
+    // Nothing measured: Burning is null for want of asking, not for want of
+    // anything to find, so the reassurance would vouch for a check never run.
+    [Fact]
+    public void NothingIsShownWhenNoWindowWasMeasured() =>
+        Assert.Equal(
+            QuotaSummarySecondRow.None,
+            QuotaSummaryText.SecondRow(SummaryWith(others: 7, paceChecked: 0, burning: false)));
+
+    // One window and nothing to compare it to.
+    [Fact]
+    public void NothingIsShownWhenThereAreNoOtherWindows() =>
+        Assert.Equal(
+            QuotaSummarySecondRow.None,
+            QuotaSummaryText.SecondRow(SummaryWith(others: 0, paceChecked: 5, burning: false)));
+
+    private static QuotaSummary SummaryWith(int others, int paceChecked, bool burning) =>
+        new(
+            TightestClient: "claude",
+            TightestAccountKey: null,
+            TightestLabel: "Weekly",
+            RemainingPercent: 41,
+            ResetsAt: null,
+            OtherWindows: others,
+            OthersComfortable: others,
+            Burning: burning
+                ? new BurnWarning("codex", null, "Weekly", 12, null, null)
+                : null,
+            PaceCheckedWindows: paceChecked);
 }

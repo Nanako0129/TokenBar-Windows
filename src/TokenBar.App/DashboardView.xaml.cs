@@ -792,17 +792,32 @@ public sealed partial class DashboardView : UserControl
     private UIElement BuildOverview(DashboardModel.Snapshot snapshot)
     {
         var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(BuildUsageChartCard(snapshot));
-        stack.Children.Add(BuildQuotaSummary(snapshot));
-        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot)));
-        var trace = BuildTrace(snapshot);
-        if (trace is not null)
+        // Order comes from OverviewCards.RenderOrder, not from the sequence of
+        // these calls, so a test can see it. macOS got this same sequence wrong
+        // once and its pinned order is what caught it; this arrived at the same
+        // mistake independently, with the quota summary built directly above
+        // the limits card and the chart therefore ahead of it.
+        foreach (var card in OverviewCards.RenderOrder)
         {
-            stack.Children.Add(Ui.Card("Live session".Localized(), trace));
+            var element = card switch
+            {
+                OverviewCard.QuotaSummary => BuildQuotaSummary(snapshot),
+                OverviewCard.Chart => BuildUsageChartCard(snapshot),
+                OverviewCard.Limits => Ui.Card("Agent limits".Localized(), BuildLimits(snapshot)),
+                // The only optional one: absent when there is no live session.
+                OverviewCard.Trace => BuildTrace(snapshot) is { } trace
+                    ? Ui.Card("Live session".Localized(), trace)
+                    : null,
+                OverviewCard.Models => Ui.Card("Models".Localized(), BuildModelRows(snapshot, maxRows: 8)),
+                OverviewCard.Streaks => Ui.Card("Streaks".Localized(), BuildStreaks(snapshot)),
+                _ => throw new InvalidOperationException($"Unhandled overview card: {card}"),
+            };
+            if (element is not null)
+            {
+                stack.Children.Add(element);
+            }
         }
 
-        stack.Children.Add(Ui.Card("Models".Localized(), BuildModelRows(snapshot, maxRows: 8)));
-        stack.Children.Add(Ui.Card("Streaks".Localized(), BuildStreaks(snapshot)));
         return stack;
     }
 
@@ -1106,6 +1121,13 @@ public sealed partial class DashboardView : UserControl
         // flight. summary == null alone cannot tell that apart from "asked
         // and nothing reported a window" — QuotaSummaryText.State needs both.
         var attempted = snapshot.Quota is not null;
+        DevLog.Write(
+            $"quota-summary: attempted={attempted} summary={(summary is null ? "null" : "ok")} "
+                + $"others={summary?.OtherWindows.ToString() ?? "-"} "
+                + $"comfortable={summary?.OthersComfortable.ToString() ?? "-"} "
+                + $"paceChecked={summary?.PaceCheckedWindows.ToString() ?? "-"} "
+                + $"burning={(summary?.Burning is null ? "none" : "yes")} "
+                + $"mode={CurrentPaceMode()}");
 
         var stack = new StackPanel { Spacing = 7 };
         switch (QuotaSummaryText.State(summary, attempted))
@@ -1152,18 +1174,23 @@ public sealed partial class DashboardView : UserControl
         // every window and Burning is null because nothing was asked, not
         // because nothing was wrong — printing the reassurance then would
         // vouch for a check that never ran.
-        if (summary.Burning is { } burning)
+        switch (QuotaSummaryText.SecondRow(summary))
         {
-            var burn = new StackPanel { Spacing = 1 };
-            burn.Children.Add(Ui.Text(QuotaSummaryText.BurnHeadline(burning), 11, bold: true));
-            var detail = Ui.Text(QuotaSummaryText.BurnDetail(burning), 10);
-            detail.Foreground = Ui.BrushFromHex(PaceOrange);
-            burn.Children.Add(detail);
-            stack.Children.Add(QuotaSummaryRow("Burning fastest".Localized(), burn));
-        }
-        else if (summary.OtherWindows > 0 && summary.PaceCheckedWindows > 0)
-        {
-            stack.Children.Add(QuotaSummaryRow("Pace".Localized(), Ui.Dim(QuotaSummaryText.PaceReassurance(), 10)));
+            case QuotaSummarySecondRow.Burning:
+                var burning = summary.Burning!;
+                var burn = new StackPanel { Spacing = 1 };
+                burn.Children.Add(Ui.Text(QuotaSummaryText.BurnHeadline(burning), 11, bold: true));
+                var detail = Ui.Text(QuotaSummaryText.BurnDetail(burning), 10);
+                detail.Foreground = Ui.BrushFromHex(PaceOrange);
+                burn.Children.Add(detail);
+                stack.Children.Add(QuotaSummaryRow("Burning fastest".Localized(), burn));
+                break;
+            case QuotaSummarySecondRow.Reassurance:
+                stack.Children.Add(QuotaSummaryRow(
+                    "Pace".Localized(), Ui.Dim(QuotaSummaryText.PaceReassurance(), 10)));
+                break;
+            case QuotaSummarySecondRow.None:
+                break;
         }
 
         // Today's totals mirror the header's own today figure (same
@@ -1177,6 +1204,7 @@ public sealed partial class DashboardView : UserControl
                 Ui.Text(
                     QuotaSummaryText.TodayText(today.Tokens, today.Cost, snapshot.CostAuthoritative), 11, 0.85)));
         }
+
     }
 
     /// <summary>Label column fixed width so the rows align, matching the

@@ -34,6 +34,7 @@
     <Compile Include="..\TokenBar.App\GraphConsumerState.cs" Link="GraphConsumerState.cs" />
     <Compile Include="..\TokenBar.App\CostSurfaceProjection.cs" Link="CostSurfaceProjection.cs" />
     <Compile Include="..\TokenBar.App\AppViews.cs" Link="AppViews.cs" />
+    <Compile Include="..\TokenBar.App\OverviewCard.cs" Link="OverviewCard.cs" />
     <Compile Include="..\TokenBar.App\AppLanguage.cs" Link="AppLanguage.cs" />
     <Compile Include="..\TokenBar.App\DrillDownSummary.cs" Link="DrillDownSummary.cs" />
     <Compile Include="..\TokenBar.App\QuotaSummaryText.cs" Link="QuotaSummaryText.cs" />
