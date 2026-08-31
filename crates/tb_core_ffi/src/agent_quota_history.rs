@@ -346,6 +346,22 @@ pub(crate) struct ExportedSeries {
 /// hardening, it only tightens, and it is measured by
 /// `export_history_leaves_a_corrupt_store_untouched`.
 ///
+/// **`load_store_at_with_mode` carries four responsibilities and only two were
+/// meant to go.** Reaching past it dropped all four at once, and each of the two
+/// that were not supposed to go came back as a separate review finding:
+///
+/// | Responsibility | Intended |
+/// |---|---|
+/// | Quarantines the file on failure | dropped on purpose |
+/// | `save_store_atomic` on the way out | dropped on purpose |
+/// | `validate_store_at` | dropped by accident — see below |
+/// | Mutual exclusion against the writer, via the lock | dropped by accident — see `EXPORT_READ_ATTEMPTS` |
+///
+/// The lesson is worth more than either fix: removing a function because of one
+/// thing it does removes everything else it was doing, and only the reason for
+/// removing it gets thought about. Anything added here later should be checked
+/// against this table first.
+///
 /// **Skipping the quarantine is not a licence to skip the validation.** Those
 /// are two separable things that `load_store_at_with_mode` happens to do
 /// together, and taking the whole path out took the check with it: a store that
@@ -370,12 +386,49 @@ pub(crate) fn export_history() -> Result<Vec<ExportedSeries>, HistoryError> {
     export_history_at_with_mode(StorageMode::System, &path)
 }
 
+/// How many times the export re-reads a store that moved underneath it.
+///
+/// `read_owner_only_with_mode` verifies **after** reading that the handle it
+/// read is still the file at the path — `same_file` on unix, `verify_path_identity`
+/// under Windows secure storage. That check is written for a caller holding the
+/// history lock, where no writer can intervene. The export deliberately does not
+/// take the lock, so an ordinary recording transaction, which installs the new
+/// store with an atomic rename, turns a perfectly consistent read of the old
+/// file into an error and blanks the lens at random during normal refreshes.
+///
+/// Three attempts because a transaction replaces the file once; a retry lands on
+/// whichever side of the rename is now settled. This does not weaken the check
+/// it retries: every attempt re-opens and re-verifies from scratch, so a
+/// substituted path has to win the race on every attempt rather than on one.
+///
+/// Any read error retries, not just the identity one. The identity failure is an
+/// `InvalidInput` distinguished from its neighbour only by message text, and a
+/// guard that pins message text is a guard that gets relocated around. A
+/// genuinely persistent error costs two extra opens and then fails exactly as
+/// before.
+const EXPORT_READ_ATTEMPTS: usize = 3;
+
+fn read_store_bytes_with_retry(
+    mut read: impl FnMut() -> io::Result<Option<Vec<u8>>>,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut attempt = 1;
+    loop {
+        match read() {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if attempt >= EXPORT_READ_ATTEMPTS => return Err(error),
+            Err(_) => attempt += 1,
+        }
+    }
+}
+
 fn export_history_at_with_mode(
     mode: StorageMode,
     path: &Path,
 ) -> Result<Vec<ExportedSeries>, HistoryError> {
     // No history file yet is an empty lens, not a failure.
-    let Some(bytes) = read_owner_only_with_mode(mode, path).map_err(|_| HistoryError::Read)? else {
+    let Some(bytes) = read_store_bytes_with_retry(|| read_owner_only_with_mode(mode, path))
+        .map_err(|_| HistoryError::Read)?
+    else {
         return Ok(Vec::new());
     };
     let store = serde_json::from_slice::<Store>(&bytes).map_err(|_| HistoryError::Read)?;
@@ -6881,6 +6934,45 @@ mod tests {
             Ok(Vec::new())
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The race this stands in for cannot be scheduled deterministically, so the
+    /// retry is tested as the decision it is: the read fails the way a store
+    /// replaced mid-read fails, and the export tries again instead of blanking.
+    #[test]
+    fn export_history_retries_a_store_replaced_underneath_it() {
+        let mut attempts = 0;
+        let result = read_store_bytes_with_retry(|| {
+            attempts += 1;
+            if attempts < EXPORT_READ_ATTEMPTS {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "quota pace artifact changed while opening",
+                ))
+            } else {
+                Ok(Some(b"{}".to_vec()))
+            }
+        });
+
+        assert_eq!(attempts, EXPORT_READ_ATTEMPTS);
+        assert_eq!(result.unwrap(), Some(b"{}".to_vec()));
+    }
+
+    /// The budget has to end. A path that keeps failing is reported, not retried
+    /// until something else times out.
+    #[test]
+    fn export_history_gives_up_after_the_read_attempt_budget() {
+        let mut attempts = 0;
+        let result = read_store_bytes_with_retry(|| {
+            attempts += 1;
+            Err::<Option<Vec<u8>>, io::Error>(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        });
+
+        assert_eq!(attempts, EXPORT_READ_ATTEMPTS);
+        assert!(result.is_err());
     }
 
     /// A foreign `schema_version` parses fine and means nothing this fold can
