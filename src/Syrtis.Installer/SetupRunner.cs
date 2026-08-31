@@ -9,14 +9,13 @@ internal readonly struct SetupRunResult(int exitCode, string? logPath, string? l
 
     /// <summary>The log this run produced, or null when it produced none.
     /// Never merely "the path we asked Setup to use" — see
-    /// <see cref="SetupRunner.LogWrittenByThisRun"/>.</summary>
+    /// <see cref="SetupRunner.WrittenLog"/>.</summary>
     internal string? LogPath { get; } = logPath;
 
     /// <summary>Why Setup could not be <em>started</em>, or null when it ran.
     /// The distinction matters to what the Done page may say: when Setup never
     /// started it also never opened the log, so pointing the user at that path
-    /// shows them either nothing or — because the name is fixed — an unrelated
-    /// run from days ago.</summary>
+    /// would show them nothing at all.</summary>
     internal string? LaunchError { get; } = launchError;
 }
 
@@ -56,9 +55,11 @@ internal static class SetupRunner
     /// the process id alone — which is an argument, and the point of this
     /// method is not to need one. The random tail settles it outright.</para>
     ///
-    /// <para><see cref="LogWrittenByThisRun"/> stays, and is now belt to this
-    /// braces: uniqueness settles ownership, the timestamp still answers
-    /// whether Setup got far enough to write anything at all.</para></summary>
+    /// <para>This is also the <em>only</em> mechanism now. It was briefly
+    /// paired with a last-write comparison kept as a second line of defence,
+    /// and that was a mistake: once the name cannot collide, the timestamp adds
+    /// no information and can only be wrong. See
+    /// <see cref="WrittenLog"/>.</para></summary>
     internal static string NewLogPath() =>
         Path.Combine(
             Path.GetTempPath(),
@@ -109,40 +110,36 @@ internal static class SetupRunner
             CreateNoWindow = true,
         };
 
-        // Read the clock before starting, not after: anything Setup writes to
-        // the log necessarily happens later, so ">= startedUtc" is exactly the
-        // set of writes this run caused. DateTime.UtcNow is coarse (about 15
-        // ms) but it rounds down, so the reading can only be at or before the
-        // true launch instant, which keeps the comparison safe without a
-        // fudge factor.
-        var startedUtc = DateTime.UtcNow;
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Failed to start Setup.exe.");
         process.WaitForExit();
-        return new SetupRunResult(process.ExitCode, LogWrittenByThisRun(logPath, startedUtc));
+        return new SetupRunResult(process.ExitCode, WrittenLog(logPath));
     }
 
-    /// <summary>The log path when this run wrote it, null otherwise.
+    /// <summary>The log this run produced, or null when Setup never got far
+    /// enough to open one.
     ///
-    /// <para>An existence check is not enough and was shipped once believing
-    /// it was. Setup can start and fail before it ever opens the log, and an
-    /// existence check cannot see that — the test machine had a two-day-old
-    /// copy at the fixed path this used to use, so the Done page would have
-    /// offered an unrelated run's record as the explanation for a failure.
-    /// <see cref="NewLogPath"/> now removes the ownership half of that
-    /// question; this answers the remaining half, which is whether Setup wrote
-    /// anything at all.</para>
+    /// <para>Existence is the whole test, because <see cref="NewLogPath"/>
+    /// hands out a name no other run can hold. That was not always true: with
+    /// one fixed filename a leftover passed an existence check, which was
+    /// answered here with a last-write comparison against the launch instant,
+    /// and then uniqueness was added on top and the comparison kept as a
+    /// second line of defence.</para>
     ///
-    /// <para>Deleting the old file before launching was the alternative. This
-    /// does not touch the user's disk and has no failure mode of its own: if
-    /// the stamp cannot be read at all, the answer is "no log", which is the
-    /// safe direction.</para></summary>
-    internal static string? LogWrittenByThisRun(string logPath, DateTime startedUtc)
+    /// <para>Keeping it was wrong. Against a name that cannot collide the
+    /// comparison carries no information, and it can still be false: %TEMP% on
+    /// FAT or exFAT records write times to two-second granularity, and the
+    /// clock can step backwards mid-install. Either makes a log this run really
+    /// did write appear older than the moment the run began, and the Done page
+    /// would then report that no log exists — hiding the one artifact that
+    /// explains the failure, at the moment it is wanted. A redundant check that
+    /// can produce a false negative is not a second line of defence, it is a
+    /// second way to be wrong.</para></summary>
+    internal static string? WrittenLog(string logPath)
     {
         try
         {
-            var info = new FileInfo(logPath);
-            return info.Exists && info.LastWriteTimeUtc >= startedUtc ? logPath : null;
+            return File.Exists(logPath) ? logPath : null;
         }
         catch (Exception)
         {

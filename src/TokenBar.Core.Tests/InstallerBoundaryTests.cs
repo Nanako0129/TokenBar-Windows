@@ -4,7 +4,7 @@ namespace TokenBar.Core.Tests;
 
 // Covers the installer's boundary logic that is honestly testable from a net10
 // suite that also runs on macOS: SetupRunner.Quote (pure string), Install-
-// Request.Parse (pure argument parsing), SetupRunner.LogWrittenByThisRun
+// Request.Parse (pure argument parsing), SetupRunner.WrittenLog
 // (FileInfo + timestamps, cross-platform), and Strings.DetectChinese (a pure
 // tag -> bool function).
 //
@@ -124,27 +124,33 @@ public class InstallerBoundaryTests
         Assert.EndsWith(".log", path, StringComparison.Ordinal);
     }
 
-    // --- SetupRunner.LogWrittenByThisRun --------------------------------------
+    // --- SetupRunner.WrittenLog -----------------------------------------------
+
+    // This used to compare the file's last write against the moment the run
+    // started, to tell a leftover from a fresh log when every run shared one
+    // filename. NewLogPath removed that need, but the comparison was kept as a
+    // second line of defence — and against a name that cannot collide it
+    // carries no information and can still be false: %TEMP% on FAT or exFAT
+    // records write times to two-second granularity, and the clock can step
+    // backwards mid-install. Either would have made the Done page claim no log
+    // exists while the log explaining the failure sat right there.
 
     [Fact]
-    public void LogWrittenByThisRun_absent_file_is_null()
+    public void WrittenLog_absent_file_is_null()
     {
         var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        Assert.Null(SetupRunner.LogWrittenByThisRun(path, DateTime.UtcNow));
+        Assert.Null(SetupRunner.WrittenLog(path));
     }
 
     [Fact]
-    public void LogWrittenByThisRun_two_days_stale_is_null()
+    public void WrittenLog_present_file_is_the_path()
     {
         var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        File.WriteAllText(path, "stale");
+        File.WriteAllText(path, "written");
         try
         {
-            var start = DateTime.UtcNow;
-            File.SetLastWriteTimeUtc(path, start.AddDays(-2));
-
-            Assert.Null(SetupRunner.LogWrittenByThisRun(path, start));
+            Assert.Equal(path, SetupRunner.WrittenLog(path));
         }
         finally
         {
@@ -152,35 +158,19 @@ public class InstallerBoundaryTests
         }
     }
 
+    // The false negative the timestamp comparison could produce, pinned from
+    // the other side: a log whose stamp predates the run is still this run's
+    // log, because no other run could have been given this name.
     [Fact]
-    public void LogWrittenByThisRun_one_second_before_start_is_null()
+    public void WrittenLog_ignores_the_timestamp_entirely()
     {
         var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        File.WriteAllText(path, "just before");
+        File.WriteAllText(path, "written, but with an older stamp");
         try
         {
-            var start = DateTime.UtcNow;
-            File.SetLastWriteTimeUtc(path, start.AddSeconds(-1));
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddDays(-2));
 
-            Assert.Null(SetupRunner.LogWrittenByThisRun(path, start));
-        }
-        finally
-        {
-            File.Delete(path);
-        }
-    }
-
-    [Fact]
-    public void LogWrittenByThisRun_written_after_start_returns_path()
-    {
-        var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        var start = DateTime.UtcNow;
-        File.WriteAllText(path, "fresh");
-        try
-        {
-            File.SetLastWriteTimeUtc(path, start.AddSeconds(1));
-
-            Assert.Equal(path, SetupRunner.LogWrittenByThisRun(path, start));
+            Assert.Equal(path, SetupRunner.WrittenLog(path));
         }
         finally
         {
