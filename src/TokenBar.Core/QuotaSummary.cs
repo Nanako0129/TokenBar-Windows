@@ -38,6 +38,11 @@ public sealed record QuotaSummary(
     string TightestLabel,
     double RemainingPercent,
     string? ResetsAt,
+    // The engine's own English reset text, carried alongside the timestamp
+    // because the countdown's precedence needs both: it stands in when the
+    // timestamp is absent or will not parse. Without it the summary lost a
+    // countdown the Agent-limits row directly below was still showing.
+    string? ResetTextFallback,
     // Windows other than the tightest that carry a usable reading.
     int OtherWindows,
     // How many of those sit at or above ComfortablePercent. Reported rather
@@ -152,6 +157,7 @@ public static class QuotaSummaryFold
             TightestLabel: tightest.Window.Label,
             RemainingPercent: tightest.Window.RemainingPercent,
             ResetsAt: tightest.Window.ResetsAt,
+            ResetTextFallback: tightest.Window.ResetText,
             OtherWindows: others.Count,
             OthersComfortable: others.Count(v => v >= ComfortablePercent),
             Burning: burning,

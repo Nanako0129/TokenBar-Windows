@@ -152,6 +152,25 @@ public sealed record UsagePace(
         return "Resets in {0}".Localized(DurationText(minutes * 60d));
     }
 
+    /// <summary>The countdown to show for a window: derived from the
+    /// structured timestamp when it parses, and the engine's own text when it
+    /// does not or when there is no timestamp at all.
+    ///
+    /// <para>One function because the precedence is three-way and was written
+    /// out twice. The Agent-limits row had it complete; the Overview summary
+    /// had only the first arm, so a window whose timestamp will not parse —
+    /// supported, and what the engine's English compatibility field exists for
+    /// — showed a countdown next to the bar and none in the summary above it.
+    /// Two surfaces disagreeing about the same clock is the exact drift the
+    /// summary was supposed to be immune to by reusing this file.</para>
+    ///
+    /// <para>Takes the two values rather than a window so the summary need not
+    /// carry one, and so both callers cannot reach for different fields.</para>
+    /// </summary>
+    public static string? ResetTextOr(string? resetsAt, string? engineText, DateTimeOffset now) =>
+        resetsAt is { } value ? ResetText(value, now) ?? engineText : engineText;
+
+
     public static string DurationText(double seconds)
     {
         var m = (int)Math.Round(seconds / 60, MidpointRounding.AwayFromZero);

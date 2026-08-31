@@ -14,16 +14,26 @@ public class QuotaSummaryTextTests
 
     private static readonly DateTimeOffset Now = DateTimeOffset.FromUnixTimeSeconds(1_750_000_000);
 
+    // `withoutResetsAt` rather than letting `resetsAt: null` mean it: the
+    // helper defaults an unspecified timestamp to a live one, so `?? default`
+    // collapsed "not specified" and "explicitly absent" into the same value and
+    // the first two reset-precedence tests below silently exercised neither
+    // case. Same shape as the argument defect this suite already pins — a
+    // signal that cannot carry the distinction being asked of it.
     private static QuotaSummary Summary(
         int otherWindows = 0, int othersComfortable = 0,
-        BurnWarning? burning = null, int paceChecked = 0, string? resetsAt = null) =>
+        BurnWarning? burning = null, int paceChecked = 0, string? resetsAt = null,
+        string? resetTextFallback = null, bool withoutResetsAt = false) =>
         new(
             TightestClient: "claude",
             TightestAccountKey: null,
             TightestLabel: "Weekly",
             RemainingPercent: 42,
-            ResetsAt: resetsAt ?? Now.AddSeconds(2 * 86_400 + 2 * 3_600).UtcDateTime
-                .ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+            ResetsAt: withoutResetsAt
+                ? null
+                : resetsAt ?? Now.AddSeconds(2 * 86_400 + 2 * 3_600).UtcDateTime
+                    .ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+            ResetTextFallback: resetTextFallback,
             OtherWindows: otherWindows,
             OthersComfortable: othersComfortable,
             Burning: burning,
@@ -213,6 +223,7 @@ public class QuotaSummaryTextTests
             TightestLabel: "Weekly",
             RemainingPercent: 41,
             ResetsAt: null,
+            ResetTextFallback: null,
             OtherWindows: others,
             OthersComfortable: others,
             Burning: burning
@@ -271,4 +282,52 @@ public class QuotaSummaryTextTests
         Assert.Equal(
             QuotaSummaryState.AllHidden,
             QuotaSummaryText.State(null, attempted: false, allHidden: true));
+
+    // --- reset text precedence --------------------------------------------
+    //
+    // Three-way, and it was written out twice: the Agent-limits row had it
+    // complete, this had only the first arm. A window whose timestamp will not
+    // parse — supported, and what the engine's English compatibility field is
+    // for — showed a countdown beside the bar and none in the summary directly
+    // above it. UsagePace.ResetTextOr is now the only statement of the rule.
+
+    [Fact]
+    public void DetailFallsBackToTheEngineTextWhenThereIsNoTimestamp()
+    {
+        var detail = QuotaSummaryText.TightestDetail(
+            Summary(withoutResetsAt: true, resetTextFallback: "resets in 3h"), Now);
+
+        Assert.Contains("resets in 3h", detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DetailFallsBackToTheEngineTextWhenTheTimestampWillNotParse()
+    {
+        var detail = QuotaSummaryText.TightestDetail(
+            Summary(resetsAt: "not-a-timestamp", resetTextFallback: "resets in 3h"), Now);
+
+        Assert.Contains("resets in 3h", detail, StringComparison.Ordinal);
+    }
+
+    // The derived countdown wins when it can be derived: it follows the UI
+    // language, the engine's field is English only.
+    [Fact]
+    public void DetailPrefersTheDerivedCountdownOverTheEngineText()
+    {
+        var detail = QuotaSummaryText.TightestDetail(
+            Summary(resetTextFallback: "resets in 3h"), Now);
+
+        Assert.DoesNotContain("resets in 3h", detail, StringComparison.Ordinal);
+    }
+
+    // Neither available: the percentage stands alone rather than trailing a
+    // separator with nothing after it.
+    [Fact]
+    public void DetailIsJustThePercentageWhenNeitherIsAvailable()
+    {
+        var detail = QuotaSummaryText.TightestDetail(
+            Summary(withoutResetsAt: true, resetTextFallback: null), Now);
+
+        Assert.DoesNotContain("·", detail, StringComparison.Ordinal);
+    }
 }

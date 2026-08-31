@@ -2065,9 +2065,7 @@ public sealed partial class DashboardView : UserControl
         // UI language; window.ResetText is the engine's English compatibility
         // field and only stands in when the timestamp will not parse. Same
         // precedence as macOS AgentLimitsCard.
-        var resetText = window.ResetsAt is { } resetsAt
-            ? UsagePace.ResetText(resetsAt, DateTimeOffset.Now) ?? window.ResetText
-            : window.ResetText;
+        var resetText = UsagePace.ResetTextOr(window.ResetsAt, window.ResetText, DateTimeOffset.Now);
         var headerTrailing = Ui.Text(
             classic ? resetText ?? row.AmountText : resetText ?? "",
             10, 0.6);

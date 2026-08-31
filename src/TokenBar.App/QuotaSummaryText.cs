@@ -81,7 +81,7 @@ public static class QuotaSummaryText
     {
         var left = "{0}% left".Localized(
             (int)Math.Round(summary.RemainingPercent, MidpointRounding.AwayFromZero));
-        var reset = summary.ResetsAt is { } resetsAt ? UsagePace.ResetText(resetsAt, now) : null;
+        var reset = UsagePace.ResetTextOr(summary.ResetsAt, summary.ResetTextFallback, now);
         return reset is null ? left : $"{left} · {reset}";
     }
 
