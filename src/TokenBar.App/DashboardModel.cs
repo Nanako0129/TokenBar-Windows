@@ -605,14 +605,7 @@ public sealed class DashboardModel
             var baseline = Current;
             if (baseline is null)
             {
-                baseline = new Snapshot(
-                    publication.Payload,
-                    null,
-                    _latestQuota,
-                    0,
-                    [],
-                    DateTimeOffset.Now,
-                    _graphState.CostAuthoritative);
+                baseline = CreateBaseline(publication.Payload);
                 DevLog.Write("first snapshot ready");
             }
 
@@ -810,6 +803,25 @@ public sealed class DashboardModel
     /// The first slow refresh creates the snapshot; fast-lane results before
     /// that are parked on a placeholder graph-less state (dropped — the slow
     /// lane lands within a second on a warm cache).</summary>
+    /// <summary>The first snapshot, from whichever lane gets there first.
+    ///
+    /// <para>One function because there were two, and they had already drifted:
+    /// the reachable one seeded the quota payload and the cost-authority flag,
+    /// the other seeded the quota payload and the attempt flag, and neither
+    /// seeded all three. The attempt flag was added to the unreachable one —
+    /// every Publish caller passes a null graph, so only OnGraphPublished ever
+    /// builds a baseline — which is why a failed cold-start fetch went on
+    /// rendering as a request still in flight after being "fixed".</para>
+    ///
+    /// <para>Everything held outside the snapshot is seeded here, and nowhere
+    /// else. A second construction site is what let a field be remembered on
+    /// one path and forgotten on the other.</para></summary>
+    private Snapshot CreateBaseline(UsagePayload graph) =>
+        new(graph, null, _latestQuota, 0, [], DateTimeOffset.Now, _graphState.CostAuthoritative)
+        {
+            QuotaAttempted = _quotaAttempted,
+        };
+
     private void Publish(
         Func<Snapshot, Snapshot> update, UsagePayload? graph,
         Func<bool>? stillValid = null)
@@ -831,10 +843,7 @@ public sealed class DashboardModel
                     return; // fast lane cannot seed the snapshot
                 }
 
-                baseline = new Snapshot(graph, null, _latestQuota, 0, [], DateTimeOffset.Now)
-                {
-                    QuotaAttempted = _quotaAttempted,
-                };
+                baseline = CreateBaseline(graph);
                 DevLog.Write("first snapshot ready"); // cold-parse timing anchor
             }
 
