@@ -56,7 +56,7 @@ public static class QuotaLensText
     /// <para><paramref name="attempted"/> is a fact about the REQUEST, not about
     /// the result — <c>grid is null</c> cannot tell "asked and empty" from "not
     /// asked", because both leave it null.</para></summary>
-    public static QuotaHeatmapState State(QuotaHeatmap? grid, bool attempted) =>
+    public static QuotaHeatmapState HeatmapState(QuotaHeatmap? grid, bool attempted) =>
         grid is { IsEmpty: false } ? QuotaHeatmapState.Grid
         : grid is { HasMovement: true } ? QuotaHeatmapState.Unplaced
         : attempted ? QuotaHeatmapState.NoMovement
@@ -64,7 +64,7 @@ public static class QuotaLensText
 
     /// <summary>The strip card's state. Same <paramref name="attempted"/>
     /// contract as the heatmap's: an empty list is not an answer.</summary>
-    public static QuotaStripState State(IReadOnlyList<QuotaWindowSummary> summaries, bool attempted) =>
+    public static QuotaStripState StripState(IReadOnlyList<QuotaWindowSummary> summaries, bool attempted) =>
         summaries.Count > 0 ? QuotaStripState.Rows
         : attempted ? QuotaStripState.NoCompletedWindows
         : QuotaStripState.Loading;

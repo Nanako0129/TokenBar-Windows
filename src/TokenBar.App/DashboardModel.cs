@@ -265,10 +265,28 @@ public sealed class DashboardModel
         /// than deriving it; this port had let it degrade into a
         /// derivation.</para></summary>
         public bool QuotaAttempted { get; init; }
+
+        /// <summary>The persisted quota curves, for the Quota lens's two
+        /// cards. A third lazy lens, read straight from the store — it does not
+        /// depend on the client selection the way Hourly/Agents do.</summary>
+        public IReadOnlyList<QuotaHistorySeries>? QuotaHistory { get; init; }
+
+        /// <summary>Whether the history READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaAttempted"/>, and a separate one: that flag reports
+        /// the agent-usage lane, this one the store lane, and a lens that read
+        /// the wrong lane's progress would announce "nothing recorded yet"
+        /// while its own fetch was still in flight.
+        ///
+        /// <para><c>QuotaHistory is not null</c> cannot answer it: a read that
+        /// returned no series and a read that has not happened both leave it
+        /// null.</para></summary>
+        public bool QuotaHistoryAttempted { get; init; }
     }
 
     private volatile bool _hourlyWanted;
     private volatile bool _agentsWanted;
+    private volatile bool _quotaHistoryWanted;
 
     /// <summary>Marks a lazy lens as needed and fetches it once; later slow
     /// refreshes keep it current.</summary>
@@ -284,9 +302,15 @@ public sealed class DashboardModel
         RequestLazyRefresh();
     }
 
+    public void EnsureQuotaHistory()
+    {
+        _quotaHistoryWanted = true;
+        RequestLazyRefresh();
+    }
+
     private void RequestLazyRefresh()
     {
-        if (!_hourlyWanted && !_agentsWanted)
+        if (!_hourlyWanted && !_agentsWanted && !_quotaHistoryWanted)
         {
             return;
         }
@@ -321,6 +345,7 @@ public sealed class DashboardModel
     {
         var hourly = _hourlyWanted;
         var agents = _agentsWanted;
+        var quotaHistory = _quotaHistoryWanted;
         string[] clients;
         long generation;
         lock (_selectionGate)
@@ -351,6 +376,13 @@ public sealed class DashboardModel
                 ? TryFetch(() => TbCore.AgentsReport(year, clients), "agents") : null;
         }
 
+        // Selection-independent: the store is keyed by provider/account/window,
+        // not by the client tabs, so this is read outside the branch above and
+        // survives the staleness check below.
+        var history = quotaHistory
+            ? TryFetch(TbCore.QuotaHistory, "quotaHistory")
+            : null;
+
         if (!SelectionStillValid(year, generation))
         {
             RequestLazyRefresh();
@@ -361,6 +393,14 @@ public sealed class DashboardModel
         {
             Hourly = hourly ? hourlyReport : s.Hourly,
             Agents = agents ? agentsReport : s.Agents,
+            // A failed read keeps whatever was already there rather than
+            // replacing a complete set with an empty one — the "absent because
+            // we could not ask" mistake, arriving as a partial result.
+            QuotaHistory = history ?? s.QuotaHistory,
+            // A failed read publishes completion with nothing to show, for the
+            // same reason the agent-usage lane does: a lens that reads null as
+            // "not yet" would wait forever for an answer that already came back.
+            QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
         }, graph: null, stillValid: () => SelectionStillValid(year, generation));
     }
 
@@ -387,6 +427,9 @@ public sealed class DashboardModel
             return;
         }
 
+        // QuotaHistory is deliberately untouched: it is not filtered by the
+        // client selection, so clearing it here would drop a valid read and
+        // send the Quota lens back to its loading line for no reason.
         Current = current with
         {
             Hourly = emptySelection ? new HourlyReport([], 0) : null,

@@ -30,23 +30,23 @@ public class QuotaLensTextTests
     {
         Assert.Equal(
             QuotaHeatmapState.Grid,
-            QuotaLensText.State(Grid(total: 12), attempted: true));
+            QuotaLensText.HeatmapState(Grid(total: 12), attempted: true));
 
         // Total == 0 with movement that could not be placed. This must NOT fall
         // through to "nothing recorded yet": that states the opposite of the
         // truth and hides the one line explaining it.
         Assert.Equal(
             QuotaHeatmapState.Unplaced,
-            QuotaLensText.State(Grid(total: 0, unplaced: 7), attempted: true));
+            QuotaLensText.HeatmapState(Grid(total: 0, unplaced: 7), attempted: true));
 
         // The pair that differs only in `attempted`, which is the whole point:
         // a card that has lost the distinction passes every assertion above.
         Assert.Equal(
             QuotaHeatmapState.NoMovement,
-            QuotaLensText.State(Grid(), attempted: true));
+            QuotaLensText.HeatmapState(Grid(), attempted: true));
         Assert.Equal(
             QuotaHeatmapState.Loading,
-            QuotaLensText.State(Grid(), attempted: false));
+            QuotaLensText.HeatmapState(Grid(), attempted: false));
     }
 
     // A lazy lens fetches on first visit, so a null grid before the fetch is the
@@ -54,8 +54,8 @@ public class QuotaLensTextTests
     [Fact]
     public void NoGridYetIsLoadingUntilTheFetchHasBeenAttempted()
     {
-        Assert.Equal(QuotaHeatmapState.Loading, QuotaLensText.State((QuotaHeatmap?)null, attempted: false));
-        Assert.Equal(QuotaHeatmapState.NoMovement, QuotaLensText.State((QuotaHeatmap?)null, attempted: true));
+        Assert.Equal(QuotaHeatmapState.Loading, QuotaLensText.HeatmapState(null, attempted: false));
+        Assert.Equal(QuotaHeatmapState.NoMovement, QuotaLensText.HeatmapState(null, attempted: true));
     }
 
     [Fact]
@@ -63,13 +63,13 @@ public class QuotaLensTextTests
     {
         Assert.Equal(
             QuotaStripState.Rows,
-            QuotaLensText.State([Summary(40)], attempted: true));
+            QuotaLensText.StripState([Summary(40)], attempted: true));
         Assert.Equal(
             QuotaStripState.NoCompletedWindows,
-            QuotaLensText.State([], attempted: true));
+            QuotaLensText.StripState([], attempted: true));
         Assert.Equal(
             QuotaStripState.Loading,
-            QuotaLensText.State([], attempted: false));
+            QuotaLensText.StripState([], attempted: false));
     }
 
     [Fact]
@@ -124,6 +124,57 @@ public class QuotaLensTextTests
         Assert.Equal("No allowance consumed in this slot", QuotaLensText.SlotEmpty());
         Assert.Equal("Fri 16:00", QuotaLensText.SlotHeader(weekday: 4, hour: 16));
         Assert.Equal("Mon 00:00", QuotaLensText.SlotHeader(weekday: 0, hour: 0));
+    }
+
+    // ---- i18n ----------------------------------------------------------
+    //
+    // Against the *shipped* strings-zh-Hant.json (the csproj copies it beside
+    // the test assembly), not a fixture: the failure being guarded against is a
+    // Localized() call site whose key was never added to that file, and against
+    // a fixture written next to the test that failure is unreachable. Each card
+    // shows one state at a time, so no screenshot can prove the others have
+    // entries — only driving each branch can.
+    [Fact]
+    public void EveryStringTheCardsCanShowHasATableEntry()
+    {
+        var grid = Grid(total: 5, unplaced: 7, days: 21);
+        Func<string?>[] surfaces =
+        [
+            QuotaLensText.StripTitle,
+            () => QuotaLensText.StripSubtitle([Summary(40)]),
+            () => QuotaLensText.Headline(Summary(40)),
+            () => QuotaLensText.Headline(Summary(100)),
+            () => QuotaLensText.WindowCount(9),
+            QuotaLensText.NoCompletedWindows,
+            () => QuotaLensText.BarAge(0),
+            () => QuotaLensText.BarAge(3),
+            () => QuotaLensText.BarConsumed(42),
+            QuotaLensText.RanOut,
+            QuotaLensText.HeatmapTitle,
+            () => QuotaLensText.HeatmapSubtitle(grid),
+            () => QuotaLensText.UnplacedBody(7),
+            () => QuotaLensText.Footnote(grid),
+            QuotaLensText.NoMovement,
+            QuotaLensText.Loading,
+            () => QuotaLensText.SlotHeader(weekday: 4, hour: 16),
+            QuotaLensText.SlotEmpty,
+            () => QuotaLensText.SlotSpend(72),
+            () => AppViews.Label(AppView.Quota),
+        ];
+
+        var english = surfaces.Select(surface => surface()).ToList();
+        Localization.Load("zh-Hant", AppContext.BaseDirectory);
+        try
+        {
+            for (var i = 0; i < surfaces.Length; i++)
+            {
+                Assert.NotEqual(english[i], surfaces[i]());
+            }
+        }
+        finally
+        {
+            Localization.Load("en", AppContext.BaseDirectory);
+        }
     }
 
     // The strip is oldest-to-newest, so the newest bar is zero windows ago.

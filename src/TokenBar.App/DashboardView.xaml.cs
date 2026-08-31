@@ -119,7 +119,7 @@ public sealed partial class DashboardView : UserControl
         };
 
         // In-flyout shortcuts, the macOS ⌘ set on Ctrl: Esc/Ctrl+W close,
-        // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..6 lenses,
+        // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..8 lenses,
         // Ctrl+[ / Ctrl+] cycle.
         // Esc yields to an open transient (the year menu): light-dismiss
         // should collapse the popup, not slide the whole flyout away.
@@ -415,6 +415,11 @@ public sealed partial class DashboardView : UserControl
         if (view == AppView.Agents)
         {
             _model?.EnsureAgents();
+        }
+
+        if (view == AppView.Quota)
+        {
+            _model?.EnsureQuotaHistory();
         }
 
         UpdateTabChrome();
@@ -750,6 +755,7 @@ public sealed partial class DashboardView : UserControl
         DetachGraph3DContentHost();
         UIElement content = _view switch
         {
+            AppView.Quota => BuildQuota(_snapshot),
             AppView.Models => BuildModels(_snapshot),
             AppView.Monthly => BuildMonthly(_snapshot),
             AppView.Daily => BuildDaily(_snapshot),

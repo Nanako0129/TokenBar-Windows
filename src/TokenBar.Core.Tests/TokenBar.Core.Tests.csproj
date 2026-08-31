@@ -39,6 +39,7 @@
     <Compile Include="..\TokenBar.App\DrillDownSummary.cs" Link="DrillDownSummary.cs" />
     <Compile Include="..\TokenBar.App\QuotaSummaryText.cs" Link="QuotaSummaryText.cs" />
     <Compile Include="..\TokenBar.App\QuotaLensText.cs" Link="QuotaLensText.cs" />
+    <Compile Include="..\TokenBar.App\QuotaLensData.cs" Link="QuotaLensData.cs" />
     <!-- Syrtis.Installer's boundary logic, pulled in for the same reason as
          the App sources above: none of these five files references
          System.Windows.Forms, so they compile as-is under net10. Deliberately
