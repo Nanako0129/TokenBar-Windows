@@ -515,24 +515,42 @@ if (-not (Test-Path -LiteralPath $wrapperExePath -PathType Leaf)) {
 # nothing here locks the file this script is about to overwrite), and refuse
 # to ship unless its embedded payload is byte-for-byte this invocation's own
 # Velopack Setup.exe.
-$wrapperAssembly = [Reflection.Assembly]::LoadFrom($wrapperExePath)
-$payloadStream = $wrapperAssembly.GetManifestResourceStream("Syrtis.Installer.payload.setup.exe")
-if ($null -eq $payloadStream) {
+#
+# The read happens in a CHILD PROCESS, and that is not incidental. Every
+# wrapper this script builds has the same assembly identity
+# ("Syrtis.Installer, Version=<repo version>"), and Assembly.LoadFrom loads
+# into the process-wide default context. Packing two RIDs from one PowerShell
+# session therefore failed the second one -- measured on the host:
+#
+#   Could not load file or assembly 'Syrtis.Installer, Version=0.2.2.0,
+#   Culture=neutral, PublicKeyToken=null'. Assembly with same name is
+#   already loaded
+#
+# A guard whose whole purpose is to catch a cross-channel payload was
+# rejecting a correct package for a reason that had nothing to do with it.
+# A fresh process cannot collide with anything; a collectible
+# AssemblyLoadContext would also work and is more moving parts for the same
+# answer.
+$readPayloadHash = @'
+param([string]$WrapperPath)
+$ErrorActionPreference = "Stop"
+$asm = [Reflection.Assembly]::LoadFrom($WrapperPath)
+$stream = $asm.GetManifestResourceStream("Syrtis.Installer.payload.setup.exe")
+if ($null -eq $stream) { exit 2 }
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $bytes = $sha.ComputeHash($stream) } finally { $sha.Dispose(); $stream.Dispose() }
+[System.BitConverter]::ToString($bytes).Replace("-", "")
+'@
+$readerScript = Join-Path $wrapperBuildDir "read-payload-hash.ps1"
+Set-Content -LiteralPath $readerScript -Value $readPayloadHash -Encoding utf8
+$payloadSha256 = (& pwsh -NoProfile -NonInteractive -File $readerScript -WrapperPath $wrapperExePath) | Select-Object -Last 1
+if ($LASTEXITCODE -eq 2) {
     throw "Install wizard wrapper carries no embedded payload resource: $wrapperExePath"
 }
-try {
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $payloadHashBytes = $sha256.ComputeHash($payloadStream)
-        $payloadSha256 = [System.BitConverter]::ToString($payloadHashBytes).Replace("-", "")
-    }
-    finally {
-        $sha256.Dispose()
-    }
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($payloadSha256)) {
+    throw "Could not read the embedded payload from $wrapperExePath (exit $LASTEXITCODE)."
 }
-finally {
-    $payloadStream.Dispose()
-}
+$payloadSha256 = $payloadSha256.Trim()
 if ($payloadSha256 -ne $velopackSetupSha256) {
     throw ("Embedded payload SHA-256 mismatch: wrapper carries {0}, this invocation's Velopack Setup.exe is {1}. " -f `
         $payloadSha256, $velopackSetupSha256) + `
