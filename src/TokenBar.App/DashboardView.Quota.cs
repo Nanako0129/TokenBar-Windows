@@ -72,6 +72,12 @@ public sealed partial class DashboardView
         var stack = new StackPanel { Spacing = 10 };
         stack.Children.Add(BuildQuotaStripCard(summaries, attempted));
         stack.Children.Add(BuildQuotaHeatmapCard(windows, grids, attempted));
+        // The Agent-limits card closes the lens on macOS, below the heatmap.
+        // The same builder the Overview uses, deliberately: this card answers
+        // "where does the allowance stand right now" while the two above answer
+        // "where has it gone", and a second implementation of the first
+        // question would be free to disagree with the first one.
+        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot)));
         return stack;
     }
 
