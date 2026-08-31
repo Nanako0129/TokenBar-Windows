@@ -1195,17 +1195,27 @@ public sealed partial class DashboardView : UserControl
                 break;
         }
 
-        // Today's totals mirror the header's own today figure (same
-        // PerDayMap lookup, same cost-authority policy) rather than a
-        // separately scoped number, so the two can't disagree.
+        // Today's totals mirror the header's own today figure: same PerDayMap
+        // lookup, same cost-authority policy, and — the part this comment
+        // previously claimed and did not deliver — the same treatment of a day
+        // with no entry. The header renders `today?.Tokens ?? 0`, so it commits
+        // to showing a zero; gating this row on TryGetValue made the two
+        // surfaces disagree on exactly the inactive days, six centimetres
+        // apart, while the comment above them asserted they could not.
+        //
+        // macOS omits its row here, and does not face the choice: its Overview
+        // has no separate today field to contradict. Windows does, so agreeing
+        // with the header that already ships beats matching a platform whose
+        // header does not exist.
         var stats = _selectedStats ?? new UsageStats(snapshot.Graph, _selectedSet);
-        if (stats.PerDayMap.TryGetValue(Format.TodayKey(), out var today))
-        {
-            stack.Children.Add(QuotaSummaryRow(
-                "Today".Localized(),
-                Ui.Text(
-                    QuotaSummaryText.TodayText(today.Tokens, today.Cost, snapshot.CostAuthoritative), 11, 0.85)));
-        }
+        stats.PerDayMap.TryGetValue(Format.TodayKey(), out var today);
+        stack.Children.Add(QuotaSummaryRow(
+            "Today".Localized(),
+            Ui.Text(
+                QuotaSummaryText.TodayText(
+                    today?.Tokens ?? 0, today?.Cost ?? 0, snapshot.CostAuthoritative),
+                11,
+                0.85)));
 
     }
 

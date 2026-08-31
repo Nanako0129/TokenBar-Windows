@@ -352,4 +352,27 @@ public class QuotaSummaryTextTests
         // The claim must hold for a window sitting exactly on the threshold.
         Assert.DoesNotContain("all above", text, StringComparison.Ordinal);
     }
+
+    // The header renders today as `today?.Tokens ?? 0`, so it shows a zero on
+    // a day with no entry. The summary row sits centimetres below it and must
+    // say the same thing; gating the row on the map entry made the two
+    // disagree on exactly the inactive days. TodayText has always accepted
+    // zero — the branch was simply unreachable from here, which is what a
+    // wrongly-placed gate looks like from the inside.
+    [Fact]
+    public void TodayTextRendersAZeroDayRatherThanNothing()
+    {
+        var text = QuotaSummaryText.TodayText(0, 0, authoritative: true);
+
+        Assert.False(string.IsNullOrWhiteSpace(text));
+        Assert.Contains("0", text, StringComparison.Ordinal);
+    }
+
+    // Zero tokens with no cost authority must not fabricate a price. The
+    // unpriced day sums to exactly zero, and "$0.00" is a number where the
+    // honest answer is that nothing is known yet.
+    [Fact]
+    public void TodayTextDoesNotInventAPriceForAnUnpricedZeroDay() =>
+        Assert.DoesNotContain(
+            "$0.00", QuotaSummaryText.TodayText(0, 0, authoritative: false), StringComparison.Ordinal);
 }
