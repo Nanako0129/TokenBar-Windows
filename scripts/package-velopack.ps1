@@ -480,6 +480,87 @@ $setupPath = Join-Path $releasesRoot $expectedSetupName
 if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
     throw "Velopack releases missing expected Setup.exe: $expectedSetupName"
 }
+
+# Build the install wizard with THIS INVOCATION's Velopack Setup.exe embedded,
+# and replace the Setup.exe in $releasesRoot with that wrapper -- one file,
+# same name, before the size-budget assertion below, so that assertion
+# measures the file that actually ships. A per-channel intermediate directory
+# keeps this pack's wrapper build isolated from any other channel packed into
+# the same $outputRootResolved.
+#
+# The SHA-256 of the just-produced Velopack Setup.exe is captured BEFORE the
+# build, from $setupPath, which nothing has touched yet.
+$velopackSetupSha256 = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash
+
+$wrapperProject = Join-Path $repoRoot "src\Syrtis.Installer\Syrtis.Installer.csproj"
+$wrapperBuildDir = Join-Path $outputRootResolved ("installer-wrapper\{0}" -f $channel)
+Invoke-Captured -Command "dotnet" -Arguments @(
+    "build", $wrapperProject,
+    "-c", "Release",
+    "-p:SyrtisPayloadPath=$setupPath",
+    "-o", $wrapperBuildDir
+) -FailureMessage "Install wizard wrapper build failed"
+
+$wrapperExePath = Join-Path $wrapperBuildDir "Syrtis.Installer.exe"
+if (-not (Test-Path -LiteralPath $wrapperExePath -PathType Leaf)) {
+    throw "Install wizard wrapper build did not produce: $wrapperExePath"
+}
+
+# Nothing else in the pipeline would catch a stale or cross-channel payload:
+# write-package-evidence.ps1 validates the Setup.exe by name and size only,
+# and (measured) the Full/win-x64 Setup at 83,721,388 bytes fits under the
+# Full/win-arm64 budget of 87,104,109 -- so an arm64-named installer carrying
+# the x64 payload would pass every existing gate. Load the just-built wrapper
+# by reflection, from the intermediate directory (never from $setupPath, so
+# nothing here locks the file this script is about to overwrite), and refuse
+# to ship unless its embedded payload is byte-for-byte this invocation's own
+# Velopack Setup.exe.
+#
+# The read happens in a CHILD PROCESS, and that is not incidental. Every
+# wrapper this script builds has the same assembly identity
+# ("Syrtis.Installer, Version=<repo version>"), and Assembly.LoadFrom loads
+# into the process-wide default context. Packing two RIDs from one PowerShell
+# session therefore failed the second one -- measured on the host:
+#
+#   Could not load file or assembly 'Syrtis.Installer, Version=0.2.2.0,
+#   Culture=neutral, PublicKeyToken=null'. Assembly with same name is
+#   already loaded
+#
+# A guard whose whole purpose is to catch a cross-channel payload was
+# rejecting a correct package for a reason that had nothing to do with it.
+# A fresh process cannot collide with anything; a collectible
+# AssemblyLoadContext would also work and is more moving parts for the same
+# answer.
+$readPayloadHash = @'
+param([string]$WrapperPath)
+$ErrorActionPreference = "Stop"
+$asm = [Reflection.Assembly]::LoadFrom($WrapperPath)
+$stream = $asm.GetManifestResourceStream("Syrtis.Installer.payload.setup.exe")
+if ($null -eq $stream) { exit 2 }
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $bytes = $sha.ComputeHash($stream) } finally { $sha.Dispose(); $stream.Dispose() }
+[System.BitConverter]::ToString($bytes).Replace("-", "")
+'@
+$readerScript = Join-Path $wrapperBuildDir "read-payload-hash.ps1"
+Set-Content -LiteralPath $readerScript -Value $readPayloadHash -Encoding utf8
+$payloadSha256 = (& pwsh -NoProfile -NonInteractive -File $readerScript -WrapperPath $wrapperExePath) | Select-Object -Last 1
+if ($LASTEXITCODE -eq 2) {
+    throw "Install wizard wrapper carries no embedded payload resource: $wrapperExePath"
+}
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($payloadSha256)) {
+    throw "Could not read the embedded payload from $wrapperExePath (exit $LASTEXITCODE)."
+}
+$payloadSha256 = $payloadSha256.Trim()
+if ($payloadSha256 -ne $velopackSetupSha256) {
+    throw ("Embedded payload SHA-256 mismatch: wrapper carries {0}, this invocation's Velopack Setup.exe is {1}. " -f `
+        $payloadSha256, $velopackSetupSha256) + `
+        "Refusing to ship a stale or cross-channel payload."
+}
+Write-Output ("Embedded payload verified: SHA-256 {0} matches this invocation's Velopack Setup.exe" -f $payloadSha256)
+
+Copy-Item -LiteralPath $wrapperExePath -Destination $setupPath -Force
+Write-Output ("Replaced {0} with the install wizard wrapper ({1} bytes)." -f $expectedSetupName, (Get-Item -LiteralPath $setupPath).Length)
+
 $setupBytes = [int64](Get-Item -LiteralPath $setupPath).Length
 $setupKey = "{0}|{1}|setup" -f $DeploymentMode, $Rid
 if (-not $nupkgSetupBudgetByModeRid.ContainsKey($setupKey)) {

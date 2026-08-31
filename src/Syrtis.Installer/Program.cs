@@ -7,15 +7,101 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        var request = InstallRequest.Parse(args);
-        return request.Kind switch
+        var request = InstallRequest.Parse(args, EmbeddedPayload.HasPayload);
+
+        // Resolved once, immediately after Parse and before WizardForm is
+        // constructed: WizardForm reads the payload's product and version in
+        // its constructor via ReadPayloadIdentity, so extracting any later
+        // (e.g. from the Installing page) would put the wrapper's own
+        // version on the Welcome page instead of the payload's. Only
+        // RunWizard/RunSilent ever reach here with SetupPath meaningful;
+        // Refuse and SelfCheck never call ResolveSetupPath.
+        if (request.Kind != InstallRequestKind.RunWizard && request.Kind != InstallRequestKind.RunSilent)
         {
-            InstallRequestKind.SelfCheck => SelfCheck.Run(),
-            InstallRequestKind.Refuse => Fail(request),
-            InstallRequestKind.RunSilent => RunSilent(request),
-            InstallRequestKind.RunWizard => RunGui(request),
-            _ => throw new InvalidOperationException($"Unknown request kind: {request.Kind}"),
-        };
+            return request.Kind switch
+            {
+                InstallRequestKind.SelfCheck => SelfCheck.Run(),
+                InstallRequestKind.Refuse => Fail(request),
+                _ => throw new InvalidOperationException($"Unknown request kind: {request.Kind}"),
+            };
+        }
+
+        string setupPath;
+        bool ownsFile;
+        try
+        {
+            (setupPath, ownsFile) = ResolveSetupPath(request);
+        }
+        catch (Exception ex)
+        {
+            // Extraction writes ~83 MB to %TEMP%, so it can fail for reasons
+            // that have nothing to do with the install: a full disk, a
+            // redirected or read-only TEMP, a policy that blocks writing
+            // executables there. Outside this try it threw past both surfaces'
+            // handlers — the wizard vanished with no dialog and --silent
+            // returned an unhandled CLR code instead of the LaunchFailed it
+            // documents. That is the defect Process.Start already taught this
+            // file, reappearing one layer up because a new step was added
+            // above the handlers rather than inside them.
+            return FailToStart(request, ex);
+        }
+
+        try
+        {
+            return request.Kind == InstallRequestKind.RunSilent
+                ? RunSilent(setupPath)
+                : RunGui(setupPath);
+        }
+        finally
+        {
+            if (ownsFile)
+            {
+                TryDelete(setupPath);
+            }
+        }
+    }
+
+    /// <summary>Report a failure that happened before either surface existed,
+    /// on whichever surface the request was headed for, and return the same
+    /// LaunchFailed code a failed Process.Start produces. The two are the same
+    /// thing to a caller: Setup never ran.</summary>
+    private static int FailToStart(InstallRequest request, Exception ex)
+    {
+        var message = Strings.ErrorPayloadUnavailable(ex.Message);
+        if (request.Kind == InstallRequestKind.RunWizard && Environment.UserInteractive)
+        {
+            MessageBox.Show(message, Strings.WindowTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        else
+        {
+            Console.Error.WriteLine(message);
+        }
+
+        return ExitCodes.LaunchFailed;
+    }
+
+    /// <summary>The path to hand both surfaces: an explicit argument's path
+    /// verbatim, or the embedded payload extracted to a fresh temp file when
+    /// none was given. <c>ownsFile</c> tells <c>Main</c> whether it is
+    /// responsible for deleting it — an explicit path is the caller's file,
+    /// never ours to remove.</summary>
+    private static (string SetupPath, bool OwnsFile) ResolveSetupPath(InstallRequest request) =>
+        request.SetupPath is { } explicitPath
+            ? (explicitPath, false)
+            : (EmbeddedPayload.ExtractToTemp(), true);
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception)
+        {
+            // Best-effort cleanup; a leftover ~83 MB temp file is a disk-space
+            // nuisance, not a correctness problem, and is not worth failing an
+            // otherwise-complete run over.
+        }
     }
 
     /// <summary>Report a startup problem on whichever surface exists, and
@@ -53,10 +139,8 @@ internal static class Program
     /// (ATTACH_PARENT_PROCESS), which cannot be verified from a remote session
     /// for the same reason the defect cannot be reproduced there, so it waits
     /// for 1b and a real console.</para></summary>
-    private static int RunSilent(InstallRequest request)
+    private static int RunSilent(string setupPath)
     {
-        var setupPath = request.SetupPath!;
-
         // Locate only proved the file is there. Windows can still refuse to
         // run it — quarantined between the check and here, blocked by policy,
         // permissions changed, or simply not an executable — and Process.Start
@@ -91,11 +175,11 @@ internal static class Program
         }
     }
 
-    private static int RunGui(InstallRequest request)
+    private static int RunGui(string setupPath)
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new WizardForm(request.SetupPath!));
+        Application.Run(new WizardForm(setupPath));
         return ExitCodes.Ok;
     }
 

@@ -48,6 +48,7 @@
          Syrtis.Installer.exe's hidden self-check switch on the framework
          that actually ships. See InstallerBoundaryTests.cs for the same
          note next to the tests. -->
+    <Compile Include="..\Syrtis.Installer\EmbeddedPayload.cs" Link="Installer\EmbeddedPayload.cs" />
     <Compile Include="..\Syrtis.Installer\ExitCodes.cs" Link="Installer\ExitCodes.cs" />
     <Compile Include="..\Syrtis.Installer\InstallRequest.cs" Link="Installer\InstallRequest.cs" />
     <Compile Include="..\Syrtis.Installer\PayloadIdentity.cs" Link="Installer\PayloadIdentity.cs" />

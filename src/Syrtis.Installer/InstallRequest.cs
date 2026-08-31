@@ -73,8 +73,13 @@ internal readonly struct InstallRequest
 
     internal InstallRequestKind Kind { get; }
 
-    /// <summary>The resolved, existing setup path. Non-null exactly when
-    /// Kind is RunWizard or RunSilent.</summary>
+    /// <summary>The resolved, existing setup path an explicit argument
+    /// named, or null when Kind is RunWizard/RunSilent by way of the
+    /// embedded payload instead — see <see cref="Parse"/>'s
+    /// <c>hasEmbeddedPayload</c> parameter. Always null when Kind is Refuse
+    /// or SelfCheck. <c>Program</c> resolves the payload case with
+    /// <c>SetupPath ?? EmbeddedPayload.ExtractToTemp()</c> once, immediately
+    /// after Parse.</summary>
     internal string? SetupPath { get; }
 
     /// <summary>Meaningful only when Kind is Refuse.</summary>
@@ -94,7 +99,16 @@ internal readonly struct InstallRequest
     private static InstallRequest Refuse(RefusalReason reason, string? token, bool silentRequested) =>
         new(InstallRequestKind.Refuse, null, reason, token, silentRequested);
 
-    internal static InstallRequest Parse(string[] args)
+    /// <summary><paramref name="hasEmbeddedPayload"/> is a parameter, not an
+    /// ambient read of <see cref="EmbeddedPayload.HasPayload"/>, because the
+    /// net10 test assembly this method is exercised from never carries the
+    /// resource. An ambient check would leave every argument test green while
+    /// describing behaviour the shipping exe no longer has — the same
+    /// "green for the wrong reason" shape earlier findings in this file
+    /// exist to prevent. Only the no-positional-argument row is affected: an
+    /// explicit path, once given, always wins, whether or not a payload is
+    /// embedded.</summary>
+    internal static InstallRequest Parse(string[] args, bool hasEmbeddedPayload)
     {
         var silentRequested = args.Any(SetupLocator.IsSilentSwitch);
 
@@ -131,13 +145,39 @@ internal readonly struct InstallRequest
             return Refuse(RefusalReason.UnexpectedArgument, nonSwitchArgs[1], silentRequested);
         }
 
-        var candidate = nonSwitchArgs.FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(candidate))
+        // "No positional argument" and "a positional argument that is blank"
+        // are different things, and only the first may fall through to the
+        // payload. A script written as `Setup.exe "%SETUP_PATH%"` with the
+        // variable unset supplies an empty argument — treating that as "no
+        // argument given" would silently install the embedded payload instead
+        // of the setup that script named, and silently for real with
+        // --silent. That breaks this type's own stated rule: an explicit path
+        // is never replaced by the payload. Tested against Length rather than
+        // against the string, because the string cannot tell them apart.
+        if (nonSwitchArgs.Length == 0)
         {
+            // Nothing was asked for: the payload, when embedded, is the
+            // default. Without a payload this is unchanged from 1a —
+            // NoSetupPath — so a plain 1a-style build still refuses cleanly.
+            if (hasEmbeddedPayload)
+            {
+                var payloadKind = silentRequested ? InstallRequestKind.RunSilent : InstallRequestKind.RunWizard;
+                return new InstallRequest(payloadKind, null, default, null, silentRequested);
+            }
+
             return Refuse(RefusalReason.NoSetupPath, null, silentRequested);
         }
 
-        // Reuses SetupLocator's own resolution (existence check + GetFullPath)
+        var candidate = nonSwitchArgs[0];
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            // Present but unusable. Refused whether or not a payload exists.
+            return Refuse(RefusalReason.NoSetupPath, null, silentRequested);
+        }
+
+        // An explicit path is an instruction and is honoured strictly: found
+        // or not, it is never silently replaced by the payload. Reuses
+        // SetupLocator's own resolution (existence check + GetFullPath)
         // rather than repeating it — the exact duplication this slice exists
         // to remove.
         var setupPath = SetupLocator.Locate(args);

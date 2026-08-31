@@ -29,14 +29,28 @@
 
   <ItemGroup>
     <!-- Reuse TokenBar.App's brandmark rather than copying the binary: built
-         into this exe's own resources via ApplicationIcon below, and also
-         copied to the output directory (Link, not a physical copy in this
-         directory) so WizardForm can load it at runtime for the Welcome
-         page's large icon. -->
-    <Content Include="..\TokenBar.App\Assets\syrtis.ico" Link="syrtis.ico" CopyToOutputDirectory="PreserveNewest" />
+         into this exe's own Win32 resources via ApplicationIcon below (the
+         window/taskbar icon before WizardForm ever runs), and embedded a
+         second time as a managed resource under a fixed logical name so
+         WizardForm can load it at runtime for the window icon and the
+         Welcome page's 96x96 image. A loose CopyToOutputDirectory file (1a's
+         approach) does not survive package-velopack.ps1's wrapper swap: the
+         shipping form is one file, renamed and dropped alone into
+         `releases\`, so a loose companion would vanish silently. -->
+    <EmbeddedResource Include="..\TokenBar.App\Assets\syrtis.ico" LogicalName="Syrtis.Installer.syrtis.ico" />
   </ItemGroup>
   <PropertyGroup>
     <ApplicationIcon>..\TokenBar.App\Assets\syrtis.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <!-- Velopack's Setup.exe, embedded only when package-velopack.ps1 passes
+       -p:SyrtisPayloadPath=<path-to-Setup.exe>. Absent that property (every
+       plain `dotnet build`, including CI's build/test steps and a developer's
+       inner loop) this ItemGroup is empty and the build stays the 1a-style
+       wrapper with no resource at all — EmbeddedPayload.HasPayload is false,
+       and InstallRequest.Parse behaves exactly as slice 1a specified. -->
+  <ItemGroup Condition="'$(SyrtisPayloadPath)' != ''">
+    <EmbeddedResource Include="$(SyrtisPayloadPath)" LogicalName="Syrtis.Installer.payload.setup.exe" />
+  </ItemGroup>
 
 </Project>
