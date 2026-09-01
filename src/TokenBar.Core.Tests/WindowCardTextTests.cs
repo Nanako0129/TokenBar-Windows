@@ -420,13 +420,33 @@ public class WindowCardTextTests
         Assert.Equal(["Session · acct-a", "Session · acct-b"], tabs.Select(t => t.Label));
     }
 
+    // The first fix shipped the raw value and it was wrong on screen: a
+    // 43-character account scope pushed the card's own title out of view.
+    [Fact]
+    public void AQualifierIsShortEnoughToSitOnATab()
+    {
+        var scope = "7M08lffPHce2VRneAFYQ-TZ35jRfP7AFM7SuWxoff2s";
+        var tabs = WindowCardText.Disambiguate(
+            [Tab(scope, "session.v1", "Session"), Tab("other-scope", "session.v1", "Session")]);
+
+        Assert.All(tabs, tab => Assert.True(tab.Label!.Length <= "Session · ".Length + 10));
+        Assert.StartsWith("Session · 7M08lffPHc", tabs[0].Label);
+    }
+
+    [Fact]
+    public void AQualifierKeepsTheWordBeforeTheHashWhenThereIsOne()
+    {
+        Assert.Equal("additional", WindowCardText.Qualifier("additional.d62616d234d82d5e7e4593f3112e1"));
+        Assert.Equal("session", WindowCardText.Qualifier("session.v1"));
+    }
+
     [Fact]
     public void TabsSharingALabelWithinOneAccountAreQualifiedByWindowKey()
     {
         var tabs = WindowCardText.Disambiguate(
             [Tab("acct-a", "session.v1", "Session"), Tab("acct-a", "fable.v1", "Session")]);
 
-        Assert.Equal(["Session · session.v1", "Session · fable.v1"], tabs.Select(t => t.Label));
+        Assert.Equal(["Session · session", "Session · fable"], tabs.Select(t => t.Label));
     }
 
     [Fact]

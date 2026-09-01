@@ -129,6 +129,29 @@ public static class WindowCardText
     /// until Windows has the account label macOS shows (<c>.claude-work</c>),
     /// and it is still the honest answer, because the alternative is three
     /// controls a user cannot tell apart.</para></summary>
+    /// <summary>Shorten a qualifier to something that fits on a tab.
+    ///
+    /// <para>The first attempt shipped the raw value and it was wrong on screen:
+    /// an account scope is a 43-character token, so a tab read
+    /// <c>Session · 7M08lffPHce2VRneAFYQ-TZ35jRfP7AFM7SuWxoff2s</c> and pushed
+    /// the card's own title out of view. "Ugly but it distinguishes" was only
+    /// half true — it distinguished and it broke the layout, which is a worse
+    /// trade than the ambiguity it replaced.</para>
+    ///
+    /// <para>A key like <c>additional.d62616d2…</c> carries a real word before
+    /// its hash, so the segment before the first separator is used when there
+    /// is one worth reading; otherwise the value is cut to a stable prefix. Not
+    /// meaningful, but short, and the same across refreshes — a control whose
+    /// label moves is worse than one that reads oddly.</para></summary>
+    internal static string Qualifier(string value)
+    {
+        var head = value.Split('.', 2)[0];
+        return head.Length is > 0 and <= QualifierLength ? head
+            : value[..Math.Min(value.Length, QualifierLength)];
+    }
+
+    private const int QualifierLength = 10;
+
     internal static IReadOnlyList<WindowCardTab> Disambiguate(
         IReadOnlyList<WindowCardTab> tabs) =>
         [.. tabs.Select(tab =>
@@ -150,7 +173,7 @@ public static class WindowCardText
                 .Select(other => other.Id.AccountScope)
                 .Distinct(StringComparer.Ordinal).Count() > 1;
             var qualifier = scopesDiffer ? tab.Id.AccountScope : tab.Id.WindowKey;
-            return tab with { Label = $"{label} · {qualifier}" };
+            return tab with { Label = $"{label} · {Qualifier(qualifier)}" };
         })];
 
     /// <summary>Messages this window's own subscription is answerable for.
