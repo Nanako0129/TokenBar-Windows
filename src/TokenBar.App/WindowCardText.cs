@@ -106,75 +106,8 @@ public static class WindowCardText
         // A running window leads: it is the one the card exists to draw, and on
         // a client with a session and a weekly window the weekly one is
         // routinely the idle half.
-        return Disambiguate([.. tabs.OrderByDescending(tab => tab.Active is not null)]);
+        return [.. tabs.OrderByDescending(tab => tab.Active is not null)];
     }
-
-    /// <summary>Make every tab label distinct within one client.
-    ///
-    /// <para>Two windows can arrive with the same label. The identity is the
-    /// store's triple, but the label is joined on <c>(clientId, windowKey)</c>
-    /// alone — 3b's contract, because the live payload carries no account
-    /// scope — so two accounts of one client resolve to one label. The provider
-    /// can also name two different windows alike.</para>
-    ///
-    /// <para>On the strip card two rows that read alike are tolerable: they sit
-    /// side by side and behave correctly. **On a row of sub-tabs they are not**,
-    /// because the user has to pick one and nothing on screen says which. That
-    /// distinction is why this exists here and not there — the same data, made
-    /// unusable by a different control.</para>
-    ///
-    /// <para>Qualified by the first field that actually differs: the account
-    /// scope when the collision spans accounts, the window key when it does
-    /// not. The scope is an opaque hash and reads poorly; it is a stand-in
-    /// until Windows has the account label macOS shows (<c>.claude-work</c>),
-    /// and it is still the honest answer, because the alternative is three
-    /// controls a user cannot tell apart.</para></summary>
-    /// <summary>Shorten a qualifier to something that fits on a tab.
-    ///
-    /// <para>The first attempt shipped the raw value and it was wrong on screen:
-    /// an account scope is a 43-character token, so a tab read
-    /// <c>Session · 7M08lffPHce2VRneAFYQ-TZ35jRfP7AFM7SuWxoff2s</c> and pushed
-    /// the card's own title out of view. "Ugly but it distinguishes" was only
-    /// half true — it distinguished and it broke the layout, which is a worse
-    /// trade than the ambiguity it replaced.</para>
-    ///
-    /// <para>A key like <c>additional.d62616d2…</c> carries a real word before
-    /// its hash, so the segment before the first separator is used when there
-    /// is one worth reading; otherwise the value is cut to a stable prefix. Not
-    /// meaningful, but short, and the same across refreshes — a control whose
-    /// label moves is worse than one that reads oddly.</para></summary>
-    internal static string Qualifier(string value)
-    {
-        var head = value.Split('.', 2)[0];
-        return head.Length is > 0 and <= QualifierLength ? head
-            : value[..Math.Min(value.Length, QualifierLength)];
-    }
-
-    private const int QualifierLength = 10;
-
-    internal static IReadOnlyList<WindowCardTab> Disambiguate(
-        IReadOnlyList<WindowCardTab> tabs) =>
-        [.. tabs.Select(tab =>
-        {
-            var label = tab.Label;
-            if (string.IsNullOrWhiteSpace(label))
-            {
-                return tab;
-            }
-
-            var clash = tabs.Where(other =>
-                string.Equals(other.Label, label, StringComparison.Ordinal)).ToList();
-            if (clash.Count < 2)
-            {
-                return tab;
-            }
-
-            var scopesDiffer = clash
-                .Select(other => other.Id.AccountScope)
-                .Distinct(StringComparer.Ordinal).Count() > 1;
-            var qualifier = scopesDiffer ? tab.Id.AccountScope : tab.Id.WindowKey;
-            return tab with { Label = $"{label} · {Qualifier(qualifier)}" };
-        })];
 
     /// <summary>Messages this window's own subscription is answerable for.
     /// Same rule as <see cref="QuotaEquivalenceFold.Cycles"/>: a message is
