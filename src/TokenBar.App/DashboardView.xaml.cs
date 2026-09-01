@@ -420,6 +420,7 @@ public sealed partial class DashboardView : UserControl
         if (view == AppView.Quota)
         {
             _model?.EnsureQuotaHistory();
+            _model?.EnsureWindowUsage();
         }
 
         UpdateTabChrome();

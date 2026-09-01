@@ -282,11 +282,27 @@ public sealed class DashboardModel
         /// returned no series and a read that has not happened both leave it
         /// null.</para></summary>
         public bool QuotaHistoryAttempted { get; init; }
+
+        /// <summary>The per-message rows behind the Quota lens's ≈ lines
+        /// (5d-1's export). A fourth lazy lens, fetched only once
+        /// <see cref="QuotaHistory"/> has told this lane how far back to ask —
+        /// the export is expensive enough (macOS's own probe: 67s over 15
+        /// days) that it must never be called with an unbounded range.</summary>
+        public Interop.WindowUsage? WindowUsage { get; init; }
+
+        /// <summary>Whether the window-usage READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaHistoryAttempted"/>, and a separate one: a fetch
+        /// that found no window to bound itself against still has to report
+        /// completion, or the equivalence lines wait forever for an answer
+        /// that was never going to come.</summary>
+        public bool WindowUsageAttempted { get; init; }
     }
 
     private volatile bool _hourlyWanted;
     private volatile bool _agentsWanted;
     private volatile bool _quotaHistoryWanted;
+    private volatile bool _windowUsageWanted;
 
     /// <summary>Marks a lazy lens as needed and fetches it once; later slow
     /// refreshes keep it current.</summary>
@@ -308,9 +324,15 @@ public sealed class DashboardModel
         RequestLazyRefresh();
     }
 
+    public void EnsureWindowUsage()
+    {
+        _windowUsageWanted = true;
+        RequestLazyRefresh();
+    }
+
     private void RequestLazyRefresh()
     {
-        if (!_hourlyWanted && !_agentsWanted && !_quotaHistoryWanted)
+        if (!_hourlyWanted && !_agentsWanted && !_quotaHistoryWanted && !_windowUsageWanted)
         {
             return;
         }
@@ -346,6 +368,7 @@ public sealed class DashboardModel
         var hourly = _hourlyWanted;
         var agents = _agentsWanted;
         var quotaHistory = _quotaHistoryWanted;
+        var windowUsage = _windowUsageWanted;
         string[] clients;
         long generation;
         lock (_selectionGate)
@@ -383,6 +406,32 @@ public sealed class DashboardModel
             ? TryFetch(TbCore.QuotaHistory, "quotaHistory")
             : null;
 
+        // Bounded by whichever history is freshest: this pass's own read when
+        // one was taken, the last-published one otherwise. Never unbounded —
+        // 5d-1's export scans the whole local corpus when its cache is cold,
+        // which macOS's own probe measured at 67s over 15 days.
+        Interop.WindowUsage? usage = null;
+        if (windowUsage)
+        {
+            var forBound = history ?? Current?.QuotaHistory ?? [];
+            if (forBound.Count == 0)
+            {
+                usage = new Interop.WindowUsage([], 0, 0);
+            }
+            else
+            {
+                // The scan this export can trigger is CPU-bound, not I/O-bound
+                // like the quota-history read above — the same reason the
+                // hourly/agents fetch above it boosts.
+                using var boost = ProcessPower.Boost();
+                usage = TryFetch(
+                    () => TbCore.WindowUsage(
+                        QuotaEquivalenceFold.BoundFromMs(forBound, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                    "windowUsage");
+            }
+        }
+
         if (!SelectionStillValid(year, generation))
         {
             RequestLazyRefresh();
@@ -401,6 +450,10 @@ public sealed class DashboardModel
             // same reason the agent-usage lane does: a lens that reads null as
             // "not yet" would wait forever for an answer that already came back.
             QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
+            // Same failed-read and same completion rules as QuotaHistory,
+            // immediately above, and for the same two reasons.
+            WindowUsage = usage ?? s.WindowUsage,
+            WindowUsageAttempted = windowUsage || s.WindowUsageAttempted,
         }, graph: null, stillValid: () => SelectionStillValid(year, generation));
     }
 

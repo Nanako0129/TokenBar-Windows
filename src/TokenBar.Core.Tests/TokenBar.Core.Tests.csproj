@@ -40,6 +40,11 @@
     <Compile Include="..\TokenBar.App\QuotaSummaryText.cs" Link="QuotaSummaryText.cs" />
     <Compile Include="..\TokenBar.App\QuotaLensText.cs" Link="QuotaLensText.cs" />
     <Compile Include="..\TokenBar.App\QuotaLensData.cs" Link="QuotaLensData.cs" />
+    <!-- The strip card's ≈ line and the heatmap hover's equivalence lines
+         (5d-2), for the same reason: DashboardView.Quota.cs compiles under no
+         test project, and this is the file whose case-fold a merged neighbour
+         would misreport a dollar figure from. -->
+    <Compile Include="..\TokenBar.App\WindowEquivalenceText.cs" Link="WindowEquivalenceText.cs" />
     <!-- Every decision the usage-attribution settings page makes, for the same
          reason as the three above: SettingsWindow.cs is compiled by no test
          project, so the suppression rule and the accept-all count would sit in

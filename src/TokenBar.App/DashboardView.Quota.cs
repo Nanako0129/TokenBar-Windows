@@ -14,14 +14,18 @@ namespace TokenBar.App;
 /// allowance goes), ported from <c>QuotaHistoryStripCard.swift</c> and
 /// <c>QuotaHeatmapCard.swift</c>.
 /// <para>
-/// Every state choice and every string comes from <see cref="QuotaLensText"/>
-/// and <see cref="QuotaLabels"/>; nothing here re-decides a branch, because
-/// this file is compiled by no test project.
+/// Every state choice and every string comes from <see cref="QuotaLensText"/>,
+/// <see cref="QuotaLabels"/> and (5d-2) <see cref="WindowEquivalenceText"/>;
+/// nothing here re-decides a branch, because this file is compiled by no test
+/// project.
 /// </para>
 /// <para>
-/// Deliberately absent: the <c>≈ token / $</c> equivalence lines both macOS
-/// cards carry. They need WindowEquivalence/UsageAttribution, which have no
-/// Windows source — an absent line, not a blank one.
+/// The <c>≈ token / $</c> equivalence lines are keyed by
+/// <see cref="QuotaWindowIdentity"/> and looked up per window/slot; a missing
+/// key (the fetch has not landed, or the window has no equivalence at all)
+/// renders through <see cref="WindowEquivalenceText.NoFigureReason"/> on the
+/// heatmap and simply draws no line on the strip — the same "absent, not
+/// blank" contract the two cards' own state machinery already uses.
 /// </para>
 /// </summary>
 public sealed partial class DashboardView
@@ -90,17 +94,27 @@ public sealed partial class DashboardView
     private UIElement BuildQuota(DashboardModel.Snapshot snapshot)
     {
         // The client tab renders the same two all-clients cards for now: the
-        // per-client quota lens (Session window / history) needs the
-        // equivalence subsystem this slice does not ship.
+        // per-client quota lens (Session window / history) is 5e, not this
+        // slice — the equivalence subsystem it also needs ships here.
         var (summaries, windows, grids) =
             QuotaLensData.Build(snapshot.QuotaHistory, snapshot.Quota);
         var attempted = snapshot.QuotaHistoryAttempted;
+        // Absent (not merely empty) until the window-usage lane has both a
+        // quota history to bound itself against and a finished fetch — the
+        // strip/heatmap draw no line for a window with no key rather than
+        // waiting on this dictionary specifically.
+        var equivalences = snapshot.WindowUsageAttempted
+            ? QuotaEquivalenceFold.Build(
+                snapshot.QuotaHistory ?? [],
+                snapshot.WindowUsage?.Messages ?? [],
+                UsageAttribution.Confirmed(AppSettings.Store))
+            : new Dictionary<QuotaWindowIdentity, WindowEquivalence.Row>();
         var stack = new StackPanel { Spacing = 10 };
         // First: this is the one card that answers "on which subscription", and
         // the two below it answer "where has the allowance gone".
         stack.Children.Add(BuildSubscriptionTrendCard(snapshot));
-        stack.Children.Add(BuildQuotaStripCard(summaries, attempted));
-        stack.Children.Add(BuildQuotaHeatmapCard(windows, grids, attempted));
+        stack.Children.Add(BuildQuotaStripCard(summaries, attempted, equivalences));
+        stack.Children.Add(BuildQuotaHeatmapCard(windows, grids, attempted, equivalences));
         // The Agent-limits card closes the lens on macOS, below the heatmap.
         // The same builder the Overview uses, deliberately: this card answers
         // "where does the allowance stand right now" while the two above answer
@@ -331,7 +345,8 @@ public sealed partial class DashboardView
     // ── Strip card ───────────────────────────────────────────────────────
 
     private FrameworkElement BuildQuotaStripCard(
-        IReadOnlyList<QuotaWindowSummary> summaries, bool attempted)
+        IReadOnlyList<QuotaWindowSummary> summaries, bool attempted,
+        IReadOnlyDictionary<QuotaWindowIdentity, WindowEquivalence.Row> equivalences)
     {
         var body = new StackPanel { Spacing = 10 };
         switch (QuotaLensText.StripState(summaries, attempted))
@@ -339,7 +354,7 @@ public sealed partial class DashboardView
             case QuotaStripState.Rows:
                 foreach (var summary in summaries)
                 {
-                    body.Children.Add(StripRow(summary));
+                    body.Children.Add(StripRow(summary, equivalences.GetValueOrDefault(summary.Id)));
                 }
 
                 break;
@@ -355,7 +370,7 @@ public sealed partial class DashboardView
             QuotaLensText.StripTitle(), body, QuotaLensText.StripSubtitle(summaries));
     }
 
-    private FrameworkElement StripRow(QuotaWindowSummary summary)
+    private FrameworkElement StripRow(QuotaWindowSummary summary, WindowEquivalence.Row? equivalence)
     {
         var block = new StackPanel { Spacing = 3 };
         var head = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5 };
@@ -365,6 +380,13 @@ public sealed partial class DashboardView
             head, Ui.Text(QuotaLensText.WindowCount(summary.CycleCount), 9, 0.5)));
         block.Children.Add(Strip(summary));
         block.Children.Add(Ui.Text(QuotaLensText.Headline(summary), 9, 0.5));
+        if (equivalence is not null)
+        {
+            var line = Ui.Dim(WindowEquivalenceText.Line(equivalence), 9);
+            line.TextWrapping = TextWrapping.Wrap;
+            block.Children.Add(line);
+        }
+
         return block;
     }
 
@@ -438,7 +460,8 @@ public sealed partial class DashboardView
     private FrameworkElement BuildQuotaHeatmapCard(
         IReadOnlyList<QuotaHeatmapWindow> windows,
         IReadOnlyDictionary<QuotaWindowIdentity, QuotaHeatmap> grids,
-        bool attempted)
+        bool attempted,
+        IReadOnlyDictionary<QuotaWindowIdentity, WindowEquivalence.Row> equivalences)
     {
         // The list already excludes windows with no movement and leads with the
         // heaviest, so the fallback is simply "the first one" rather than a
@@ -447,11 +470,12 @@ public sealed partial class DashboardView
             ?? windows.FirstOrDefault();
         var grid = selected is null ? null : grids.GetValueOrDefault(selected.Id);
 
+        var equivalence = selected is null ? null : equivalences.GetValueOrDefault(selected.Id);
         var body = new StackPanel { Spacing = 4 };
         switch (QuotaLensText.HeatmapState(grid, attempted))
         {
             case QuotaHeatmapState.Grid:
-                body.Children.Add(Heatmap(grid!));
+                body.Children.Add(Heatmap(grid!, equivalence));
                 body.Children.Add(HourAxis());
                 if (QuotaLensText.Footnote(grid!) is { } footnote)
                 {
@@ -514,7 +538,7 @@ public sealed partial class DashboardView
         };
     }
 
-    private FrameworkElement Heatmap(QuotaHeatmap grid)
+    private FrameworkElement Heatmap(QuotaHeatmap grid, WindowEquivalence.Row? equivalence)
     {
         var accent = AccentColor();
         var host = new Grid { ColumnSpacing = 0 };
@@ -559,7 +583,7 @@ public sealed partial class DashboardView
                     Background = new SolidColorBrush(CellFill(accent, value, grid.Peak)),
                 };
                 var (day, slot) = (weekday, hour);
-                HoverTip.AttachRich(cell, () => SlotTip(day, slot, value));
+                HoverTip.AttachRich(cell, () => SlotTip(day, slot, value, equivalence));
                 Grid.SetRow(cell, weekday);
                 Grid.SetColumn(cell, hour);
                 cells.Children.Add(cell);
@@ -588,13 +612,34 @@ public sealed partial class DashboardView
         return Tint(accent, opacity);
     }
 
-    private static UIElement SlotTip(int weekday, int hour, double value)
+    private static UIElement SlotTip(int weekday, int hour, double value, WindowEquivalence.Row? equivalence)
     {
         var panel = new StackPanel { Spacing = 3, MinWidth = 186 };
         panel.Children.Add(TipText(QuotaLensText.SlotHeader(weekday, hour), 11, bold: true));
-        panel.Children.Add(value <= 0
-            ? TipText(QuotaLensText.SlotEmpty(), 9, 0.6)
-            : TipText(QuotaLensText.SlotSpend(value)));
+        if (value <= 0)
+        {
+            panel.Children.Add(TipText(QuotaLensText.SlotEmpty(), 9, 0.6));
+            return panel;
+        }
+
+        panel.Children.Add(TipText(QuotaLensText.SlotSpend(value)));
+        // Converted from the window's own equivalence rather than measured —
+        // see WindowEquivalenceText.Slot's own doc comment for why this reads
+        // the pooled history fold rather than scanning messages per slot.
+        var lines = WindowEquivalenceText.Slot(value, equivalence);
+        // A real figure reads as body copy (Secondary present, the money/error
+        // line); the no-figure reason is the sole line and reads as dim, the
+        // same tertiary weight QuotaLensText.SlotEmpty above uses.
+        var primary = TipText(lines.Primary, 9, lines.Secondary is null ? 0.6 : 1.0);
+        primary.TextWrapping = TextWrapping.Wrap;
+        panel.Children.Add(primary);
+        if (lines.Secondary is { } secondary)
+        {
+            var line = TipText(secondary, 9, 0.6);
+            line.TextWrapping = TextWrapping.Wrap;
+            panel.Children.Add(line);
+        }
+
         return panel;
     }
 
