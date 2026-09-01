@@ -373,14 +373,20 @@ public class UsageAttributionPageTests : IDisposable
             () => UsageAttributionPage.StateLabel(UsageAttribution.State.Unassigned),
             () => UsageAttributionPage.ProviderLabel(""),
             () => UsageAttributionPage.ClassificationForLabel(row),
-            // NOT here, and each for a reason rather than an oversight:
+            // All three, because these are the only strings on this page that
+            // appear when something has gone wrong with the user's stored
+            // classification — the moment English fallback is least affordable.
+            () => UsageAttributionPage.FailureMessage(
+                UsageAttributionSettings.WriteFailure.InvalidExistingValue),
+            () => UsageAttributionPage.FailureMessage(
+                UsageAttributionSettings.WriteFailure.EntryLimit),
+            () => UsageAttributionPage.FailureMessage(
+                UsageAttributionSettings.WriteFailure.SizeOrInvalidRecord),
+            // NOT here, and for a reason rather than an oversight:
             //   SourceTitle — its format string is "{0} · {1}" both sides, so
             //     an identical result proves nothing. macOS needs the entry
             //     because %@ has to become positional %1$@; C# is positional
             //     already.
-            //   FailureMessage — the three WriteFailure messages have no
-            //     zh-Hant transcription in the extract this slice was given, so
-            //     they deliberately fall back to English. Reported as open.
         ];
 
         var english = surfaces.Select(surface => surface()).ToList();
