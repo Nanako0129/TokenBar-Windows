@@ -32,8 +32,13 @@ public enum WindowCardState
 
 /// <summary>One sub-tab of the Session-window card: a window of the selected
 /// client, and the cycle running inside it.</summary>
+/// <param name="HasHistory">Whether a stored series was found for this window
+/// at all. Distinct from <paramref name="Active"/> being null: that also
+/// happens when a series EXISTS but its last window simply ended, which is
+/// <see cref="WindowCardState.Idle"/>, not <see cref="WindowCardState.NoQuotaHistory"/>
+/// — two different facts a shared null would collapse into one.</param>
 public sealed record WindowCardTab(
-    QuotaWindowIdentity Id, string? Label, QuotaActiveCycle? Active);
+    QuotaWindowIdentity Id, string? Label, QuotaActiveCycle? Active, bool HasHistory);
 
 /// <summary>
 /// Every state choice and every string on the Session-window card (port of
@@ -61,8 +66,33 @@ public static class WindowCardText
     /// picker does not offer.</summary>
     public const string TabKey = "tokenbar.windowcard.window";
 
+    /// <summary>The account scope a live window's tab carries when no stored
+    /// series can supply one. The live payload does not model more than one
+    /// account per client (see <c>WindowCardLoader.select</c>'s "primary
+    /// account only" restriction on macOS), so there is exactly one scope to
+    /// name here.</summary>
+    private const string PrimaryAccountScope = "primary";
+
     /// <summary>
-    /// The windows of one client, each with its running cycle.
+    /// One tab per window the client is CURRENTLY reporting, each carrying
+    /// the running cycle a stored series has for it.
+    /// <para>
+    /// Enumerated from the live side — <see cref="AgentUsageSnapshot.UniqueCardWindows"/>
+    /// — the same shape as macOS's <c>uniqueCardWindows</c>-driven
+    /// <c>candidates</c> list, and for the same reason: the live payload names
+    /// each window once, with the provider's own label, while the store can
+    /// hold several series for what is now one window (a rename, a re-carded
+    /// provider revision). Enumerating the store side instead is what
+    /// produced the duplicate and raw-key tabs this replaces — several stored
+    /// series mapping to one live window each drew their own tab, and a
+    /// series matching no live label fell back to printing its raw store key.
+    /// </para>
+    /// <para>
+    /// A stored series with no live window (the provider stopped reporting
+    /// it) deliberately produces no tab: macOS cannot show a window its own
+    /// live payload no longer offers either, and a history-only tab would
+    /// have no live label to show.
+    /// </para>
     /// <para>
     /// <see cref="QuotaHistorySeries.ProviderId"/> is — despite the field name
     /// inherited from the wire — already a registered CLIENT id, the
@@ -77,30 +107,38 @@ public static class WindowCardText
         AgentUsagePayload? quota,
         string clientId)
     {
-        var labels = new Dictionary<(string Client, string Window), string>();
-        foreach (var agent in quota?.Agents ?? [])
+        // Keyed by the store's WindowKey — the join PaceStatus.WindowKey can
+        // reach — so a live window finds its own running cycle without
+        // needing to know the store's AccountScope half up front. First wins,
+        // same as the label lookup this replaces: the live payload offers no
+        // second account to disambiguate against on Windows today.
+        var byWindowKey = new Dictionary<string, QuotaHistorySeries>();
+        foreach (var series in history ?? [])
         {
-            foreach (var window in agent.UniqueCardWindows)
+            if (series.ProviderId == clientId)
             {
-                if (window.PaceStatus.WindowKey is { } key)
-                {
-                    labels.TryAdd((agent.ClientId, key), window.Label);
-                }
+                byWindowKey.TryAdd(series.WindowKey, series);
             }
         }
 
+        var agent = quota?.Agents.FirstOrDefault(a => a.ClientId == clientId);
         var tabs = new List<WindowCardTab>();
-        foreach (var series in history ?? [])
+        foreach (var window in agent?.UniqueCardWindows ?? [])
         {
-            if (series.ProviderId != clientId)
-            {
-                continue;
-            }
-
+            var series = window.PaceStatus.WindowKey is { } key
+                ? byWindowKey.GetValueOrDefault(key)
+                : null;
             tabs.Add(new WindowCardTab(
-                new QuotaWindowIdentity(series.ProviderId, series.AccountScope, series.WindowKey),
-                labels.GetValueOrDefault((series.ProviderId, series.WindowKey)),
-                QuotaHistoryFold.Active(series.Samples)));
+                // The store's own WindowKey when a series was found — that is
+                // what BuildWindowHistoryCard joins back against to find this
+                // window's past cycles — and the live CardId only as a
+                // fallback identity for a window the store has nothing under,
+                // where no such join is possible anyway.
+                new QuotaWindowIdentity(
+                    clientId, series?.AccountScope ?? PrimaryAccountScope, series?.WindowKey ?? window.CardId),
+                window.Label,
+                series is null ? null : QuotaHistoryFold.Active(series.Samples),
+                HasHistory: series is not null));
         }
 
         // A running window leads: it is the one the card exists to draw, and on
@@ -129,7 +167,11 @@ public static class WindowCardText
 
     public static WindowCardState State(WindowCardTab? tab, bool attempted)
     {
-        if (tab is null)
+        // No tab at all (nothing to select) and a tab with no stored series
+        // (a live window the store has nothing recorded for) are the same
+        // fact from this card's point of view, and `attempted` still decides
+        // whether that is a wait or an answer either way.
+        if (tab is null || !tab.HasHistory)
         {
             return attempted ? WindowCardState.NoQuotaHistory : WindowCardState.Loading;
         }

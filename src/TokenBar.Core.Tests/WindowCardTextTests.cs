@@ -34,7 +34,98 @@ public class WindowCardTextTests
         string client, string provider, string model, long at = 1) =>
         new(at, client, provider, model, 0, 100, 0, 0, 0, 0.5, true);
 
-    // ---- the per-client filter -----------------------------------------
+    // `Tabs` now enumerates the LIVE side — one tab per window the client is
+    // currently reporting — rather than the store side, so every fixture that
+    // wants a tab has to supply the live window that tab comes from.
+    private static UsageWindow Window(string cardId, string label, string? windowKey) =>
+        new(
+            Label: label,
+            UsedPercent: 10,
+            RemainingPercent: 90,
+            CardId: cardId,
+            PaceStatus: windowKey is null
+                ? new PaceStatus(UsagePaceState.Unavailable)
+                : new PaceStatus(UsagePaceState.Available, WindowKey: windowKey));
+
+    private static AgentUsagePayload Quota(string clientId, params UsageWindow[] windows) =>
+        new("2026-01-01T00:00:00Z",
+            [new AgentUsageSnapshot(clientId, "source", "2026-01-01T00:00:00Z", windows)]);
+
+    // ---- the live-window enumeration -------------------------------------
+
+    // The bug this fix removes: several stored series collapsing onto one
+    // live window used to draw one tab PER SERIES, and a series with no
+    // live-side match fell back to printing its raw store key. Four live
+    // windows — one of them keyless, one of them fed by two stored series
+    // that share a windowKey — must yield exactly four tabs, each carrying
+    // the provider's own label and none of them a raw key.
+    [Fact]
+    public void FourLiveWindowsYieldFourTabsWithDistinctLabelsEvenWhenSeriesShareAWindowKey()
+    {
+        var quota = Quota(
+            "codex",
+            Window("codex|session.v1", "Session", "session.v1"),
+            Window("codex|weekly.v1", "Weekly", "weekly.v1"),
+            Window("codex|fable.v1", "Fable only", "weekly_scoped.fable.v1"),
+            Window("codex|additional.d62616d2.primary.v1", "Extra usage", windowKey: null));
+
+        var tabs = WindowCardText.Tabs(
+            [
+                Series("codex", "session.v1", Sample(40, ResetAt - 600)),
+                // A second stored series landing on the SAME windowKey — a
+                // rename or a re-carded provider revision. Must not draw a
+                // second tab for the one live window it maps to.
+                Series("codex", "session.v1", Sample(41, ResetAt - 600)),
+                Series("codex", "weekly_scoped.fable.v1", Sample(12, ResetAt - 600)),
+            ],
+            quota,
+            clientId: "codex");
+
+        Assert.Equal(4, tabs.Count);
+        Assert.Equal(
+            new[] { "Session", "Weekly", "Fable only", "Extra usage" }.OrderBy(l => l),
+            tabs.Select(tab => tab.Label).OrderBy(l => l));
+        // No tab label is ever a raw store key — neither the dotted window
+        // key nor the hashed card id it used to fall back to.
+        Assert.All(tabs, tab => Assert.False(string.IsNullOrWhiteSpace(tab.Label)));
+        Assert.DoesNotContain(tabs, tab => tab.Label == "weekly_scoped.fable.v1");
+        Assert.DoesNotContain(tabs, tab => tab.Label!.Contains("d62616d2"));
+    }
+
+    // A live window the store has no series for still gets a tab — it just
+    // has no history to draw, which is `NoQuotaHistory`, not an absent tab.
+    [Fact]
+    public void ALiveWindowWithNoStoredSeriesStillGetsATab()
+    {
+        var quota = Quota("codex", Window("codex|weekly.v1", "Weekly", "weekly.v1"));
+
+        var tabs = WindowCardText.Tabs([], quota, "codex");
+
+        Assert.Single(tabs);
+        Assert.Equal("Weekly", tabs[0].Label);
+        Assert.Equal(WindowCardState.NoQuotaHistory, WindowCardText.State(tabs[0], attempted: true));
+        Assert.Equal(WindowCardState.Loading, WindowCardText.State(tabs[0], attempted: false));
+    }
+
+    // A stored series with no live window (the provider stopped reporting
+    // it) produces no tab: macOS cannot show a window its own live payload
+    // no longer offers either.
+    [Fact]
+    public void AStoredSeriesWithNoLiveWindowProducesNoTab()
+    {
+        var quota = Quota("codex", Window("codex|session.v1", "Session", "session.v1"));
+
+        var tabs = WindowCardText.Tabs(
+            [
+                Series("codex", "session.v1", Sample(40, ResetAt - 600)),
+                Series("codex", "retired.window.v1", Sample(99, ResetAt - 600)),
+            ],
+            quota,
+            "codex");
+
+        Assert.Single(tabs);
+        Assert.Equal("Session", tabs[0].Label);
+    }
 
     // The window key is the store's own, and ProviderId is already a registered
     // CLIENT id (QuotaEquivalenceFold states this and relies on it), so the
@@ -48,32 +139,14 @@ public class WindowCardTextTests
                 Series("claude", "weekly.v1", Sample(12, ResetAt - 600)),
                 Series("codex", "main.weekly.v1", Sample(70, ResetAt - 600)),
             ],
-            quota: null,
+            Quota(
+                "claude",
+                Window("claude|session.v1", "Session", "session.v1"),
+                Window("claude|weekly.v1", "Weekly", "weekly.v1")),
             clientId: "claude");
 
         Assert.Equal(2, tabs.Count);
         Assert.All(tabs, tab => Assert.Equal("claude", tab.Id.ProviderId));
-        Assert.Equal(
-            ["session.v1", "weekly.v1"],
-            tabs.Select(tab => tab.Id.WindowKey).OrderBy(key => key));
-    }
-
-    // Two accounts of one client hold the same window key, and the identity
-    // keeps them apart — a filter that dropped the scope would fold two
-    // subscriptions' curves into one tab.
-    [Fact]
-    public void TabsKeepTwoScopesOfOneWindowApart()
-    {
-        var tabs = WindowCardText.Tabs(
-            [
-                new QuotaHistorySeries("claude", "a", "session.v1", [Sample(40, ResetAt - 600)]),
-                new QuotaHistorySeries("claude", "b", "session.v1", [Sample(10, ResetAt - 600)]),
-            ],
-            quota: null,
-            clientId: "claude");
-
-        Assert.Equal(2, tabs.Count);
-        Assert.Equal(["a", "b"], tabs.Select(tab => tab.Id.AccountScope).OrderBy(s => s));
     }
 
     // A running window leads: on a client with a session and a weekly window
@@ -87,10 +160,13 @@ public class WindowCardTextTests
                 Series("claude", "weekly.v1", Sample(12, ResetAt - 600, active: false)),
                 Series("claude", "session.v1", Sample(40, ResetAt - 600)),
             ],
-            quota: null,
+            Quota(
+                "claude",
+                Window("claude|weekly.v1", "Weekly", "weekly.v1"),
+                Window("claude|session.v1", "Session", "session.v1")),
             clientId: "claude");
 
-        Assert.Equal("session.v1", tabs[0].Id.WindowKey);
+        Assert.Equal("Session", tabs[0].Label);
     }
 
     // Bars under the quota line are a claim about which subscription paid, so
@@ -194,13 +270,19 @@ public class WindowCardTextTests
     public void EveryStateIsDistinct()
     {
         var running = WindowCardText.Tabs(
-            [Series("claude", "session.v1", Sample(40, ResetAt - 600))], null, "claude")[0];
+            [Series("claude", "session.v1", Sample(40, ResetAt - 600))],
+            Quota("claude", Window("claude|session.v1", "Session", "session.v1")),
+            "claude")[0];
         var idle = WindowCardText.Tabs(
             [Series("claude", "session.v1", Sample(40, ResetAt - 600, active: false))],
-            null, "claude")[0];
+            Quota("claude", Window("claude|session.v1", "Session", "session.v1")),
+            "claude")[0];
         var unplaceable = WindowCardText.Tabs(
             [Series("claude", "session.v1", Sample(40, ResetAt - 600, duration: 0))],
-            null, "claude")[0];
+            Quota("claude", Window("claude|session.v1", "Session", "session.v1")),
+            "claude")[0];
+        var noHistory = WindowCardText.Tabs(
+            [], Quota("claude", Window("claude|session.v1", "Session", "session.v1")), "claude")[0];
 
         Assert.Equal(WindowCardState.Chart, WindowCardText.State(running, attempted: true));
         Assert.Equal(WindowCardState.Idle, WindowCardText.State(idle, attempted: true));
@@ -211,6 +293,10 @@ public class WindowCardTextTests
         // settled is the first paint of every cold start.
         Assert.Equal(WindowCardState.NoQuotaHistory, WindowCardText.State(null, attempted: true));
         Assert.Equal(WindowCardState.Loading, WindowCardText.State(null, attempted: false));
+        // A live window with a tab but no matched series reads the same as no
+        // tab at all — `HasHistory` is what carries the distinction from
+        // `Idle`, not the tab's mere presence.
+        Assert.Equal(WindowCardState.NoQuotaHistory, WindowCardText.State(noHistory, attempted: true));
     }
 
     // Each empty state has its own sentence. "The window ended" and "the
@@ -338,7 +424,9 @@ public class WindowCardTextTests
     public void EveryStringTheCardCanShowHasATableEntry()
     {
         var tab = WindowCardText.Tabs(
-            [Series("claude", "session.v1", Sample(40, ResetAt - 600))], null, "claude")[0];
+            [Series("claude", "session.v1", Sample(40, ResetAt - 600))],
+            Quota("claude", Window("claude|session.v1", "Session", "session.v1")),
+            "claude")[0];
         var start = 1_000_000L;
         var chart = WindowCardGeometry.Chart(
             start, start + (FiveHours * 1000), start + 1_800_000,
