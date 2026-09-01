@@ -154,4 +154,112 @@ public static class WindowHistoryText
     public static string Percent(WindowHistoryRow row) =>
         ((int)Math.Round(row.UsedPercent, MidpointRounding.AwayFromZero))
             .ToString(System.Globalization.CultureInfo.CurrentCulture) + "%";
+
+    // ---- the expanded row (PARITY-3b's deferred half, now unblocked by 5a,
+    // 5d-1 and 5d-2) --------------------------------------------------------
+
+    /// <summary>One coloured segment of the collapsed row's usage bar — this
+    /// subscription's models, proportioned by tokens. Empty when nothing has
+    /// been attributed to this cycle at all.</summary>
+    public readonly record struct WindowHistorySegment(string Color, double Fraction);
+
+    /// <summary>The usage bar's segments, coloured from the app's shared
+    /// palette — the same one the model breakdown and the usage chart use, so
+    /// a model is not one colour on this card and another everywhere else —
+    /// in the same order <see cref="QuotaHistoryRow.Models"/> lists them, so
+    /// a reader who opens a row finds the segments in the order they just
+    /// read about.</summary>
+    public static IReadOnlyList<WindowHistorySegment> Segments(QuotaHistoryRow row, ModelColorMap colors) =>
+        row.MineTokens <= 0
+            ? []
+            : [.. row.Models.Select(model => new WindowHistorySegment(
+                colors.Color(model.ProviderId, model.ModelId), (double)model.Tokens / row.MineTokens))];
+
+    /// <summary>The expander's model rows: the heaviest four, in the same
+    /// order the usage bar segments them.</summary>
+    public static IReadOnlyList<QuotaHistoryModel> TopModels(QuotaHistoryRow row) => [.. row.Models.Take(4)];
+
+    /// <summary>A model row's own token figure. Dash, not "0", when the
+    /// metric itself is absent — the mirror of <see cref="ModelCost"/>: a
+    /// model attributed by cost alone carries no token count, and printing
+    /// "0" states a measurement nobody took.</summary>
+    public static string ModelTokens(QuotaHistoryModel model) =>
+        model.Tokens > 0 ? Format.CompactTokens(model.Tokens) : "·";
+
+    /// <summary>The mirror of <see cref="ModelTokens"/>: dash when this model
+    /// carried no price.</summary>
+    public static string ModelCost(QuotaHistoryModel model) =>
+        model.Cost > 0 ? Format.Usd(model.Cost) : "·";
+
+    /// <summary>Shown in place of the model rows when every message this
+    /// window's messages resolved out of this subscription — declared
+    /// elsewhere, excluded, or never classified — leaving nothing charged to
+    /// it. Distinct from an empty list with no explanation: an expanded row
+    /// with nothing under it otherwise reads as a card that gave up mid-scan.</summary>
+    public static string NothingChargedNote() =>
+        "Nothing in this window was charged to this subscription.".Localized();
+
+    /// <summary>
+    /// The line that explains a flat quota bar: everything else recorded in
+    /// the same hours, named by which of three attribution states it actually
+    /// holds — declared elsewhere, declared excluded, or never classified.
+    /// Null when there is nothing to report.
+    /// <para>
+    /// Five variants, not one flat "other subscriptions": that phrase is a
+    /// claim the user only made about the first state. Reporting an explicit
+    /// exclusion back to the user as "unclassified" would tell them their own
+    /// decision was an outstanding question, so excluded and unclassified are
+    /// kept apart, and each combination that can actually occur gets its own
+    /// sentence.
+    /// </para>
+    /// </summary>
+    public static string? SameHoursLine(QuotaHistoryRow row)
+    {
+        // "Recorded" means either kind of evidence, the same rule the row's
+        // own money column uses: a provider entry can carry a cost with no
+        // token components.
+        if (row.OtherTokens <= 0 && row.OtherCost <= 0)
+        {
+            return null;
+        }
+
+        // One-value phrasing whenever one side is absent, in EITHER
+        // direction — the mirror of the model rows' own dash rule, stated
+        // here as a single combined value rather than two dashed fields
+        // because this line is prose, not a table column.
+        var value = row.OtherTokens > 0 && row.OtherCost > 0
+            ? Format.CompactTokens(row.OtherTokens) + " · " + Format.Usd(row.OtherCost)
+            : row.OtherTokens > 0 ? Format.CompactTokens(row.OtherTokens) : Format.Usd(row.OtherCost);
+
+        if (row.OtherHasUnattributed)
+        {
+            return row.OtherHasAssigned || row.OtherHasExcluded
+                ? "Other and unclassified usage in the same hours: {0}".Localized(value)
+                : "Unclassified usage in the same hours: {0}".Localized(value);
+        }
+
+        if (row.OtherHasExcluded)
+        {
+            return row.OtherHasAssigned
+                ? "Other and excluded usage in the same hours: {0}".Localized(value)
+                : "Excluded usage in the same hours: {0}".Localized(value);
+        }
+
+        return "Other subscriptions in the same hours: {0}".Localized(value);
+    }
+
+    /// <summary>
+    /// Above the rows: what a tenth of this window's allowance has been worth,
+    /// pooled across every cycle ON SCREEN rather than read off one — a single
+    /// row's ratio is dominated by the 1-point reading quantisation, and the
+    /// whole reason to pool is that the individual figures cannot be trusted.
+    /// <paramref name="shown"/> must already be restricted to the rows the
+    /// card actually draws: a hidden older cycle folded in here would move a
+    /// number nobody can see the evidence for.
+    /// </summary>
+    public static WindowEquivalence.Row Equivalence(IReadOnlyList<QuotaHistoryRow> shown, bool declared) =>
+        WindowEquivalence.Aggregate(
+            declared,
+            [.. shown.Select(row => new WindowEquivalence.Cycle(
+                row.Cycle.UsedPercent, row.SpanTokens, row.SpanCost, row.Cycle.ObservedFraction))]);
 }

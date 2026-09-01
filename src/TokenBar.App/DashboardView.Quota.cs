@@ -762,9 +762,24 @@ public sealed partial class DashboardView
         IReadOnlyList<QuotaCycle> cycles = series is null
             ? []
             : QuotaHistoryFold.Considered(QuotaHistoryFold.Cycles(series.Samples));
+
+        // One join for the whole card. The collapsed rows' spans, the
+        // expanded model breakdown and same-hours line, and the ≈
+        // equivalence line above them all come from this single scan —
+        // sorted once, one contiguous slice per cycle — rather than the
+        // O(cycles x messages) shape a second per-cycle filter would cost.
+        //
+        // modelScope: null. Windows has no scoped-window data wired yet (no
+        // Fable-only-style provider-scoped limit is exposed on this platform
+        // today), so every model counts — the same unscoped behaviour the
+        // history card already had through QuotaEquivalenceFold.
+        var historyRows = QuotaHistoryFold.Rows(cycles, messages, clientId, modelScope: null, confirmed.Records);
+        var byResetAt = historyRows.ToDictionary(historyRow => historyRow.Id);
         var rows = WindowHistoryText.Rows(
             cycles,
-            QuotaEquivalenceFold.Cycles(cycles, clientId, messages, confirmed.Records));
+            [.. historyRows.Select(historyRow => new WindowEquivalence.Cycle(
+                historyRow.Cycle.UsedPercent, historyRow.SpanTokens, historyRow.SpanCost,
+                historyRow.Cycle.ObservedFraction))]);
 
         var body = new StackPanel { Spacing = 0 };
         var state = WindowHistoryText.State(rows, snapshot.QuotaHistoryAttempted);
@@ -776,9 +791,21 @@ public sealed partial class DashboardView
             return Ui.Card(WindowHistoryText.Title(), body);
         }
 
+        // "10% of quota ~ X tokens · $Y" — pooled over the rows actually
+        // shown, above them, because a single row's ratio is dominated by
+        // the 1-point reading quantisation.
+        var equivalence = WindowHistoryText.Equivalence(
+            [.. rows.Select(row => byResetAt[row.ResetAtMs])],
+            declared: confirmed.Records.Count > 0);
+        var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
+        equivalenceLine.TextWrapping = TextWrapping.Wrap;
+        equivalenceLine.Margin = new Thickness(0, 0, 0, 6);
+        body.Children.Add(equivalenceLine);
+
+        var colors = new ModelColorMap(snapshot.Models, snapshot.CostAuthoritative);
         foreach (var row in rows)
         {
-            body.Children.Add(HistoryRow(row));
+            body.Children.Add(HistoryRow(row, byResetAt[row.ResetAtMs], colors));
         }
 
         // The line that keeps the money column from reading as a bill.
@@ -789,7 +816,7 @@ public sealed partial class DashboardView
         return Ui.Card(WindowHistoryText.Title(), body, WindowHistoryText.Subtitle(rows));
     }
 
-    private FrameworkElement HistoryRow(WindowHistoryRow row)
+    private FrameworkElement HistoryRow(WindowHistoryRow row, QuotaHistoryRow historyRow, ModelColorMap colors)
     {
         var open = _historyExpanded == row.ResetAtMs;
         var block = new StackPanel { Spacing = 4, Margin = new Thickness(0, 5, 0, 5) };
@@ -802,7 +829,7 @@ public sealed partial class DashboardView
         };
         head.Children.Add(Ui.Text(open ? "▾" : "▸", 8, 0.45));
         head.Children.Add(Ui.Text(row.Stamp, 9, 0.6));
-        head.Children.Add(HistoryBars(row));
+        head.Children.Add(HistoryBars(row, historyRow, colors));
         var percent = Ui.Text(WindowHistoryText.Percent(row), 9);
         percent.Width = 30;
         percent.TextAlignment = TextAlignment.Right;
@@ -834,10 +861,66 @@ public sealed partial class DashboardView
                 detail.Children.Add(line);
             }
 
+            // The heaviest four of this subscription's models, or the line
+            // that says none of this window was charged to it — never a bare
+            // empty expander, which reads as a card that gave up mid-scan.
+            //
+            // Not distinguished from "the usage scan has not landed yet":
+            // this card's collapsed row already shows 0 tokens rather than a
+            // spinner while that scan is out (WindowHistoryText.Rows draws
+            // every cycle regardless), so this detail view keeps the same
+            // choice rather than adding a second wait state the row above it
+            // does not have.
+            var topModels = WindowHistoryText.TopModels(historyRow);
+            if (topModels.Count == 0)
+            {
+                detail.Children.Add(Ui.Text(WindowHistoryText.NothingChargedNote(), 10, 0.45));
+            }
+            else
+            {
+                foreach (var model in topModels)
+                {
+                    detail.Children.Add(ModelDetailRow(model));
+                }
+            }
+
+            // The line that explains a flat quota bar: everything else
+            // recorded in the same hours, named by which attribution states
+            // it actually holds.
+            if (WindowHistoryText.SameHoursLine(historyRow) is { } sameHours)
+            {
+                var line = Ui.Text(sameHours, 9, 0.45);
+                line.TextWrapping = TextWrapping.Wrap;
+                line.Margin = new Thickness(0, 2, 0, 0);
+                detail.Children.Add(line);
+            }
+
             block.Children.Add(detail);
         }
 
         return block;
+    }
+
+    private static FrameworkElement ModelDetailRow(QuotaHistoryModel model)
+    {
+        var grid = new Grid { ColumnSpacing = 6 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(54) });
+
+        // Ui.Text already trims to an ellipsis by default.
+        grid.Children.Add(Ui.Text(model.ModelId, 10, 0.85));
+
+        var tokens = Ui.Text(WindowHistoryText.ModelTokens(model), 10, 0.6);
+        Grid.SetColumn(tokens, 1);
+        grid.Children.Add(tokens);
+
+        var cost = Ui.Text(WindowHistoryText.ModelCost(model), 10);
+        cost.TextAlignment = TextAlignment.Right;
+        Grid.SetColumn(cost, 2);
+        grid.Children.Add(cost);
+
+        return grid;
     }
 
     /// <summary>Two bars, stacked and deliberately NOT sharing a scale. Quota
@@ -847,17 +930,18 @@ public sealed partial class DashboardView
     /// that is not there. Adjacent and separately scaled, the mismatch between
     /// the two lengths is legible instead of hidden, and that mismatch is what
     /// this card exists to expose.</summary>
-    private FrameworkElement HistoryBars(WindowHistoryRow row)
+    private FrameworkElement HistoryBars(WindowHistoryRow row, QuotaHistoryRow historyRow, ModelColorMap colors)
     {
         var stack = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
         stack.Children.Add(HistoryBar(
             row.QuotaFraction,
             AccentColor(),
             row.ThinObservation ? HistoryThinOpacity : HistoryQuotaOpacity));
-        // Relative to the heaviest window on screen. An empty strip is a real
-        // answer: this window consumed allowance and nothing in it was declared
-        // as this subscription's.
-        stack.Children.Add(HistoryBar(row.UsageFraction, AccentColor(), 0.55));
+        // Relative to the heaviest window on screen, segmented by model in
+        // the app's shared palette. An empty strip is a real answer: this
+        // window consumed allowance and nothing in it was declared as this
+        // subscription's.
+        stack.Children.Add(HistoryUsageBar(row, historyRow, colors));
         return stack;
     }
 
@@ -884,6 +968,55 @@ public sealed partial class DashboardView
             });
         }
 
+        return host;
+    }
+
+    /// <summary>The usage bar, coloured per model instead of one flat tint —
+    /// the model-segmented bar. <see cref="HistoryBar"/> stays the plain track
+    /// for the quota half above it and for every empty usage strip.</summary>
+    private static FrameworkElement HistoryUsageBar(
+        WindowHistoryRow row, QuotaHistoryRow historyRow, ModelColorMap colors)
+    {
+        var segments = WindowHistoryText.Segments(historyRow, colors);
+        if (row.UsageFraction <= 0 || segments.Count == 0)
+        {
+            // Same flat tint the bar drew before it was model-segmented. In
+            // practice this is unreachable whenever SpanTokens > 0, since the
+            // span is a subset of MineTokens' wider window — but a defensive
+            // fallback for the edge where they disagree should look like the
+            // established bar, not invent a second visual language for it.
+            return HistoryBar(row.UsageFraction, AccentColor(), 0.55);
+        }
+
+        var full = Math.Max(1, HistoryBarWidth * Math.Min(1, row.UsageFraction));
+        var host = new Grid { Width = HistoryBarWidth, Height = HistoryBarHeight };
+        host.Children.Add(new Rectangle
+        {
+            Height = HistoryBarHeight,
+            RadiusX = HistoryBarHeight / 2,
+            RadiusY = HistoryBarHeight / 2,
+            Fill = new SolidColorBrush(Tint(Colors.Gray, 0.2)),
+        });
+
+        var strip = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Width = full,
+            Height = HistoryBarHeight,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Clip = new RectangleGeometry { Rect = new Windows.Foundation.Rect(0, 0, full, HistoryBarHeight) },
+        };
+        foreach (var segment in segments)
+        {
+            strip.Children.Add(new Rectangle
+            {
+                Width = Math.Max(0, full * segment.Fraction),
+                Height = HistoryBarHeight,
+                Fill = Ui.BrushFromHex(segment.Color),
+            });
+        }
+
+        host.Children.Add(strip);
         return host;
     }
 

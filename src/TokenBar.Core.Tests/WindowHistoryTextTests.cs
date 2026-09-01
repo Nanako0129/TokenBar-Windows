@@ -158,6 +158,11 @@ public class WindowHistoryTextTests
     public void EveryStringTheCardCanShowHasATableEntry()
     {
         var rows = WindowHistoryText.Rows([Cycle(10 * Hour, 42, observed: 0.2)], [Span(1, 1)]);
+        var otherAssignedRow = HistoryRow(otherAssigned: true);
+        var otherExcludedRow = HistoryRow(otherExcluded: true);
+        var otherUnattributedRow = HistoryRow(otherUnattributed: true);
+        var otherAssignedAndExcludedRow = HistoryRow(otherAssigned: true, otherExcluded: true);
+        var otherAssignedAndUnattributedRow = HistoryRow(otherAssigned: true, otherUnattributed: true);
         Func<string?>[] surfaces =
         [
             WindowHistoryText.Title,
@@ -166,6 +171,12 @@ public class WindowHistoryTextTests
             () => WindowHistoryText.EmptyBody(WindowHistoryState.NoHistory),
             () => WindowHistoryText.ThinObservationNote(rows[0]),
             () => WindowHistoryText.Disclaimer("claude"),
+            WindowHistoryText.NothingChargedNote,
+            () => WindowHistoryText.SameHoursLine(otherAssignedRow),
+            () => WindowHistoryText.SameHoursLine(otherExcludedRow),
+            () => WindowHistoryText.SameHoursLine(otherUnattributedRow),
+            () => WindowHistoryText.SameHoursLine(otherAssignedAndExcludedRow),
+            () => WindowHistoryText.SameHoursLine(otherAssignedAndUnattributedRow),
         ];
 
         var english = surfaces.Select(surface => surface()).ToList();
@@ -182,4 +193,149 @@ public class WindowHistoryTextTests
             Localization.Load("en", AppContext.BaseDirectory);
         }
     }
+
+    // ---- the expanded row (PARITY-3b's deferred half) ---------------------
+
+    private static QuotaHistoryRow HistoryRow(
+        long mineTokens = 0, double mineCost = 0,
+        long otherTokens = 100, double otherCost = 1.0,
+        bool otherAssigned = false, bool otherExcluded = false, bool otherUnattributed = false,
+        IReadOnlyList<QuotaHistoryModel>? models = null) =>
+        new(
+            Cycle: Cycle(10 * Hour, 42),
+            MineTokens: mineTokens,
+            MineTokensExCacheRead: mineTokens,
+            MineCost: mineCost,
+            SpanTokens: mineTokens,
+            SpanCost: mineCost,
+            OtherTokens: otherTokens,
+            OtherCost: otherCost,
+            OtherHasAssigned: otherAssigned,
+            OtherHasExcluded: otherExcluded,
+            OtherHasUnattributed: otherUnattributed,
+            Models: models ?? []);
+
+    // The five variants named in the fold's own comment, each selected by its
+    // OWN combination of presence flags — not by comparing token counts, the
+    // defect QuotaHistoryRow's doc comment records having paid for once.
+    [Theory]
+    [InlineData(true, false, false, "Other subscriptions in the same hours: 100 · $1.00")]
+    [InlineData(false, true, false, "Excluded usage in the same hours: 100 · $1.00")]
+    [InlineData(false, false, true, "Unclassified usage in the same hours: 100 · $1.00")]
+    [InlineData(true, true, false, "Other and excluded usage in the same hours: 100 · $1.00")]
+    [InlineData(true, false, true, "Other and unclassified usage in the same hours: 100 · $1.00")]
+    public void EachPresenceFlagCombinationSelectsItsOwnLead(
+        bool assigned, bool excluded, bool unattributed, string expected)
+    {
+        var row = HistoryRow(otherAssigned: assigned, otherExcluded: excluded, otherUnattributed: unattributed);
+        Assert.Equal(expected, WindowHistoryText.SameHoursLine(row));
+    }
+
+    // Unclassified takes precedence in the lead over excluded when both are
+    // present alongside "other" — the fold checks OtherHasUnattributed first.
+    [Fact]
+    public void UnattributedTakesPrecedenceOverExcludedInTheLead() =>
+        Assert.Equal(
+            "Other and unclassified usage in the same hours: 100 · $1.00",
+            WindowHistoryText.SameHoursLine(
+                HistoryRow(otherAssigned: true, otherExcluded: true, otherUnattributed: true)));
+
+    // The exact defect the fold's comment names: a contribution that carries
+    // cost and NO tokens must still produce a line — a token-only comparison
+    // would have called this bucket empty.
+    [Fact]
+    public void ACostOnlyUnattributedContributionStillProducesALine() =>
+        Assert.Equal(
+            "Unclassified usage in the same hours: $7.50",
+            WindowHistoryText.SameHoursLine(
+                HistoryRow(otherTokens: 0, otherCost: 7.5, otherUnattributed: true)));
+
+    // The mirror: tokens with no price prints the tokens alone.
+    [Fact]
+    public void ATokenOnlyContributionPrintsTokensAlone() =>
+        Assert.Equal(
+            "Other subscriptions in the same hours: 100",
+            WindowHistoryText.SameHoursLine(HistoryRow(otherTokens: 100, otherCost: 0, otherAssigned: true)));
+
+    // Nothing recorded in the same hours at all -> no line, not an empty one.
+    [Fact]
+    public void NoOtherEvidenceProducesNoLine() =>
+        Assert.Null(WindowHistoryText.SameHoursLine(HistoryRow(otherTokens: 0, otherCost: 0)));
+
+    private static QuotaHistoryModel Model(string modelId, long tokens, double cost) =>
+        new("anthropic", modelId, tokens, cost);
+
+    // "The heaviest four" — a fifth, smaller model does not appear.
+    [Fact]
+    public void TopModelsIsTheHeaviestFour()
+    {
+        var row = HistoryRow(models:
+        [
+            Model("m1", 500, 1),
+            Model("m2", 400, 1),
+            Model("m3", 300, 1),
+            Model("m4", 200, 1),
+            Model("m5", 100, 1),
+        ]);
+
+        Assert.Equal(["m1", "m2", "m3", "m4"], WindowHistoryText.TopModels(row).Select(m => m.ModelId).ToArray());
+    }
+
+    // The dash rule: a model attributed by cost alone carries no token count,
+    // and the mirror for a model with tokens and no price.
+    [Fact]
+    public void AModelRowDashesTheMetricItDoesNotCarry()
+    {
+        Assert.Equal("·", WindowHistoryText.ModelTokens(Model("cost-only", 0, 5)));
+        Assert.Equal("$5.00", WindowHistoryText.ModelCost(Model("cost-only", 0, 5)));
+        Assert.Equal("1.5K", WindowHistoryText.ModelTokens(Model("token-only", 1_500, 0)));
+        Assert.Equal("·", WindowHistoryText.ModelCost(Model("token-only", 1_500, 0)));
+    }
+
+    // Segments are proportioned by tokens against THIS ROW's own MineTokens,
+    // and empty when nothing has been attributed at all — an empty usage bar
+    // is a real answer, not a rendering failure.
+    [Fact]
+    public void SegmentsAreProportionedByTokensAgainstMineTokens()
+    {
+        var row = HistoryRow(mineTokens: 1000, models: [Model("a", 750, 1), Model("b", 250, 1)]);
+
+        var colors = new ModelColorMap([]);
+        var segments = WindowHistoryText.Segments(row, colors);
+
+        Assert.Equal(2, segments.Count);
+        Assert.Equal(0.75, segments[0].Fraction, 6);
+        Assert.Equal(0.25, segments[1].Fraction, 6);
+    }
+
+    [Fact]
+    public void NoMineTokensMeansNoSegments()
+    {
+        var row = HistoryRow(mineTokens: 0, models: [Model("a", 0, 5)]);
+        Assert.Empty(WindowHistoryText.Segments(row, new ModelColorMap([])));
+    }
+
+    // The equivalence pools only the rows actually shown on screen: a wider
+    // pool moves a number the reader has no rows on screen to check.
+    [Fact]
+    public void EquivalencePoolsOnlyTheShownRows()
+    {
+        // Three cycles at 20% each with matching span evidence clears
+        // WindowEquivalence.MinimumCycles (3) and its MinimumDelta gate.
+        var shown = Enumerable.Range(0, 3)
+            .Select(i => HistoryRow(mineTokens: 1000, mineCost: 10) with
+            {
+                Cycle = Cycle((10 + i) * Hour, 20),
+            })
+            .ToList();
+
+        var row = WindowHistoryText.Equivalence(shown, declared: true);
+
+        Assert.True(row.IsRatio);
+    }
+
+    [Fact]
+    public void EquivalenceIsUndeclaredWhenNothingHasBeenClassified() =>
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(
+            WindowHistoryText.Equivalence([HistoryRow()], declared: false));
 }
