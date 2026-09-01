@@ -40,6 +40,11 @@
     <Compile Include="..\TokenBar.App\QuotaSummaryText.cs" Link="QuotaSummaryText.cs" />
     <Compile Include="..\TokenBar.App\QuotaLensText.cs" Link="QuotaLensText.cs" />
     <Compile Include="..\TokenBar.App\QuotaLensData.cs" Link="QuotaLensData.cs" />
+    <!-- Every decision the usage-attribution settings page makes, for the same
+         reason as the three above: SettingsWindow.cs is compiled by no test
+         project, so the suppression rule and the accept-all count would sit in
+         a file nothing can assert against. -->
+    <Compile Include="..\TokenBar.App\UsageAttributionPage.cs" Link="UsageAttributionPage.cs" />
     <!-- Syrtis.Installer's boundary logic, pulled in for the same reason as
          the App sources above: none of these five files references
          System.Windows.Forms, so they compile as-is under net10. Deliberately
