@@ -399,4 +399,51 @@ public class WindowCardTextTests
             Localization.Load("en", AppContext.BaseDirectory);
         }
     }
+
+    // ---- tab-label collisions -------------------------------------------
+    //
+    // Found on the user's own screen: a Claude tab row showing 工作階段 three
+    // times. The identity is the store's triple, but the label joins on
+    // (clientId, windowKey), so two accounts of one client resolve to one
+    // label. Tolerable on the strip card, where the rows sit side by side;
+    // unusable on sub-tabs, where one has to be picked.
+
+    private static WindowCardTab Tab(string scope, string window, string? label) =>
+        new(new QuotaWindowIdentity("claude", scope, window), label, null);
+
+    [Fact]
+    public void TabsSharingALabelAcrossAccountsAreQualifiedByScope()
+    {
+        var tabs = WindowCardText.Disambiguate(
+            [Tab("acct-a", "session.v1", "Session"), Tab("acct-b", "session.v1", "Session")]);
+
+        Assert.Equal(["Session · acct-a", "Session · acct-b"], tabs.Select(t => t.Label));
+    }
+
+    [Fact]
+    public void TabsSharingALabelWithinOneAccountAreQualifiedByWindowKey()
+    {
+        var tabs = WindowCardText.Disambiguate(
+            [Tab("acct-a", "session.v1", "Session"), Tab("acct-a", "fable.v1", "Session")]);
+
+        Assert.Equal(["Session · session.v1", "Session · fable.v1"], tabs.Select(t => t.Label));
+    }
+
+    [Fact]
+    public void ALabelNothingElseSharesIsLeftAlone()
+    {
+        var tabs = WindowCardText.Disambiguate(
+            [Tab("acct-a", "session.v1", "Session"), Tab("acct-a", "weekly.v1", "Weekly")]);
+
+        Assert.Equal(["Session", "Weekly"], tabs.Select(t => t.Label));
+    }
+
+    [Fact]
+    public void AnUnjoinedLabelStaysNullSoTheKeyFallbackStillApplies()
+    {
+        var tabs = WindowCardText.Disambiguate(
+            [Tab("acct-a", "session.v1", null), Tab("acct-b", "session.v1", null)]);
+
+        Assert.All(tabs, tab => Assert.Null(tab.Label));
+    }
 }
