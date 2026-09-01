@@ -80,6 +80,27 @@ public sealed record QuotaCycle(
     public long DurationMs => ResetAtMs - StartMs;
 }
 
+/// <summary>
+/// The running cycle: where it sits on the clock, and every reading taken
+/// inside it. See <see cref="QuotaHistoryFold.Active"/>.
+/// <para>
+/// <see cref="ResetAtMs"/> and <see cref="StartMs"/> are nullable together, and
+/// that is the third outcome this type exists to carry: a window that IS
+/// running but whose newest reading reports no usable duration cannot be
+/// placed on an axis. "Nothing is running" and "something is running that we
+/// cannot place" are different sentences on the card, and a record that could
+/// only say "no cycle" would have merged them into the first — which is the
+/// one that claims the user has stopped working.
+/// </para>
+/// </summary>
+public sealed record QuotaActiveCycle(
+    long? ResetAtMs, long? StartMs, IReadOnlyList<QuotaSample> Samples)
+{
+    /// <summary>True when the window has both ends and the geometry can be
+    /// asked for a chart.</summary>
+    public bool IsPlaced => ResetAtMs is not null && StartMs is not null;
+}
+
 public static class QuotaHistoryFold
 {
     /// <summary>
@@ -162,6 +183,52 @@ public static class QuotaHistoryFold
         }
 
         return cycles.OrderByDescending(cycle => cycle.ResetAtMs).ToList();
+    }
+
+    /// <summary>
+    /// The cycle still running, and the readings taken inside it — the half
+    /// <see cref="Cycles"/> deliberately excludes.
+    /// <para>
+    /// The Session-window card draws exactly this: a line through the samples
+    /// of the window the user is in right now. It is the same
+    /// <c>IsActiveGroup</c> bit that keeps the running cycle out of the strip's
+    /// "past windows", read the other way round, so the two surfaces cannot
+    /// disagree about which cycle is current.
+    /// </para>
+    /// <para>
+    /// Placement comes from the NEWEST active sample's own
+    /// <c>ResetAt</c>/<c>DurationSeconds</c>, the same rule
+    /// <see cref="Cycles"/> applies per cycle: a provider that changes its
+    /// reported duration mid-window should have the window placed by what it
+    /// reports now. Every active sample is carried, including any taken before
+    /// such a shift — the geometry clips to the window bounds, and dropping a
+    /// reading here would delete evidence the card is meant to show.
+    /// </para>
+    /// <para>Null only when nothing is running. A running window whose newest
+    /// sample reports no usable duration comes back with its readings and no
+    /// placement (<see cref="QuotaActiveCycle.IsPlaced"/> false), because an
+    /// unplaceable window is not an idle one and the card has a different
+    /// sentence for each.</para>
+    /// </summary>
+    public static QuotaActiveCycle? Active(IReadOnlyList<QuotaHistorySample> samples)
+    {
+        var active = samples
+            .Where(sample => sample.IsActiveGroup)
+            .OrderBy(sample => sample.SampledAt)
+            .ToList();
+        if (active.Count == 0)
+        {
+            return null;
+        }
+
+        var newest = active[^1];
+        var placed = newest.DurationSeconds > 0;
+        return new QuotaActiveCycle(
+            ResetAtMs: placed ? newest.ResetAt * 1000 : null,
+            StartMs: placed ? (newest.ResetAt - newest.DurationSeconds) * 1000 : null,
+            Samples: active
+                .Select(sample => new QuotaSample(sample.SampledAt * 1000, sample.UsedPercent))
+                .ToList());
     }
 
     /// <summary>

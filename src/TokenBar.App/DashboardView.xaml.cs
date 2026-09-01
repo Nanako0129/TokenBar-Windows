@@ -1256,10 +1256,21 @@ public sealed partial class DashboardView : UserControl
             _ => PaceMode.Historical,
         };
 
-    private static FrameworkElement BuildLimits(DashboardModel.Snapshot snapshot)
+    /// <summary><paramref name="clientId"/> narrows the card to one
+    /// subscription for the per-client Quota lens (5e). A parameter rather than
+    /// a second builder: this card answers "where does the allowance stand
+    /// right now", and a copy of it would be free to disagree with the original
+    /// on the same window.</summary>
+    private static FrameworkElement BuildLimits(
+        DashboardModel.Snapshot snapshot, string? clientId = null)
     {
         var panel = new StackPanel { Spacing = 10 };
         var agents = snapshot.Quota?.Agents ?? [];
+        if (clientId is not null)
+        {
+            agents = [.. agents.Where(agent => agent.ClientId == clientId)];
+        }
+
         if (agents.Count == 0)
         {
             panel.Children.Add(Ui.Dim("No quota data yet.".Localized()));

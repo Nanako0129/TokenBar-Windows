@@ -115,4 +115,55 @@ public class QuotaHistoryFoldTests
         Assert.Equal(QuotaHistorySampleOrigin.ImportedV2, sample.Origin);
         Assert.True(sample.IsActiveGroup);
     }
+
+    // ---- the running cycle (5e) ----------------------------------------
+
+    // The same IsActiveGroup bit, read the other way round: what Cycles leaves
+    // out is exactly what the Session-window card draws.
+    [Fact]
+    public void ActiveIsTheCycleCyclesExcludes()
+    {
+        QuotaHistorySample[] samples =
+        [
+            Sample(ResetAt - FiveHours, ResetAt - FiveHours - 600, 55),
+            Sample(ResetAt, ResetAt - 3_600, 20, isActiveGroup: true),
+            Sample(ResetAt, ResetAt - 600, 40, isActiveGroup: true),
+        ];
+
+        Assert.Single(QuotaHistoryFold.Cycles(samples));
+        var active = QuotaHistoryFold.Active(samples);
+
+        Assert.NotNull(active);
+        Assert.True(active!.IsPlaced);
+        Assert.Equal(ResetAt * 1000, active.ResetAtMs);
+        Assert.Equal((ResetAt - FiveHours) * 1000, active.StartMs);
+        // Oldest first, in ms, so the geometry can walk them straight through.
+        Assert.Equal([20d, 40d], active.Samples.Select(sample => sample.UsedPercent));
+        Assert.Equal((ResetAt - 3_600) * 1000, active.Samples[0].AtMs);
+    }
+
+    [Fact]
+    public void NoActiveSampleMeansNothingIsRunning() =>
+        Assert.Null(QuotaHistoryFold.Active([Sample(ResetAt, ResetAt - 600, 40)]));
+
+    // The third outcome, and the one a nullable cycle alone would have merged
+    // into "nothing is running": a window IS running and the provider reported
+    // no usable duration to place it with.
+    [Fact]
+    public void ARunningWindowWithNoUsableDurationKeepsItsReadingsAndLosesItsPlacement()
+    {
+        var active = QuotaHistoryFold.Active(
+        [
+            Sample(ResetAt, ResetAt - 600, 40, isActiveGroup: true) with
+            {
+                DurationSeconds = 0,
+            },
+        ]);
+
+        Assert.NotNull(active);
+        Assert.False(active!.IsPlaced);
+        Assert.Null(active.StartMs);
+        Assert.Null(active.ResetAtMs);
+        Assert.Single(active.Samples);
+    }
 }

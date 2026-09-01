@@ -55,6 +55,14 @@
          state choice is the defect this card can actually ship (a range with
          real usage but no token counts announcing "no usage recorded"). -->
     <Compile Include="..\TokenBar.App\SubscriptionTrendText.cs" Link="SubscriptionTrendText.cs" />
+    <!-- The per-client Quota lens (5e): the Session-window card's five-state
+         branch, its hatched no-sample series, and the window-history card's row
+         fold and disclaimer. Same reason again — DashboardView.Quota.cs is
+         compiled by no test project, and "no sample" being a drawn series
+         rather than a gap is exactly the kind of rule a layout file loses
+         silently. -->
+    <Compile Include="..\TokenBar.App\WindowCardText.cs" Link="WindowCardText.cs" />
+    <Compile Include="..\TokenBar.App\WindowHistoryText.cs" Link="WindowHistoryText.cs" />
     <!-- Syrtis.Installer's boundary logic, pulled in for the same reason as
          the App sources above: none of these five files references
          System.Windows.Forms, so they compile as-is under net10. Deliberately

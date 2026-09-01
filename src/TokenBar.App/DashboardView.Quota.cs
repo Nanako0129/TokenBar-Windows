@@ -4,6 +4,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
 using TokenBar.Core;
+using TokenBar.Interop;
 using Windows.UI;
 using Grid = Microsoft.UI.Xaml.Controls.Grid;
 
@@ -93,9 +94,13 @@ public sealed partial class DashboardView
 
     private UIElement BuildQuota(DashboardModel.Snapshot snapshot)
     {
-        // The client tab renders the same two all-clients cards for now: the
-        // per-client quota lens (Session window / history) is 5e, not this
-        // slice — the equivalence subsystem it also needs ships here.
+        // A client tab asks about one subscription, so it gets that
+        // subscription's own three cards rather than the all-clients four.
+        if (_activeClientTab != ClientRegistry.OverviewTab)
+        {
+            return BuildClientQuota(snapshot, _activeClientTab);
+        }
+
         var (summaries, windows, grids) =
             QuotaLensData.Build(snapshot.QuotaHistory, snapshot.Quota);
         var attempted = snapshot.QuotaHistoryAttempted;
@@ -340,6 +345,546 @@ public sealed partial class DashboardView
         }
 
         return row;
+    }
+
+    // ── The per-client lens (5e) ─────────────────────────────────────────
+
+    // Visual parameters, from WindowUsageCard.swift:44-50 and its draw(). Named
+    // so a round of visual feedback edits one line.
+    private const double WindowChartHeight = 96;
+    /// <summary>The bar band is a third of the chart. The line uses the whole
+    /// box, so the two overlap by design: in "used" mode early in a window the
+    /// line runs low, straight through the bars. Rather than move either
+    /// series, the bars recede and light one at a time under the cursor while
+    /// the line stays in front.</summary>
+    private const double WindowBarBand = 32;
+    private const double WindowBarRestOpacity = 0.17;
+    private const double WindowBarHoverOpacity = 0.62;
+    /// <summary>The hatch's plate and its stripes. One weight for both
+    /// no-sample stretches — the leading one and the future — because they mean
+    /// the same thing: no quota reading here, so no line.</summary>
+    private const double WindowHatchPlateOpacity = 0.06;
+    private const double WindowHatchStrokeOpacity = 0.18;
+    /// <summary>Horizontal step between stripes, in pixels. Any denser and the
+    /// hatch reads as a solid block at popover width.</summary>
+    private const double WindowHatchStep = 5;
+    private const double WindowCurveWidth = 1.8;
+    private const double WindowSampleDot = 4;
+
+    private string _windowCardTab =
+        AppSettings.Store.GetString(WindowCardText.TabKey) ?? string.Empty;
+
+    private QuotaMetric _windowMetric =
+        AppSettings.Store.GetBool(WindowCardText.AsUsedKey, false)
+            ? QuotaMetric.Used : QuotaMetric.Remaining;
+
+    /// <summary>Which history row is open, keyed by the cycle's reset instant —
+    /// the same value the fold uses as a row's identity.</summary>
+    private long? _historyExpanded;
+
+    /// <summary>One subscription's own three cards: the window it is in now,
+    /// where its allowance stands, and the windows before this one.</summary>
+    private UIElement BuildClientQuota(DashboardModel.Snapshot snapshot, string clientId)
+    {
+        var tabs = WindowCardText.Tabs(snapshot.QuotaHistory, snapshot.Quota, clientId);
+        var selected = tabs.FirstOrDefault(tab => WindowId(tab.Id) == _windowCardTab)
+            ?? tabs.FirstOrDefault();
+        var confirmed = UsageAttribution.Confirmed(AppSettings.Store);
+        var messages = snapshot.WindowUsage?.Messages ?? [];
+
+        var stack = new StackPanel { Spacing = 10 };
+        stack.Children.Add(BuildWindowCard(snapshot, tabs, selected, messages, confirmed, clientId));
+        // The same builder the Overview and the all-clients lens use, filtered
+        // to this client. A second implementation of "where does the allowance
+        // stand right now" would be free to disagree with the first.
+        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot, clientId)));
+        stack.Children.Add(BuildWindowHistoryCard(snapshot, selected, messages, confirmed, clientId));
+        return stack;
+    }
+
+    private FrameworkElement BuildWindowCard(
+        DashboardModel.Snapshot snapshot,
+        IReadOnlyList<WindowCardTab> tabs,
+        WindowCardTab? selected,
+        IReadOnlyList<WindowMessage> messages,
+        UsageAttribution.Table confirmed,
+        string clientId)
+    {
+        var state = WindowCardText.State(selected, snapshot.QuotaHistoryAttempted);
+        var body = new StackPanel { Spacing = 4 };
+        if (tabs.Count > 1)
+        {
+            body.Children.Add(WindowTabs(tabs, selected));
+        }
+
+        if (state != WindowCardState.Chart)
+        {
+            var line = Ui.Dim(WindowCardText.EmptyBody(state));
+            line.TextWrapping = TextWrapping.Wrap;
+            body.Children.Add(line);
+            return Ui.Card(
+                WindowCardText.Title(selected),
+                body,
+                WindowCardText.Subtitle(state, selected, DateTimeOffset.Now));
+        }
+
+        var active = selected!.Active!;
+        var start = active.StartMs!.Value;
+        var end = active.ResetAtMs!.Value;
+        // Clamped to the window's own end: past reset the provider's next
+        // reading opens a new cycle, and a `now` beyond the axis would put the
+        // hatch and the zones outside the box they are drawn in.
+        var now = Math.Min(DateTimeOffset.Now.ToUnixTimeMilliseconds(), end);
+        var mine = WindowCardText.Mine(messages, clientId, confirmed.Records);
+        var geometry = WindowCardGeometry.Chart(start, end, now, active.Samples, mine, _windowMetric);
+
+        var (percent, caption) = WindowCardText.Headline(geometry, _windowMetric);
+        var headline = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        if (percent is not null)
+        {
+            headline.Children.Add(Ui.Text(percent, 22, bold: true));
+        }
+
+        headline.Children.Add(Ui.Dim(caption));
+        body.Children.Add(headline);
+        body.Children.Add(WindowChart(geometry, mine));
+        body.Children.Add(WindowLegend(geometry));
+        if (WindowCardText.UndatedNote(snapshot.WindowUsage?.UndatedCount ?? 0) is { } undated)
+        {
+            var note = Ui.Dim(undated, 9);
+            note.TextWrapping = TextWrapping.Wrap;
+            body.Children.Add(note);
+        }
+
+        return Ui.Card(
+            WindowCardText.Title(selected),
+            body,
+            WindowCardText.Subtitle(state, selected, DateTimeOffset.Now),
+            WindowMetricToggle());
+    }
+
+    /// <summary>One sub-tab per window this client has recorded. Pills rather
+    /// than a menu: a client has two or three windows, and which one you are
+    /// looking at is the card's own subject.</summary>
+    private FrameworkElement WindowTabs(
+        IReadOnlyList<WindowCardTab> tabs, WindowCardTab? selected)
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+        foreach (var tab in tabs)
+        {
+            var pill = LensPill(
+                string.IsNullOrWhiteSpace(tab.Label) ? tab.Id.WindowKey : tab.Label!.Localized(),
+                tab == selected);
+            var id = WindowId(tab.Id);
+            pill.Click += (_, _) =>
+            {
+                _windowCardTab = id;
+                AppSettings.Store.SetString(WindowCardText.TabKey, id);
+                RenderContent(animated: false);
+            };
+            row.Children.Add(pill);
+        }
+
+        return row;
+    }
+
+    private FrameworkElement WindowMetricToggle()
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+        foreach (var metric in new[] { QuotaMetric.Remaining, QuotaMetric.Used })
+        {
+            var pill = LensPill(WindowCardText.MetricLabel(metric), _windowMetric == metric);
+            pill.Click += (_, _) =>
+            {
+                _windowMetric = metric;
+                // The Agent-limits card's own key: one preference, so the two
+                // cards on this page cannot count in opposite directions.
+                AppSettings.Store.SetBool(WindowCardText.AsUsedKey, metric == QuotaMetric.Used);
+                RenderContent(animated: false);
+            };
+            row.Children.Add(pill);
+        }
+
+        return row;
+    }
+
+    /// <summary>Three series in one box: the hatched no-sample regions, the
+    /// usage bars, and the quota line with its sample dots.</summary>
+    private FrameworkElement WindowChart(
+        ChartGeometry geometry, IReadOnlyList<WindowMessage> mine)
+    {
+        var canvas = new Canvas { Height = WindowChartHeight };
+        var accent = AccentColor();
+
+        void Draw()
+        {
+            canvas.Children.Clear();
+            var width = canvas.ActualWidth;
+            if (width <= 0)
+            {
+                return;
+            }
+
+            // Drawn, not left blank. A gap would say "nothing happened here";
+            // the hatch says "we did not look here", which is the fact.
+            foreach (var (from, to) in WindowCardText.NoSampleRegions(geometry))
+            {
+                canvas.Children.Add(Hatch(from * width, (to - from) * width));
+            }
+
+            // Bars and zones are produced together and share an index, so the
+            // zone under the cursor lights its own bar and nothing else.
+            var lit = new Rectangle?[geometry.Bars.Count];
+            for (var index = 0; index < geometry.Bars.Count; index++)
+            {
+                var bar = geometry.Bars[index];
+                var x = bar.X * width;
+                var barWidth = Math.Max((bar.Width * width) - 1, 0.5);
+                if (bar.IsEmpty)
+                {
+                    // A baseline tick, so "nothing was spent in this interval"
+                    // stays distinguishable from "no data here".
+                    var tick = new Rectangle
+                    {
+                        Width = barWidth,
+                        Height = 1,
+                        Fill = new SolidColorBrush(Tint(Colors.Gray, 0.28)),
+                    };
+                    Canvas.SetLeft(tick, x);
+                    Canvas.SetTop(tick, WindowChartHeight - 1);
+                    canvas.Children.Add(tick);
+                    continue;
+                }
+
+                var height = Math.Max(bar.Height * WindowBarBand, 1);
+                var rect = new Rectangle
+                {
+                    Width = barWidth,
+                    Height = height,
+                    Fill = new SolidColorBrush(Tint(accent, WindowBarRestOpacity)),
+                };
+                Canvas.SetLeft(rect, x);
+                Canvas.SetTop(rect, WindowChartHeight - height);
+                canvas.Children.Add(rect);
+                lit[index] = rect;
+            }
+
+            // The line last, so it is in front of the bars it explains.
+            if (geometry.Curve.Count > 1)
+            {
+                var points = new PointCollection();
+                foreach (var point in geometry.Curve)
+                {
+                    points.Add(new Windows.Foundation.Point(point.X * width, CurveY(point.Y)));
+                }
+
+                canvas.Children.Add(new Polyline
+                {
+                    Points = points,
+                    Stroke = new SolidColorBrush(accent),
+                    StrokeThickness = WindowCurveWidth,
+                    StrokeLineJoin = PenLineJoin.Round,
+                    IsHitTestVisible = false,
+                });
+            }
+
+            foreach (var point in geometry.SamplePoints)
+            {
+                var dot = new Ellipse
+                {
+                    Width = WindowSampleDot,
+                    Height = WindowSampleDot,
+                    Stroke = new SolidColorBrush(accent),
+                    StrokeThickness = 1.1,
+                    IsHitTestVisible = false,
+                };
+                Canvas.SetLeft(dot, (point.X * width) - (WindowSampleDot / 2));
+                Canvas.SetTop(dot, CurveY(point.Y) - (WindowSampleDot / 2));
+                canvas.Children.Add(dot);
+            }
+
+            // Hit zones on top: they tile [windowStart, now] exactly, so the
+            // future is unhittable by construction rather than by intent.
+            foreach (var zone in geometry.Hits)
+            {
+                var overlay = new Rectangle
+                {
+                    Width = Math.Max(zone.Width * width, 1),
+                    Height = WindowChartHeight,
+                    Fill = new SolidColorBrush(Colors.Transparent),
+                };
+                Canvas.SetLeft(overlay, zone.X * width);
+                Canvas.SetTop(overlay, 0);
+                var hovered = zone;
+                var bar = zone.Index < lit.Length ? lit[zone.Index] : null;
+                if (bar is not null)
+                {
+                    AttachHoverOutline(overlay, isHovered =>
+                        bar.Fill = new SolidColorBrush(Tint(
+                            accent, isHovered ? WindowBarHoverOpacity : WindowBarRestOpacity)));
+                }
+
+                HoverTip.AttachRich(overlay, () => WindowZoneTip(hovered, mine));
+                canvas.Children.Add(overlay);
+            }
+        }
+
+        canvas.SizeChanged += (_, _) => Draw();
+        return canvas;
+    }
+
+    /// <summary>Fixed 0…100: rescaling would make 7% used and 63% used look the
+    /// same, which is the one thing this card exists to tell apart.</summary>
+    private static double CurveY(double value) =>
+        10 + ((1 - (value / 100)) * (WindowChartHeight - 16));
+
+    private static FrameworkElement Hatch(double left, double width)
+    {
+        var host = new Canvas
+        {
+            Width = width,
+            Height = WindowChartHeight,
+            // Scoped so the stripes cannot leak onto the bars and line beside
+            // them.
+            Clip = new RectangleGeometry
+            {
+                Rect = new Windows.Foundation.Rect(0, 0, width, WindowChartHeight),
+            },
+            IsHitTestVisible = false,
+        };
+        host.Children.Add(new Rectangle
+        {
+            Width = width,
+            Height = WindowChartHeight,
+            Fill = new SolidColorBrush(Tint(Colors.Gray, WindowHatchPlateOpacity)),
+        });
+        var stroke = new SolidColorBrush(Tint(Colors.Gray, WindowHatchStrokeOpacity));
+        for (var x = -WindowChartHeight; x < width; x += WindowHatchStep)
+        {
+            host.Children.Add(new Line
+            {
+                X1 = x,
+                Y1 = WindowChartHeight,
+                X2 = x + WindowChartHeight,
+                Y2 = 0,
+                Stroke = stroke,
+                StrokeThickness = 0.6,
+            });
+        }
+
+        Canvas.SetLeft(host, left);
+        Canvas.SetTop(host, 0);
+        return host;
+    }
+
+    private UIElement WindowZoneTip(HitZone zone, IReadOnlyList<WindowMessage> mine)
+    {
+        var panel = new StackPanel { Spacing = 3, MinWidth = 186 };
+        panel.Children.Add(TipText(
+            WindowCardText.ClockRange(zone.LoMs, zone.HiMs), 11, bold: true));
+        panel.Children.Add(TipText(WindowCardText.ZoneQuota(zone, _windowMetric), 9, 0.6));
+        if (WindowCardText.ZoneConsumed(zone, _windowMetric) is { } consumed)
+        {
+            panel.Children.Add(TipText(consumed, 9));
+        }
+
+        var (tokens, money, empty) = WindowCardText.ZoneUsage(WindowCardText.InZone(mine, zone));
+        if (empty is not null)
+        {
+            panel.Children.Add(TipText(empty, 9, 0.6));
+        }
+        else
+        {
+            panel.Children.Add(TipRow(TipText(tokens!, 9, 0.6), money!, 0.6));
+        }
+
+        return panel;
+    }
+
+    private FrameworkElement WindowLegend(ChartGeometry geometry)
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+        var accent = AccentColor();
+        row.Children.Add(LegendKey(accent, 1.0, WindowCardText.QuotaKey(), line: true));
+        row.Children.Add(LegendKey(accent, 0.5, WindowCardText.UsageKey(), line: false));
+        // The hatch has a legend entry because it is a series, not a gap: a
+        // reader has to be able to look it up.
+        row.Children.Add(LegendKey(Colors.Gray, 0.3, WindowCardText.NoSampleKey(), line: false));
+        row.Children.Add(Ui.Text(
+            WindowCardText.Readings(geometry.SamplePoints.Count), 9, 0.45));
+        return row;
+    }
+
+    private static FrameworkElement LegendKey(Color color, double opacity, string label, bool line)
+    {
+        var item = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 4,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        item.Children.Add(new Rectangle
+        {
+            Width = line ? 12 : 8,
+            Height = line ? 2 : 8,
+            RadiusX = line ? 1 : 2,
+            RadiusY = line ? 1 : 2,
+            Fill = new SolidColorBrush(Tint(color, opacity)),
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        item.Children.Add(Ui.Text(label, 9, 0.7));
+        return item;
+    }
+
+    // ── 時間窗歷史 ────────────────────────────────────────────────────────
+
+    private const double HistoryBarWidth = 62;
+    private const double HistoryBarHeight = 4;
+    private const double HistoryQuotaOpacity = 0.85;
+    /// <summary>A barely-witnessed cycle draws its quota bar faint: the figure
+    /// is a floor, and the bar must not read as a measurement.</summary>
+    private const double HistoryThinOpacity = 0.35;
+
+    private FrameworkElement BuildWindowHistoryCard(
+        DashboardModel.Snapshot snapshot,
+        WindowCardTab? selected,
+        IReadOnlyList<WindowMessage> messages,
+        UsageAttribution.Table confirmed,
+        string clientId)
+    {
+        IReadOnlyList<QuotaHistorySeries> history = snapshot.QuotaHistory ?? [];
+        var series = selected is null
+            ? null
+            : history.FirstOrDefault(s =>
+                s.ProviderId == selected.Id.ProviderId
+                && s.AccountScope == selected.Id.AccountScope
+                && s.WindowKey == selected.Id.WindowKey);
+        IReadOnlyList<QuotaCycle> cycles = series is null
+            ? []
+            : QuotaHistoryFold.Considered(QuotaHistoryFold.Cycles(series.Samples));
+        var rows = WindowHistoryText.Rows(
+            cycles,
+            QuotaEquivalenceFold.Cycles(cycles, clientId, messages, confirmed.Records));
+
+        var body = new StackPanel { Spacing = 0 };
+        var state = WindowHistoryText.State(rows, snapshot.QuotaHistoryAttempted);
+        if (state != WindowHistoryState.Rows)
+        {
+            var line = Ui.Dim(WindowHistoryText.EmptyBody(state));
+            line.TextWrapping = TextWrapping.Wrap;
+            body.Children.Add(line);
+            return Ui.Card(WindowHistoryText.Title(), body);
+        }
+
+        foreach (var row in rows)
+        {
+            body.Children.Add(HistoryRow(row));
+        }
+
+        // The line that keeps the money column from reading as a bill.
+        var disclaimer = Ui.Text(WindowHistoryText.Disclaimer(clientId), 9, 0.45);
+        disclaimer.TextWrapping = TextWrapping.Wrap;
+        disclaimer.Margin = new Thickness(0, 6, 0, 0);
+        body.Children.Add(disclaimer);
+        return Ui.Card(WindowHistoryText.Title(), body, WindowHistoryText.Subtitle(rows));
+    }
+
+    private FrameworkElement HistoryRow(WindowHistoryRow row)
+    {
+        var open = _historyExpanded == row.ResetAtMs;
+        var block = new StackPanel { Spacing = 4, Margin = new Thickness(0, 5, 0, 5) };
+
+        var head = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            Background = new SolidColorBrush(Colors.Transparent), // hit-test
+        };
+        head.Children.Add(Ui.Text(open ? "▾" : "▸", 8, 0.45));
+        head.Children.Add(Ui.Text(row.Stamp, 9, 0.6));
+        head.Children.Add(HistoryBars(row));
+        var percent = Ui.Text(WindowHistoryText.Percent(row), 9);
+        percent.Width = 30;
+        percent.TextAlignment = TextAlignment.Right;
+        head.Children.Add(percent);
+        head.Children.Add(Ui.Text(WindowHistoryText.Tokens(row), 9, 0.6));
+        var cost = Ui.Text(WindowHistoryText.Cost(row), 9);
+        cost.Width = 54;
+        cost.TextAlignment = TextAlignment.Right;
+        head.Children.Add(cost);
+        var id = row.ResetAtMs;
+        head.Tapped += (_, _) =>
+        {
+            _historyExpanded = open ? null : id;
+            RenderContent(animated: false);
+        };
+        block.Children.Add(head);
+
+        if (open)
+        {
+            var detail = new StackPanel { Spacing = 3, Margin = new Thickness(16, 2, 0, 0) };
+            // The full interval lives here rather than in the row: it is what a
+            // reader opens a row to confirm.
+            detail.Children.Add(Ui.Text(row.Range, 9, 0.45));
+            if (WindowHistoryText.ThinObservationNote(row) is { } note)
+            {
+                var line = Ui.Text(note, 9);
+                line.Foreground = Ui.BrushFromHex(PaceOrange);
+                line.TextWrapping = TextWrapping.Wrap;
+                detail.Children.Add(line);
+            }
+
+            block.Children.Add(detail);
+        }
+
+        return block;
+    }
+
+    /// <summary>Two bars, stacked and deliberately NOT sharing a scale. Quota
+    /// and tokens are not proportional — measured on live data one window moved
+    /// 1% of the allowance carrying 18.0M attributed tokens and another moved
+    /// 9% carrying 22.8M — so one bar, or one axis, would draw a relationship
+    /// that is not there. Adjacent and separately scaled, the mismatch between
+    /// the two lengths is legible instead of hidden, and that mismatch is what
+    /// this card exists to expose.</summary>
+    private FrameworkElement HistoryBars(WindowHistoryRow row)
+    {
+        var stack = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
+        stack.Children.Add(HistoryBar(
+            row.QuotaFraction,
+            AccentColor(),
+            row.ThinObservation ? HistoryThinOpacity : HistoryQuotaOpacity));
+        // Relative to the heaviest window on screen. An empty strip is a real
+        // answer: this window consumed allowance and nothing in it was declared
+        // as this subscription's.
+        stack.Children.Add(HistoryBar(row.UsageFraction, AccentColor(), 0.55));
+        return stack;
+    }
+
+    private static FrameworkElement HistoryBar(double fraction, Color color, double opacity)
+    {
+        var host = new Grid { Width = HistoryBarWidth, Height = HistoryBarHeight };
+        host.Children.Add(new Rectangle
+        {
+            Height = HistoryBarHeight,
+            RadiusX = HistoryBarHeight / 2,
+            RadiusY = HistoryBarHeight / 2,
+            Fill = new SolidColorBrush(Tint(Colors.Gray, 0.2)),
+        });
+        if (fraction > 0)
+        {
+            host.Children.Add(new Rectangle
+            {
+                Width = Math.Max(1, HistoryBarWidth * Math.Min(1, fraction)),
+                Height = HistoryBarHeight,
+                RadiusX = HistoryBarHeight / 2,
+                RadiusY = HistoryBarHeight / 2,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Fill = new SolidColorBrush(Tint(color, opacity)),
+            });
+        }
+
+        return host;
     }
 
     // ── Strip card ───────────────────────────────────────────────────────
