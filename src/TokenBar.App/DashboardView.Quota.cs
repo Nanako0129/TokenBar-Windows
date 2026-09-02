@@ -474,14 +474,14 @@ public sealed partial class DashboardView
         // this active cycle's own sample span since there is no QuotaCycle
         // for a window that has not reset yet.
         //
-        // attempted: WindowUsageAttempted, not the tab's own
+        // attempt: snapshot.WindowUsageOutcome, not the tab's own
         // QuotaHistoryAttempted — the quota samples and the message export
         // are two separate fetches, and a chart can already be drawn from the
-        // first while the second is still in flight.
+        // first while the second is still in flight (or has just failed).
         var declared = QuotaEquivalenceFold.DeclaredSpan(
             active.Samples[0].AtMs, active.Samples[^1].AtMs, messages, confirmed.Records);
         var equivalence = WindowCardText.LiveEquivalence(
-            active.Samples, mine, declared, snapshot.WindowUsageAttempted);
+            active.Samples, mine, declared, snapshot.WindowUsageOutcome);
         var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
         equivalenceLine.TextWrapping = TextWrapping.Wrap;
         equivalenceLine.Margin = new Thickness(0, 2, 0, 0);
@@ -837,9 +837,24 @@ public sealed partial class DashboardView
         // draws for the strip/heatmap: a declaration for another subscription
         // does not make THIS window's own unclassified messages "recorded as
         // zero".
-        var equivalence = WindowHistoryText.Equivalence(
-            [.. rows.Select(row => byResetAt[row.ResetAtMs])],
-            declared: QuotaEquivalenceFold.Declared(cycles, messages, confirmed.Records));
+        //
+        // Gated on WindowUsageOutcome, not the card-level QuotaHistoryAttempted
+        // `state` above: `declared` is computed from `messages`, which come
+        // from the WindowUsage fetch, not the QuotaHistory one. History can
+        // land (state == Rows) while the message export is still in flight —
+        // or has failed — and asking Declared() of an empty `messages` list at
+        // that moment reads as "nothing classified", telling an
+        // already-classified user to go classify their usage: the same
+        // wrong-lane read QuotaEquivalenceFold.Build's own caller above (:111)
+        // already guards against.
+        var equivalence = snapshot.WindowUsageOutcome switch
+        {
+            WindowEquivalence.FetchOutcome.Succeeded => WindowHistoryText.Equivalence(
+                [.. rows.Select(row => byResetAt[row.ResetAtMs])],
+                declared: QuotaEquivalenceFold.Declared(cycles, messages, confirmed.Records)),
+            WindowEquivalence.FetchOutcome.Failed => new WindowEquivalence.Row.ScanFailed(),
+            _ => new WindowEquivalence.Row.Loading(),
+        };
         var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
         equivalenceLine.TextWrapping = TextWrapping.Wrap;
         equivalenceLine.Margin = new Thickness(0, 0, 0, 6);

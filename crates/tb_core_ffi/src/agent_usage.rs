@@ -64,13 +64,52 @@ pub struct AgentUsageSnapshot {
     source: String,
     updated_at: String,
     identity: Option<AgentIdentity>,
-    #[serde(skip)]
+    /// The opaque HMAC scope of the currently-authenticated identity for this
+    /// provider, or the reason it could not be resolved. Exposed on the wire
+    /// (unlike the earlier `#[serde(skip)]`) so a C# consumer can match a live
+    /// agent to the SAME account's stored quota-history series rather than
+    /// falling back to "first series under this window key" — the two can
+    /// differ the moment an account switch adds a second series under one
+    /// `(providerId, windowKey)`. `Ok`/`Err` are kept distinguishable on the
+    /// wire (an object with either `scope` or `error` set, never both) —
+    /// collapsing a resolution failure into an absent field would read as "no
+    /// scope needed" rather than "could not tell".
+    #[serde(serialize_with = "serialize_account_scope")]
     pub(crate) account_scope: Result<AccountScope, AccountScopeError>,
     windows: Vec<UsageWindow>,
     credits: Option<CreditsSnapshot>,
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport_diagnostic: Option<SafeTransportDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountScopeWire<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn serialize_account_scope<S>(
+    value: &Result<AccountScope, AccountScopeError>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let wire = match value {
+        Ok(scope) => AccountScopeWire {
+            scope: Some(scope.as_str()),
+            error: None,
+        },
+        Err(error) => AccountScopeWire {
+            scope: None,
+            error: Some(error.to_string()),
+        },
+    };
+    wire.serialize(serializer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -8899,6 +8938,21 @@ mod tests {
             .as_object_mut()
             .expect("payload serializes as an object")
             .remove("publicationGeneration");
+        // `accountScope` is a Windows-only wire addition (the account-dimension
+        // fix, PR #81 structural review): it did not exist when this fixture
+        // was authored as the Swift↔C# cross-check oracle input, and adding it
+        // to the shared fixture would require re-baselining that byte-for-byte
+        // parity contract (crosscheck/README.md's pinned hashes) for a field
+        // the Swift side has no reason to emit here. Stripped from the
+        // comparison the same way `publicationGeneration` is above, rather
+        // than folded into the shared fixture.
+        if let Some(agents) = serialized.get_mut("agents").and_then(Value::as_array_mut) {
+            for agent in agents {
+                if let Some(object) = agent.as_object_mut() {
+                    object.remove("accountScope");
+                }
+            }
+        }
         assert_eq!(fixture["payload"], serialized);
     }
 }

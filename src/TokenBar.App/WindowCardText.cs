@@ -66,11 +66,13 @@ public static class WindowCardText
     /// picker does not offer.</summary>
     public const string TabKey = "tokenbar.windowcard.window";
 
-    /// <summary>The account scope a live window's tab carries when no stored
-    /// series can supply one. The live payload does not model more than one
-    /// account per client (see <c>WindowCardLoader.select</c>'s "primary
-    /// account only" restriction on macOS), so there is exactly one scope to
-    /// name here.</summary>
+    /// <summary>The account scope a live window's tab carries when neither a
+    /// stored series nor the live payload itself can supply one — the live
+    /// agent's own <see cref="AgentUsageSnapshot.AccountScope"/> resolution
+    /// failed (or this snapshot predates the field), so there is no real HMAC
+    /// to compare against and this placeholder is the only identity left to
+    /// name the tab with. Last resort, not the common case: whenever the live
+    /// scope IS known, <see cref="Tabs"/> uses it directly.</summary>
     private const string PrimaryAccountScope = "primary";
 
     /// <summary>
@@ -101,27 +103,57 @@ public static class WindowCardText
     /// filter is that equality and nothing else; no join table, and no
     /// second id space to drift.
     /// </para>
+    /// <para>
+    /// The store legitimately holds two series under one
+    /// <c>(providerId, windowKey)</c> that differ only in
+    /// <see cref="QuotaHistorySeries.AccountScope"/> — an account switch
+    /// leaves the PREVIOUS account's series in place and starts a new one for
+    /// the newly-signed-in identity. Joining by <c>WindowKey</c> alone (as
+    /// this used to) cannot tell them apart, so which one a tab bound to was
+    /// decided by dictionary iteration order — silently binding the old
+    /// account's chart, running-cycle placement and window history to the new
+    /// account's tab. The live agent's own resolved
+    /// <see cref="AgentUsageSnapshot.AccountScope"/> is the one signal that
+    /// says which account is CURRENTLY signed in, so a series is only
+    /// eligible for this join when its <c>AccountScope</c> equals the live
+    /// one — the previous account's series are excluded outright, not merely
+    /// deprioritised. When the live scope itself could not be resolved (an
+    /// <see cref="AccountScopeStatus.Error"/>, or an older payload that
+    /// predates the field) there is no account signal to filter by at all, so
+    /// this falls back to the pre-fix first-wins behaviour — the same
+    /// information the app has always had in that case, not worse.
+    /// </para>
     /// </summary>
     public static IReadOnlyList<WindowCardTab> Tabs(
         IReadOnlyList<QuotaHistorySeries>? history,
         AgentUsagePayload? quota,
         string clientId)
     {
+        var agent = quota?.Agents.FirstOrDefault(a => a.ClientId == clientId);
+        var liveScope = agent?.AccountScope?.Scope;
+
         // Keyed by the store's WindowKey — the join PaceStatus.WindowKey can
         // reach — so a live window finds its own running cycle without
-        // needing to know the store's AccountScope half up front. First wins,
-        // same as the label lookup this replaces: the live payload offers no
-        // second account to disambiguate against on Windows today.
+        // needing to know the store's AccountScope half up front. Restricted
+        // to the live account's own scope first (see the doc comment above);
+        // TryAdd's first-wins only matters within that filtered set, or as a
+        // last resort when no live scope is available to filter by at all.
         var byWindowKey = new Dictionary<string, QuotaHistorySeries>();
         foreach (var series in history ?? [])
         {
-            if (series.ProviderId == clientId)
+            if (series.ProviderId != clientId)
             {
-                byWindowKey.TryAdd(series.WindowKey, series);
+                continue;
             }
+
+            if (liveScope is not null && series.AccountScope != liveScope)
+            {
+                continue;
+            }
+
+            byWindowKey.TryAdd(series.WindowKey, series);
         }
 
-        var agent = quota?.Agents.FirstOrDefault(a => a.ClientId == clientId);
         var tabs = new List<WindowCardTab>();
         foreach (var window in agent?.UniqueCardWindows ?? [])
         {
@@ -133,9 +165,15 @@ public static class WindowCardText
                 // what BuildWindowHistoryCard joins back against to find this
                 // window's past cycles — and the live CardId only as a
                 // fallback identity for a window the store has nothing under,
-                // where no such join is possible anyway.
+                // where no such join is possible anyway. The account half
+                // prefers the matched series' own scope, then the live scope
+                // (a window the store has nothing under yet, yet the live
+                // agent still names an account), then the last-resort
+                // placeholder.
                 new QuotaWindowIdentity(
-                    clientId, series?.AccountScope ?? PrimaryAccountScope, series?.WindowKey ?? window.CardId),
+                    clientId,
+                    series?.AccountScope ?? liveScope ?? PrimaryAccountScope,
+                    series?.WindowKey ?? window.CardId),
                 window.Label,
                 series is null ? null : QuotaHistoryFold.Active(series.Samples),
                 HasHistory: series is not null));
@@ -172,7 +210,7 @@ public static class WindowCardText
     /// messages, so this card and the chart above it can never disagree about
     /// which usage counts.
     /// <para>
-    /// <paramref name="declared"/> and <paramref name="attempted"/> are the
+    /// <paramref name="declared"/> and <paramref name="attempt"/> are the
     /// same two facts <see cref="WindowHistoryText.Equivalence"/> already
     /// requires for its pooled line, required here for the same reason:
     /// <see cref="WindowEquivalence.LiveRow"/> cannot accept a call that
@@ -183,10 +221,10 @@ public static class WindowCardText
         IReadOnlyList<QuotaSample> samples,
         IReadOnlyList<WindowMessage> mine,
         bool declared,
-        bool attempted) =>
+        WindowEquivalence.FetchOutcome attempt) =>
         WindowEquivalence.LiveRow(
             declared,
-            attempted,
+            attempt,
             [.. samples.Select(sample => new WindowEquivalence.Sample(sample.AtMs, sample.UsedPercent))],
             mine);
 

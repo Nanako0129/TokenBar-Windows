@@ -30,6 +30,10 @@ public class WindowCardTextTests
         string clientId, string windowKey, params QuotaHistorySample[] samples) =>
         new(clientId, "primary", windowKey, samples);
 
+    private static QuotaHistorySeries Series(
+        string clientId, string accountScope, string windowKey, params QuotaHistorySample[] samples) =>
+        new(clientId, accountScope, windowKey, samples);
+
     private static WindowMessage Message(
         string client, string provider, string model, long at = 1) =>
         new(at, client, provider, model, 0, 100, 0, 0, 0, 0.5, true);
@@ -50,6 +54,16 @@ public class WindowCardTextTests
     private static AgentUsagePayload Quota(string clientId, params UsageWindow[] windows) =>
         new("2026-01-01T00:00:00Z",
             [new AgentUsageSnapshot(clientId, "source", "2026-01-01T00:00:00Z", windows)]);
+
+    /// <summary>The live agent's own resolved account scope — the HMAC a
+    /// stored <see cref="QuotaHistorySeries.AccountScope"/> is compared
+    /// against, per <see cref="WindowCardText.Tabs"/>.</summary>
+    private static AgentUsagePayload Quota(
+        string clientId, string accountScope, params UsageWindow[] windows) =>
+        new("2026-01-01T00:00:00Z",
+            [new AgentUsageSnapshot(
+                clientId, "source", "2026-01-01T00:00:00Z", windows,
+                AccountScope: new AccountScopeStatus(Scope: accountScope))]);
 
     // ---- the live-window enumeration -------------------------------------
 
@@ -125,6 +139,64 @@ public class WindowCardTextTests
 
         Assert.Single(tabs);
         Assert.Equal("Session", tabs[0].Label);
+    }
+
+    // The account dimension (PR #81 structural review, P2): the store can
+    // hold two series under one (providerId, windowKey) that differ only in
+    // AccountScope — an account switch leaves the previous account's series
+    // in place and starts a new one. Joining by WindowKey alone cannot tell
+    // them apart, so which one a tab bound to used to be decided by
+    // dictionary iteration order (TryAdd, first wins) rather than by which
+    // account is actually signed in. The live agent's own resolved
+    // AccountScope is the signal that says which one that is; a series
+    // belonging to any other account must be excluded outright, not merely
+    // deprioritised — the account-b series is listed FIRST here specifically
+    // so a first-wins join would pick the wrong one.
+    [Fact]
+    public void TabsBindToTheLiveAccountsOwnSeriesNotWhicheverComesFirst()
+    {
+        var quota = Quota(
+            "claude", accountScope: "account-a",
+            Window("claude|session.v1", "Session", "session.v1"));
+
+        var tabs = WindowCardText.Tabs(
+            [
+                // Listed first, and would win under a plain WindowKey-only
+                // TryAdd join — but it belongs to the account that is no
+                // longer signed in.
+                Series("claude", "account-b", "session.v1", Sample(90, ResetAt - 600)),
+                Series("claude", "account-a", "session.v1", Sample(40, ResetAt - 600)),
+            ],
+            quota,
+            clientId: "claude");
+
+        var tab = Assert.Single(tabs);
+        Assert.Equal("account-a", tab.Id.AccountScope);
+        Assert.True(tab.HasHistory);
+        // The account-a series' own sample (40%), not account-b's (90%) —
+        // pinning that the RIGHT series' data reached the tab, not just that
+        // the right scope string was recorded on the identity.
+        Assert.NotNull(tab.Active);
+        Assert.Equal(40, tab.Active!.Samples[^1].UsedPercent);
+    }
+
+    // The mirror case: when the live scope cannot be resolved at all (an
+    // AccountScopeStatus.Error, or an absent AccountScope on an older
+    // payload), there is no account signal to filter by, so this falls back
+    // to the pre-fix first-wins behaviour rather than showing nothing.
+    [Fact]
+    public void TabsFallBackToFirstWinsWhenTheLiveScopeIsUnavailable()
+    {
+        var tabs = WindowCardText.Tabs(
+            [
+                Series("claude", "account-a", "session.v1", Sample(40, ResetAt - 600)),
+                Series("claude", "account-b", "session.v1", Sample(90, ResetAt - 600)),
+            ],
+            Quota("claude", Window("claude|session.v1", "Session", "session.v1")),
+            clientId: "claude");
+
+        var tab = Assert.Single(tabs);
+        Assert.Equal("account-a", tab.Id.AccountScope);
     }
 
     // The window key is the store's own, and ProviderId is already a registered
@@ -554,7 +626,7 @@ public class WindowCardTextTests
         QuotaSample[] samples = [new(0, 10), new(1000, 30)];
         WindowMessage[] mine = [new(500, "claude-code", "anthropic", "sonnet", 1_000, 0, 0, 0, 0, 2.0, true)];
 
-        var row = WindowCardText.LiveEquivalence(samples, mine, declared: true, attempted: true);
+        var row = WindowCardText.LiveEquivalence(samples, mine, declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded);
 
         var ratio = Assert.IsType<WindowEquivalence.Row.Ratio>(row);
         Assert.Equal(500, ratio.TokensPerTenth);
@@ -572,7 +644,7 @@ public class WindowCardTextTests
     public void LiveEquivalenceReachesEveryRowCaseTheChartCanProduce(
         QuotaSample[] samples, WindowMessage[] mine, Type expectedRowType)
     {
-        var row = WindowCardText.LiveEquivalence(samples, mine, declared: true, attempted: true);
+        var row = WindowCardText.LiveEquivalence(samples, mine, declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded);
         Assert.IsType(expectedRowType, row);
 
         // The strip card's own renderer must accept whatever comes back —
@@ -600,7 +672,7 @@ public class WindowCardTextTests
         // Plenty of quota movement and an empty `mine` — exactly what an
         // unclassified machine hands this call site (WindowCardText.Mine
         // filters every message out when nothing is declared).
-        var row = WindowCardText.LiveEquivalence(samples, [], declared: false, attempted: true);
+        var row = WindowCardText.LiveEquivalence(samples, [], declared: false, attempt: WindowEquivalence.FetchOutcome.Succeeded);
 
         Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
     }
@@ -613,9 +685,23 @@ public class WindowCardTextTests
     {
         QuotaSample[] samples = [new(0, 10), new(1000, 30)];
 
-        var row = WindowCardText.LiveEquivalence(samples, [], declared: true, attempted: false);
+        var row = WindowCardText.LiveEquivalence(samples, [], declared: true, attempt: WindowEquivalence.FetchOutcome.NotAttempted);
 
         Assert.IsType<WindowEquivalence.Row.Loading>(row);
+    }
+
+    // The third state the old bool collapsed: the window-usage fetch was
+    // attempted and threw (DashboardModel.FetchLazyWanted's TryFetch
+    // swallows the exception and still publishes completion), so `mine` is
+    // empty because nothing was read, not because the scan found nothing.
+    [Fact]
+    public void LiveEquivalenceIsScanFailedNotUnaccountedWhenTheFetchThrew()
+    {
+        QuotaSample[] samples = [new(0, 10), new(1000, 30)];
+
+        var row = WindowCardText.LiveEquivalence(samples, [], declared: true, attempt: WindowEquivalence.FetchOutcome.Failed);
+
+        Assert.IsType<WindowEquivalence.Row.ScanFailed>(row);
     }
 
     public static TheoryData<QuotaSample[], WindowMessage[], Type> LiveEquivalenceCases()

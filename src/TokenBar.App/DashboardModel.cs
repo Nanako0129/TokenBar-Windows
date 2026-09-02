@@ -297,6 +297,27 @@ public sealed class DashboardModel
         /// completion, or the equivalence lines wait forever for an answer
         /// that was never going to come.</summary>
         public bool WindowUsageAttempted { get; init; }
+
+        /// <summary>
+        /// The three facts <see cref="WindowUsageAttempted"/> and
+        /// <see cref="WindowUsage"/> together carry, collapsed here so a call
+        /// site reads one signal instead of re-deriving it: not attempted yet,
+        /// attempted and the fetch threw (this lane's <c>TryFetch</c> swallows
+        /// the exception and publishes completion anyway, but with no data —
+        /// <see cref="WindowUsage"/> stays whatever it was before, which is
+        /// null on a first fetch that fails), or attempted and it landed.
+        /// <para>
+        /// A caller that instead read <c>WindowUsageAttempted</c> alone and
+        /// defaulted <c>WindowUsage?.Messages</c> to <c>[]</c> could not tell
+        /// a completed empty scan from a scan that never ran — the exact
+        /// ambiguity <see cref="WindowEquivalence.FetchOutcome"/> exists to
+        /// remove.
+        /// </para>
+        /// </summary>
+        public WindowEquivalence.FetchOutcome WindowUsageOutcome =>
+            !WindowUsageAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
+            : WindowUsage is null ? WindowEquivalence.FetchOutcome.Failed
+            : WindowEquivalence.FetchOutcome.Succeeded;
     }
 
     private volatile bool _hourlyWanted;

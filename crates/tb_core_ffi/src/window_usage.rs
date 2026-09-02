@@ -26,8 +26,12 @@
 //! this on both counts: a request whose `until_ms` grew past what is cached
 //! reuses that scan's data when the source token is unchanged — nothing new
 //! can have been written to storage without it changing — and a genuine
-//! source change (or a shrinking `until_ms`, which no production caller
-//! produces) still falls through to a fresh scan.
+//! source change still falls through to a fresh scan. A shrinking `until_ms`
+//! (no production caller produces one today) does NOT trigger a rescan — the
+//! wider cached scan already covers it — but it must never hand back
+//! messages past its own narrower bound either, so a cache hit whose entry
+//! was scanned further than the request is asking for is trimmed to
+//! `[from_ms, until_ms)` before it is returned (see `narrow_to_request`).
 
 use serde::Serialize;
 use serde_json::Value;
@@ -80,15 +84,16 @@ pub(crate) fn cached(
                 at.elapsed() <= Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS)
                     && *cached_until >= until_ms,
                 *token,
+                *cached_until,
                 data.clone(),
             )
         })
     };
-    let Some((fresh_enough_and_covers, token, data)) = cached else {
+    let Some((fresh_enough_and_covers, token, cached_until, data)) = cached else {
         return compute(context, from_ms, until_ms, key);
     };
     if fresh_enough_and_covers {
-        return Ok(data);
+        return Ok(narrow_to_request(data, until_ms, cached_until));
     }
 
     // Either the cache is stale, or the request grew past what was scanned.
@@ -110,11 +115,37 @@ pub(crate) fn cached(
                     entry.2 = until_ms;
                 }
             }
-            return Ok(data);
+            return Ok(narrow_to_request(data, until_ms, cached_until));
         }
     }
 
     compute(context, from_ms, until_ms, key)
+}
+
+/// Trims a cache hit's messages to the caller's own `until_ms` when the
+/// cached entry was scanned further than that — the case a shrinking request
+/// produces, since `fresh_enough_and_covers`/the token probe above both admit
+/// `cached_until >= until_ms`, not `==`. Without this a narrower request
+/// silently inherited every message the wider scan had already found, past
+/// its own stated upper bound. A no-op (returns `data` unchanged) whenever
+/// the entry was not scanned any further than what was asked for.
+fn narrow_to_request(data: Value, until_ms: i64, cached_until: i64) -> Value {
+    if cached_until <= until_ms {
+        return data;
+    }
+    let mut data = data;
+    if let Some(object) = data.as_object_mut() {
+        if let Some(Value::Array(messages)) = object.get_mut("messages") {
+            messages.retain(|message| {
+                message
+                    .get("timestamp")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|timestamp| timestamp < until_ms)
+            });
+        }
+        object.insert("untilMs".to_string(), Value::from(until_ms));
+    }
+    data
 }
 
 /// Held across a scan so overlapping callers share one, instead of each
@@ -183,6 +214,14 @@ struct Message {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WindowData {
+    /// The interval this payload actually speaks for — `[from_ms, until_ms)`
+    /// — so a consumer can check what it got against what it asked for
+    /// instead of trusting the request echoed the response. `from_ms` never
+    /// changes after a scan (it is the cache key); `until_ms` is rewritten by
+    /// `narrow_to_request`/the growing-request branch above to whichever
+    /// bound this exact answer covers.
+    from_ms: i64,
+    until_ms: i64,
     messages: Vec<Message>,
     undated_count: u32,
     processing_time_ms: u32,
@@ -208,6 +247,8 @@ pub(crate) fn run(
     ))?;
 
     let data = WindowData {
+        from_ms,
+        until_ms,
         messages: usage
             .messages
             .into_iter()
@@ -334,5 +375,70 @@ mod tests {
         // from > until: no message's timestamp can ever satisfy the filter.
         let value = run(&context, 1_700_000_060_000, 1_700_000_000_000).expect("empty window");
         assert_eq!(value["messages"].as_array().unwrap().len(), 0);
+    }
+
+    // The defect a false comment used to describe as already fixed: a cache
+    // entry scanned through `cached_until` must not hand back messages past a
+    // NARROWER request's own `until_ms`, even though it is served from cache
+    // rather than rescanned.
+    #[test]
+    fn a_narrower_request_does_not_return_messages_past_its_own_until_ms() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let from_ms = 1_700_000_000_000;
+        let key = cache_key(from_ms);
+        let context = test_context("narrow-request");
+        let wide_until = from_ms + 120_000;
+        let narrow_until = from_ms + 60_000;
+        let token = tokscale_core::local_source_change_token_with_source_context(
+            context.resolved(),
+            &context.parse_options(None, None),
+        )
+        .unwrap_or(0);
+        let wide = serde_json::json!({
+            "fromMs": from_ms,
+            "untilMs": wide_until,
+            "messages": [
+                {"timestamp": from_ms + 10_000, "client": "a", "providerId": "p", "modelId": "m",
+                 "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
+                 "cost": 0.0, "isTurnStart": true},
+                // Past the narrower request's until_ms: must never come back below.
+                {"timestamp": from_ms + 90_000, "client": "a", "providerId": "p", "modelId": "m",
+                 "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
+                 "cost": 0.0, "isTurnStart": true},
+            ],
+            "undatedCount": 0,
+            "processingTimeMs": 0,
+        });
+        {
+            let mut cache =
+                WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(key, (Instant::now(), token, wide_until, wide));
+        }
+        let before = scan_count();
+
+        let result =
+            cached(&context, from_ms, narrow_until).expect("narrower request served from cache");
+
+        assert_eq!(
+            scan_count(),
+            before,
+            "a narrower request that the cache already covers must not trigger a rescan"
+        );
+        let messages = result["messages"].as_array().expect("messages array");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["timestamp"].as_i64().unwrap() < narrow_until),
+            "no returned message may carry a timestamp at or past the request's own until_ms: {messages:?}"
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(result["untilMs"].as_i64(), Some(narrow_until));
+    }
+
+    #[test]
+    fn narrow_to_request_is_a_noop_when_the_cache_did_not_scan_further() {
+        let data = serde_json::json!({"messages": [], "untilMs": 100});
+        let unchanged = narrow_to_request(data.clone(), 100, 100);
+        assert_eq!(unchanged, data);
     }
 }

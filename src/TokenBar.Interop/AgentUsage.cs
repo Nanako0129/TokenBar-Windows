@@ -10,6 +10,22 @@ public sealed record AgentIdentity(
     string? Email = null,
     string? Plan = null);
 
+/// <summary>
+/// The Rust `account_scope: Result&lt;AccountScope, AccountScopeError&gt;` for one
+/// agent, exactly as the wire keeps its two cases apart: an object carrying
+/// EITHER <see cref="Scope"/> (the opaque HMAC of the authenticated identity —
+/// the same string a stored <c>QuotaHistorySeries.AccountScope</c> carries,
+/// so the two can be compared directly) OR <see cref="Error"/>, never both and
+/// never neither.
+/// <para>
+/// Kept as two independent nullable fields rather than folding a resolution
+/// failure into an absent/null scope: that collapse is exactly what used to
+/// make "no scope needed" and "could not tell" indistinguishable on the wire
+/// (see the Rust field's own doc comment, <c>agent_usage.rs</c>).
+/// </para>
+/// </summary>
+public sealed record AccountScopeStatus(string? Scope = null, string? Error = null);
+
 public sealed record HistoricalPace(
     double ExpectedUsedPercent,
     double? EtaSeconds = null,
@@ -715,7 +731,11 @@ public sealed record AgentUsageSnapshot(
     CreditsSnapshot? Credits = null,
     string? Error = null,
     [property: JsonConverter(typeof(AgentUsageTransportDiagnosticJsonConverter))]
-    AgentUsageTransportDiagnostic? TransportDiagnostic = null) : IJsonOnDeserialized
+    AgentUsageTransportDiagnostic? TransportDiagnostic = null,
+    /// <summary>Null only when this snapshot predates the field (an older
+    /// cdylib, or a hand-built test fixture) — a real payload always carries
+    /// one case or the other. See <see cref="AccountScopeStatus"/>.</summary>
+    AccountScopeStatus? AccountScope = null) : IJsonOnDeserialized
 {
     void IJsonOnDeserialized.OnDeserialized()
     {

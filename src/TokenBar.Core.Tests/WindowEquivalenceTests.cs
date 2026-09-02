@@ -57,7 +57,7 @@ public class WindowEquivalenceTests
     public void FewerThanTwoSamplesIsUnavailable()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [new WindowEquivalence.Sample(0, 10)], []);
         Assert.IsType<WindowEquivalence.Row.Unavailable>(row);
     }
@@ -68,7 +68,7 @@ public class WindowEquivalenceTests
     public void TwoSamplesWithNoMovementIsNotMoved()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(0, 40),
                 new WindowEquivalence.Sample(1000, 40),
@@ -85,7 +85,7 @@ public class WindowEquivalenceTests
     public void MovementWithNoMessagesInSpanIsUnaccountedNotAZeroRatio()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 30),
@@ -101,7 +101,7 @@ public class WindowEquivalenceTests
     public void SmallMovementWithEvidenceIsInsufficientNotNotMoved()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 12), // delta = 2 < 5
@@ -117,7 +117,7 @@ public class WindowEquivalenceTests
     public void TokensWithNoCostIsTokensOnlyNotAZeroDollarRatio()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 20), // delta = 10
@@ -131,7 +131,7 @@ public class WindowEquivalenceTests
     public void CostWithNoTokensIsCostOnlyNotZeroTokenRatio()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 20),
@@ -145,7 +145,7 @@ public class WindowEquivalenceTests
     public void BothTokensAndCostIsRatio()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 20),
@@ -164,7 +164,7 @@ public class WindowEquivalenceTests
     public void OnlyMessagesInsideTheSampleSpanCount()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: true,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(1000, 10),
                 new WindowEquivalence.Sample(2000, 20),
@@ -189,7 +189,7 @@ public class WindowEquivalenceTests
     public void UndeclaredWinsOverPlentifulEvidence()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: false, attempted: true,
+            declared: false, attempt: WindowEquivalence.FetchOutcome.Succeeded,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 30),
@@ -205,7 +205,7 @@ public class WindowEquivalenceTests
     public void NotYetAttemptedIsLoadingNotUnaccounted()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: true, attempted: false,
+            declared: true, attempt: WindowEquivalence.FetchOutcome.NotAttempted,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 30),
@@ -221,7 +221,40 @@ public class WindowEquivalenceTests
     public void UndeclaredWinsOverNotYetAttempted()
     {
         var row = WindowEquivalence.LiveRow(
-            declared: false, attempted: false,
+            declared: false, attempt: WindowEquivalence.FetchOutcome.NotAttempted,
+            [
+                new WindowEquivalence.Sample(0, 10),
+                new WindowEquivalence.Sample(1000, 30),
+            ],
+            []);
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
+    }
+
+    // The third fact a plain `bool attempted` could not carry: the fetch was
+    // attempted and threw, not merely "not yet". A caller that (as
+    // DashboardModel.FetchLazyWanted used to) published completion with an
+    // empty message list on a failed fetch must not see this collapse into
+    // Unaccounted ("no usage was recorded") — nothing was actually read.
+    [Fact]
+    public void FailedFetchIsScanFailedNotUnaccounted()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Failed,
+            [
+                new WindowEquivalence.Sample(0, 10),
+                new WindowEquivalence.Sample(1000, 30),
+            ],
+            []);
+        Assert.IsType<WindowEquivalence.Row.ScanFailed>(row);
+    }
+
+    // declared is still checked first for the failed outcome too — same rule
+    // as NotAttempted, same reason.
+    [Fact]
+    public void UndeclaredWinsOverFailedFetch()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: false, attempt: WindowEquivalence.FetchOutcome.Failed,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 30),

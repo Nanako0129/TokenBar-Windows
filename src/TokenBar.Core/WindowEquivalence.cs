@@ -15,6 +15,44 @@ namespace TokenBar.Core;
 public static class WindowEquivalence
 {
     /// <summary>
+    /// Three facts a single <c>bool attempted</c> collapsed into one: never
+    /// asked, asked and the fetch threw, asked and it landed. <see cref="LiveRow"/>
+    /// used to take a <c>bool</c> here, and <c>DashboardModel.FetchLazyWanted</c>
+    /// published <c>WindowUsageAttempted = true</c> with <c>WindowUsage</c> still
+    /// null when the fetch threw — so a caller reading only "attempted" saw an
+    /// empty message list and reported <see cref="Row.Unaccounted"/> ("no usage
+    /// was recorded"), which is false about a scan that never ran to
+    /// completion. <see cref="Failed"/> exists so that call site does not have
+    /// to remember to also check whether the data actually arrived — the type
+    /// itself carries the distinction.
+    /// <para>
+    /// Also fixes an unrelated defect the old two-bool call
+    /// (<c>LiveRow(declared, attempted, …)</c>) invited: <c>declared</c> and
+    /// <c>attempted</c> were both <c>bool</c>, so a caller that transposed them
+    /// still compiled — silently turning "loading" into "unclassified" or vice
+    /// versa. <c>declared</c> stays a <c>bool</c>; this is a distinct enum, so
+    /// the two parameters can no longer be swapped without a compile error.
+    /// </para>
+    /// </summary>
+    public enum FetchOutcome
+    {
+        /// <summary>The fetch has not been asked for yet, or is still in
+        /// flight.</summary>
+        NotAttempted,
+
+        /// <summary>Asked, and the fetch threw — distinct from
+        /// <see cref="NotAttempted"/> (still waiting for a first answer) and
+        /// from <see cref="Succeeded"/> with an empty result (asked, and the
+        /// answer was "nothing here"). An empty <c>messages</c> list under
+        /// this outcome means "we do not know", not "there is nothing".</summary>
+        Failed,
+
+        /// <summary>Asked, and the fetch returned — <c>messages</c> is the
+        /// real answer, even when it is empty.</summary>
+        Succeeded,
+    }
+
+    /// <summary>
     /// The token count a quota ratio may divide, for ONE message.
     /// <para>
     /// A function rather than a convention, because this ratio is computed in
@@ -172,6 +210,23 @@ public static class WindowEquivalence
         public sealed record Loading : Row;
 
         /// <summary>
+        /// The message scan this row's evidence would come from was
+        /// attempted and threw — distinct from both <see cref="Loading"/>
+        /// (still waiting for a first answer) and <see cref="Unaccounted"/>
+        /// (the scan ran to completion and genuinely found nothing).
+        /// <para>
+        /// Reachable only from <see cref="LiveRow"/> with
+        /// <see cref="FetchOutcome.Failed"/>: <c>DashboardModel</c> publishes
+        /// completion even when the underlying fetch throws (so a lens
+        /// waiting on "not yet" does not wait forever), and that completion
+        /// carries no messages. Reporting that as <see cref="Unaccounted"/>
+        /// told a user who declared everything that none of their usage was
+        /// recorded, when in fact nothing had been read at all.
+        /// </para>
+        /// </summary>
+        public sealed record ScanFailed : Row;
+
+        /// <summary>
         /// The cycles disagree by more than the tolerance, so there is no
         /// single figure to give — only the span they cover.
         /// <para>
@@ -217,6 +272,7 @@ public static class WindowEquivalence
             r.Count, r.Needed),
         Row.Undeclared => "Classify your usage in Settings to see what this window is worth".Localized(),
         Row.Loading => "Reading recent usage…".Localized(),
+        Row.ScanFailed => "Could not read recent usage".Localized(),
         Row.Spread r => "10% of quota ~ {0}-{1} · {2}-{3} API-equivalent".Localized(
             tokens(r.LowPerTenth), tokens(r.HighPerTenth), money(r.LowCostPerTenth), money(r.HighCostPerTenth)),
         _ => throw new ArgumentOutOfRangeException(nameof(row), row, "Unhandled WindowEquivalence.Row case"),
@@ -269,28 +325,31 @@ public static class WindowEquivalence
     /// subscription's attributed usage. <paramref name="samples"/> must be the
     /// ones inside the window, in time order.
     /// <para>
-    /// <paramref name="declared"/> and <paramref name="attempted"/> are
+    /// <paramref name="declared"/> and <paramref name="attempt"/> are
     /// required, not optional, for the same reason <see cref="Aggregate"/>
     /// takes <c>declared</c>: an empty <paramref name="messages"/> list is
     /// ambiguous on its own — "filtered to nothing because nothing is
-    /// declared", "not scanned yet" and "scanned, nothing there" are three
-    /// different facts that arrive as the same empty list, and only the
-    /// caller knows which one it has. A caller that skips either parameter
-    /// does not compile, which is the point: round 4 added a caller that
-    /// skipped both, silently, because neither was asked for.
+    /// declared", "not scanned yet", "the scan threw" and "scanned, nothing
+    /// there" are four different facts that arrive as the same empty list,
+    /// and only the caller knows which one it has. A caller that skips
+    /// either parameter does not compile, which is the point: round 4 added
+    /// a caller that skipped both, silently, because neither was asked for.
     /// </para>
     /// </summary>
     public static Row LiveRow(
-        bool declared, bool attempted, IReadOnlyList<Sample> samples, IReadOnlyList<WindowMessage> messages)
+        bool declared, FetchOutcome attempt, IReadOnlyList<Sample> samples, IReadOnlyList<WindowMessage> messages)
     {
         if (!declared)
         {
             return new Row.Undeclared();
         }
 
-        if (!attempted)
+        switch (attempt)
         {
-            return new Row.Loading();
+            case FetchOutcome.NotAttempted:
+                return new Row.Loading();
+            case FetchOutcome.Failed:
+                return new Row.ScanFailed();
         }
 
         if (samples.Count < 2)
