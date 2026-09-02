@@ -8938,6 +8938,21 @@ mod tests {
             .as_object_mut()
             .expect("payload serializes as an object")
             .remove("publicationGeneration");
+        // Asserted before it is stripped, the way `publicationGeneration` is
+        // above. Stripping a field without first stating its shape leaves the
+        // wire contract untested on this side, and this particular field fails
+        // silently: `AgentUsageSnapshot.AccountScope` is nullable in C#, so a
+        // shape the decoder does not recognise arrives as null and the window
+        // card falls back to picking whichever stored series comes first —
+        // which is the defect this field was added to remove.
+        // This fixture's snapshot resolves no credential, so it exercises the
+        // Err half. The Ok half is pinned by `account_scope_serializes_as_a
+        // _two_case_object`.
+        assert_eq!(
+            serialized["agents"][0]["accountScope"],
+            serde_json::json!({ "error": "no trusted account evidence" })
+        );
+
         // `accountScope` is a Windows-only wire addition (the account-dimension
         // fix, PR #81 structural review): it did not exist when this fixture
         // was authored as the Swift↔C# cross-check oracle input, and adding it
