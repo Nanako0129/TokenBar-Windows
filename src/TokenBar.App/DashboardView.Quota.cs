@@ -145,8 +145,16 @@ public sealed partial class DashboardView
             Format.TodayKey(),
             SubscriptionTrendText.Window);
 
+        // This card's window is always [today - 13, today] (see State's own
+        // doc comment). The dashboard year filter selects which year
+        // snapshot.Graph.Contributions holds, and a past year cannot overlap
+        // that fixed window — so a past-year selection gets its own state
+        // rather than silently folding zero rows and reporting "no usage".
+        var pastYearSelected = _model?.Year is { } selectedYear
+            && selectedYear != Format.TodayKey()[..4];
+
         var body = new StackPanel { Spacing = 4 };
-        var state = SubscriptionTrendText.State(trend, _trendMetric);
+        var state = SubscriptionTrendText.State(trend, _trendMetric, pastYearSelected);
         if (state == SubscriptionTrendState.Chart)
         {
             body.Children.Add(TrendChart(trend));

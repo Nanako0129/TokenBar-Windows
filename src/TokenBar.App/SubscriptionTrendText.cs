@@ -20,6 +20,15 @@ public enum SubscriptionTrendState
     /// <summary>The series has not been published yet, which is not the same as
     /// an empty range.</summary>
     Loading,
+
+    /// <summary>A past year is selected in the dashboard's year filter. This
+    /// card always follows the most recent <see cref="SubscriptionTrendText.Window"/>
+    /// days ending today (macOS's own <c>SubscriptionTrendCard.swift</c> anchors
+    /// the same way, with no year-filter awareness at all) — a year filter change
+    /// never moves that window, so it can never overlap a past year. "No usage
+    /// recorded in this range" would be false: the graph plainly has data for
+    /// that year, this card simply never looks at it.</summary>
+    PastYear,
 }
 
 /// <summary>
@@ -70,8 +79,17 @@ public static class SubscriptionTrendText
     /// Kept because the state is a property of the card, not of its one caller,
     /// and a second caller with a lazier feed would otherwise reintroduce the
     /// "no usage recorded" lie during a fetch.</para></summary>
-    public static SubscriptionTrendState State(SubscriptionTrend? trend, ChartMetric metric)
+    public static SubscriptionTrendState State(
+        SubscriptionTrend? trend, ChartMetric metric, bool pastYearSelected = false)
     {
+        // Checked before Loading, too: a past year picks a window this card
+        // structurally cannot show data for, whether or not the fetch for
+        // TODAY's window has landed yet.
+        if (pastYearSelected)
+        {
+            return SubscriptionTrendState.PastYear;
+        }
+
         if (trend is null)
         {
             return SubscriptionTrendState.Loading;
@@ -97,6 +115,8 @@ public static class SubscriptionTrendText
             ? "Usage recorded, but none of it is priced.".Localized()
             : "Usage recorded, but it carries no token counts.".Localized(),
         SubscriptionTrendState.NoUsage => "No usage recorded in this range.".Localized(),
+        SubscriptionTrendState.PastYear =>
+            "Always shows the most recent 14 days, not the selected year.".Localized(),
         _ => "Reading daily usage…".Localized(),
     };
 

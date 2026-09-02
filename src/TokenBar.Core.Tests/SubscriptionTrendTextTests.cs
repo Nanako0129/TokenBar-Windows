@@ -104,6 +104,39 @@ public class SubscriptionTrendTextTests
         Assert.Null(SubscriptionTrendText.Subtitle(null));
     }
 
+    // A past year picks a window this card's fixed [today-13, today] anchor
+    // cannot ever cover (Codex round-2 P2-1). The state must not be NoUsage —
+    // that copy says "no usage recorded in this range" while the graph plainly
+    // has data for that year, this card simply never looks at it — regardless
+    // of whether the (still-current) trend itself is empty, has spend, or has
+    // not published yet.
+    [Fact]
+    public void APastYearSelectionIsItsOwnStateNeverNoUsage()
+    {
+        var trendWithSpend = Trend(tokens: 100, cost: 1.5);
+        foreach (var trend in new[] { trendWithSpend, SubscriptionTrend.Empty, null })
+        {
+            var state = SubscriptionTrendText.State(trend, ChartMetric.Cost, pastYearSelected: true);
+            Assert.Equal(SubscriptionTrendState.PastYear, state);
+            Assert.NotEqual(
+                "No usage recorded in this range.",
+                SubscriptionTrendText.EmptyBody(state, ChartMetric.Cost));
+        }
+
+        Assert.Equal(
+            "Always shows the most recent 14 days, not the selected year.",
+            SubscriptionTrendText.EmptyBody(SubscriptionTrendState.PastYear, ChartMetric.Cost));
+    }
+
+    // The current year (or "All") is not a past-year selection: the card must
+    // keep behaving exactly as it did before this state existed.
+    [Fact]
+    public void ThePastYearFlagDefaultsToFalse()
+    {
+        var trend = Trend(tokens: 100, cost: 1.5);
+        Assert.Equal(SubscriptionTrendState.Chart, SubscriptionTrendText.State(trend, ChartMetric.Cost));
+    }
+
     // ---- Copy and ordering -----------------------------------------------
 
     // The subtitle names the first day the fold actually covered, so it and the
@@ -213,6 +246,7 @@ public class SubscriptionTrendTextTests
             () => SubscriptionTrendText.EmptyBody(
                 SubscriptionTrendState.MetricUnavailable, ChartMetric.Tokens),
             () => SubscriptionTrendText.EmptyBody(SubscriptionTrendState.Loading, ChartMetric.Cost),
+            () => SubscriptionTrendText.EmptyBody(SubscriptionTrendState.PastYear, ChartMetric.Cost),
             () => SubscriptionTrendText.UndeclaredHint(trend),
             () => SubscriptionTrendText.MetricLabel(ChartMetric.Cost),
             () => SubscriptionTrendText.MetricLabel(ChartMetric.Tokens),

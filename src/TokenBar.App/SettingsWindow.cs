@@ -170,6 +170,12 @@ public sealed class SettingsWindow : Window
         {
             e.Cancel = true; // hide, macOS isReleasedWhenClosed=false parity
             AppWindow.Hide();
+            // Singleton across hide/show (see AttributionReportGate's own doc
+            // comment): reset the fetch guard here so the next visit to the
+            // attribution page refetches, instead of a provider first observed
+            // after the one fetch this process ever made staying unclassifiable
+            // until restart.
+            _attributionGate.Reset();
         };
 
         // A write from any control may change which sub-controls apply
@@ -484,19 +490,17 @@ public sealed class SettingsWindow : Window
     // report yet" and "the request came back without one" are different
     // answers, and PageState needs them apart.
     private ModelReport? _attributionReport;
-    private bool _attributionReportRequested;
-    private bool _attributionReportSettled;
+    private readonly AttributionReportGate _attributionGate = new();
     private string? _attributionNotice;
     private string? _attributionSignature;
 
     private void EnsureAttributionReport()
     {
-        if (_attributionReportRequested)
+        if (!_attributionGate.ShouldFetch())
         {
             return;
         }
 
-        _attributionReportRequested = true;
         _ = Task.Run(() =>
             {
                 try
@@ -515,7 +519,7 @@ public sealed class SettingsWindow : Window
                     _attributionReport = completed.Status == TaskStatus.RanToCompletion
                         ? completed.Result
                         : null;
-                    _attributionReportSettled = true;
+                    _attributionGate.Settle();
                     _pages["attribution"] = BuildAttributionPage(AppSettings.Store);
                     if (_selectedTag == "attribution")
                     {
@@ -565,7 +569,7 @@ public sealed class SettingsWindow : Window
             _quota(),
             UsageAttribution.Confirmed(store),
             UsageAttribution.Suggestions(store),
-            isLoading: !_attributionReportSettled);
+            isLoading: !_attributionGate.Settled);
 
         var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
         var body = new StackPanel { Spacing = 8 };

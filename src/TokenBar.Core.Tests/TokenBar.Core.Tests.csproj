@@ -50,6 +50,13 @@
          project, so the suppression rule and the accept-all count would sit in
          a file nothing can assert against. -->
     <Compile Include="..\TokenBar.App\UsageAttributionPage.cs" Link="UsageAttributionPage.cs" />
+    <!-- The attribution page's model-report fetch guard (P2-2, round 2):
+         SettingsWindow.cs is a singleton reused across hide/show, so a bare
+         fetch-once-per-process guard meant a provider first observed after
+         that one fetch never appeared until the app restarted. Pulled out for
+         the same reason as the file above: SettingsWindow.cs compiles under no
+         test project. -->
+    <Compile Include="..\TokenBar.App\AttributionReportGate.cs" Link="AttributionReportGate.cs" />
     <!-- The 每日・依訂閱 card's four-state branch and its copy, for the same
          reason: DashboardView.Quota.cs is compiled by no test project, and the
          state choice is the defect this card can actually ship (a range with

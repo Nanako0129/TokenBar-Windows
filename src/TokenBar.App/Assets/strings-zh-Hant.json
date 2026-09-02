@@ -19,6 +19,7 @@
   "All time {0}": "累計 {0}",
   "All years": "全部年份",
   "Always colored": "一律上色",
+  "Always shows the most recent 14 days, not the selected year.": "一律只顯示最近 14 天，不受所選年份影響。",
   "Amounts are API list-price equivalents for usage you declared as {0} — not what the subscription charged.": "金額是你歸類為 {0} 的用量按 API 定價換算的等值，不是訂閱實際收取的費用。",
   "Animate with token rate": "依 token 用量調整動畫速度",
   "Apr": "4月",
