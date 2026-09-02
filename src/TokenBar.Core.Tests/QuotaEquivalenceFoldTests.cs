@@ -183,4 +183,49 @@ public class QuotaEquivalenceFoldTests
         // StartMs = (100 - 50) * 1000 = 50_000, FirstSampleMs = 60_000.
         Assert.Equal(50_000, bound);
     }
+
+    // A series holding only its running cycle has no Cycles/Considered entries
+    // at all (QuotaHistoryFold.Cycles excludes IsActiveGroup samples), so
+    // without also consulting Active the bound falls back to "now" and the
+    // scanned window collapses to [now, now) — a fresh install, or any window
+    // whose first cycle has not completed, shows no usage.
+    [Fact]
+    public void BoundFromMsUsesThePlacedActiveCyclesStartWhenNoCycleHasCompleted()
+    {
+        var samples = new[]
+        {
+            new QuotaHistorySample(
+                ResetAt: 200, DurationSeconds: 50, DurationSource: QuotaHistoryDurationSource.Provider,
+                UsedPercent: 10, SampledAt: 160, Origin: QuotaHistorySampleOrigin.LiveV3, IsActiveGroup: true),
+            new QuotaHistorySample(
+                ResetAt: 200, DurationSeconds: 50, DurationSource: QuotaHistoryDurationSource.Provider,
+                UsedPercent: 40, SampledAt: 190, Origin: QuotaHistorySampleOrigin.LiveV3, IsActiveGroup: true),
+        };
+        var history = new[] { new QuotaHistorySeries("claude", "acct", "session.v1", samples) };
+
+        var bound = QuotaEquivalenceFold.BoundFromMs(history, fallbackMs: long.MaxValue);
+
+        // StartMs = (200 - 50) * 1000 = 150_000, FirstSampleMs = 160_000 ->
+        // min is the cycle's own start, not the earliest reading.
+        Assert.Equal(150_000, bound);
+    }
+
+    // An active cycle whose newest sample reports no usable duration cannot be
+    // placed on an axis (QuotaActiveCycle.IsPlaced false) and must not invent a
+    // bound — falling back to fallbackMs, same as no cycle at all.
+    [Fact]
+    public void BoundFromMsIgnoresAnUnplacedActiveCycle()
+    {
+        var samples = new[]
+        {
+            new QuotaHistorySample(
+                ResetAt: 0, DurationSeconds: 0, DurationSource: QuotaHistoryDurationSource.Provider,
+                UsedPercent: 10, SampledAt: 160, Origin: QuotaHistorySampleOrigin.LiveV3, IsActiveGroup: true),
+        };
+        var history = new[] { new QuotaHistorySeries("claude", "acct", "session.v1", samples) };
+
+        var bound = QuotaEquivalenceFold.BoundFromMs(history, fallbackMs: 12345);
+
+        Assert.Equal(12345, bound);
+    }
 }

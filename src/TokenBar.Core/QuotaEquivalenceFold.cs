@@ -111,18 +111,43 @@ public static class QuotaEquivalenceFold
     /// <see cref="QuotaCycle.FirstSampleMs"/>: the same "evidence reaches back
     /// to whichever is earlier" rule <see cref="QuotaHistoryFold"/> already
     /// states for a provider that shortened its reported window mid-cycle.
+    /// </para>
+    /// <para>
+    /// Also considers each series' placed running cycle
+    /// (<see cref="QuotaHistoryFold.Active"/>), applying the same
+    /// earlier-of-start-or-first-reading rule. <see cref="QuotaHistoryFold.Cycles"/>
+    /// deliberately excludes the running cycle, so a series holding only its
+    /// active cycle — a fresh install, or any window whose first cycle has not
+    /// completed — has an empty <see cref="Considered"/> set; without this, the
+    /// scan bound falls back to <paramref name="fallbackMs"/> (the caller's
+    /// "now"), the requested window collapses to <c>[now, now)</c>, and
+    /// <c>BuildWindowCard</c> — which draws the active cycle's usage from
+    /// exactly these messages — shows no usage for a cycle that is plainly
+    /// running. An unplaced active cycle (<see cref="QuotaActiveCycle.IsPlaced"/>
+    /// false) contributes nothing: there is no start to bound a scan by.
     /// </para></summary>
     public static long BoundFromMs(IReadOnlyList<QuotaHistorySeries> history, long fallbackMs)
     {
         long? earliest = null;
+        void Consider(long candidateMs)
+        {
+            if (earliest is null || candidateMs < earliest)
+            {
+                earliest = candidateMs;
+            }
+        }
+
         foreach (var series in history)
         {
             foreach (var cycle in QuotaHistoryFold.Considered(QuotaHistoryFold.Cycles(series.Samples)))
             {
-                if (earliest is null || cycle.EvidenceStartMs < earliest)
-                {
-                    earliest = cycle.EvidenceStartMs;
-                }
+                Consider(cycle.EvidenceStartMs);
+            }
+
+            if (QuotaHistoryFold.Active(series.Samples) is { IsPlaced: true } active)
+            {
+                var firstSampleMs = active.Samples[0].AtMs;
+                Consider(Math.Min(active.StartMs!.Value, firstSampleMs));
             }
         }
 
