@@ -304,4 +304,59 @@ public class QuotaLensProjectionTests
         Assert.NotNull(model.Client!.Selected);
         Assert.Null(model.Client.LiveEquivalence);
     }
+
+    // ---- round 8 finding 2: the collapsed row must show the WHOLE-WINDOW
+    // total, not the sample-span-restricted one -----------------------------
+
+    // A single-sample completed cycle: FirstSampleMs == LastSampleMs, so the
+    // span QuotaHistoryFold.SpanTotals bounds is empty by construction — the
+    // same "one-sample cycle" case WindowEquivalence's own comment on
+    // MinimumObservedFraction/MinimumCycles notes computes to exactly zero.
+    // A message stamped between the cycle's own StartMs and its first quota
+    // sample is inside [EvidenceStartMs, ResetAtMs) — Mine — but strictly
+    // before FirstSampleMs, so it is outside the span. If the display row
+    // were built from SpanTokens/SpanCost (the round 8 bug) this message
+    // would vanish from the collapsed row and its bar scale while still
+    // showing up in the row's own expanded model breakdown.
+    [Fact]
+    public void TheCollapsedHistoryRowShowsTheSameTotalAsItsOwnExpandedModelBreakdown()
+    {
+        // duration 5h = 18_000s, resetAt 6_000s -> StartMs = -12_000_000.
+        // sampledAt 5_000s -> FirstSampleMs = LastSampleMs = 5_000_000.
+        var series = Series(
+            "codex", "primary", "session.v1",
+            Sample(usedPercent: 40, sampledAt: 5_000, resetAt: 6_000, active: false, duration: 18_000));
+        var quota = Quota("codex", Window("codex|session.v1", "Session", "session.v1"));
+        // 1_000_000ms is inside [StartMs=-12_000_000, ResetAtMs=6_000_000) —
+        // Mine — and NOT inside (FirstSampleMs=5_000_000, LastSampleMs] —
+        // Span, which is empty here regardless.
+        var messages = new[] { Message(1_000_000, "codex", "openai", tokens: 1_000, cost: 5.0) };
+        var confirmed = Confirmed(
+            new UsageAttribution.Record("codex", "openai", UsageAttribution.State.Assigned("codex")));
+
+        var model = QuotaLensProjection.Build(
+            [series], quota, EmptyGraph(),
+            windowUsage: new WindowUsage(messages, 0, 0),
+            WindowEquivalence.FetchOutcome.Succeeded, quotaHistoryAttempted: true,
+            confirmed, year: null,
+            new QuotaLensProjection.Selection("codex", string.Empty));
+
+        var displayRow = Assert.Single(model.Client!.History.DisplayRows);
+        var storedRow = model.Client.History.ByResetAt[displayRow.ResetAtMs];
+
+        // The fixture actually exercises the Mine-vs-Span gap it claims to.
+        Assert.Equal(1_000, storedRow.MineTokens);
+        Assert.Equal(5.0, storedRow.MineCost);
+        Assert.Equal(0, storedRow.SpanTokens);
+        Assert.Equal(0, storedRow.SpanCost);
+
+        // The collapsed row and its own expanded model breakdown must report
+        // the same total — the whole-window one, not the empty span.
+        var breakdownTokens = storedRow.Models.Sum(m => m.Tokens);
+        var breakdownCost = storedRow.Models.Sum(m => m.Cost);
+        Assert.Equal(1_000, breakdownTokens);
+        Assert.Equal(5.0, breakdownCost);
+        Assert.Equal(breakdownTokens, displayRow.Tokens);
+        Assert.Equal(breakdownCost, displayRow.Cost);
+    }
 }

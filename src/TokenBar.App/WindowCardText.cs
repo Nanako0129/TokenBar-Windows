@@ -18,6 +18,14 @@ public enum WindowCardState
     /// draw.</summary>
     NoQuotaHistory,
 
+    /// <summary>The quota-history read was attempted and threw — distinct
+    /// from <see cref="NoQuotaHistory"/>, which claims the read landed and
+    /// genuinely found nothing for this window. Round 8's finding: a failed
+    /// read used to collapse into <see cref="NoQuotaHistory"/> because
+    /// <c>State</c> took only a <c>bool attempted</c>, which cannot carry
+    /// this distinction.</summary>
+    HistoryFetchFailed,
+
     /// <summary>The last window ended and nothing has been used since.</summary>
     Idle,
 
@@ -228,15 +236,20 @@ public static class WindowCardText
             [.. samples.Select(sample => new WindowEquivalence.Sample(sample.AtMs, sample.UsedPercent))],
             mine);
 
-    public static WindowCardState State(WindowCardTab? tab, bool attempted)
+    public static WindowCardState State(WindowCardTab? tab, WindowEquivalence.FetchOutcome outcome)
     {
         // No tab at all (nothing to select) and a tab with no stored series
         // (a live window the store has nothing recorded for) are the same
-        // fact from this card's point of view, and `attempted` still decides
-        // whether that is a wait or an answer either way.
+        // fact from this card's point of view, and `outcome` still decides
+        // whether that is a wait, a failure, or an answer either way.
         if (tab is null || !tab.HasHistory)
         {
-            return attempted ? WindowCardState.NoQuotaHistory : WindowCardState.Loading;
+            return outcome switch
+            {
+                WindowEquivalence.FetchOutcome.NotAttempted => WindowCardState.Loading,
+                WindowEquivalence.FetchOutcome.Failed => WindowCardState.HistoryFetchFailed,
+                _ => WindowCardState.NoQuotaHistory,
+            };
         }
 
         return tab.Active switch
@@ -260,6 +273,7 @@ public static class WindowCardText
         {
             WindowCardState.Loading => "Waiting for quota".Localized(),
             WindowCardState.NoQuotaHistory => "No quota history".Localized(),
+            WindowCardState.HistoryFetchFailed => "Quota history could not be read. It will be retried.".Localized(),
             WindowCardState.Idle => "No window running".Localized(),
             WindowCardState.Unplaceable => "Window unavailable".Localized(),
             _ => "Resets in {0}".Localized(UsagePace.DurationText(
@@ -275,6 +289,8 @@ public static class WindowCardText
         WindowCardState.Loading => "Waiting for quota…".Localized(),
         WindowCardState.NoQuotaHistory =>
             "This window has no recorded quota history, so there is no line to draw.".Localized(),
+        WindowCardState.HistoryFetchFailed =>
+            "Quota history could not be read. It will be retried.".Localized(),
         WindowCardState.Idle =>
             "The last window ended and nothing has been used since — no window is running."
                 .Localized(),

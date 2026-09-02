@@ -253,10 +253,23 @@ public static class QuotaLensProjection
         // had.
         var rows = QuotaHistoryFold.Rows(cycles, messages, owner, modelScope: null, confirmed.Records);
         var byResetAt = rows.ToDictionary(row => row.Id);
+        // MineTokens/MineCost — the WHOLE-WINDOW totals attributed to this
+        // subscription — not SpanTokens/SpanCost, which QuotaHistoryFold
+        // restricts to the interval between the cycle's first and last quota
+        // sample. Usage after EvidenceStartMs but before that first sample,
+        // or after the last sample but before reset, is in Mine and not in
+        // Span, so passing Span here under-reported the collapsed row and its
+        // bar scale against the same row's own expanded model breakdown
+        // (QuotaHistoryModel.Tokens sums to MineTokens, not SpanTokens) —
+        // round 8's finding. The span-restricted figures stay where they
+        // belong: WindowHistoryText.Equivalence below reads
+        // QuotaHistoryRow.SpanTokens/SpanCost directly, because that ratio's
+        // denominator (quota movement) is only defined across those same
+        // samples.
         var displayRows = WindowHistoryText.Rows(
             cycles,
             [.. rows.Select(row => new WindowEquivalence.Cycle(
-                row.Cycle.UsedPercent, row.SpanTokens, row.SpanCost, row.Cycle.ObservedFraction))]);
+                row.Cycle.UsedPercent, row.MineTokens, row.MineCost, row.Cycle.ObservedFraction))]);
 
         // Gated on the fetch's own outcome, not on whether QuotaHistory
         // itself landed: `declared` is computed from `messages`, which come

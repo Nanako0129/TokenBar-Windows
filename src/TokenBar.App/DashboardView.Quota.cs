@@ -407,7 +407,7 @@ public sealed partial class DashboardView
     {
         var tabs = client.Tabs;
         var selected = client.Selected;
-        var state = WindowCardText.State(selected, snapshot.QuotaHistoryAttempted);
+        var state = WindowCardText.State(selected, snapshot.QuotaHistoryOutcome);
         var body = new StackPanel { Spacing = 4 };
         if (tabs.Count > 1)
         {
@@ -767,7 +767,7 @@ public sealed partial class DashboardView
         var rows = history.DisplayRows;
 
         var body = new StackPanel { Spacing = 0 };
-        var state = WindowHistoryText.State(rows, snapshot.QuotaHistoryAttempted);
+        var state = WindowHistoryText.State(rows, snapshot.QuotaHistoryOutcome);
         if (state != WindowHistoryState.Rows)
         {
             var line = Ui.Dim(WindowHistoryText.EmptyBody(state));

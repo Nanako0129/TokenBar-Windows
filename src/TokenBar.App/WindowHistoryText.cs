@@ -12,6 +12,15 @@ public enum WindowHistoryState
     Loading,
 
     NoHistory,
+
+    /// <summary>The quota-history read was attempted and threw — distinct
+    /// from <see cref="NoHistory"/>, which claims the read landed and
+    /// genuinely found no earlier windows. Round 8's finding: a failed read
+    /// used to collapse into <see cref="NoHistory"/> because <c>State</c>
+    /// took only a <c>bool attempted</c>, which cannot carry this
+    /// distinction.</summary>
+    Failed,
+
     Rows,
 }
 
@@ -62,10 +71,15 @@ public static class WindowHistoryText
     /// for most of it.</summary>
     public const double ThinObservation = 0.5;
 
-    public static WindowHistoryState State(IReadOnlyList<WindowHistoryRow> rows, bool attempted) =>
+    public static WindowHistoryState State(
+        IReadOnlyList<WindowHistoryRow> rows, WindowEquivalence.FetchOutcome outcome) =>
         rows.Count > 0 ? WindowHistoryState.Rows
-            : attempted ? WindowHistoryState.NoHistory
-            : WindowHistoryState.Loading;
+            : outcome switch
+            {
+                WindowEquivalence.FetchOutcome.NotAttempted => WindowHistoryState.Loading,
+                WindowEquivalence.FetchOutcome.Failed => WindowHistoryState.Failed,
+                _ => WindowHistoryState.NoHistory,
+            };
 
     /// <summary>
     /// The visible rows, newest first.
@@ -126,10 +140,12 @@ public static class WindowHistoryText
     public static string? Subtitle(IReadOnlyList<WindowHistoryRow> rows) =>
         rows.Count == 0 ? null : "{0} windows".Localized(rows.Count);
 
-    public static string EmptyBody(WindowHistoryState state) =>
-        state == WindowHistoryState.Loading
-            ? "Reading quota history…".Localized()
-            : "No earlier windows recorded yet. They accumulate as TokenBar runs.".Localized();
+    public static string EmptyBody(WindowHistoryState state) => state switch
+    {
+        WindowHistoryState.Loading => "Reading quota history…".Localized(),
+        WindowHistoryState.Failed => "Quota history could not be read. It will be retried.".Localized(),
+        _ => "No earlier windows recorded yet. They accumulate as TokenBar runs.".Localized(),
+    };
 
     public static string? ThinObservationNote(WindowHistoryRow row) =>
         row.ThinObservation

@@ -117,8 +117,11 @@ public class WindowCardTextTests
 
         Assert.Single(tabs);
         Assert.Equal("Weekly", tabs[0].Label);
-        Assert.Equal(WindowCardState.NoQuotaHistory, WindowCardText.State(tabs[0], attempted: true));
-        Assert.Equal(WindowCardState.Loading, WindowCardText.State(tabs[0], attempted: false));
+        Assert.Equal(
+            WindowCardState.NoQuotaHistory,
+            WindowCardText.State(tabs[0], WindowEquivalence.FetchOutcome.Succeeded));
+        Assert.Equal(
+            WindowCardState.Loading, WindowCardText.State(tabs[0], WindowEquivalence.FetchOutcome.NotAttempted));
     }
 
     // A stored series with no live window (the provider stopped reporting
@@ -408,19 +411,37 @@ public class WindowCardTextTests
         var noHistory = WindowCardText.Tabs(
             [], Quota("claude", Window("claude|session.v1", "Session", "session.v1")), "claude")[0];
 
-        Assert.Equal(WindowCardState.Chart, WindowCardText.State(running, attempted: true));
-        Assert.Equal(WindowCardState.Idle, WindowCardText.State(idle, attempted: true));
         Assert.Equal(
-            WindowCardState.Unplaceable, WindowCardText.State(unplaceable, attempted: true));
-        // The pair that differs only in `attempted`, which is the whole point:
+            WindowCardState.Chart, WindowCardText.State(running, WindowEquivalence.FetchOutcome.Succeeded));
+        Assert.Equal(
+            WindowCardState.Idle, WindowCardText.State(idle, WindowEquivalence.FetchOutcome.Succeeded));
+        Assert.Equal(
+            WindowCardState.Unplaceable,
+            WindowCardText.State(unplaceable, WindowEquivalence.FetchOutcome.Succeeded));
+        // The pair that differs only in `outcome`, which is the whole point:
         // a lazy lens fetches on first visit, so no tab before the read has
         // settled is the first paint of every cold start.
-        Assert.Equal(WindowCardState.NoQuotaHistory, WindowCardText.State(null, attempted: true));
-        Assert.Equal(WindowCardState.Loading, WindowCardText.State(null, attempted: false));
+        Assert.Equal(
+            WindowCardState.NoQuotaHistory,
+            WindowCardText.State(null, WindowEquivalence.FetchOutcome.Succeeded));
+        Assert.Equal(
+            WindowCardState.Loading, WindowCardText.State(null, WindowEquivalence.FetchOutcome.NotAttempted));
+        // Round 8: a fetch that threw is neither of the above — it must not
+        // render as "no history" (which claims the read landed and found
+        // nothing) nor stay stuck on "loading" (which claims no answer has
+        // come back at all).
+        Assert.Equal(
+            WindowCardState.HistoryFetchFailed,
+            WindowCardText.State(null, WindowEquivalence.FetchOutcome.Failed));
         // A live window with a tab but no matched series reads the same as no
         // tab at all — `HasHistory` is what carries the distinction from
         // `Idle`, not the tab's mere presence.
-        Assert.Equal(WindowCardState.NoQuotaHistory, WindowCardText.State(noHistory, attempted: true));
+        Assert.Equal(
+            WindowCardState.NoQuotaHistory,
+            WindowCardText.State(noHistory, WindowEquivalence.FetchOutcome.Succeeded));
+        Assert.Equal(
+            WindowCardState.HistoryFetchFailed,
+            WindowCardText.State(noHistory, WindowEquivalence.FetchOutcome.Failed));
     }
 
     // Each empty state has its own sentence. "The window ended" and "the
@@ -563,10 +584,12 @@ public class WindowCardTextTests
             () => WindowCardText.Title(tab),
             () => WindowCardText.Subtitle(WindowCardState.Loading, null, DateTimeOffset.Now),
             () => WindowCardText.Subtitle(WindowCardState.NoQuotaHistory, null, DateTimeOffset.Now),
+            () => WindowCardText.Subtitle(WindowCardState.HistoryFetchFailed, null, DateTimeOffset.Now),
             () => WindowCardText.Subtitle(WindowCardState.Idle, null, DateTimeOffset.Now),
             () => WindowCardText.Subtitle(WindowCardState.Unplaceable, null, DateTimeOffset.Now),
             () => WindowCardText.EmptyBody(WindowCardState.Loading),
             () => WindowCardText.EmptyBody(WindowCardState.NoQuotaHistory),
+            () => WindowCardText.EmptyBody(WindowCardState.HistoryFetchFailed),
             () => WindowCardText.EmptyBody(WindowCardState.Idle),
             () => WindowCardText.EmptyBody(WindowCardState.Unplaceable),
             () => WindowCardText.Headline(chart, QuotaMetric.Used).Caption,

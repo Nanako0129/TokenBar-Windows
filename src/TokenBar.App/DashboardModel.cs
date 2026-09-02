@@ -283,6 +283,30 @@ public sealed class DashboardModel
         /// null.</para></summary>
         public bool QuotaHistoryAttempted { get; init; }
 
+        /// <summary>Whether the MOST RECENT attempted quota-history fetch
+        /// threw, kept separate from whether <see cref="QuotaHistory"/> itself
+        /// is null — the same distinction <see cref="WindowUsageFetchFailed"/>
+        /// carries for the window-usage lane, and for the same reason: a
+        /// failed read keeps the prior <see cref="QuotaHistory"/> so a card
+        /// still has something to draw, which means <c>QuotaHistory is null</c>
+        /// alone cannot tell a failed retry from a first read that has not
+        /// landed yet, or from one that failed after a previous success left
+        /// data behind. Round 8's finding on this lane: without this field the
+        /// session card and the history card had no way to distinguish "the
+        /// read threw" from "the read landed and found nothing" and resolved
+        /// both to the latter.</summary>
+        public bool QuotaHistoryFetchFailed { get; init; }
+
+        /// <summary>The three facts <see cref="QuotaHistoryAttempted"/> and
+        /// <see cref="QuotaHistoryFetchFailed"/> together carry, collapsed the
+        /// same way <see cref="WindowUsageOutcome"/> collapses its own pair:
+        /// not attempted yet, attempted and the most recent fetch threw, or
+        /// attempted and it landed.</summary>
+        public WindowEquivalence.FetchOutcome QuotaHistoryOutcome =>
+            !QuotaHistoryAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
+            : QuotaHistoryFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : WindowEquivalence.FetchOutcome.Succeeded;
+
         /// <summary>The per-message rows behind the Quota lens's ≈ lines
         /// (5d-1's export). A fourth lazy lens, fetched only once
         /// <see cref="QuotaHistory"/> has told this lane how far back to ask —
@@ -496,6 +520,9 @@ public sealed class DashboardModel
             // same reason the agent-usage lane does: a lens that reads null as
             // "not yet" would wait forever for an answer that already came back.
             QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
+            // This pass's own result, not derived from whether `history` ended
+            // up retained — same reasoning as WindowUsageFetchFailed below.
+            QuotaHistoryFetchFailed = quotaHistory ? history is null : s.QuotaHistoryFetchFailed,
             // Same failed-read and same completion rules as QuotaHistory,
             // immediately above, and for the same two reasons.
             WindowUsage = usage ?? s.WindowUsage,

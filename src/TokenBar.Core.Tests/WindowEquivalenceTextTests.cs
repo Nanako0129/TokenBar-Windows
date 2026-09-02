@@ -76,6 +76,43 @@ public class WindowEquivalenceTextTests
         Assert.Null(slot.Secondary);
     }
 
+    // ── Line's two scan states, and their translation (round 8 finding 3)
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void LineNamesTheTwoScanStates()
+    {
+        Assert.Equal(
+            "Reading local usage…", WindowEquivalenceText.Line(new WindowEquivalence.Row.Loading()));
+        Assert.Equal(
+            "Local usage could not be read.",
+            WindowEquivalenceText.Line(new WindowEquivalence.Row.ScanFailed()));
+    }
+
+    // Against the *shipped* strings-zh-Hant.json, for the reason every other
+    // i18n test in this test project states: a Localized() call site whose
+    // key was never added to that file renders in English inside an
+    // otherwise-translated lens, and only driving the branch can prove the
+    // entry exists. Round 8's finding: these two keys were added by this
+    // branch with no zh-Hant entry at all.
+    [Fact]
+    public void TheTwoScanStatesAreTranslatedInTheShippedTable()
+    {
+        var loadingEnglish = WindowEquivalenceText.Line(new WindowEquivalence.Row.Loading());
+        var failedEnglish = WindowEquivalenceText.Line(new WindowEquivalence.Row.ScanFailed());
+
+        Localization.Load("zh-Hant", AppContext.BaseDirectory);
+        try
+        {
+            Assert.NotEqual(loadingEnglish, WindowEquivalenceText.Line(new WindowEquivalence.Row.Loading()));
+            Assert.NotEqual(failedEnglish, WindowEquivalenceText.Line(new WindowEquivalence.Row.ScanFailed()));
+        }
+        finally
+        {
+            Localization.Load("en", AppContext.BaseDirectory);
+        }
+    }
+
     // ── NoFigureReason ───────────────────────────────────────────────────
 
     // Each stated per case rather than blamed on "not enough history" — the

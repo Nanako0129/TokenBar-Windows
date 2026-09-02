@@ -120,14 +120,27 @@ public class WindowHistoryTextTests
     {
         var rows = WindowHistoryText.Rows([Cycle(10 * Hour, 42)], [Span(1, 1)]);
 
-        Assert.Equal(WindowHistoryState.Rows, WindowHistoryText.State(rows, attempted: true));
-        // The pair that differs only in `attempted`: `cycles` derives from a
+        Assert.Equal(
+            WindowHistoryState.Rows, WindowHistoryText.State(rows, WindowEquivalence.FetchOutcome.Succeeded));
+        // The pair that differs only in `outcome`: `cycles` derives from a
         // lazily-read store, so an empty list before the read has settled means
         // "still asking", not "nothing recorded".
-        Assert.Equal(WindowHistoryState.NoHistory, WindowHistoryText.State([], attempted: true));
-        Assert.Equal(WindowHistoryState.Loading, WindowHistoryText.State([], attempted: false));
+        Assert.Equal(
+            WindowHistoryState.NoHistory,
+            WindowHistoryText.State([], WindowEquivalence.FetchOutcome.Succeeded));
+        Assert.Equal(
+            WindowHistoryState.Loading,
+            WindowHistoryText.State([], WindowEquivalence.FetchOutcome.NotAttempted));
+        // Round 8: a fetch that threw is neither "still asking" nor "landed
+        // and found nothing" — it must render as its own failure state.
+        Assert.Equal(
+            WindowHistoryState.Failed,
+            WindowHistoryText.State([], WindowEquivalence.FetchOutcome.Failed));
         Assert.NotEqual(
             WindowHistoryText.EmptyBody(WindowHistoryState.Loading),
+            WindowHistoryText.EmptyBody(WindowHistoryState.NoHistory));
+        Assert.NotEqual(
+            WindowHistoryText.EmptyBody(WindowHistoryState.Failed),
             WindowHistoryText.EmptyBody(WindowHistoryState.NoHistory));
     }
 
@@ -169,6 +182,7 @@ public class WindowHistoryTextTests
             () => WindowHistoryText.Subtitle(rows),
             () => WindowHistoryText.EmptyBody(WindowHistoryState.Loading),
             () => WindowHistoryText.EmptyBody(WindowHistoryState.NoHistory),
+            () => WindowHistoryText.EmptyBody(WindowHistoryState.Failed),
             () => WindowHistoryText.ThinObservationNote(rows[0]),
             () => WindowHistoryText.Disclaimer("claude"),
             WindowHistoryText.NothingChargedNote,

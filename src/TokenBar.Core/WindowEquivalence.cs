@@ -271,8 +271,8 @@ public static class WindowEquivalence
         Row.TooFewCycles r => "{0} of {1} windows recorded — the estimate needs that many".Localized(
             r.Count, r.Needed),
         Row.Undeclared => "Classify your usage in Settings to see what this window is worth".Localized(),
-        Row.Loading => "Reading recent usage…".Localized(),
-        Row.ScanFailed => "Could not read recent usage".Localized(),
+        Row.Loading => "Reading local usage…".Localized(),
+        Row.ScanFailed => "Local usage could not be read.".Localized(),
         Row.Spread r => "10% of quota ~ {0}-{1} · {2}-{3} API-equivalent".Localized(
             tokens(r.LowPerTenth), tokens(r.HighPerTenth), money(r.LowCostPerTenth), money(r.HighCostPerTenth)),
         _ => throw new ArgumentOutOfRangeException(nameof(row), row, "Unhandled WindowEquivalence.Row case"),
