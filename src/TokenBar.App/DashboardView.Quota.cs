@@ -94,32 +94,37 @@ public sealed partial class DashboardView
 
     private UIElement BuildQuota(DashboardModel.Snapshot snapshot)
     {
+        // The one snapshot-to-parameters unpack this view still does: three
+        // reads (Confirmed, _model?.Year, the fields named below), no
+        // decision. Everything QuotaLensProjection.Build's seven sites used
+        // to decide inline now happens once, in a file a test project
+        // compiles — see QuotaLensProjection's own class doc comment.
+        var model = QuotaLensProjection.Build(
+            snapshot.QuotaHistory,
+            snapshot.Quota,
+            snapshot.Graph,
+            snapshot.WindowUsage,
+            snapshot.WindowUsageOutcome,
+            snapshot.QuotaHistoryAttempted,
+            UsageAttribution.Confirmed(AppSettings.Store),
+            _model?.Year,
+            new QuotaLensProjection.Selection(_activeClientTab, _windowCardTab));
+
         // A client tab asks about one subscription, so it gets that
         // subscription's own three cards rather than the all-clients four.
         if (_activeClientTab != ClientRegistry.OverviewTab)
         {
-            return BuildClientQuota(snapshot, _activeClientTab);
+            return BuildClientQuota(snapshot, model.Client!, _activeClientTab);
         }
 
-        var (summaries, windows, grids) =
-            QuotaLensData.Build(snapshot.QuotaHistory, snapshot.Quota);
-        var attempted = snapshot.QuotaHistoryAttempted;
-        // Absent (not merely empty) until the window-usage lane has both a
-        // quota history to bound itself against and a finished fetch — the
-        // strip/heatmap draw no line for a window with no key rather than
-        // waiting on this dictionary specifically.
-        var equivalences = snapshot.WindowUsageAttempted
-            ? QuotaEquivalenceFold.Build(
-                snapshot.QuotaHistory ?? [],
-                snapshot.WindowUsage?.Messages ?? [],
-                UsageAttribution.Confirmed(AppSettings.Store))
-            : new Dictionary<QuotaWindowIdentity, WindowEquivalence.Row>();
         var stack = new StackPanel { Spacing = 10 };
         // First: this is the one card that answers "on which subscription", and
         // the two below it answer "where has the allowance gone".
-        stack.Children.Add(BuildSubscriptionTrendCard(snapshot));
-        stack.Children.Add(BuildQuotaStripCard(summaries, attempted, equivalences));
-        stack.Children.Add(BuildQuotaHeatmapCard(windows, grids, attempted, equivalences));
+        stack.Children.Add(BuildSubscriptionTrendCard(model.Trend, model.TrendPastYearSelected));
+        stack.Children.Add(BuildQuotaStripCard(
+            model.Overview.Summaries, model.Overview.Attempted, model.Overview.Equivalences));
+        stack.Children.Add(BuildQuotaHeatmapCard(
+            model.Overview.Windows, model.Overview.Grids, model.Overview.Attempted, model.Overview.Equivalences));
         // The Agent-limits card closes the lens on macOS, below the heatmap.
         // The same builder the Overview uses, deliberately: this card answers
         // "where does the allowance stand right now" while the two above answer
@@ -135,24 +140,13 @@ public sealed partial class DashboardView
     /// against. Not a restyled copy of the Overview chart: that one buckets by
     /// CLIENT — which tool ran the work — and the two answers routinely invert.
     /// <para>Every branch and every string is <see cref="SubscriptionTrendText"/>'s;
-    /// this file decides nothing, because no test project compiles it.</para></summary>
-    private FrameworkElement BuildSubscriptionTrendCard(DashboardModel.Snapshot snapshot)
+    /// this view decides nothing — <paramref name="trend"/> and
+    /// <paramref name="pastYearSelected"/> both come from
+    /// <see cref="QuotaLensProjection"/>, whose own doc comment on
+    /// <c>BuildTrend</c> covers the January-crossing-into-December case this
+    /// card used to get wrong.</para></summary>
+    private FrameworkElement BuildSubscriptionTrendCard(SubscriptionTrend trend, bool pastYearSelected)
     {
-        var trend = SubscriptionTrendFold.Build(
-            AttributedDailySeries.Points(
-                snapshot.Graph.Contributions,
-                UsageAttribution.Confirmed(AppSettings.Store).Records),
-            Format.TodayKey(),
-            SubscriptionTrendText.Window);
-
-        // This card's window is always [today - 13, today] (see State's own
-        // doc comment). The dashboard year filter selects which year
-        // snapshot.Graph.Contributions holds, and a past year cannot overlap
-        // that fixed window — so a past-year selection gets its own state
-        // rather than silently folding zero rows and reporting "no usage".
-        var pastYearSelected = _model?.Year is { } selectedYear
-            && selectedYear != Format.TodayKey()[..4];
-
         var body = new StackPanel { Spacing = 4 };
         var state = SubscriptionTrendText.State(trend, _trendMetric, pastYearSelected);
         if (state == SubscriptionTrendState.Chart)
@@ -392,37 +386,27 @@ public sealed partial class DashboardView
 
     /// <summary>One subscription's own three cards: the window it is in now,
     /// where its allowance stands, and the windows before this one.</summary>
-    private UIElement BuildClientQuota(DashboardModel.Snapshot snapshot, string clientId)
+    private UIElement BuildClientQuota(
+        DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client, string clientId)
     {
-        // Every subscription-facing lookup below (tabs, limits, history) is
-        // keyed by the quota OWNER, not the raw client id — antigravity-cli
-        // spends the antigravity subscription. The raw id survives only for
-        // this tab's own display identity (WindowHistoryText.Disclaimer).
-        var owner = ClientRegistry.QuotaOwner(clientId);
-        var tabs = WindowCardText.Tabs(snapshot.QuotaHistory, snapshot.Quota, owner);
-        var selected = tabs.FirstOrDefault(tab => WindowId(tab.Id) == _windowCardTab)
-            ?? tabs.FirstOrDefault();
-        var confirmed = UsageAttribution.Confirmed(AppSettings.Store);
-        var messages = snapshot.WindowUsage?.Messages ?? [];
-
         var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(BuildWindowCard(snapshot, tabs, selected, messages, confirmed, owner));
+        stack.Children.Add(BuildWindowCard(snapshot, client));
         // The same builder the Overview and the all-clients lens use, filtered
         // to this client. A second implementation of "where does the allowance
         // stand right now" would be free to disagree with the first.
-        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot, owner)));
-        stack.Children.Add(BuildWindowHistoryCard(snapshot, selected, messages, confirmed, clientId, owner));
+        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot, client.Owner)));
+        // clientId (not client.Owner) is passed only for the history card's
+        // own display identity (WindowHistoryText.Disclaimer) — every
+        // subscription-facing lookup already happened in the projection,
+        // keyed by the owner.
+        stack.Children.Add(BuildWindowHistoryCard(snapshot, client, clientId));
         return stack;
     }
 
-    private FrameworkElement BuildWindowCard(
-        DashboardModel.Snapshot snapshot,
-        IReadOnlyList<WindowCardTab> tabs,
-        WindowCardTab? selected,
-        IReadOnlyList<WindowMessage> messages,
-        UsageAttribution.Table confirmed,
-        string owner)
+    private FrameworkElement BuildWindowCard(DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client)
     {
+        var tabs = client.Tabs;
+        var selected = client.Selected;
         var state = WindowCardText.State(selected, snapshot.QuotaHistoryAttempted);
         var body = new StackPanel { Spacing = 4 };
         if (tabs.Count > 1)
@@ -448,7 +432,7 @@ public sealed partial class DashboardView
         // reading opens a new cycle, and a `now` beyond the axis would put the
         // hatch and the zones outside the box they are drawn in.
         var now = Math.Min(DateTimeOffset.Now.ToUnixTimeMilliseconds(), end);
-        var mine = WindowCardText.Mine(messages, owner, confirmed.Records);
+        var mine = client.Mine;
         var geometry = WindowCardGeometry.Chart(start, end, now, active.Samples, mine, _windowMetric);
 
         var (percent, caption) = WindowCardText.Headline(geometry, _windowMetric);
@@ -465,29 +449,22 @@ public sealed partial class DashboardView
 
         // "10% of quota ~ X tokens · $Y", live off this window's own samples —
         // the same line the History card prints pooled over past cycles, here
-        // for the one currently running.
-        //
-        // declared, so an unclassified machine reads "classify your usage"
-        // rather than "nothing was recorded" (WindowEquivalence.LiveRow's own
-        // doc comment) — the same per-window check the History card below
-        // already does via QuotaEquivalenceFold.Declared, here restricted to
-        // this active cycle's own sample span since there is no QuotaCycle
-        // for a window that has not reset yet.
-        //
-        // attempt: snapshot.WindowUsageOutcome, not the tab's own
-        // QuotaHistoryAttempted — the quota samples and the message export
-        // are two separate fetches, and a chart can already be drawn from the
-        // first while the second is still in flight (or has just failed).
-        var declared = QuotaEquivalenceFold.DeclaredSpan(
-            active.Samples[0].AtMs, active.Samples[^1].AtMs, messages, confirmed.Records);
-        var equivalence = WindowCardText.LiveEquivalence(
-            active.Samples, mine, declared, snapshot.WindowUsageOutcome);
-        var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
+        // for the one currently running. Computed once by the projection
+        // (QuotaLensProjection.BuildClient), the same declared/outcome
+        // reasoning this comment used to carry inline — see that method's own
+        // comments for why: an unclassified machine reads "classify your
+        // usage" rather than "nothing was recorded", and the outcome is the
+        // quota-samples fetch's own, not the window-usage tab's
+        // QuotaHistoryAttempted, because the two are separate fetches. Never
+        // null here: WindowCardText.State only reaches Chart when the
+        // projection's own guard for LiveEquivalence (a placed active cycle)
+        // already held.
+        var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(client.LiveEquivalence!), 9, 0.6);
         equivalenceLine.TextWrapping = TextWrapping.Wrap;
         equivalenceLine.Margin = new Thickness(0, 2, 0, 0);
         body.Children.Add(equivalenceLine);
 
-        if (WindowCardText.UndatedNote(snapshot.WindowUsage?.UndatedCount ?? 0) is { } undated)
+        if (WindowCardText.UndatedNote(client.UndatedCount) is { } undated)
         {
             var note = Ui.Dim(undated, 9);
             note.TextWrapping = TextWrapping.Wrap;
@@ -784,41 +761,10 @@ public sealed partial class DashboardView
     private const double HistoryThinOpacity = 0.35;
 
     private FrameworkElement BuildWindowHistoryCard(
-        DashboardModel.Snapshot snapshot,
-        WindowCardTab? selected,
-        IReadOnlyList<WindowMessage> messages,
-        UsageAttribution.Table confirmed,
-        string clientId,
-        string owner)
+        DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client, string clientId)
     {
-        IReadOnlyList<QuotaHistorySeries> history = snapshot.QuotaHistory ?? [];
-        var series = selected is null
-            ? null
-            : history.FirstOrDefault(s =>
-                s.ProviderId == selected.Id.ProviderId
-                && s.AccountScope == selected.Id.AccountScope
-                && s.WindowKey == selected.Id.WindowKey);
-        IReadOnlyList<QuotaCycle> cycles = series is null
-            ? []
-            : QuotaHistoryFold.Considered(QuotaHistoryFold.Cycles(series.Samples));
-
-        // One join for the whole card. The collapsed rows' spans, the
-        // expanded model breakdown and same-hours line, and the ≈
-        // equivalence line above them all come from this single scan —
-        // sorted once, one contiguous slice per cycle — rather than the
-        // O(cycles x messages) shape a second per-cycle filter would cost.
-        //
-        // modelScope: null. Windows has no scoped-window data wired yet (no
-        // Fable-only-style provider-scoped limit is exposed on this platform
-        // today), so every model counts — the same unscoped behaviour the
-        // history card already had through QuotaEquivalenceFold.
-        var historyRows = QuotaHistoryFold.Rows(cycles, messages, owner, modelScope: null, confirmed.Records);
-        var byResetAt = historyRows.ToDictionary(historyRow => historyRow.Id);
-        var rows = WindowHistoryText.Rows(
-            cycles,
-            [.. historyRows.Select(historyRow => new WindowEquivalence.Cycle(
-                historyRow.Cycle.UsedPercent, historyRow.SpanTokens, historyRow.SpanCost,
-                historyRow.Cycle.ObservedFraction))]);
+        var history = client.History;
+        var rows = history.DisplayRows;
 
         var body = new StackPanel { Spacing = 0 };
         var state = WindowHistoryText.State(rows, snapshot.QuotaHistoryAttempted);
@@ -832,30 +778,11 @@ public sealed partial class DashboardView
 
         // "10% of quota ~ X tokens · $Y" — pooled over the rows actually
         // shown, above them, because a single row's ratio is dominated by
-        // the 1-point reading quantisation.
-        // Per window, not per app — the same distinction QuotaEquivalenceFold
-        // draws for the strip/heatmap: a declaration for another subscription
-        // does not make THIS window's own unclassified messages "recorded as
-        // zero".
-        //
-        // Gated on WindowUsageOutcome, not the card-level QuotaHistoryAttempted
-        // `state` above: `declared` is computed from `messages`, which come
-        // from the WindowUsage fetch, not the QuotaHistory one. History can
-        // land (state == Rows) while the message export is still in flight —
-        // or has failed — and asking Declared() of an empty `messages` list at
-        // that moment reads as "nothing classified", telling an
-        // already-classified user to go classify their usage: the same
-        // wrong-lane read QuotaEquivalenceFold.Build's own caller above (:111)
-        // already guards against.
-        var equivalence = snapshot.WindowUsageOutcome switch
-        {
-            WindowEquivalence.FetchOutcome.Succeeded => WindowHistoryText.Equivalence(
-                [.. rows.Select(row => byResetAt[row.ResetAtMs])],
-                declared: QuotaEquivalenceFold.Declared(cycles, messages, confirmed.Records)),
-            WindowEquivalence.FetchOutcome.Failed => new WindowEquivalence.Row.ScanFailed(),
-            _ => new WindowEquivalence.Row.Loading(),
-        };
-        var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
+        // the 1-point reading quantisation. Gated on WindowUsageOutcome, not
+        // the card-level QuotaHistoryAttempted `state` above — see
+        // QuotaLensProjection.BuildHistory's own comment for why (the quota
+        // samples and the message export are two separate fetches).
+        var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(history.Equivalence), 9, 0.6);
         equivalenceLine.TextWrapping = TextWrapping.Wrap;
         equivalenceLine.Margin = new Thickness(0, 0, 0, 6);
         body.Children.Add(equivalenceLine);
@@ -863,7 +790,7 @@ public sealed partial class DashboardView
         var colors = new ModelColorMap(snapshot.Models, snapshot.CostAuthoritative);
         foreach (var row in rows)
         {
-            body.Children.Add(HistoryRow(row, byResetAt[row.ResetAtMs], colors));
+            body.Children.Add(HistoryRow(row, history.ByResetAt[row.ResetAtMs], colors));
         }
 
         // The line that keeps the money column from reading as a bill.

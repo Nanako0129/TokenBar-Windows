@@ -298,25 +298,50 @@ public sealed class DashboardModel
         /// that was never going to come.</summary>
         public bool WindowUsageAttempted { get; init; }
 
+        /// <summary>Whether the MOST RECENT attempted window-usage fetch
+        /// threw, kept separate from whether <see cref="WindowUsage"/> itself
+        /// is null.
+        ///
+        /// <para>
+        /// <c>FetchLazyWanted</c> retains the prior <see cref="WindowUsage"/>
+        /// on a failed read (round 7's fix for the "absent because we could
+        /// not ask" mistake — see <see cref="QuotaHistory"/>'s own doc
+        /// comment) rather than replacing it with nothing. That is correct for
+        /// what a card should keep drawing, and wrong as a signal: a fetch
+        /// that failed after an earlier one had succeeded leaves
+        /// <see cref="WindowUsage"/> non-null, so a reader deriving the outcome
+        /// from its nullness alone reports <see cref="WindowEquivalence.FetchOutcome.Succeeded"/>
+        /// about a pass that just failed, and every equivalence line computes
+        /// against stale, possibly-hours-old messages while claiming a fresh
+        /// read. This field is that pass's own result, recorded independently
+        /// of what data ended up retained — not a recombination of
+        /// <see cref="WindowUsageAttempted"/> and <see cref="WindowUsage"/>,
+        /// which is the pair that could not carry this distinction in the
+        /// first place.
+        /// </para>
+        /// </summary>
+        public bool WindowUsageFetchFailed { get; init; }
+
         /// <summary>
         /// The three facts <see cref="WindowUsageAttempted"/> and
-        /// <see cref="WindowUsage"/> together carry, collapsed here so a call
-        /// site reads one signal instead of re-deriving it: not attempted yet,
-        /// attempted and the fetch threw (this lane's <c>TryFetch</c> swallows
-        /// the exception and publishes completion anyway, but with no data —
-        /// <see cref="WindowUsage"/> stays whatever it was before, which is
-        /// null on a first fetch that fails), or attempted and it landed.
+        /// <see cref="WindowUsageFetchFailed"/> together carry, collapsed here
+        /// so a call site reads one signal instead of re-deriving it: not
+        /// attempted yet, attempted and the most recent fetch threw, or
+        /// attempted and it landed.
         /// <para>
         /// A caller that instead read <c>WindowUsageAttempted</c> alone and
         /// defaulted <c>WindowUsage?.Messages</c> to <c>[]</c> could not tell
         /// a completed empty scan from a scan that never ran — the exact
         /// ambiguity <see cref="WindowEquivalence.FetchOutcome"/> exists to
-        /// remove.
+        /// remove. Deriving it from <c>WindowUsage is null</c> instead cannot
+        /// tell a failed retry from a successful one, once a prior successful
+        /// fetch has left data behind for a later failure to retain — see
+        /// <see cref="WindowUsageFetchFailed"/>'s own doc comment.
         /// </para>
         /// </summary>
         public WindowEquivalence.FetchOutcome WindowUsageOutcome =>
             !WindowUsageAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : WindowUsage is null ? WindowEquivalence.FetchOutcome.Failed
+            : WindowUsageFetchFailed ? WindowEquivalence.FetchOutcome.Failed
             : WindowEquivalence.FetchOutcome.Succeeded;
     }
 
@@ -475,6 +500,12 @@ public sealed class DashboardModel
             // immediately above, and for the same two reasons.
             WindowUsage = usage ?? s.WindowUsage,
             WindowUsageAttempted = windowUsage || s.WindowUsageAttempted,
+            // This pass's own result, not derived from whether `usage` ended
+            // up retained: a pass that did not ask this time (`windowUsage`
+            // false) leaves the flag exactly where the last attempt that DID
+            // ask left it, and a pass that did ask records `usage is null`
+            // directly — see WindowUsageFetchFailed's own doc comment.
+            WindowUsageFetchFailed = windowUsage ? usage is null : s.WindowUsageFetchFailed,
         }, graph: null, stillValid: () => SelectionStillValid(year, generation));
     }
 

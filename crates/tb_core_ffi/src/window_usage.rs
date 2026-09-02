@@ -167,22 +167,37 @@ fn compute(
     // Re-check under the lock. A caller that queued behind another's scan is
     // asking a question that scan may have just answered; running a second one
     // to produce the same bytes is the duplicate this lock exists to remove.
-    {
+    let hit = {
         let cache = WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((at, _, cached_until, data)) = cache.get(&key) {
-            if *cached_until >= until_ms && at.elapsed() <= Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS) {
-                return Ok(data.clone());
-            }
+        cache.get(&key).and_then(|(at, _, cached_until, data)| {
+            (*cached_until >= until_ms
+                && at.elapsed() <= Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS))
+            .then(|| (data.clone(), *cached_until))
+        })
+    };
+    // `hit` and the freshly-scanned branch below join at ONE exit
+    // (`narrow_to_request` below, called exactly once) rather than each
+    // returning its own narrowed value. The recheck-hit branch used to return
+    // `data` as-is: two concurrent callers with no covering entry yet both
+    // reach this function, the first publishes a scan through its own WIDER
+    // `until_ms`, and the second — narrower — found that entry right here and
+    // handed back every message up to the first caller's bound, past its own.
+    // `cached()`'s two call sites already narrow correctly; this was the one
+    // exit that did not.
+    let (data, cached_until) = match hit {
+        Some((data, cached_until)) => (data, cached_until),
+        None => {
+            let token = tokscale_core::local_source_change_token_with_source_context(
+                context.resolved(),
+                &context.parse_options(None, None),
+            )
+            .unwrap_or(0);
+            let data = run(context, from_ms, until_ms)?;
+            publish(key, (Instant::now(), token, until_ms, data.clone()));
+            (data, until_ms)
         }
-    }
-    let token = tokscale_core::local_source_change_token_with_source_context(
-        context.resolved(),
-        &context.parse_options(None, None),
-    )
-    .unwrap_or(0);
-    let data = run(context, from_ms, until_ms)?;
-    publish(key, (Instant::now(), token, until_ms, data.clone()));
-    Ok(data)
+    };
+    Ok(narrow_to_request(data, until_ms, cached_until))
 }
 
 /// Cache a freshly scanned window. Unlike the macOS source, there is no root
@@ -440,5 +455,68 @@ mod tests {
         let data = serde_json::json!({"messages": [], "untilMs": 100});
         let unchanged = narrow_to_request(data.clone(), 100, 100);
         assert_eq!(unchanged, data);
+    }
+
+    // Round-7 finding: `compute`'s own recheck-under-lock used to return the
+    // hit unnarrowed. Simulates the second of two concurrent callers with no
+    // covering entry yet: the first has already published a WIDER scan by the
+    // time this one enters `compute` and finds it under the `COMPUTE` lock.
+    #[test]
+    fn compute_narrows_a_cache_hit_found_under_its_own_lock() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let from_ms = 1_700_000_000_000;
+        let key = cache_key(from_ms);
+        let context = test_context("compute-recheck-narrow");
+        let wide_until = from_ms + 120_000;
+        let narrow_until = from_ms + 60_000;
+        let token = tokscale_core::local_source_change_token_with_source_context(
+            context.resolved(),
+            &context.parse_options(None, None),
+        )
+        .unwrap_or(0);
+        let wide = serde_json::json!({
+            "fromMs": from_ms,
+            "untilMs": wide_until,
+            "messages": [
+                {"timestamp": from_ms + 10_000, "client": "a", "providerId": "p", "modelId": "m",
+                 "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
+                 "cost": 0.0, "isTurnStart": true},
+                // Past the narrower caller's own until_ms: must never come back.
+                {"timestamp": from_ms + 90_000, "client": "a", "providerId": "p", "modelId": "m",
+                 "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
+                 "cost": 0.0, "isTurnStart": true},
+            ],
+            "undatedCount": 0,
+            "processingTimeMs": 0,
+        });
+        {
+            let mut cache =
+                WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(key, (Instant::now(), token, wide_until, wide));
+        }
+        let before = scan_count();
+
+        // `compute` directly, not `cached`: this is exactly the call the
+        // narrower of two concurrent callers makes once it decides there is
+        // no covering entry yet (`cached`'s own two exits already narrow
+        // correctly and are not what this test is asserting about).
+        let result =
+            compute(&context, from_ms, narrow_until, key).expect("recheck hit, narrowed");
+
+        assert_eq!(
+            scan_count(),
+            before,
+            "a hit found under the COMPUTE lock must not trigger a second scan"
+        );
+        let messages = result["messages"].as_array().expect("messages array");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["timestamp"].as_i64().unwrap() < narrow_until),
+            "no returned message may carry a timestamp at or past the caller's own \
+             until_ms: {messages:?}"
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(result["untilMs"].as_i64(), Some(narrow_until));
     }
 }
