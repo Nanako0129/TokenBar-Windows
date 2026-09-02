@@ -554,7 +554,7 @@ public class WindowCardTextTests
         QuotaSample[] samples = [new(0, 10), new(1000, 30)];
         WindowMessage[] mine = [new(500, "claude-code", "anthropic", "sonnet", 1_000, 0, 0, 0, 0, 2.0, true)];
 
-        var row = WindowCardText.LiveEquivalence(samples, mine);
+        var row = WindowCardText.LiveEquivalence(samples, mine, declared: true, attempted: true);
 
         var ratio = Assert.IsType<WindowEquivalence.Row.Ratio>(row);
         Assert.Equal(500, ratio.TokensPerTenth);
@@ -572,13 +572,50 @@ public class WindowCardTextTests
     public void LiveEquivalenceReachesEveryRowCaseTheChartCanProduce(
         QuotaSample[] samples, WindowMessage[] mine, Type expectedRowType)
     {
-        var row = WindowCardText.LiveEquivalence(samples, mine);
+        var row = WindowCardText.LiveEquivalence(samples, mine, declared: true, attempted: true);
         Assert.IsType(expectedRowType, row);
 
         // The strip card's own renderer must accept whatever comes back —
         // Text() throws on an unhandled case, so this also guards that no
         // reachable LiveRow case was left unmapped there.
         Assert.NotEmpty(WindowEquivalenceText.Line(row));
+    }
+
+    // Round-5 P2: the Session-window card's own live equivalence line was the
+    // THIRD call site to reach WindowEquivalence's evidence rules, and it was
+    // wired straight to LiveRow's samples/messages with no `declared` or
+    // `attempted` in sight — the same unclassified corpus the fold
+    // (QuotaEquivalenceFoldTests) and the history card
+    // (WindowHistoryTextTests) already pin to Undeclared read as Unaccounted
+    // here instead, because an empty `mine` list from "nothing classified"
+    // and an empty list from "quota moved, nothing recorded" are the same
+    // list. `declared` and `attempted` are now required parameters of
+    // LiveEquivalence itself — this pins that they are actually respected,
+    // not merely accepted.
+    [Fact]
+    public void LiveEquivalenceIsUndeclaredNotUnaccountedForAnUnclassifiedCorpus()
+    {
+        QuotaSample[] samples = [new(0, 10), new(1000, 30)];
+
+        // Plenty of quota movement and an empty `mine` — exactly what an
+        // unclassified machine hands this call site (WindowCardText.Mine
+        // filters every message out when nothing is declared).
+        var row = WindowCardText.LiveEquivalence(samples, [], declared: false, attempted: true);
+
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
+    }
+
+    // The other state the same defect collapsed into Unaccounted: the
+    // window-usage export has not landed yet, so `mine` is empty because
+    // nothing has been scanned, not because nothing was found.
+    [Fact]
+    public void LiveEquivalenceIsLoadingNotUnaccountedWhenNotYetAttempted()
+    {
+        QuotaSample[] samples = [new(0, 10), new(1000, 30)];
+
+        var row = WindowCardText.LiveEquivalence(samples, [], declared: true, attempted: false);
+
+        Assert.IsType<WindowEquivalence.Row.Loading>(row);
     }
 
     public static TheoryData<QuotaSample[], WindowMessage[], Type> LiveEquivalenceCases()

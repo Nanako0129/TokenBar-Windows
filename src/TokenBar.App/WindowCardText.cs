@@ -170,10 +170,23 @@ public static class WindowCardText
     /// window's own quota readings (the same ones the chart draws) and
     /// <paramref name="mine"/>, <see cref="Mine"/>'s already-attributed
     /// messages, so this card and the chart above it can never disagree about
-    /// which usage counts.</summary>
+    /// which usage counts.
+    /// <para>
+    /// <paramref name="declared"/> and <paramref name="attempted"/> are the
+    /// same two facts <see cref="WindowHistoryText.Equivalence"/> already
+    /// requires for its pooled line, required here for the same reason:
+    /// <see cref="WindowEquivalence.LiveRow"/> cannot accept a call that
+    /// omits either, so this wrapper cannot either.
+    /// </para>
+    /// </summary>
     public static WindowEquivalence.Row LiveEquivalence(
-        IReadOnlyList<QuotaSample> samples, IReadOnlyList<WindowMessage> mine) =>
+        IReadOnlyList<QuotaSample> samples,
+        IReadOnlyList<WindowMessage> mine,
+        bool declared,
+        bool attempted) =>
         WindowEquivalence.LiveRow(
+            declared,
+            attempted,
             [.. samples.Select(sample => new WindowEquivalence.Sample(sample.AtMs, sample.UsedPercent))],
             mine);
 

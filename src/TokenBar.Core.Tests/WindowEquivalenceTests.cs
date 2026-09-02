@@ -57,6 +57,7 @@ public class WindowEquivalenceTests
     public void FewerThanTwoSamplesIsUnavailable()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [new WindowEquivalence.Sample(0, 10)], []);
         Assert.IsType<WindowEquivalence.Row.Unavailable>(row);
     }
@@ -67,6 +68,7 @@ public class WindowEquivalenceTests
     public void TwoSamplesWithNoMovementIsNotMoved()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [
                 new WindowEquivalence.Sample(0, 40),
                 new WindowEquivalence.Sample(1000, 40),
@@ -83,6 +85,7 @@ public class WindowEquivalenceTests
     public void MovementWithNoMessagesInSpanIsUnaccountedNotAZeroRatio()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 30),
@@ -98,6 +101,7 @@ public class WindowEquivalenceTests
     public void SmallMovementWithEvidenceIsInsufficientNotNotMoved()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 12), // delta = 2 < 5
@@ -113,6 +117,7 @@ public class WindowEquivalenceTests
     public void TokensWithNoCostIsTokensOnlyNotAZeroDollarRatio()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 20), // delta = 10
@@ -126,6 +131,7 @@ public class WindowEquivalenceTests
     public void CostWithNoTokensIsCostOnlyNotZeroTokenRatio()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 20),
@@ -139,6 +145,7 @@ public class WindowEquivalenceTests
     public void BothTokensAndCostIsRatio()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [
                 new WindowEquivalence.Sample(0, 10),
                 new WindowEquivalence.Sample(1000, 20),
@@ -157,6 +164,7 @@ public class WindowEquivalenceTests
     public void OnlyMessagesInsideTheSampleSpanCount()
     {
         var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: true,
             [
                 new WindowEquivalence.Sample(1000, 10),
                 new WindowEquivalence.Sample(2000, 20),
@@ -170,6 +178,56 @@ public class WindowEquivalenceTests
         var ratio = Assert.IsType<WindowEquivalence.Row.Ratio>(row);
         Assert.Equal(1500, ratio.TokensPerTenth); // (1000 + 500) / 10 * 10
         Assert.Equal(5.0, ratio.CostPerTenth); // (4 + 1) / 10 * 10
+    }
+
+    // `declared` wins before evidence is even looked at, the same rule
+    // Aggregate already enforces — plenty of movement and plenty of
+    // attributed tokens/cost here, and the row still must not read
+    // Unaccounted, which is the round-5 P2 this parameter exists to make
+    // structurally unreachable.
+    [Fact]
+    public void UndeclaredWinsOverPlentifulEvidence()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: false, attempted: true,
+            [
+                new WindowEquivalence.Sample(0, 10),
+                new WindowEquivalence.Sample(1000, 30),
+            ],
+            [Message(500, 1000, 4.0)]);
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
+    }
+
+    // The other half of the same defect: the message scan has not landed yet
+    // (attempted = false), so an empty/partial `messages` list must read as
+    // "still reading", not "nothing recorded on this machine".
+    [Fact]
+    public void NotYetAttemptedIsLoadingNotUnaccounted()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: true, attempted: false,
+            [
+                new WindowEquivalence.Sample(0, 10),
+                new WindowEquivalence.Sample(1000, 30),
+            ],
+            []);
+        Assert.IsType<WindowEquivalence.Row.Loading>(row);
+    }
+
+    // declared is checked before attempted: an undeclared user with no scan
+    // yet still gets the actionable "classify your usage" sentence, not the
+    // passive "still reading" one.
+    [Fact]
+    public void UndeclaredWinsOverNotYetAttempted()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: false, attempted: false,
+            [
+                new WindowEquivalence.Sample(0, 10),
+                new WindowEquivalence.Sample(1000, 30),
+            ],
+            []);
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
     }
 
     [Fact]

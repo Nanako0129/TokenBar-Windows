@@ -466,7 +466,22 @@ public sealed partial class DashboardView
         // "10% of quota ~ X tokens · $Y", live off this window's own samples —
         // the same line the History card prints pooled over past cycles, here
         // for the one currently running.
-        var equivalence = WindowCardText.LiveEquivalence(active.Samples, mine);
+        //
+        // declared, so an unclassified machine reads "classify your usage"
+        // rather than "nothing was recorded" (WindowEquivalence.LiveRow's own
+        // doc comment) — the same per-window check the History card below
+        // already does via QuotaEquivalenceFold.Declared, here restricted to
+        // this active cycle's own sample span since there is no QuotaCycle
+        // for a window that has not reset yet.
+        //
+        // attempted: WindowUsageAttempted, not the tab's own
+        // QuotaHistoryAttempted — the quota samples and the message export
+        // are two separate fetches, and a chart can already be drawn from the
+        // first while the second is still in flight.
+        var declared = QuotaEquivalenceFold.DeclaredSpan(
+            active.Samples[0].AtMs, active.Samples[^1].AtMs, messages, confirmed.Records);
+        var equivalence = WindowCardText.LiveEquivalence(
+            active.Samples, mine, declared, snapshot.WindowUsageAttempted);
         var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
         equivalenceLine.TextWrapping = TextWrapping.Wrap;
         equivalenceLine.Margin = new Thickness(0, 2, 0, 0);

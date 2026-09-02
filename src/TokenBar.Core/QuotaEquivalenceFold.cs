@@ -120,23 +120,36 @@ public static class QuotaEquivalenceFold
     public static bool Declared(
         IReadOnlyList<QuotaCycle> cycles,
         IReadOnlyList<WindowMessage> messages,
+        IReadOnlyList<UsageAttribution.Record> confirmed) =>
+        cycles.Any(cycle => DeclaredSpan(cycle.FirstSampleMs, cycle.LastSampleMs, messages, confirmed));
+
+    /// <summary>
+    /// <see cref="Declared"/>'s own per-cycle check, pulled out so the live
+    /// window card — one running cycle, not a stored <see cref="QuotaCycle"/>
+    /// list — can ask the identical question over its own sample span
+    /// (<c>WindowCardText.LiveEquivalence</c>) instead of copying the scan.
+    /// <paramref name="fromMs"/>/<paramref name="toMs"/> use the same
+    /// <c>(from, to]</c> rule as <see cref="Cycles"/> and
+    /// <see cref="WindowEquivalence.LiveRow"/>.
+    /// </summary>
+    public static bool DeclaredSpan(
+        long fromMs,
+        long toMs,
+        IReadOnlyList<WindowMessage> messages,
         IReadOnlyList<UsageAttribution.Record> confirmed)
     {
-        foreach (var cycle in cycles)
+        foreach (var message in messages)
         {
-            foreach (var message in messages)
+            if (message.Timestamp <= fromMs || message.Timestamp > toMs)
             {
-                if (message.Timestamp <= cycle.FirstSampleMs || message.Timestamp > cycle.LastSampleMs)
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                var state = UsageAttribution.Resolve(
-                    message.Client, message.ProviderId, message.ModelId, confirmed);
-                if (state.Kind != UsageAttribution.StateKind.Unassigned)
-                {
-                    return true;
-                }
+            var state = UsageAttribution.Resolve(
+                message.Client, message.ProviderId, message.ModelId, confirmed);
+            if (state.Kind != UsageAttribution.StateKind.Unassigned)
+            {
+                return true;
             }
         }
 

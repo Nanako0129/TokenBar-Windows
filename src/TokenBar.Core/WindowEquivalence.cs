@@ -156,6 +156,22 @@ public static class WindowEquivalence
         public sealed record Undeclared : Row;
 
         /// <summary>
+        /// The message scan this row's evidence would come from has not
+        /// landed yet — distinct from <see cref="Unaccounted"/>, which claims
+        /// the scan ran and found nothing.
+        /// <para>
+        /// Reachable only from <see cref="LiveRow"/>: the live card's quota
+        /// samples and its message export are two separate fetches, so a
+        /// window can already be charting a running cycle while the export
+        /// that would prove usage is still in flight. An empty message list
+        /// at that moment means "not looked yet", not "nothing there", and
+        /// <see cref="Unaccounted"/>'s copy ("no usage was recorded") is false
+        /// about a scan that has not run.
+        /// </para>
+        /// </summary>
+        public sealed record Loading : Row;
+
+        /// <summary>
         /// The cycles disagree by more than the tolerance, so there is no
         /// single figure to give — only the span they cover.
         /// <para>
@@ -200,6 +216,7 @@ public static class WindowEquivalence
         Row.TooFewCycles r => "{0} of {1} windows recorded — the estimate needs that many".Localized(
             r.Count, r.Needed),
         Row.Undeclared => "Classify your usage in Settings to see what this window is worth".Localized(),
+        Row.Loading => "Reading recent usage…".Localized(),
         Row.Spread r => "10% of quota ~ {0}-{1} · {2}-{3} API-equivalent".Localized(
             tokens(r.LowPerTenth), tokens(r.HighPerTenth), money(r.LowCostPerTenth), money(r.HighCostPerTenth)),
         _ => throw new ArgumentOutOfRangeException(nameof(row), row, "Unhandled WindowEquivalence.Row case"),
@@ -247,11 +264,35 @@ public static class WindowEquivalence
     /// signature.</summary>
     public readonly record struct Sample(long AtMs, double UsedPercent);
 
-    /// <summary><paramref name="messages"/> must already be filtered to this
+    /// <summary>
+    /// <paramref name="messages"/> must already be filtered to this
     /// subscription's attributed usage. <paramref name="samples"/> must be the
-    /// ones inside the window, in time order.</summary>
-    public static Row LiveRow(IReadOnlyList<Sample> samples, IReadOnlyList<WindowMessage> messages)
+    /// ones inside the window, in time order.
+    /// <para>
+    /// <paramref name="declared"/> and <paramref name="attempted"/> are
+    /// required, not optional, for the same reason <see cref="Aggregate"/>
+    /// takes <c>declared</c>: an empty <paramref name="messages"/> list is
+    /// ambiguous on its own — "filtered to nothing because nothing is
+    /// declared", "not scanned yet" and "scanned, nothing there" are three
+    /// different facts that arrive as the same empty list, and only the
+    /// caller knows which one it has. A caller that skips either parameter
+    /// does not compile, which is the point: round 4 added a caller that
+    /// skipped both, silently, because neither was asked for.
+    /// </para>
+    /// </summary>
+    public static Row LiveRow(
+        bool declared, bool attempted, IReadOnlyList<Sample> samples, IReadOnlyList<WindowMessage> messages)
     {
+        if (!declared)
+        {
+            return new Row.Undeclared();
+        }
+
+        if (!attempted)
+        {
+            return new Row.Loading();
+        }
+
         if (samples.Count < 2)
         {
             return new Row.Unavailable();
