@@ -462,6 +462,16 @@ public sealed partial class DashboardView
         body.Children.Add(headline);
         body.Children.Add(WindowChart(geometry, mine));
         body.Children.Add(WindowLegend(geometry));
+
+        // "10% of quota ~ X tokens · $Y", live off this window's own samples —
+        // the same line the History card prints pooled over past cycles, here
+        // for the one currently running.
+        var equivalence = WindowCardText.LiveEquivalence(active.Samples, mine);
+        var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
+        equivalenceLine.TextWrapping = TextWrapping.Wrap;
+        equivalenceLine.Margin = new Thickness(0, 2, 0, 0);
+        body.Children.Add(equivalenceLine);
+
         if (WindowCardText.UndatedNote(snapshot.WindowUsage?.UndatedCount ?? 0) is { } undated)
         {
             var note = Ui.Dim(undated, 9);

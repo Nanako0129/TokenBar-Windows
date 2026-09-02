@@ -165,6 +165,18 @@ public static class WindowCardText
                 && state.Target == clientId;
         })];
 
+    /// <summary>The Chart state's own <c>≈</c> line — the live counterpart of
+    /// <see cref="WindowHistoryText.Equivalence"/>'s pooled one. Takes the
+    /// window's own quota readings (the same ones the chart draws) and
+    /// <paramref name="mine"/>, <see cref="Mine"/>'s already-attributed
+    /// messages, so this card and the chart above it can never disagree about
+    /// which usage counts.</summary>
+    public static WindowEquivalence.Row LiveEquivalence(
+        IReadOnlyList<QuotaSample> samples, IReadOnlyList<WindowMessage> mine) =>
+        WindowEquivalence.LiveRow(
+            [.. samples.Select(sample => new WindowEquivalence.Sample(sample.AtMs, sample.UsedPercent))],
+            mine);
+
     public static WindowCardState State(WindowCardTab? tab, bool attempted)
     {
         // No tab at all (nothing to select) and a tab with no stored series

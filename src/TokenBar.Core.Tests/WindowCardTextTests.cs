@@ -539,4 +539,85 @@ public class WindowCardTextTests
             Localization.Load("en", AppContext.BaseDirectory);
         }
     }
+
+    // ---- LiveEquivalence ---------------------------------------------------
+
+    // Round-4 P2: BuildWindowCard's Chart state stopped after the chart and
+    // legend — WindowEquivalence.LiveRow had no caller outside tests, so the
+    // card never printed the "10% of quota ~ ..." line macOS shows. This pins
+    // the wiring: QuotaSample (the chart's own reading type) converts to
+    // WindowEquivalence.Sample and reaches LiveRow, using the samples and
+    // attributed messages the card already has in hand.
+    [Fact]
+    public void LiveEquivalenceConvertsQuotaSamplesAndReachesARatio()
+    {
+        QuotaSample[] samples = [new(0, 10), new(1000, 30)];
+        WindowMessage[] mine = [new(500, "claude-code", "anthropic", "sonnet", 1_000, 0, 0, 0, 0, 2.0, true)];
+
+        var row = WindowCardText.LiveEquivalence(samples, mine);
+
+        var ratio = Assert.IsType<WindowEquivalence.Row.Ratio>(row);
+        Assert.Equal(500, ratio.TokensPerTenth);
+        Assert.Equal(1.0, ratio.CostPerTenth);
+    }
+
+    // The card must render EVERY Row case, not only Ratio — the reasons-
+    // there-is-no-number cases are the point of the type. A dashboard that
+    // special-cased Ratio (`row is Ratio r ? ... : nothing`) would pass a test
+    // that only ever fed it a Ratio; this theory feeds LiveEquivalence one
+    // input per reachable case and pins that each survives the conversion
+    // instead of collapsing to Unavailable or Undeclared.
+    [Theory]
+    [MemberData(nameof(LiveEquivalenceCases))]
+    public void LiveEquivalenceReachesEveryRowCaseTheChartCanProduce(
+        QuotaSample[] samples, WindowMessage[] mine, Type expectedRowType)
+    {
+        var row = WindowCardText.LiveEquivalence(samples, mine);
+        Assert.IsType(expectedRowType, row);
+
+        // The strip card's own renderer must accept whatever comes back —
+        // Text() throws on an unhandled case, so this also guards that no
+        // reachable LiveRow case was left unmapped there.
+        Assert.NotEmpty(WindowEquivalenceText.Line(row));
+    }
+
+    public static TheoryData<QuotaSample[], WindowMessage[], Type> LiveEquivalenceCases()
+    {
+        var data = new TheoryData<QuotaSample[], WindowMessage[], Type>();
+
+        // Unavailable: fewer than two readings.
+        data.Add([new(0, 10)], [], typeof(WindowEquivalence.Row.Unavailable));
+
+        // NotMoved: two readings, no delta.
+        data.Add([new(0, 10), new(1000, 10)], [], typeof(WindowEquivalence.Row.NotMoved));
+
+        // Unaccounted: quota moved, nothing attributed inside the span.
+        data.Add([new(0, 10), new(1000, 30)], [], typeof(WindowEquivalence.Row.Unaccounted));
+
+        // Insufficient: quota moved, but by less than MinimumDelta (5 points).
+        data.Add(
+            [new(0, 10), new(1000, 12)],
+            [new WindowMessage(500, "claude-code", "anthropic", "sonnet", 100, 0, 0, 0, 0, 0.1, true)],
+            typeof(WindowEquivalence.Row.Insufficient));
+
+        // TokensOnly: enough delta and tokens, no priced cost.
+        data.Add(
+            [new(0, 10), new(1000, 30)],
+            [new WindowMessage(500, "claude-code", "anthropic", "sonnet", 1_000, 0, 0, 0, 0, 0, true)],
+            typeof(WindowEquivalence.Row.TokensOnly));
+
+        // CostOnly: enough delta and cost, no counted tokens.
+        data.Add(
+            [new(0, 10), new(1000, 30)],
+            [new WindowMessage(500, "claude-code", "anthropic", "sonnet", 0, 0, 0, 0, 0, 2.0, true)],
+            typeof(WindowEquivalence.Row.CostOnly));
+
+        // Ratio: enough delta, both tokens and cost present.
+        data.Add(
+            [new(0, 10), new(1000, 30)],
+            [new WindowMessage(500, "claude-code", "anthropic", "sonnet", 1_000, 0, 0, 0, 0, 2.0, true)],
+            typeof(WindowEquivalence.Row.Ratio));
+
+        return data;
+    }
 }
