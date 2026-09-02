@@ -198,6 +198,63 @@ public class QuotaHistoryFoldTests
         Assert.Equal(7.5, row.OtherCost);
     }
 
+    // Round-3 P1: the per-client lens must key `subscription` by the quota
+    // OWNER (ClientRegistry.QuotaOwner), not the raw client id — a message
+    // the user assigned to "antigravity" is that subscription's evidence
+    // regardless of which CLI process logged it. Passing the raw
+    // "antigravity-cli" id here — what DashboardView.Quota.cs's per-client
+    // lens did before the fix — finds this row's own usage under nobody's
+    // name and empties the whole card, which the second assertion pins.
+    [Fact]
+    public void RowsKeysOnTheQuotaOwnerNotTheRawClientId()
+    {
+        var confirmed = new List<UsageAttribution.Record>
+        {
+            new("antigravity-cli", "antigravity", UsageAttribution.State.Assigned("antigravity")),
+        };
+        var cycles = new[] { HistoryCycle(1000, 2000, 40) };
+        var messages = new[] { Message(1500, "antigravity-cli", "antigravity", "m1", 100, 1.0) };
+
+        var owner = ClientRegistry.QuotaOwner("antigravity-cli");
+        Assert.Equal("antigravity", owner);
+
+        var byOwner = Assert.Single(QuotaHistoryFold.Rows(cycles, messages, owner, null, confirmed));
+        Assert.Equal(100, byOwner.MineTokens);
+        Assert.Equal(1.0, byOwner.MineCost);
+        Assert.Equal(0, byOwner.OtherTokens);
+
+        // The bug: the raw id finds none of this window's own evidence, so
+        // every message it should own falls through to "other" instead.
+        var byRawId = Assert.Single(
+            QuotaHistoryFold.Rows(cycles, messages, "antigravity-cli", null, confirmed));
+        Assert.Equal(0, byRawId.MineTokens);
+        Assert.Equal(100, byRawId.OtherTokens);
+    }
+
+    // A client whose owner equals its own id (no CLI/subscription split) must
+    // see identical behaviour either way — the fix must not introduce a
+    // second id space where none exists.
+    [Fact]
+    public void RowsIsUnaffectedWhenTheOwnerEqualsTheRawClientId()
+    {
+        var confirmed = new List<UsageAttribution.Record>
+        {
+            new("codex", "openai", UsageAttribution.State.Assigned("codex")),
+        };
+        var cycles = new[] { HistoryCycle(1000, 2000, 40) };
+        var messages = new[] { Message(1500, "codex", "openai", "m1", 100, 1.0) };
+
+        var owner = ClientRegistry.QuotaOwner("codex");
+        Assert.Equal("codex", owner);
+
+        var byOwner = Assert.Single(QuotaHistoryFold.Rows(cycles, messages, owner, null, confirmed));
+        var byRawId = Assert.Single(QuotaHistoryFold.Rows(cycles, messages, "codex", null, confirmed));
+        Assert.Equal(100, byOwner.MineTokens);
+        Assert.Equal(byOwner.MineTokens, byRawId.MineTokens);
+        Assert.Equal(byOwner.MineCost, byRawId.MineCost);
+        Assert.Equal(byOwner.OtherTokens, byRawId.OtherTokens);
+    }
+
     // Each state sets EXACTLY its own flag and no other — isolated, so a fold
     // that swapped which case sets which flag (Assigned setting
     // OtherHasExcluded, say) cannot pass by having both flags true from a mix

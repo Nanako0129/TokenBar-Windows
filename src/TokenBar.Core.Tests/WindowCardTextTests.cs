@@ -200,6 +200,58 @@ public class WindowCardTextTests
         Assert.Empty(WindowCardText.Mine(
             [Message("claude-code", "anthropic", "sonnet")], "claude", []));
 
+    // Round-3 P1: antigravity-cli spends the "antigravity" subscription
+    // (ClientRegistry.QuotaOwner), so `Tabs` and `Mine` — every
+    // subscription-facing lookup on the per-client lens — must be keyed by
+    // that owner, not the raw client id, or the whole card renders empty for
+    // that client even though it consumes the subscription.
+    [Fact]
+    public void TabsAndMineResolveAgainstTheOwnerForAClientWhoseOwnerDiffersFromItsId()
+    {
+        var owner = ClientRegistry.QuotaOwner("antigravity-cli");
+        Assert.Equal("antigravity", owner);
+
+        var quota = Quota(owner, Window("antigravity|session.v1", "Session", "session.v1"));
+        var byOwner = WindowCardText.Tabs(
+            [Series(owner, "session.v1", Sample(40, ResetAt - 600))], quota, owner);
+        Assert.Single(byOwner);
+        Assert.Equal("Session", byOwner[0].Label);
+
+        // The bug: the raw id finds neither the live agent nor the stored
+        // series, so the tab list — and with it the whole card — is empty.
+        var byRawId = WindowCardText.Tabs(
+            [Series(owner, "session.v1", Sample(40, ResetAt - 600))], quota, "antigravity-cli");
+        Assert.Empty(byRawId);
+
+        UsageAttribution.Record[] confirmed =
+        [
+            new("antigravity-cli", "antigravity", null,
+                new UsageAttribution.State(UsageAttribution.StateKind.Assigned, owner)),
+        ];
+        var messages = new[] { Message("antigravity-cli", "antigravity", "model") };
+        Assert.Single(WindowCardText.Mine(messages, owner, confirmed));
+        Assert.Empty(WindowCardText.Mine(messages, "antigravity-cli", confirmed));
+    }
+
+    // A client whose owner equals its own id must behave identically either
+    // way — the fix must not introduce a second id space for clients that
+    // never had one.
+    [Fact]
+    public void TabsAndMineAreUnaffectedWhenTheOwnerEqualsTheRawClientId()
+    {
+        var owner = ClientRegistry.QuotaOwner("codex");
+        Assert.Equal("codex", owner);
+
+        var quota = Quota("codex", Window("codex|session.v1", "Session", "session.v1"));
+        var byOwner = WindowCardText.Tabs(
+            [Series("codex", "session.v1", Sample(40, ResetAt - 600))], quota, owner);
+        var byRawId = WindowCardText.Tabs(
+            [Series("codex", "session.v1", Sample(40, ResetAt - 600))], quota, "codex");
+        Assert.Single(byOwner);
+        Assert.Single(byRawId);
+        Assert.Equal(byOwner[0].Label, byRawId[0].Label);
+    }
+
     // ---- the no-sample series ------------------------------------------
 
     // "無樣本" is a rendered series, not an absence. The stretch with no reading

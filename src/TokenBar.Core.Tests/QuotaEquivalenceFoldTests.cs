@@ -143,6 +143,86 @@ public class QuotaEquivalenceFoldTests
         Assert.True(result.ContainsKey(id));
     }
 
+    // Round-3 P2: `declared` must be decided per window, from that window's
+    // OWN messages, not from whether the user has classified ANYTHING
+    // anywhere. A user who classified their Claude usage has still declared
+    // nothing about a second, entirely different subscription's window — its
+    // unclassified messages must read as "classify your usage" (Undeclared),
+    // not as "the allowance moved and nothing was recorded" (Unaccounted),
+    // which is false: the scan DID record that usage, it is merely
+    // unclassified. A single-window fixture cannot tell the two rules apart
+    // — the global flag and the per-window flag agree whenever there is only
+    // one window — so this is deliberately two.
+    [Fact]
+    public void DeclaredIsPerWindowNotGlobal()
+    {
+        var confirmed = UsageAttribution.Table.Empty with
+        {
+            // Classifies the CLAUDE window's own client/provider only.
+            Records = [new UsageAttribution.Record("claude-code", "anthropic", UsageAttribution.State.Assigned("claude"))],
+        };
+
+        var claudeSamples = new[]
+        {
+            new QuotaHistorySample(
+                ResetAt: 2, DurationSeconds: 2, DurationSource: QuotaHistoryDurationSource.Provider,
+                UsedPercent: 10, SampledAt: 0, Origin: QuotaHistorySampleOrigin.LiveV3, IsActiveGroup: false),
+            new QuotaHistorySample(
+                ResetAt: 2, DurationSeconds: 2, DurationSource: QuotaHistoryDurationSource.Provider,
+                UsedPercent: 40, SampledAt: 2, Origin: QuotaHistorySampleOrigin.LiveV3, IsActiveGroup: false),
+        };
+        // A second, unrelated subscription's window — never classified by
+        // the confirmed table above.
+        var codexSamples = new[]
+        {
+            new QuotaHistorySample(
+                ResetAt: 200, DurationSeconds: 100, DurationSource: QuotaHistoryDurationSource.Provider,
+                UsedPercent: 10, SampledAt: 100, Origin: QuotaHistorySampleOrigin.LiveV3, IsActiveGroup: false),
+            new QuotaHistorySample(
+                ResetAt: 200, DurationSeconds: 100, DurationSource: QuotaHistoryDurationSource.Provider,
+                UsedPercent: 40, SampledAt: 200, Origin: QuotaHistorySampleOrigin.LiveV3, IsActiveGroup: false),
+        };
+        var history = new[]
+        {
+            new QuotaHistorySeries("claude", "acct", "session.v1", claudeSamples),
+            new QuotaHistorySeries("codex", "acct", "weekly.v1", codexSamples),
+        };
+        var messages = new[]
+        {
+            Message(1000, "claude-code", "anthropic", 1000, 5.0), // classified -> claude
+            Message(150_000, "codex-cli", "openai", 1000, 5.0), // never classified
+        };
+
+        var result = QuotaEquivalenceFold.Build(history, messages, confirmed);
+
+        var codexRow = result[new QuotaWindowIdentity("codex", "acct", "weekly.v1")];
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(codexRow);
+
+        // The classified window must not itself read as undeclared — it has
+        // its own evidence and its own declaration.
+        var claudeRow = result[new QuotaWindowIdentity("claude", "acct", "session.v1")];
+        Assert.IsNotType<WindowEquivalence.Row.Undeclared>(claudeRow);
+    }
+
+    // Declared() itself: an EXCLUDED classification is still a declaration —
+    // the user reached this window's evidence and said "not this
+    // subscription" — and must count the same as Assigned, not fall through
+    // to "nothing was ever classified here". A check that only recognised
+    // Assigned would still pass every Build() fixture above (none of them
+    // exercise Excluded), so this is asserted directly against Declared.
+    [Fact]
+    public void DeclaredCountsAnExcludedClassificationAsADeclarationToo()
+    {
+        var confirmed = new List<UsageAttribution.Record>
+        {
+            new("cursor", "anthropic", UsageAttribution.State.Excluded),
+        };
+        var cycles = new[] { Cycle(1000, 2000, 40) };
+        var messages = new[] { Message(1500, "cursor", "anthropic", 1000, 5.0) };
+
+        Assert.True(QuotaEquivalenceFold.Declared(cycles, messages, confirmed));
+    }
+
     [Fact]
     public void BoundFromMsFallsBackWhenNoCycleExists()
     {

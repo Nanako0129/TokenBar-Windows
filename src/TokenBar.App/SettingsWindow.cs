@@ -501,6 +501,12 @@ public sealed class SettingsWindow : Window
             return;
         }
 
+        // Captured now: a hide/show/hide while this fetch is still out calls
+        // Reset() and lets a second fetch start before this one lands, and
+        // AttributionReportGate.Generation moves on to that one. This
+        // completion stays tied to the generation it was actually asked
+        // for.
+        var generation = _attributionGate.Generation;
         _ = Task.Run(() =>
             {
                 try
@@ -516,6 +522,16 @@ public sealed class SettingsWindow : Window
             .ContinueWith(
                 completed =>
                 {
+                    // A superseded completion — an older fetch that finished
+                    // after a newer one already landed — must not overwrite
+                    // the newer result with stale rows, and must not claim
+                    // the settle/rebuild that belongs to the request actually
+                    // still current.
+                    if (!_attributionGate.IsCurrent(generation))
+                    {
+                        return;
+                    }
+
                     _attributionReport = completed.Status == TaskStatus.RanToCompletion
                         ? completed.Result
                         : null;

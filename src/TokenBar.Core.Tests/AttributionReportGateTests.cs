@@ -67,4 +67,69 @@ public class AttributionReportGateTests
     {
         Assert.False(new AttributionReportGate().Settled);
     }
+
+    // Round-3 P2 (a race the previous fix introduced): Reset() re-arms the
+    // latch without knowing whether the fetch it is resetting has finished,
+    // so a hide/show/hide can start a second fetch while the first is still
+    // out. SettingsWindow.EnsureAttributionReport captures Generation before
+    // starting each fetch and checks IsCurrent from the completion — this
+    // pins that contract deterministically, with no Task/timing involved:
+    // the OLDER fetch's captured generation must read as stale once a NEWER
+    // one has started, regardless of which one's network call actually
+    // returns first.
+    [Fact]
+    public void AnOlderGenerationIsNotCurrentOnceANewerFetchHasStarted()
+    {
+        var gate = new AttributionReportGate();
+
+        Assert.True(gate.ShouldFetch());
+        var firstGeneration = gate.Generation;
+        Assert.True(gate.IsCurrent(firstGeneration));
+
+        // Hide, then show again before the first request lands.
+        gate.Reset();
+        Assert.True(gate.ShouldFetch());
+        var secondGeneration = gate.Generation;
+
+        Assert.NotEqual(firstGeneration, secondGeneration);
+        // The older fetch's completion — arriving after the newer one
+        // started, whichever order the two network calls actually land in —
+        // must not be able to claim it is still the current request.
+        Assert.False(gate.IsCurrent(firstGeneration));
+        Assert.True(gate.IsCurrent(secondGeneration));
+    }
+
+    // The mirror of the case above: if the OLDER fetch happens to land
+    // first, only the newer generation may still write. A caller applying
+    // this rule (`if (!IsCurrent(captured)) return;` before writing its
+    // cache) can therefore never have a newer result overwritten by a
+    // straggling older one, deterministically, without needing the two
+    // completions to actually race in real time.
+    [Fact]
+    public void ApplyingOnlyCurrentGenerationCompletionsCannotLetAnOlderOneOverwriteANewerResult()
+    {
+        var gate = new AttributionReportGate();
+        Assert.True(gate.ShouldFetch());
+        var firstGeneration = gate.Generation;
+
+        gate.Reset();
+        Assert.True(gate.ShouldFetch());
+        var secondGeneration = gate.Generation;
+
+        string? cache = null;
+
+        // The newer fetch's completion lands first and writes.
+        if (gate.IsCurrent(secondGeneration))
+        {
+            cache = "second (fresh)";
+        }
+
+        // The older fetch's completion lands after — it must be refused.
+        if (gate.IsCurrent(firstGeneration))
+        {
+            cache = "first (stale)";
+        }
+
+        Assert.Equal("second (fresh)", cache);
+    }
 }

@@ -85,7 +85,6 @@ public static class QuotaEquivalenceFold
         IReadOnlyList<WindowMessage> messages,
         UsageAttribution.Table confirmed)
     {
-        var declared = confirmed.Records.Count > 0;
         var result = new Dictionary<QuotaWindowIdentity, WindowEquivalence.Row>();
         foreach (var series in history)
         {
@@ -96,10 +95,52 @@ public static class QuotaEquivalenceFold
             // equivalence" either.
             var considered = QuotaHistoryFold.Considered(QuotaHistoryFold.Cycles(series.Samples));
             var spanCycles = Cycles(considered, series.ProviderId, messages, confirmed.Records);
+            // Per window, not per app: a user who classified their Codex
+            // usage but never touched this window's own messages has still
+            // declared nothing about THIS subscription's evidence, so a zero
+            // span here means "unclassified", not "recorded as zero".
+            // Checked against every message the window's own cycles cover
+            // (any resolved state, not just ones assigned to this provider) —
+            // the same population `Cycles` scans above — so a second
+            // subscription's declaration cannot stand in for this one's.
+            var declared = Declared(considered, messages, confirmed.Records);
             result[id] = WindowEquivalence.Aggregate(declared, spanCycles);
         }
 
         return result;
+    }
+
+    /// <summary>Whether at least one message inside this window's own admitted
+    /// cycles has been classified at all (assigned OR excluded — anything but
+    /// the untouched default). Distinct from <see cref="Cycles"/>'s filter,
+    /// which additionally requires the classification to point AT this
+    /// window: a message assigned to a different subscription still proves
+    /// the user reached this window's evidence and chose to route it
+    /// elsewhere, which is not "undeclared".</summary>
+    public static bool Declared(
+        IReadOnlyList<QuotaCycle> cycles,
+        IReadOnlyList<WindowMessage> messages,
+        IReadOnlyList<UsageAttribution.Record> confirmed)
+    {
+        foreach (var cycle in cycles)
+        {
+            foreach (var message in messages)
+            {
+                if (message.Timestamp <= cycle.FirstSampleMs || message.Timestamp > cycle.LastSampleMs)
+                {
+                    continue;
+                }
+
+                var state = UsageAttribution.Resolve(
+                    message.Client, message.ProviderId, message.ModelId, confirmed);
+                if (state.Kind != UsageAttribution.StateKind.Unassigned)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /// <summary>The earliest instant any window's admitted cycles need

@@ -394,19 +394,24 @@ public sealed partial class DashboardView
     /// where its allowance stands, and the windows before this one.</summary>
     private UIElement BuildClientQuota(DashboardModel.Snapshot snapshot, string clientId)
     {
-        var tabs = WindowCardText.Tabs(snapshot.QuotaHistory, snapshot.Quota, clientId);
+        // Every subscription-facing lookup below (tabs, limits, history) is
+        // keyed by the quota OWNER, not the raw client id — antigravity-cli
+        // spends the antigravity subscription. The raw id survives only for
+        // this tab's own display identity (WindowHistoryText.Disclaimer).
+        var owner = ClientRegistry.QuotaOwner(clientId);
+        var tabs = WindowCardText.Tabs(snapshot.QuotaHistory, snapshot.Quota, owner);
         var selected = tabs.FirstOrDefault(tab => WindowId(tab.Id) == _windowCardTab)
             ?? tabs.FirstOrDefault();
         var confirmed = UsageAttribution.Confirmed(AppSettings.Store);
         var messages = snapshot.WindowUsage?.Messages ?? [];
 
         var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(BuildWindowCard(snapshot, tabs, selected, messages, confirmed, clientId));
+        stack.Children.Add(BuildWindowCard(snapshot, tabs, selected, messages, confirmed, owner));
         // The same builder the Overview and the all-clients lens use, filtered
         // to this client. A second implementation of "where does the allowance
         // stand right now" would be free to disagree with the first.
-        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot, clientId)));
-        stack.Children.Add(BuildWindowHistoryCard(snapshot, selected, messages, confirmed, clientId));
+        stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot, owner)));
+        stack.Children.Add(BuildWindowHistoryCard(snapshot, selected, messages, confirmed, clientId, owner));
         return stack;
     }
 
@@ -416,7 +421,7 @@ public sealed partial class DashboardView
         WindowCardTab? selected,
         IReadOnlyList<WindowMessage> messages,
         UsageAttribution.Table confirmed,
-        string clientId)
+        string owner)
     {
         var state = WindowCardText.State(selected, snapshot.QuotaHistoryAttempted);
         var body = new StackPanel { Spacing = 4 };
@@ -443,7 +448,7 @@ public sealed partial class DashboardView
         // reading opens a new cycle, and a `now` beyond the axis would put the
         // hatch and the zones outside the box they are drawn in.
         var now = Math.Min(DateTimeOffset.Now.ToUnixTimeMilliseconds(), end);
-        var mine = WindowCardText.Mine(messages, clientId, confirmed.Records);
+        var mine = WindowCardText.Mine(messages, owner, confirmed.Records);
         var geometry = WindowCardGeometry.Chart(start, end, now, active.Samples, mine, _windowMetric);
 
         var (percent, caption) = WindowCardText.Headline(geometry, _windowMetric);
@@ -758,7 +763,8 @@ public sealed partial class DashboardView
         WindowCardTab? selected,
         IReadOnlyList<WindowMessage> messages,
         UsageAttribution.Table confirmed,
-        string clientId)
+        string clientId,
+        string owner)
     {
         IReadOnlyList<QuotaHistorySeries> history = snapshot.QuotaHistory ?? [];
         var series = selected is null
@@ -781,7 +787,7 @@ public sealed partial class DashboardView
         // Fable-only-style provider-scoped limit is exposed on this platform
         // today), so every model counts — the same unscoped behaviour the
         // history card already had through QuotaEquivalenceFold.
-        var historyRows = QuotaHistoryFold.Rows(cycles, messages, clientId, modelScope: null, confirmed.Records);
+        var historyRows = QuotaHistoryFold.Rows(cycles, messages, owner, modelScope: null, confirmed.Records);
         var byResetAt = historyRows.ToDictionary(historyRow => historyRow.Id);
         var rows = WindowHistoryText.Rows(
             cycles,
@@ -802,9 +808,13 @@ public sealed partial class DashboardView
         // "10% of quota ~ X tokens · $Y" — pooled over the rows actually
         // shown, above them, because a single row's ratio is dominated by
         // the 1-point reading quantisation.
+        // Per window, not per app — the same distinction QuotaEquivalenceFold
+        // draws for the strip/heatmap: a declaration for another subscription
+        // does not make THIS window's own unclassified messages "recorded as
+        // zero".
         var equivalence = WindowHistoryText.Equivalence(
             [.. rows.Select(row => byResetAt[row.ResetAtMs])],
-            declared: confirmed.Records.Count > 0);
+            declared: QuotaEquivalenceFold.Declared(cycles, messages, confirmed.Records));
         var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(equivalence), 9, 0.6);
         equivalenceLine.TextWrapping = TextWrapping.Wrap;
         equivalenceLine.Margin = new Thickness(0, 0, 0, 6);
