@@ -69,6 +69,11 @@ public sealed class SettingsWindow : Window
     };
     private readonly NavigationViewItem _menuBarItem = new() { Content = "Menu bar".Localized(), Tag = "menubar" };
     private readonly NavigationViewItem _dashboardItem = new() { Content = "Dashboard".Localized(), Tag = "dashboard" };
+    private readonly NavigationViewItem _attributionItem = new()
+    {
+        Content = UsageAttributionPage.Copy.Section.Localized(),
+        Tag = "attribution",
+    };
     private readonly NavigationViewItem _generalItem = new() { Content = "General".Localized(), Tag = "general" };
     private readonly NavigationViewItem _aboutItem = new() { Content = "About".Localized(), Tag = "about" };
     private readonly Dictionary<string, StackPanel> _pages = new(StringComparer.Ordinal);
@@ -123,6 +128,7 @@ public sealed class SettingsWindow : Window
         _nav.PaneFooter = BuildFooter();
         _nav.MenuItems.Add(_menuBarItem);
         _nav.MenuItems.Add(_dashboardItem);
+        _nav.MenuItems.Add(_attributionItem);
         _nav.MenuItems.Add(_generalItem);
         _nav.MenuItems.Add(_aboutItem);
         _nav.SelectedItem = _menuBarItem;
@@ -164,6 +170,12 @@ public sealed class SettingsWindow : Window
         {
             e.Cancel = true; // hide, macOS isReleasedWhenClosed=false parity
             AppWindow.Hide();
+            // Singleton across hide/show (see AttributionReportGate's own doc
+            // comment): reset the fetch guard here so the next visit to the
+            // attribution page refetches, instead of a provider first observed
+            // after the one fetch this process ever made staying unclassifiable
+            // until restart.
+            _attributionGate.Reset();
         };
 
         // A write from any control may change which sub-controls apply
@@ -235,6 +247,7 @@ public sealed class SettingsWindow : Window
         var store = AppSettings.Store;
         _pages["menubar"] = BuildMenuBarPage(store);
         _pages["dashboard"] = BuildDashboardPage(store);
+        _pages["attribution"] = BuildAttributionPage(store);
         _pages["general"] = BuildGeneralPage(store);
         _pages["about"] = BuildAboutPage();
         ShowPage(_selectedTag);
@@ -247,6 +260,11 @@ public sealed class SettingsWindow : Window
     /// switching pages never waits on a rebuild.</summary>
     private void ShowPage(string tag)
     {
+        if (tag == "attribution")
+        {
+            EnsureAttributionReport();
+        }
+
         if (_pages.TryGetValue(tag, out var page))
         {
             _scroll.Content = page;
@@ -460,6 +478,238 @@ public sealed class SettingsWindow : Window
         panel.Children.Add(Section("Flyout size".Localized(), sizeRow));
 
         return panel;
+    }
+
+    // ── Usage attribution page ────────────────────────────────────────────
+    //
+    // macOS's SettingsPanel is handed the ALL-TIME model report so every
+    // observed provider stays classifiable even while the dashboard is scoped
+    // to one year (SettingsPanel.swift:37-39). The tray feed carries no report,
+    // so this window fetches its own, once, off the UI thread, on first visit
+    // to the page. Until it settles the page shows the loading line — "no
+    // report yet" and "the request came back without one" are different
+    // answers, and PageState needs them apart.
+    private ModelReport? _attributionReport;
+    private readonly AttributionReportGate _attributionGate = new();
+    private string? _attributionNotice;
+    private string? _attributionSignature;
+
+    private void EnsureAttributionReport()
+    {
+        if (!_attributionGate.ShouldFetch())
+        {
+            return;
+        }
+
+        // Captured now: a hide/show/hide while this fetch is still out calls
+        // Reset() and lets a second fetch start before this one lands, and
+        // AttributionReportGate.Generation moves on to that one. This
+        // completion stays tied to the generation it was actually asked
+        // for.
+        var generation = _attributionGate.Generation;
+        _ = Task.Run(() =>
+            {
+                try
+                {
+                    return TbCore.ModelReport();
+                }
+                catch (Exception ex)
+                {
+                    DevLog.Write($"settings attribution report: {ex.Message}");
+                    return null;
+                }
+            })
+            .ContinueWith(
+                completed =>
+                {
+                    // A superseded completion — an older fetch that finished
+                    // after a newer one already landed — must not overwrite
+                    // the newer result with stale rows, and must not claim
+                    // the settle/rebuild that belongs to the request actually
+                    // still current.
+                    if (!_attributionGate.IsCurrent(generation))
+                    {
+                        return;
+                    }
+
+                    _attributionReport = completed.Status == TaskStatus.RanToCompletion
+                        ? completed.Result
+                        : null;
+                    _attributionGate.Settle();
+                    _pages["attribution"] = BuildAttributionPage(AppSettings.Store);
+                    if (_selectedTag == "attribution")
+                    {
+                        ShowPage(_selectedTag);
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    /// <summary>Regenerate the stored proposals when the inputs they were
+    /// derived from have changed — macOS's <c>.task(id: signature)</c>
+    /// (SettingsPanel.swift:220-222, :236-249). The signature carries
+    /// <c>targetsKnown</c>, but the guard above it makes that constant here: a
+    /// missing payload returns before anything is written, exactly as
+    /// <c>refreshAttributionSuggestions</c> does.</summary>
+    private void SyncAttributionSuggestions()
+    {
+        if (_attributionReport is not { } report || _quota() is not { } payload)
+        {
+            return;
+        }
+
+        var signature = UsageAttributionSettings.Signature(
+            report.Entries,
+            UsageAttributionSettings.SubscriptionClients(payload),
+            targetsKnown: true,
+            UsageAttributionSettings.RoutedSubscriptionsFrom(payload));
+        if (signature == _attributionSignature)
+        {
+            return;
+        }
+
+        _attributionSignature = signature;
+        _attributionNotice = UsageAttributionPage.RefreshSuggestions(
+            AppSettings.Store, report.Entries, payload) is { } failure
+            ? UsageAttributionPage.FailureMessage(failure)
+            : null;
+    }
+
+    private StackPanel BuildAttributionPage(SettingsStore store)
+    {
+        SyncAttributionSuggestions();
+        var view = UsageAttributionPage.Resolve(
+            _attributionReport?.Entries,
+            _quota(),
+            UsageAttribution.Confirmed(store),
+            UsageAttribution.Suggestions(store),
+            isLoading: !_attributionGate.Settled);
+
+        var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
+        var body = new StackPanel { Spacing = 8 };
+        body.Children.Add(Hint(UsageAttributionPage.Copy.ClassifyHint.Localized()));
+        body.Children.Add(Hint(UsageAttributionPage.Copy.CanonicalizationHint.Localized()));
+        body.Children.Add(Hint(UsageAttributionPage.Copy.DeclarationHint.Localized()));
+
+        if (_attributionNotice is { } notice)
+        {
+            var line = Ui.Dim(notice, 11);
+            line.Opacity = 1;
+            line.Foreground = (Brush)Application.Current.Resources["SystemFillColorCriticalBrush"];
+            body.Children.Add(line);
+        }
+
+        if (view.SuggestionCount > 0)
+        {
+            var accept = new Button
+            {
+                Content = UsageAttributionPage.AcceptAllLabel(view.SuggestionCount),
+                Style = (Style)Application.Current.Resources["AccentButtonStyle"],
+                FontSize = 12,
+                Padding = new Thickness(10, 3, 10, 4),
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+                accept, "AttributionAcceptAll");
+            accept.Click += (_, _) => ApplyAttributionWrite(
+                UsageAttributionPage.AcceptAll(store, view.Rows));
+            body.Children.Add(accept);
+            body.Children.Add(Hint(UsageAttributionPage.Copy.SuggestionsHint.Localized()));
+        }
+
+        switch (view.State)
+        {
+            case UsageAttributionSettings.PageState.Loading:
+                body.Children.Add(Ui.Dim(
+                    UsageAttributionPage.Copy.LoadingUsage.Localized(), 12));
+                break;
+            case UsageAttributionSettings.PageState.Unavailable:
+                body.Children.Add(Ui.Dim(
+                    UsageAttributionPage.Copy.Unavailable.Localized(), 12));
+                break;
+            case UsageAttributionSettings.PageState.Empty:
+                body.Children.Add(Ui.Dim(UsageAttributionPage.Copy.NoRows.Localized(), 12));
+                break;
+            default:
+                var rows = new StackPanel { Spacing = 10 };
+                foreach (var row in view.Rows)
+                {
+                    rows.Children.Add(AttributionRow(store, row, view.TargetClients));
+                }
+
+                body.Children.Add(rows);
+                break;
+        }
+
+        panel.Children.Add(Section(UsageAttributionPage.Copy.Section.Localized(), body));
+        return panel;
+    }
+
+    private Grid AttributionRow(
+        SettingsStore store, UsageAttributionSettings.Row row, IReadOnlyList<string> targetClients)
+    {
+        var text = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center };
+        text.Children.Add(Ui.Text(UsageAttributionPage.SourceTitle(row), 12));
+        text.Children.Add(Ui.Dim(UsageAttributionPage.ObservedLine(row), 11));
+
+        // Unassigned, "Not a subscription", then one entry per selectable
+        // target — the same order the macOS picker lists.
+        var choices = new List<UsageAttribution.State>
+        {
+            UsageAttribution.State.Unassigned,
+            UsageAttribution.State.Excluded,
+        };
+        choices.AddRange(UsageAttributionPage.PickerTargets(row, targetClients)
+            .Select(UsageAttribution.State.Assigned));
+
+        var picker = new ComboBox
+        {
+            Width = 168,
+            FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center,
+            ItemsSource = choices.Select(UsageAttributionPage.StateLabel).ToList(),
+            // Set BEFORE the handler: assigning a selection is what raises
+            // SelectionChanged, and a write on every rebuild would turn painting
+            // the page into classifying every source on it.
+            SelectedIndex = Math.Max(0, choices.IndexOf(row.State)),
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            picker, $"AttributionPicker_{row.Id}");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(
+            picker, UsageAttributionPage.ClassificationForLabel(row));
+        HoverTip.Attach(picker, () => UsageAttributionPage.Copy.Classification.Localized());
+        picker.SelectionChanged += (_, _) =>
+        {
+            if (picker.SelectedIndex >= 0 && choices[picker.SelectedIndex] != row.State)
+            {
+                ApplyAttributionWrite(
+                    UsageAttributionPage.Save(store, row, choices[picker.SelectedIndex]));
+            }
+        };
+
+        var left = new StackPanel { Spacing = 3 };
+        left.Children.Add(text);
+        if (row.SuggestedState is { } suggested)
+        {
+            var label = Ui.Text(UsageAttributionPage.SuggestionLabel(suggested), 11);
+            label.Foreground = (Brush)Application.Current.Resources["SystemFillColorCautionBrush"];
+            left.Children.Add(label);
+        }
+
+        return Ui.Row(left, picker);
+    }
+
+    /// <summary>A refused write leaves the store untouched and therefore fires
+    /// no Changed, so the page has to be rebuilt here or the notice explaining
+    /// the refusal would never appear.</summary>
+    private void ApplyAttributionWrite(UsageAttributionSettings.WriteFailure? failure)
+    {
+        _attributionNotice = failure is { } value
+            ? UsageAttributionPage.FailureMessage(value)
+            : null;
+        _pages["attribution"] = BuildAttributionPage(AppSettings.Store);
+        ShowPage(_selectedTag);
     }
 
     // ── General page: Startup, Data refresh ──────────────────────────────

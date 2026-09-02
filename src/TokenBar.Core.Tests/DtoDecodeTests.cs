@@ -105,6 +105,46 @@ public class DtoDecodeTests
         JsonSerializer.Deserialize<UsageWindow>(json, Web)
         ?? throw new InvalidOperationException("window decoded to null");
 
+    // The account-scope wire contract, asserted against the bytes Rust emits
+    // rather than against a C#-built object.
+    //
+    // `AgentUsageSnapshot.AccountScope` is nullable and `AccountScopeStatus`'s
+    // members are nullable, so a shape this decoder does not recognise arrives
+    // as null and throws nothing. `WindowCardText.Tabs` then falls back to
+    // picking whichever stored series comes first — the exact defect the field
+    // was added to remove — with every other test still green. Nothing else on
+    // either side compares these bytes: the Rust half pins the Err shape in
+    // `provider_quota_pace_v3_fixture_locks_production_serializer`, and every
+    // other C# test constructs `AccountScopeStatus` directly.
+    [Fact]
+    public void AnAccountScopeDecodesFromTheShapeRustSerializes()
+    {
+        var ok = DecodeAgentUsagePayload(
+            agentsJson: """[{"clientId":"codex","source":"oauth","updatedAt":"now","windows":[],"accountScope":{"scope":"scope-a"}}]""");
+        var okScope = Assert.Single(ok.Agents).AccountScope;
+        Assert.NotNull(okScope);
+        Assert.Equal("scope-a", okScope!.Scope);
+        Assert.Null(okScope.Error);
+
+        var failed = DecodeAgentUsagePayload(
+            agentsJson: """[{"clientId":"codex","source":"oauth","updatedAt":"now","windows":[],"accountScope":{"error":"no trusted account evidence"}}]""");
+        var failedScope = Assert.Single(failed.Agents).AccountScope;
+        Assert.NotNull(failedScope);
+        Assert.Equal("no trusted account evidence", failedScope!.Error);
+        Assert.Null(failedScope.Scope);
+    }
+
+    // An older cdylib emits no field at all. That is a third state and it must
+    // stay distinguishable from both: a resolved scope, a resolution that
+    // failed, and a producer that predates the field entirely.
+    [Fact]
+    public void AnAbsentAccountScopeStaysNullRatherThanBecomingAnEmptyStatus()
+    {
+        var payload = DecodeAgentUsagePayload();
+
+        Assert.Null(Assert.Single(payload.Agents).AccountScope);
+    }
+
     private static AgentUsagePayload DecodeAgentUsagePayload(
         string? subscriptionsJson = null,
         string agentsJson = """[{"clientId":"codex","source":"oauth","updatedAt":"now","windows":[]}]""")

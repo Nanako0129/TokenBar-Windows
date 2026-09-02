@@ -87,6 +87,28 @@ public sealed class SettingsStore
         }
     }
 
+    /// <summary>Presence and value kind, which <see cref="GetString"/> collapses:
+    /// it returns its fallback both for an absent key and for a key present
+    /// holding a non-string JSON value. Those are different outcomes for a codec
+    /// that must not overwrite what it cannot read — a present non-string belongs
+    /// to a foreign writer. Returns false when the key is absent; true with
+    /// <paramref name="value"/> set for a present string; true with
+    /// <paramref name="value"/> null for a present non-string.</summary>
+    public bool TryGetString(string key, out string? value)
+    {
+        lock (_gate)
+        {
+            if (!_values.TryGetValue(key, out var v))
+            {
+                value = null;
+                return false;
+            }
+
+            value = v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+            return true;
+        }
+    }
+
     public bool GetBool(string key, bool fallback)
     {
         lock (_gate)

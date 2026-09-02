@@ -38,6 +38,39 @@
     <Compile Include="..\TokenBar.App\AppLanguage.cs" Link="AppLanguage.cs" />
     <Compile Include="..\TokenBar.App\DrillDownSummary.cs" Link="DrillDownSummary.cs" />
     <Compile Include="..\TokenBar.App\QuotaSummaryText.cs" Link="QuotaSummaryText.cs" />
+    <Compile Include="..\TokenBar.App\QuotaLensText.cs" Link="QuotaLensText.cs" />
+    <Compile Include="..\TokenBar.App\QuotaLensData.cs" Link="QuotaLensData.cs" />
+    <Compile Include="..\TokenBar.App\QuotaLensProjection.cs" Link="QuotaLensProjection.cs" />
+    <!-- The strip card's ≈ line and the heatmap hover's equivalence lines
+         (5d-2), for the same reason: DashboardView.Quota.cs compiles under no
+         test project, and this is the file whose case-fold a merged neighbour
+         would misreport a dollar figure from. -->
+    <Compile Include="..\TokenBar.App\WindowEquivalenceText.cs" Link="WindowEquivalenceText.cs" />
+    <!-- Every decision the usage-attribution settings page makes, for the same
+         reason as the three above: SettingsWindow.cs is compiled by no test
+         project, so the suppression rule and the accept-all count would sit in
+         a file nothing can assert against. -->
+    <Compile Include="..\TokenBar.App\UsageAttributionPage.cs" Link="UsageAttributionPage.cs" />
+    <!-- The attribution page's model-report fetch guard (P2-2, round 2):
+         SettingsWindow.cs is a singleton reused across hide/show, so a bare
+         fetch-once-per-process guard meant a provider first observed after
+         that one fetch never appeared until the app restarted. Pulled out for
+         the same reason as the file above: SettingsWindow.cs compiles under no
+         test project. -->
+    <Compile Include="..\TokenBar.App\AttributionReportGate.cs" Link="AttributionReportGate.cs" />
+    <!-- The 每日・依訂閱 card's four-state branch and its copy, for the same
+         reason: DashboardView.Quota.cs is compiled by no test project, and the
+         state choice is the defect this card can actually ship (a range with
+         real usage but no token counts announcing "no usage recorded"). -->
+    <Compile Include="..\TokenBar.App\SubscriptionTrendText.cs" Link="SubscriptionTrendText.cs" />
+    <!-- The per-client Quota lens (5e): the Session-window card's five-state
+         branch, its hatched no-sample series, and the window-history card's row
+         fold and disclaimer. Same reason again — DashboardView.Quota.cs is
+         compiled by no test project, and "no sample" being a drawn series
+         rather than a gap is exactly the kind of rule a layout file loses
+         silently. -->
+    <Compile Include="..\TokenBar.App\WindowCardText.cs" Link="WindowCardText.cs" />
+    <Compile Include="..\TokenBar.App\WindowHistoryText.cs" Link="WindowHistoryText.cs" />
     <!-- Syrtis.Installer's boundary logic, pulled in for the same reason as
          the App sources above: none of these five files references
          System.Windows.Forms, so they compile as-is under net10. Deliberately

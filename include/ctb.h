@@ -113,6 +113,21 @@ char *tb_agent_usage(void);
 // envelope.
 char *tb_quota_history(void);
 
+// Per-message usage rows inside the absolute interval [from_ms, until_ms)
+// (WindowUsage: {messages:[{timestamp,client,providerId,modelId,input,output,
+// cacheRead,cacheWrite,reasoning,cost,isTurnStart}], undatedCount,
+// processingTimeMs}). No bucketing and no attribution — attribution is applied
+// C#-side, since it is the user's own declaration. Backs the quota lens's
+// per-cycle folds, which need usage scoped to one quota cycle's observed span
+// (HourlyReport's hour buckets and tb_usage_trace's trailing live window can't
+// slice an arbitrary five-hour cycle). Expensive: an unbounded window scans
+// the whole local corpus, so this is never a call the UI thread should make
+// directly. `until_ms` is quantised to the minute before it becomes the cache
+// key, so the answer can be up to a minute short of the requested end — the
+// trade that gives a poll-every-60s caller a cache hit on every call after the
+// first.
+char *tb_window_usage(int64_t from_ms, int64_t until_ms);
+
 // Release a string returned by any tb_* entry point.
 void tb_free(char *p);
 

@@ -119,7 +119,7 @@ public sealed partial class DashboardView : UserControl
         };
 
         // In-flyout shortcuts, the macOS ⌘ set on Ctrl: Esc/Ctrl+W close,
-        // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..6 lenses,
+        // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..8 lenses,
         // Ctrl+[ / Ctrl+] cycle.
         // Esc yields to an open transient (the year menu): light-dismiss
         // should collapse the popup, not slide the whole flyout away.
@@ -415,6 +415,12 @@ public sealed partial class DashboardView : UserControl
         if (view == AppView.Agents)
         {
             _model?.EnsureAgents();
+        }
+
+        if (view == AppView.Quota)
+        {
+            _model?.EnsureQuotaHistory();
+            _model?.EnsureWindowUsage();
         }
 
         UpdateTabChrome();
@@ -750,6 +756,7 @@ public sealed partial class DashboardView : UserControl
         DetachGraph3DContentHost();
         UIElement content = _view switch
         {
+            AppView.Quota => BuildQuota(_snapshot),
             AppView.Models => BuildModels(_snapshot),
             AppView.Monthly => BuildMonthly(_snapshot),
             AppView.Daily => BuildDaily(_snapshot),
@@ -1249,10 +1256,21 @@ public sealed partial class DashboardView : UserControl
             _ => PaceMode.Historical,
         };
 
-    private static FrameworkElement BuildLimits(DashboardModel.Snapshot snapshot)
+    /// <summary><paramref name="clientId"/> narrows the card to one
+    /// subscription for the per-client Quota lens (5e). A parameter rather than
+    /// a second builder: this card answers "where does the allowance stand
+    /// right now", and a copy of it would be free to disagree with the original
+    /// on the same window.</summary>
+    private static FrameworkElement BuildLimits(
+        DashboardModel.Snapshot snapshot, string? clientId = null)
     {
         var panel = new StackPanel { Spacing = 10 };
         var agents = snapshot.Quota?.Agents ?? [];
+        if (clientId is not null)
+        {
+            agents = [.. agents.Where(agent => agent.ClientId == clientId)];
+        }
+
         if (agents.Count == 0)
         {
             panel.Children.Add(Ui.Dim("No quota data yet.".Localized()));

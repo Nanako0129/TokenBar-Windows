@@ -265,10 +265,114 @@ public sealed class DashboardModel
         /// than deriving it; this port had let it degrade into a
         /// derivation.</para></summary>
         public bool QuotaAttempted { get; init; }
+
+        /// <summary>The persisted quota curves, for the Quota lens's two
+        /// cards. A third lazy lens, read straight from the store — it does not
+        /// depend on the client selection the way Hourly/Agents do.</summary>
+        public IReadOnlyList<QuotaHistorySeries>? QuotaHistory { get; init; }
+
+        /// <summary>Whether the history READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaAttempted"/>, and a separate one: that flag reports
+        /// the agent-usage lane, this one the store lane, and a lens that read
+        /// the wrong lane's progress would announce "nothing recorded yet"
+        /// while its own fetch was still in flight.
+        ///
+        /// <para><c>QuotaHistory is not null</c> cannot answer it: a read that
+        /// returned no series and a read that has not happened both leave it
+        /// null.</para></summary>
+        public bool QuotaHistoryAttempted { get; init; }
+
+        /// <summary>Whether the MOST RECENT attempted quota-history fetch
+        /// threw, kept separate from whether <see cref="QuotaHistory"/> itself
+        /// is null — the same distinction <see cref="WindowUsageFetchFailed"/>
+        /// carries for the window-usage lane, and for the same reason: a
+        /// failed read keeps the prior <see cref="QuotaHistory"/> so a card
+        /// still has something to draw, which means <c>QuotaHistory is null</c>
+        /// alone cannot tell a failed retry from a first read that has not
+        /// landed yet, or from one that failed after a previous success left
+        /// data behind. Round 8's finding on this lane: without this field the
+        /// session card and the history card had no way to distinguish "the
+        /// read threw" from "the read landed and found nothing" and resolved
+        /// both to the latter.</summary>
+        public bool QuotaHistoryFetchFailed { get; init; }
+
+        /// <summary>The three facts <see cref="QuotaHistoryAttempted"/> and
+        /// <see cref="QuotaHistoryFetchFailed"/> together carry, collapsed the
+        /// same way <see cref="WindowUsageOutcome"/> collapses its own pair:
+        /// not attempted yet, attempted and the most recent fetch threw, or
+        /// attempted and it landed.</summary>
+        public WindowEquivalence.FetchOutcome QuotaHistoryOutcome =>
+            !QuotaHistoryAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
+            : QuotaHistoryFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : WindowEquivalence.FetchOutcome.Succeeded;
+
+        /// <summary>The per-message rows behind the Quota lens's ≈ lines
+        /// (5d-1's export). A fourth lazy lens, fetched only once
+        /// <see cref="QuotaHistory"/> has told this lane how far back to ask —
+        /// the export is expensive enough (macOS's own probe: 67s over 15
+        /// days) that it must never be called with an unbounded range.</summary>
+        public Interop.WindowUsage? WindowUsage { get; init; }
+
+        /// <summary>Whether the window-usage READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaHistoryAttempted"/>, and a separate one: a fetch
+        /// that found no window to bound itself against still has to report
+        /// completion, or the equivalence lines wait forever for an answer
+        /// that was never going to come.</summary>
+        public bool WindowUsageAttempted { get; init; }
+
+        /// <summary>Whether the MOST RECENT attempted window-usage fetch
+        /// threw, kept separate from whether <see cref="WindowUsage"/> itself
+        /// is null.
+        ///
+        /// <para>
+        /// <c>FetchLazyWanted</c> retains the prior <see cref="WindowUsage"/>
+        /// on a failed read (round 7's fix for the "absent because we could
+        /// not ask" mistake — see <see cref="QuotaHistory"/>'s own doc
+        /// comment) rather than replacing it with nothing. That is correct for
+        /// what a card should keep drawing, and wrong as a signal: a fetch
+        /// that failed after an earlier one had succeeded leaves
+        /// <see cref="WindowUsage"/> non-null, so a reader deriving the outcome
+        /// from its nullness alone reports <see cref="WindowEquivalence.FetchOutcome.Succeeded"/>
+        /// about a pass that just failed, and every equivalence line computes
+        /// against stale, possibly-hours-old messages while claiming a fresh
+        /// read. This field is that pass's own result, recorded independently
+        /// of what data ended up retained — not a recombination of
+        /// <see cref="WindowUsageAttempted"/> and <see cref="WindowUsage"/>,
+        /// which is the pair that could not carry this distinction in the
+        /// first place.
+        /// </para>
+        /// </summary>
+        public bool WindowUsageFetchFailed { get; init; }
+
+        /// <summary>
+        /// The three facts <see cref="WindowUsageAttempted"/> and
+        /// <see cref="WindowUsageFetchFailed"/> together carry, collapsed here
+        /// so a call site reads one signal instead of re-deriving it: not
+        /// attempted yet, attempted and the most recent fetch threw, or
+        /// attempted and it landed.
+        /// <para>
+        /// A caller that instead read <c>WindowUsageAttempted</c> alone and
+        /// defaulted <c>WindowUsage?.Messages</c> to <c>[]</c> could not tell
+        /// a completed empty scan from a scan that never ran — the exact
+        /// ambiguity <see cref="WindowEquivalence.FetchOutcome"/> exists to
+        /// remove. Deriving it from <c>WindowUsage is null</c> instead cannot
+        /// tell a failed retry from a successful one, once a prior successful
+        /// fetch has left data behind for a later failure to retain — see
+        /// <see cref="WindowUsageFetchFailed"/>'s own doc comment.
+        /// </para>
+        /// </summary>
+        public WindowEquivalence.FetchOutcome WindowUsageOutcome =>
+            !WindowUsageAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
+            : WindowUsageFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : WindowEquivalence.FetchOutcome.Succeeded;
     }
 
     private volatile bool _hourlyWanted;
     private volatile bool _agentsWanted;
+    private volatile bool _quotaHistoryWanted;
+    private volatile bool _windowUsageWanted;
 
     /// <summary>Marks a lazy lens as needed and fetches it once; later slow
     /// refreshes keep it current.</summary>
@@ -284,9 +388,21 @@ public sealed class DashboardModel
         RequestLazyRefresh();
     }
 
+    public void EnsureQuotaHistory()
+    {
+        _quotaHistoryWanted = true;
+        RequestLazyRefresh();
+    }
+
+    public void EnsureWindowUsage()
+    {
+        _windowUsageWanted = true;
+        RequestLazyRefresh();
+    }
+
     private void RequestLazyRefresh()
     {
-        if (!_hourlyWanted && !_agentsWanted)
+        if (!_hourlyWanted && !_agentsWanted && !_quotaHistoryWanted && !_windowUsageWanted)
         {
             return;
         }
@@ -321,6 +437,8 @@ public sealed class DashboardModel
     {
         var hourly = _hourlyWanted;
         var agents = _agentsWanted;
+        var quotaHistory = _quotaHistoryWanted;
+        var windowUsage = _windowUsageWanted;
         string[] clients;
         long generation;
         lock (_selectionGate)
@@ -351,6 +469,39 @@ public sealed class DashboardModel
                 ? TryFetch(() => TbCore.AgentsReport(year, clients), "agents") : null;
         }
 
+        // Selection-independent: the store is keyed by provider/account/window,
+        // not by the client tabs, so this is read outside the branch above and
+        // survives the staleness check below.
+        var history = quotaHistory
+            ? TryFetch(TbCore.QuotaHistory, "quotaHistory")
+            : null;
+
+        // Bounded by whichever history is freshest: this pass's own read when
+        // one was taken, the last-published one otherwise. Never unbounded —
+        // 5d-1's export scans the whole local corpus when its cache is cold,
+        // which macOS's own probe measured at 67s over 15 days.
+        Interop.WindowUsage? usage = null;
+        if (windowUsage)
+        {
+            var forBound = history ?? Current?.QuotaHistory ?? [];
+            if (forBound.Count == 0)
+            {
+                usage = new Interop.WindowUsage([], 0, 0);
+            }
+            else
+            {
+                // The scan this export can trigger is CPU-bound, not I/O-bound
+                // like the quota-history read above — the same reason the
+                // hourly/agents fetch above it boosts.
+                using var boost = ProcessPower.Boost();
+                usage = TryFetch(
+                    () => TbCore.WindowUsage(
+                        QuotaEquivalenceFold.BoundFromMs(forBound, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                    "windowUsage");
+            }
+        }
+
         if (!SelectionStillValid(year, generation))
         {
             RequestLazyRefresh();
@@ -361,6 +512,27 @@ public sealed class DashboardModel
         {
             Hourly = hourly ? hourlyReport : s.Hourly,
             Agents = agents ? agentsReport : s.Agents,
+            // A failed read keeps whatever was already there rather than
+            // replacing a complete set with an empty one — the "absent because
+            // we could not ask" mistake, arriving as a partial result.
+            QuotaHistory = history ?? s.QuotaHistory,
+            // A failed read publishes completion with nothing to show, for the
+            // same reason the agent-usage lane does: a lens that reads null as
+            // "not yet" would wait forever for an answer that already came back.
+            QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
+            // This pass's own result, not derived from whether `history` ended
+            // up retained — same reasoning as WindowUsageFetchFailed below.
+            QuotaHistoryFetchFailed = quotaHistory ? history is null : s.QuotaHistoryFetchFailed,
+            // Same failed-read and same completion rules as QuotaHistory,
+            // immediately above, and for the same two reasons.
+            WindowUsage = usage ?? s.WindowUsage,
+            WindowUsageAttempted = windowUsage || s.WindowUsageAttempted,
+            // This pass's own result, not derived from whether `usage` ended
+            // up retained: a pass that did not ask this time (`windowUsage`
+            // false) leaves the flag exactly where the last attempt that DID
+            // ask left it, and a pass that did ask records `usage is null`
+            // directly — see WindowUsageFetchFailed's own doc comment.
+            WindowUsageFetchFailed = windowUsage ? usage is null : s.WindowUsageFetchFailed,
         }, graph: null, stillValid: () => SelectionStillValid(year, generation));
     }
 
@@ -387,6 +559,9 @@ public sealed class DashboardModel
             return;
         }
 
+        // QuotaHistory is deliberately untouched: it is not filtered by the
+        // client selection, so clearing it here would drop a valid read and
+        // send the Quota lens back to its loading line for no reason.
         Current = current with
         {
             Hourly = emptySelection ? new HourlyReport([], 0) : null,

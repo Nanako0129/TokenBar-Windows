@@ -31,6 +31,7 @@ mod model_report;
 mod opencode_integrations;
 mod usage_graph;
 mod usage_tail;
+mod window_usage;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
@@ -677,6 +678,31 @@ pub extern "C" fn tb_quota_history() -> *mut c_char {
                     serde_json::to_value(series)
                         .map_err(|error| format!("serialize quota history: {error}"))
                 }),
+        )
+    })
+}
+
+/// Per-message usage rows inside the absolute interval `[from_ms, until_ms)`,
+/// one row per message with no bucketing (`WindowUsage` in the C# decoder).
+/// Backs the quota lens's per-cycle folds (`WindowEquivalence`, ported in a
+/// later slice), which need usage scoped to one quota cycle's observed span —
+/// `HourlyReport`'s hour buckets and `tb_usage_trace`'s trailing live window
+/// can't slice an arbitrary five-hour cycle.
+///
+/// Expensive and deliberately not throttled to the UI thread: an unbounded
+/// window scans the whole local corpus (macOS's own probe: 14.93 days /
+/// 109,278 messages / 67 seconds). `until_ms` is quantised to the minute
+/// before it becomes the cache key, so the answer can be up to a minute short
+/// of the requested end — the trade that buys a poll-every-60s caller a cache
+/// hit on every call after the first. See `window_usage::cached` for the
+/// full cache shape.
+#[no_mangle]
+pub extern "C" fn tb_window_usage(from_ms: i64, until_ms: i64) -> *mut c_char {
+    guarded("tb_window_usage", || {
+        envelope(
+            LocalSourceContext::process()
+                .map_err(|error| error.to_string())
+                .and_then(|context| window_usage::cached(&context, from_ms, until_ms)),
         )
     })
 }
