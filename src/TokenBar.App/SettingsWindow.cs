@@ -541,8 +541,10 @@ public sealed class SettingsWindow : Window
                     // unconditionally true and the Attempted/FetchFailed
                     // outputs collapse to facts about THIS completion alone —
                     // previousAttempted/previousFetchFailed are unused inputs
-                    // in that case, so their values here are arbitrary. Only
-                    // .Value (fetched ?? previous) is consulted: a transient
+                    // in that case, so its value here is arbitrary (LazyLaneFold's
+                    // own FetchFailed output and previousFetchFailed input were
+                    // deleted outright — see LazyLaneFold's own doc comment).
+                    // Only .Value (fetched ?? previous) is consulted: a transient
                     // null must not erase a previously-good report, or the
                     // rebuilt page below reads as "Unavailable" and hides
                     // every classification row it was already showing.
@@ -553,8 +555,7 @@ public sealed class SettingsWindow : Window
                         requested: true,
                         fetched,
                         _attributionReport,
-                        previousAttempted: true,
-                        previousFetchFailed: false).Value;
+                        previousAttempted: true).Value;
                     _attributionGate.Settle();
                     _pages["attribution"] = BuildAttributionPage(AppSettings.Store);
                     // Never call ShowPage from here while hidden: ShowPage's

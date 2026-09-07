@@ -10,6 +10,15 @@ namespace TokenBar.Core.Tests;
 // previously-good report with null. DashboardModel.cs itself is compiled by
 // no test project (it opens with `using Microsoft.UI.Dispatching;`), so this
 // is the seam that actually gets exercised.
+//
+// A third output, FetchFailed, and the previousFetchFailed input that fed it,
+// were dropped later: every reader on the equivalence path that cared about
+// "did the MOST RECENT attempt fail" already checked Value for retained data
+// first, so once Value is non-null, deriving Failed-vs-Succeeded from
+// Value is null alone reaches the same answer that output existed to correct
+// — see DashboardModel.Snapshot.HourlyOutcome's own doc comment. The tests
+// that existed only to pin that output are gone; the rest keep asserting the
+// Value/Attempted behaviour that remains.
 public class LazyLaneFoldTests
 {
     private sealed record Report(int Value);
@@ -22,7 +31,7 @@ public class LazyLaneFoldTests
         var previous = new Report(7);
 
         var result = LazyLaneFold.Apply(
-            requested: true, fetched: null, previous, previousAttempted: true, previousFetchFailed: false);
+            requested: true, fetched: null, previous, previousAttempted: true);
 
         // The bug this fold exists to fix: `requested ? fetched : previous`
         // (the old Hourly/Agents line) would have set Value to null here,
@@ -30,7 +39,6 @@ public class LazyLaneFoldTests
         // for the Value line reproduces exactly that regression.
         Assert.Equal(previous, result.Value);
         Assert.True(result.Attempted);
-        Assert.True(result.FetchFailed);
     }
 
     [Fact]
@@ -40,62 +48,33 @@ public class LazyLaneFoldTests
         var fresh = new Report(9);
 
         var result = LazyLaneFold.Apply(
-            requested: true, fetched: fresh, previous, previousAttempted: true, previousFetchFailed: true);
+            requested: true, fetched: fresh, previous, previousAttempted: true);
 
         Assert.Equal(fresh, result.Value);
         Assert.True(result.Attempted);
-        Assert.False(result.FetchFailed);
     }
 
     [Fact]
-    public void APassThatDidNotAskLeavesEverythingAtWhateverThePriorPassLeftIt()
+    public void APassThatDidNotAskLeavesTheValueAtWhateverThePriorPassLeftIt()
     {
         var previous = new Report(7);
 
         var result = LazyLaneFold.Apply(
-            requested: false, fetched: null, previous, previousAttempted: true, previousFetchFailed: true);
+            requested: false, fetched: null, previous, previousAttempted: true);
 
         Assert.Equal(previous, result.Value);
         Assert.True(result.Attempted);
-        // Not derived from `fetched is null` when this pass never asked —
-        // the prior pass's own FetchFailed carries forward unexamined.
-        Assert.True(result.FetchFailed);
     }
 
-    // ---- attempted/failed as facts about THIS request, not the result -----
+    // ---- attempted as a fact about THIS request, not the result -----------
 
     [Fact]
     public void NeverRequestedAndNothingRetainedIsNotAttempted()
     {
         var result = LazyLaneFold.Apply<Report>(
-            requested: false, fetched: null, previous: null, previousAttempted: false, previousFetchFailed: false);
+            requested: false, fetched: null, previous: null, previousAttempted: false);
 
         Assert.Null(result.Value);
         Assert.False(result.Attempted);
-        Assert.False(result.FetchFailed);
-    }
-
-    [Fact]
-    public void ARequestedFirstFetchThatThrowsIsAttemptedAndFailedWithNoPriorDataToRetain()
-    {
-        var result = LazyLaneFold.Apply<Report>(
-            requested: true, fetched: null, previous: null, previousAttempted: false, previousFetchFailed: false);
-
-        Assert.Null(result.Value);
-        Assert.True(result.Attempted);
-        Assert.True(result.FetchFailed);
-    }
-
-    [Fact]
-    public void ASuccessAfterAnEarlierFailureClearsFetchFailed()
-    {
-        var fresh = new Report(3);
-
-        var result = LazyLaneFold.Apply(
-            requested: true, fetched: fresh, previous: (Report?)null, previousAttempted: true, previousFetchFailed: true);
-
-        Assert.Equal(fresh, result.Value);
-        Assert.True(result.Attempted);
-        Assert.False(result.FetchFailed);
     }
 }

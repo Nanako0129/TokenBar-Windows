@@ -27,9 +27,21 @@ namespace TokenBar.Core;
 /// </summary>
 public static class LazyLaneFold
 {
-    /// <summary>The three facts one lane's own Publish call needs, folded from
-    /// this pass's own result and the snapshot's prior state.</summary>
-    public readonly record struct Result<T>(T? Value, bool Attempted, bool FetchFailed) where T : class;
+    /// <summary>The two facts one lane's own Publish call needs, folded from
+    /// this pass's own result and the snapshot's prior state.
+    /// <para>
+    /// A third output, <c>FetchFailed</c> — this pass's own success/failure,
+    /// recorded independently of whether <c>Value</c> ended up retained —
+    /// was dropped along with the <c>previousFetchFailed</c> input it read.
+    /// Every reader on the equivalence path that cared about that
+    /// distinction already checks <c>Value</c> for retained data before ever
+    /// falling back to an outcome derived from it, so once <c>Value</c> is
+    /// non-null a caller deriving Failed-vs-Succeeded from
+    /// <c>Value is null</c> alone reaches the same answer that flag existed
+    /// to correct — see <c>DashboardModel.Snapshot.HourlyOutcome</c>'s own
+    /// doc comment.
+    /// </para></summary>
+    public readonly record struct Result<T>(T? Value, bool Attempted) where T : class;
 
     /// <param name="requested">Whether THIS pass asked for the lane at all —
     /// the caller's own "wanted" flag, not derived from <paramref name="fetched"/>:
@@ -43,11 +55,15 @@ public static class LazyLaneFold
     /// being inferred from it).</param>
     /// <param name="previous">The snapshot's own already-published value,
     /// kept when this pass has nothing newer to report.</param>
+    /// <param name="previousAttempted">Whether an earlier pass ever
+    /// requested this lane. Every caller in this codebase requests a lane on
+    /// every pass once it has ever requested it once (there is no "un-want"
+    /// operation), so <paramref name="requested"/> alone already carries this
+    /// once true — kept as an explicit input rather than folded away so a
+    /// lane that resets its own "requested" flag independently (none does
+    /// today) is not silently mishandled.</param>
     public static Result<T> Apply<T>(
-        bool requested, T? fetched, T? previous, bool previousAttempted, bool previousFetchFailed)
+        bool requested, T? fetched, T? previous, bool previousAttempted)
         where T : class =>
-        new(
-            fetched ?? previous,
-            requested || previousAttempted,
-            requested ? fetched is null : previousFetchFailed);
+        new(fetched ?? previous, requested || previousAttempted);
 }

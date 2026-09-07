@@ -47,10 +47,14 @@ public sealed class DashboardModel
     /// <summary>Whether the MOST RECENT completed quota fetch threw, held
     /// outside the snapshot for the same cold-start reason
     /// <see cref="_quotaAttempted"/> is — see that field's own doc comment.
-    /// Kept separate from <c>Quota is null</c> for the same reason
-    /// <c>QuotaHistoryFetchFailed</c> is kept separate from
-    /// <c>QuotaHistory is null</c>: a failed read must render differently
-    /// from "asked, and there is nothing to report".</summary>
+    /// Kept separate from <c>Quota is null</c>, unlike the equivalent flags
+    /// this branch once carried for the hourly/agents/quota-history/window-
+    /// usage lanes (deleted — see <see cref="Snapshot.HourlyOutcome"/>'s own
+    /// doc comment for why those four were redundant with their payload's
+    /// nullness): this lane's Overview quota-summary card is not one of the
+    /// equivalence-path readers that made the other four moot, so a failed
+    /// read here still needs to render differently from "asked, and there is
+    /// nothing to report".</summary>
     private volatile bool _quotaFetchFailed;
 
     // Year filter for every lens (macOS DashboardModel.year); null = all
@@ -268,23 +272,22 @@ public sealed class DashboardModel
         /// yet from one that landed and found nothing.</summary>
         public bool HourlyAttempted { get; init; }
 
-        /// <summary>Whether the MOST RECENT attempted hourly fetch threw,
-        /// kept separate from whether <see cref="Hourly"/> itself is null —
-        /// the same distinction <see cref="QuotaHistoryFetchFailed"/> carries
-        /// for its own lane, and for the same reason: round 9's finding was
-        /// that this lane had NEITHER field, so <c>FetchLazyWanted</c>
-        /// published <c>Hourly = hourly ? hourlyReport : s.Hourly</c> with no
-        /// retention at all — a transient failure overwrote a previously-good
-        /// report with null, and the view could not tell that apart from a
-        /// cold start still loading.</summary>
-        public bool HourlyFetchFailed { get; init; }
-
-        /// <summary>The three facts <see cref="HourlyAttempted"/> and
-        /// <see cref="HourlyFetchFailed"/> together carry, collapsed the same
-        /// way <see cref="QuotaHistoryOutcome"/> collapses its own pair.</summary>
+        /// <summary>The two facts <see cref="HourlyAttempted"/> and
+        /// <see cref="Hourly"/> collapse to: not attempted yet, attempted and
+        /// nothing is retained (the only way <see cref="Hourly"/> can still be
+        /// null once attempted, since a completed-and-empty read always
+        /// publishes a non-null empty report), or attempted with something to
+        /// show. A separate <c>HourlyFetchFailed</c> flag used to carry "the
+        /// MOST RECENT attempt threw" independently of <see cref="Hourly"/>'s
+        /// own nullness, on the theory that a failed retry retaining a prior
+        /// good report needed to render as failed rather than succeeded. It
+        /// does not: every reader of this outcome checks <see cref="Hourly"/>
+        /// for data first and falls back to this enum only when there is none
+        /// to draw (retained data wins), so once <see cref="Hourly"/> is
+        /// non-null the distinction that flag drew was never read.</summary>
         public WindowEquivalence.FetchOutcome HourlyOutcome =>
             !HourlyAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : HourlyFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : Hourly is null ? WindowEquivalence.FetchOutcome.Failed
             : WindowEquivalence.FetchOutcome.Succeeded;
 
         public AgentsReport? Agents { get; init; }
@@ -293,17 +296,11 @@ public sealed class DashboardModel
         /// Agents lane.</summary>
         public bool AgentsAttempted { get; init; }
 
-        /// <summary>Same fact as <see cref="HourlyFetchFailed"/>, for the
-        /// Agents lane — round 9's finding applied equally to both: neither
-        /// lane retained on failure, and neither could distinguish "loading"
-        /// from "just failed".</summary>
-        public bool AgentsFetchFailed { get; init; }
-
         /// <summary>Same collapse as <see cref="HourlyOutcome"/>, for the
-        /// Agents lane.</summary>
+        /// Agents lane, for the same reason.</summary>
         public WindowEquivalence.FetchOutcome AgentsOutcome =>
             !AgentsAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : AgentsFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : Agents is null ? WindowEquivalence.FetchOutcome.Failed
             : WindowEquivalence.FetchOutcome.Succeeded;
 
         /// <summary>Whether a quota fetch has finished, whatever it returned.
@@ -320,13 +317,18 @@ public sealed class DashboardModel
         public bool QuotaAttempted { get; init; }
 
         /// <summary>Whether the MOST RECENT attempted quota fetch threw, kept
-        /// separate from whether <see cref="Quota"/> itself is null — the
-        /// same distinction <see cref="QuotaHistoryFetchFailed"/> carries for
-        /// the store lane, and for the same reason: a failed agent-usage read
-        /// used to publish <c>QuotaAttempted = true</c> with <see cref="Quota"/>
-        /// left null, which is exactly what a completed-and-empty read also
-        /// looks like, so the Overview quota-summary card rendered a failed
-        /// scan identically to "asked, and nothing reported a window".</summary>
+        /// separate from whether <see cref="Quota"/> itself is null: a failed
+        /// agent-usage read used to publish <c>QuotaAttempted = true</c> with
+        /// <see cref="Quota"/> left null, which is exactly what a
+        /// completed-and-empty read also looks like, so the Overview
+        /// quota-summary card rendered a failed scan identically to "asked,
+        /// and nothing reported a window". The equivalent flag the
+        /// quota-history/window-usage/hourly/agents lanes once carried was
+        /// deleted (see <see cref="HourlyOutcome"/>'s own doc comment) because
+        /// every reader in the equivalence path already checked its payload
+        /// for data before ever consulting the flag; this lane's own readers
+        /// (<see cref="QuotaSummaryText"/>) are outside that path and were not
+        /// part of this change, so this flag is untouched.</summary>
         public bool QuotaFetchFailed { get; init; }
 
         /// <summary>The three facts <see cref="QuotaAttempted"/> and
@@ -354,28 +356,21 @@ public sealed class DashboardModel
         /// null.</para></summary>
         public bool QuotaHistoryAttempted { get; init; }
 
-        /// <summary>Whether the MOST RECENT attempted quota-history fetch
-        /// threw, kept separate from whether <see cref="QuotaHistory"/> itself
-        /// is null — the same distinction <see cref="WindowUsageFetchFailed"/>
-        /// carries for the window-usage lane, and for the same reason: a
-        /// failed read keeps the prior <see cref="QuotaHistory"/> so a card
-        /// still has something to draw, which means <c>QuotaHistory is null</c>
-        /// alone cannot tell a failed retry from a first read that has not
-        /// landed yet, or from one that failed after a previous success left
-        /// data behind. Round 8's finding on this lane: without this field the
-        /// session card and the history card had no way to distinguish "the
-        /// read threw" from "the read landed and found nothing" and resolved
-        /// both to the latter.</summary>
-        public bool QuotaHistoryFetchFailed { get; init; }
-
-        /// <summary>The three facts <see cref="QuotaHistoryAttempted"/> and
-        /// <see cref="QuotaHistoryFetchFailed"/> together carry, collapsed the
-        /// same way <see cref="WindowUsageOutcome"/> collapses its own pair:
-        /// not attempted yet, attempted and the most recent fetch threw, or
-        /// attempted and it landed.</summary>
+        /// <summary>The two facts <see cref="QuotaHistoryAttempted"/> and
+        /// <see cref="QuotaHistory"/> collapse to, the same way
+        /// <see cref="HourlyOutcome"/> collapses its own pair (see that
+        /// property's own doc comment for why the separate
+        /// <c>QuotaHistoryFetchFailed</c> flag this used to also read was
+        /// redundant and has been deleted): not attempted yet, attempted with
+        /// nothing retained, or attempted with something to show. A failed
+        /// read keeps the prior <see cref="QuotaHistory"/> so a card still has
+        /// something to draw, which is exactly why <c>QuotaHistory is null</c>
+        /// alone is sufficient here — every reader on the equivalence path
+        /// checks for retained data before ever falling back to this
+        /// enum.</summary>
         public WindowEquivalence.FetchOutcome QuotaHistoryOutcome =>
             !QuotaHistoryAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : QuotaHistoryFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : QuotaHistory is null ? WindowEquivalence.FetchOutcome.Failed
             : WindowEquivalence.FetchOutcome.Succeeded;
 
         /// <summary>The per-message rows behind the Quota lens's ≈ lines
@@ -393,50 +388,42 @@ public sealed class DashboardModel
         /// that was never going to come.</summary>
         public bool WindowUsageAttempted { get; init; }
 
-        /// <summary>Whether the MOST RECENT attempted window-usage fetch
-        /// threw, kept separate from whether <see cref="WindowUsage"/> itself
-        /// is null.
-        ///
-        /// <para>
-        /// <c>FetchLazyWanted</c> retains the prior <see cref="WindowUsage"/>
-        /// on a failed read (round 7's fix for the "absent because we could
-        /// not ask" mistake — see <see cref="QuotaHistory"/>'s own doc
-        /// comment) rather than replacing it with nothing. That is correct for
-        /// what a card should keep drawing, and wrong as a signal: a fetch
-        /// that failed after an earlier one had succeeded leaves
-        /// <see cref="WindowUsage"/> non-null, so a reader deriving the outcome
-        /// from its nullness alone reports <see cref="WindowEquivalence.FetchOutcome.Succeeded"/>
-        /// about a pass that just failed, and every equivalence line computes
-        /// against stale, possibly-hours-old messages while claiming a fresh
-        /// read. This field is that pass's own result, recorded independently
-        /// of what data ended up retained — not a recombination of
-        /// <see cref="WindowUsageAttempted"/> and <see cref="WindowUsage"/>,
-        /// which is the pair that could not carry this distinction in the
-        /// first place.
-        /// </para>
-        /// </summary>
-        public bool WindowUsageFetchFailed { get; init; }
-
         /// <summary>
-        /// The three facts <see cref="WindowUsageAttempted"/> and
-        /// <see cref="WindowUsageFetchFailed"/> together carry, collapsed here
-        /// so a call site reads one signal instead of re-deriving it: not
-        /// attempted yet, attempted and the most recent fetch threw, or
-        /// attempted and it landed.
+        /// The two facts <see cref="WindowUsageAttempted"/> and
+        /// <see cref="WindowUsage"/> collapse to, so a call site reads one
+        /// signal instead of re-deriving it: not attempted yet, attempted
+        /// with nothing retained (the no-bound-window path still publishes a
+        /// non-null empty payload, so this can only mean the fetch threw), or
+        /// attempted with something to show.
         /// <para>
         /// A caller that instead read <c>WindowUsageAttempted</c> alone and
         /// defaulted <c>WindowUsage?.Messages</c> to <c>[]</c> could not tell
         /// a completed empty scan from a scan that never ran — the exact
         /// ambiguity <see cref="WindowEquivalence.FetchOutcome"/> exists to
-        /// remove. Deriving it from <c>WindowUsage is null</c> instead cannot
-        /// tell a failed retry from a successful one, once a prior successful
-        /// fetch has left data behind for a later failure to retain — see
-        /// <see cref="WindowUsageFetchFailed"/>'s own doc comment.
+        /// remove. That ambiguity is what <see cref="WindowUsage"/>'s own
+        /// nullness resolves; a separate <c>WindowUsageFetchFailed</c> flag
+        /// used to also distinguish a failed retry that RETAINS a prior
+        /// success's data from a fresh success, on the theory that stale
+        /// retained messages must not be read as current evidence. Every
+        /// reader on the equivalence path (<see cref="WindowEquivalence.LiveRow"/>,
+        /// <see cref="QuotaLensProjection.BuildHistory"/>,
+        /// <see cref="QuotaLensProjection.BuildOverview"/>) instead checks
+        /// this outcome and only falls back to the retained payload once it
+        /// reads <see cref="WindowEquivalence.FetchOutcome.Succeeded"/> — so
+        /// with the flag gone, a failed refetch that retains messages now
+        /// reads as <c>Succeeded</c> and those three sites render from the
+        /// retained data, the same data the card drawing the bars right above
+        /// the equivalence line already draws from unconditionally (see
+        /// <c>DashboardView.Quota.cs</c>'s own <c>BuildClientQuota</c>/
+        /// <c>BuildHistory</c> use of <see cref="QuotaLensProjection.Client.Mine"/>).
+        /// Staleness is not flagged anywhere else on these cards either, so
+        /// this stops being a distinction the model can afford to keep making
+        /// on its own.
         /// </para>
         /// </summary>
         public WindowEquivalence.FetchOutcome WindowUsageOutcome =>
             !WindowUsageAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : WindowUsageFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : WindowUsage is null ? WindowEquivalence.FetchOutcome.Failed
             : WindowEquivalence.FetchOutcome.Succeeded;
     }
 
@@ -588,37 +575,28 @@ public sealed class DashboardModel
             // failure, so a transient throw overwrote good cached data with
             // null and the view could not tell that apart from a cold
             // start).
-            var hourlyFold = LazyLaneFold.Apply(hourly, hourlyReport, s.Hourly, s.HourlyAttempted, s.HourlyFetchFailed);
-            var agentsFold = LazyLaneFold.Apply(agents, agentsReport, s.Agents, s.AgentsAttempted, s.AgentsFetchFailed);
+            var hourlyFold = LazyLaneFold.Apply(hourly, hourlyReport, s.Hourly, s.HourlyAttempted);
+            var agentsFold = LazyLaneFold.Apply(agents, agentsReport, s.Agents, s.AgentsAttempted);
             return s with
             {
                 Hourly = hourlyFold.Value,
                 HourlyAttempted = hourlyFold.Attempted,
-                HourlyFetchFailed = hourlyFold.FetchFailed,
                 Agents = agentsFold.Value,
                 AgentsAttempted = agentsFold.Attempted,
-                AgentsFetchFailed = agentsFold.FetchFailed,
                 // A failed read keeps whatever was already there rather than
                 // replacing a complete set with an empty one — the "absent because
-                // we could not ask" mistake, arriving as a partial result.
+                // we could not ask" mistake, arriving as a partial result. Whether
+                // THIS pass's own read failed no longer needs a field of its own:
+                // see Snapshot.WindowUsageOutcome's own doc comment.
                 QuotaHistory = history ?? s.QuotaHistory,
                 // A failed read publishes completion with nothing to show, for the
                 // same reason the agent-usage lane does: a lens that reads null as
                 // "not yet" would wait forever for an answer that already came back.
                 QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
-                // This pass's own result, not derived from whether `history` ended
-                // up retained — same reasoning as WindowUsageFetchFailed below.
-                QuotaHistoryFetchFailed = quotaHistory ? history is null : s.QuotaHistoryFetchFailed,
                 // Same failed-read and same completion rules as QuotaHistory,
-                // immediately above, and for the same two reasons.
+                // immediately above, and for the same reason.
                 WindowUsage = usage ?? s.WindowUsage,
                 WindowUsageAttempted = windowUsage || s.WindowUsageAttempted,
-                // This pass's own result, not derived from whether `usage` ended
-                // up retained: a pass that did not ask this time (`windowUsage`
-                // false) leaves the flag exactly where the last attempt that DID
-                // ask left it, and a pass that did ask records `usage is null`
-                // directly — see WindowUsageFetchFailed's own doc comment.
-                WindowUsageFetchFailed = windowUsage ? usage is null : s.WindowUsageFetchFailed,
             };
         }, graph: null, stillValid: () => SelectionStillValid(year, generation));
     }
@@ -650,23 +628,21 @@ public sealed class DashboardModel
         // client selection, so clearing it here would drop a valid read and
         // send the Quota lens back to its loading line for no reason.
         //
-        // Hourly/AgentsAttempted and their FetchFailed flags reset alongside
-        // the reports themselves: this path means "this lane's data is for
-        // the wrong selection now", which is a fact about the OLD selection's
-        // fetch, not the new one — the new selection has not been asked about
-        // yet, attempted or otherwise. Left alone (as round 9 deliberately
-        // did, since nothing read HourlyOutcome/AgentsOutcome yet), a prior
-        // successful attempt would survive the clear and HourlyOutcome would
-        // keep reporting Succeeded about a lane that now holds either a
-        // synthesized empty placeholder or null.
+        // Hourly/AgentsAttempted reset alongside the reports themselves: this
+        // path means "this lane's data is for the wrong selection now", which
+        // is a fact about the OLD selection's fetch, not the new one — the
+        // new selection has not been asked about yet, attempted or
+        // otherwise. Left alone (as round 9 deliberately did, since nothing
+        // read HourlyOutcome/AgentsOutcome yet), a prior successful attempt
+        // would survive the clear and HourlyOutcome would keep reporting
+        // Succeeded about a lane that now holds either a synthesized empty
+        // placeholder or null.
         Current = current with
         {
             Hourly = emptySelection ? new HourlyReport([], 0) : null,
             HourlyAttempted = false,
-            HourlyFetchFailed = false,
             Agents = emptySelection ? new AgentsReport([], 0, 0) : null,
             AgentsAttempted = false,
-            AgentsFetchFailed = false,
         };
         _lastSnapshot = Current;
     }

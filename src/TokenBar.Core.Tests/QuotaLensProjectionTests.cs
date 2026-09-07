@@ -137,22 +137,37 @@ public class QuotaLensProjectionTests
         Assert.Single(model.Overview.Equivalences);
     }
 
-    // ---- finding 2: retained-stale data is not a fresh success ------------
+    // ---- retained data renders as data, not as a failure ------------------
 
-    // The three call sites this finding touches, all fed the SAME messages
-    // (standing in for WindowUsage retained from an earlier successful fetch)
-    // under a Failed outcome: none of them may read those messages as
-    // current evidence, because DashboardModel retains stale WindowUsage
-    // across a failing refresh (see Snapshot.WindowUsageFetchFailed's own
-    // doc comment) and an empty/messages-bearing list under Failed means "we
-    // do not know", not "here is the answer".
+    // Formerly "FailedOutcomeIsNotReadAsSuccessAtAnyOfTheThreeSitesEvenWithMessagesRetained",
+    // pinning the opposite rule: a Failed outcome, retaining stale messages
+    // from an earlier successful fetch, still rendered ScanFailed rather than
+    // a ratio computed from those messages. That rule inverted with
+    // DashboardModel.Snapshot.WindowUsageOutcome (see its own doc comment):
+    // DashboardModel never nulls WindowUsage out on a failed refetch, it only
+    // ever retains, and WindowUsageOutcome is now derived purely from
+    // `WindowUsage is null` — so once any earlier fetch has succeeded, this
+    // lane can no longer produce Failed while messages are retained; the
+    // combination this test used to construct directly cannot occur upstream
+    // any more. What DOES occur on a failed refresh that retains data is
+    // Succeeded with those same (possibly stale) messages — the exact
+    // scenario `DashboardView.Quota.cs`'s Session-window card already lived
+    // in: it draws its bars from `client.Mine` (built from these same
+    // retained messages, unconditionally) while the line directly beneath
+    // printed `client.LiveEquivalence`, which under the old rule was
+    // `Row.ScanFailed` — bars drawn from data the line under them said could
+    // not be read. This test pins the fix: retained messages render as data
+    // at all three equivalence sites, because there is no longer a way to
+    // tell a fresh success from a failed retry that retained good data, and
+    // no card anywhere carries a staleness marker to hedge with.
     [Fact]
-    public void FailedOutcomeIsNotReadAsSuccessAtAnyOfTheThreeSitesEvenWithMessagesRetained()
+    public void RetainedMessagesRenderAsDataAtAllThreeSitesRatherThanScanFailed()
     {
         var history = new[] { TwoCycleSeries("codex", "primary", "weekly.v1") };
-        // Stale messages: present, and would otherwise produce a real ratio —
-        // proving the branch below is not simply "no messages, so no line".
-        var staleMessages = new[]
+        // Stale-looking messages: present, and would otherwise produce a real
+        // ratio — proving the branch below is not simply "no messages, so no
+        // line".
+        var retainedMessages = new[]
         {
             Message(InActiveSpanMs, "codex", "openai", 5_000, 25.0),
         };
@@ -161,37 +176,26 @@ public class QuotaLensProjectionTests
         // tab and site 4 (the live card) has something to test at all.
         var quota = Quota("codex", Window("codex|weekly.v1", "Weekly", "weekly.v1"));
 
-        var failed = QuotaLensProjection.Build(
+        var model = QuotaLensProjection.Build(
             history, quota, EmptyGraph(),
-            windowUsage: new WindowUsage(staleMessages, 0, 0),
-            windowUsageOutcome: WindowEquivalence.FetchOutcome.Failed,
-            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded, confirmed, year: null,
-            new QuotaLensProjection.Selection("codex", string.Empty));
-
-        // Site 1 (overview): no key at all, not a row computed from stale data.
-        Assert.Empty(failed.Overview.Equivalences);
-
-        // Site 4 (live card): ScanFailed, not a ratio computed from the stale
-        // messages that are still sitting on the active cycle's own span.
-        Assert.NotNull(failed.Client);
-        Assert.IsType<WindowEquivalence.Row.ScanFailed>(failed.Client!.LiveEquivalence);
-
-        // Site 6 (history card): ScanFailed, for the same reason.
-        Assert.IsType<WindowEquivalence.Row.ScanFailed>(failed.Client.History.Equivalence);
-
-        // The fresh-success control: the identical inputs, outcome flipped to
-        // Succeeded, must NOT report ScanFailed at either of the two
-        // per-client sites — the distinction this finding exists to draw.
-        var succeeded = QuotaLensProjection.Build(
-            history, quota, EmptyGraph(),
-            windowUsage: new WindowUsage(staleMessages, 0, 0),
+            windowUsage: new WindowUsage(retainedMessages, 0, 0),
+            // Succeeded: the only outcome DashboardModel can now report once
+            // WindowUsage is non-null, whether this pass's own fetch just
+            // landed or just failed and fell back to what was already there.
             windowUsageOutcome: WindowEquivalence.FetchOutcome.Succeeded,
             quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded, confirmed, year: null,
             new QuotaLensProjection.Selection("codex", string.Empty));
 
-        Assert.NotEmpty(succeeded.Overview.Equivalences);
-        Assert.IsNotType<WindowEquivalence.Row.ScanFailed>(succeeded.Client!.LiveEquivalence);
-        Assert.IsNotType<WindowEquivalence.Row.ScanFailed>(succeeded.Client.History.Equivalence);
+        // Site 1 (overview): a row computed from the retained messages.
+        Assert.NotEmpty(model.Overview.Equivalences);
+
+        // Site 4 (live card): a ratio computed from the retained messages,
+        // not ScanFailed.
+        Assert.NotNull(model.Client);
+        Assert.IsNotType<WindowEquivalence.Row.ScanFailed>(model.Client!.LiveEquivalence);
+
+        // Site 6 (history card): same rendering, same reason.
+        Assert.IsNotType<WindowEquivalence.Row.ScanFailed>(model.Client.History.Equivalence);
     }
 
     // ---- finding 4: the trend window's own range, not the calendar year ---
