@@ -25,32 +25,62 @@
 //! Keying by `from_ms` instead fixes the miss-every-poll half of that: an
 //! ordinary poll whose `until_ms` did NOT grow past what is already cached
 //! reuses that scan's data once the source-change token confirms storage is
-//! unchanged. It does NOT fix the other half — the token proves only that
-//! storage has not changed since the cached scan ran, and that scan was
-//! itself bounded by its own `until_ms` (`run` passes it straight into
+//! unchanged.
+//!
+//! A request whose `until_ms` grew past what is cached (a widening request)
+//! is more delicate. The token alone does NOT justify reusing the cached
+//! data for it — the token proves only that storage has not changed since
+//! the cached scan ran, and that scan was itself bounded by its own
+//! `until_ms` (`run` passes it straight into
 //! `tokscale_core::get_window_usage_with_source_context`), so it says
 //! nothing about messages in `[cached_until, until_ms)` a WIDER request asks
 //! for; those could have been on disk the whole time, simply past the
-//! earlier scan's own requested bound. A request whose `until_ms` grew past
-//! what is cached must always fall through to a real rescan bounded by the
-//! new, wider `until_ms` — the token cannot stand in for that. A shrinking
-//! `until_ms` (no production caller produces one today) does NOT trigger a
-//! rescan — the wider cached scan already covers it — but it must never hand
-//! back messages past its own narrower bound either, so a cache hit whose
-//! entry was scanned further than the request is asking for is trimmed to
-//! `[from_ms, until_ms)` before it is returned (see `narrow_to_request`).
+//! earlier scan's own requested bound rather than absent from the source
+//! (round 10's finding — an earlier version of this cache widened
+//! unconditionally and was wrong). The one case where widening past
+//! `cached_until` IS sound: the cached scan's own bound had already reached
+//! the real wall clock at the moment it ran (`cached_until >=` the scan's
+//! own wall-clock timestamp) — which is exactly what `DashboardModel`'s
+//! `until_ms = now` polling produces. A message cannot be written before the
+//! clock reaches its own timestamp, so nothing in the gap could have existed
+//! yet when that scan ran; anything found there later must have been
+//! written AFTER the scan, which the unchanged token already rules out. A
+//! bounded historical request has no such property — its own bound sits
+//! fixed, far below the real clock at scan time — and always falls through
+//! to a real rescan bounded by the new, wider `until_ms`. See the
+//! widening-soundness comment on `cached` below for the full argument. A
+//! shrinking `until_ms` (no production caller produces one today) does NOT
+//! trigger a rescan — the wider cached scan already covers it — but it must
+//! never hand back messages past its own narrower bound either, so a cache
+//! hit whose entry was scanned further than the request is asking for is
+//! trimmed to `[from_ms, until_ms)` before it is returned (see
+//! `narrow_to_request`).
 
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) type CacheKey = i64;
-/// (computed-at, source token, the `until_ms` this entry was scanned through,
-/// mapped window payload).
-type CacheEntry = (Instant, u64, i64, Value);
+/// (computed-at [`Instant`, for the age check], source token, the `until_ms`
+/// this entry was scanned through, the wall-clock unix-ms moment the scan
+/// itself ran [`Instant` cannot be compared against `until_ms`, hence a
+/// separate field — see `wall_clock_now_ms`], mapped window payload).
+type CacheEntry = (Instant, u64, i64, i64, Value);
+
+/// Real (unix-ms) wall clock, distinct from the monotonic `Instant` the entry
+/// also carries. Needed to tell a scan whose own bound already reached "now"
+/// when it ran (an ordinary poll) from one bounded to a fixed point in the
+/// past (a historical request) — see the widening-soundness comment in
+/// `cached` below.
+fn wall_clock_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 static SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -81,7 +111,7 @@ pub(crate) fn cached(
     let key = cache_key(from_ms);
     let cached = {
         let cache = WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.get(&key).map(|(at, token, cached_until, data)| {
+        cache.get(&key).map(|(at, token, cached_until, scanned_at_ms, data)| {
             (
                 // A cached scan only speaks for messages up to `cached_until`,
                 // so it is trusted without a token probe only when it also
@@ -92,11 +122,12 @@ pub(crate) fn cached(
                     && *cached_until >= until_ms,
                 *token,
                 *cached_until,
+                *scanned_at_ms,
                 data.clone(),
             )
         })
     };
-    let Some((fresh_enough_and_covers, token, cached_until, data)) = cached else {
+    let Some((fresh_enough_and_covers, token, cached_until, scanned_at_ms, data)) = cached else {
         return compute(context, from_ms, until_ms, key);
     };
     if fresh_enough_and_covers {
@@ -104,19 +135,34 @@ pub(crate) fn cached(
     }
 
     // Either the cache is stale, or the request grew past what was scanned.
-    // Probe with the cache lock released, matching graph_cached: the token
-    // only proves storage has not changed since THIS entry's scan ran — it
-    // says nothing about what a scan bounded by a wider `until_ms` would
-    // have found, because `run` passes `until_ms` straight into
-    // `tokscale_core::get_window_usage_with_source_context` as the scan's own
-    // upper bound. A message timestamped in `[cached_until, until_ms)` can
-    // have been on disk the whole time, simply past the earlier scan's
-    // requested bound, not past what the source contained. So the fast path
-    // is only valid when the cached entry already covers the request; an
-    // unchanged source still refreshes the timestamp (nothing to rescan for
-    // freshness), but a request that grew past what was scanned always falls
-    // through to a real rescan below.
-    if cached_until >= until_ms {
+    // Two different reasons the token probe below is allowed to stand in for
+    // a rescan, and only one of them extends trust past `cached_until`:
+    //
+    // - Not a widen (`until_ms <= cached_until`): the cache is merely old
+    //   (age > ONESHOT_MAX_AGE_SECS). Nothing new is being claimed — the
+    //   answer is narrowed to `until_ms`, which the entry already covered —
+    //   so an unchanged token unconditionally justifies reusing it.
+    // - A widen (`until_ms > cached_until`): the token only proves storage
+    //   has not changed since THIS entry's OWN scan ran — it says nothing
+    //   about what a scan bounded by a wider `until_ms` would have found,
+    //   because `run` passes `until_ms` straight into
+    //   `tokscale_core::get_window_usage_with_source_context` as the scan's
+    //   own upper bound. A message timestamped in `[cached_until, until_ms)`
+    //   can have been on disk the whole time, simply past the earlier scan's
+    //   requested bound, not past what the source contained — UNLESS that
+    //   earlier scan's own bound had already reached the real wall clock at
+    //   the moment it ran (`cached_until >= scanned_at_ms`): then nothing
+    //   past `cached_until` could have existed yet when the scan ran (a
+    //   message cannot be written before the clock reaches its own
+    //   timestamp), so anything in the gap must have been written AFTER the
+    //   scan — exactly what the unchanged token already rules out. That is
+    //   the ordinary polling caller (`DashboardModel` requests `until_ms =
+    //   now` every 60s, so each scan's own bound IS the wall clock it ran
+    //   at). A bounded historical request has `cached_until` fixed far below
+    //   `scanned_at_ms`, fails this test, and always falls through to a real
+    //   rescan below.
+    let widening = until_ms > cached_until;
+    if !widening || cached_until >= scanned_at_ms {
         if let Ok(probe_token) = tokscale_core::local_source_change_token_with_source_context(
             context.resolved(),
             &context.parse_options(None, None),
@@ -138,24 +184,29 @@ pub(crate) fn cached(
 /// Trims a cache hit's messages to the caller's own `until_ms` when the
 /// cached entry was scanned further than that — the case a shrinking request
 /// produces, since `fresh_enough_and_covers`/the token probe above both admit
-/// `cached_until >= until_ms`, not `==`. Without this a narrower request
-/// silently inherited every message the wider scan had already found, past
-/// its own stated upper bound. A no-op (returns `data` unchanged) whenever
-/// the entry was not scanned any further than what was asked for.
+/// `cached_until >= until_ms`, not `==`. Also the single exit that rewrites
+/// the payload's own `untilMs` field to `until_ms`, in EVERY case, not only
+/// the shrinking one: the soundness-gated widening path in `cached` above
+/// can legitimately serve a `until_ms` past `cached_until` (it has already
+/// proven no message exists in the gap), and the returned JSON must say what
+/// it now covers rather than the stale, narrower bound the entry was
+/// actually scanned through — leaving the two disagreeing was round 10's
+/// second finding.
 fn narrow_to_request(data: Value, until_ms: i64, cached_until: i64) -> Value {
-    if cached_until <= until_ms {
-        return data;
-    }
     let mut data = data;
-    if let Some(object) = data.as_object_mut() {
-        if let Some(Value::Array(messages)) = object.get_mut("messages") {
-            messages.retain(|message| {
-                message
-                    .get("timestamp")
-                    .and_then(Value::as_i64)
-                    .is_some_and(|timestamp| timestamp < until_ms)
-            });
+    if cached_until > until_ms {
+        if let Some(object) = data.as_object_mut() {
+            if let Some(Value::Array(messages)) = object.get_mut("messages") {
+                messages.retain(|message| {
+                    message
+                        .get("timestamp")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|timestamp| timestamp < until_ms)
+                });
+            }
         }
+    }
+    if let Some(object) = data.as_object_mut() {
         object.insert("untilMs".to_string(), Value::from(until_ms));
     }
     data
@@ -182,7 +233,7 @@ fn compute(
     // to produce the same bytes is the duplicate this lock exists to remove.
     let hit = {
         let cache = WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.get(&key).and_then(|(at, _, cached_until, data)| {
+        cache.get(&key).and_then(|(at, _, cached_until, _scanned_at_ms, data)| {
             (*cached_until >= until_ms
                 && at.elapsed() <= Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS))
             .then(|| (data.clone(), *cached_until))
@@ -205,8 +256,17 @@ fn compute(
                 &context.parse_options(None, None),
             )
             .unwrap_or(0);
+            // Captured before `run` (which can take tens of seconds on a
+            // large store), not after: this stands in for "the wall clock at
+            // the moment this scan was asked to run", which is what the
+            // widening-soundness check in `cached` above needs to compare
+            // against this scan's own `until_ms` bound. Capturing it after
+            // `run` would make every slow first scan look artificially
+            // historical relative to its own bound, permanently disabling
+            // the ordinary-polling fast path for that entry's whole life.
+            let scanned_at_ms = wall_clock_now_ms();
             let data = run(context, from_ms, until_ms)?;
-            publish(key, (Instant::now(), token, until_ms, data.clone()));
+            publish(key, (Instant::now(), token, until_ms, scanned_at_ms, data.clone()));
             (data, until_ms)
         }
     };
@@ -246,10 +306,13 @@ struct WindowData {
     /// — so a consumer can check what it got against what it asked for
     /// instead of trusting the request echoed the response. `from_ms` never
     /// changes after a scan (it is the cache key); `until_ms` is rewritten by
-    /// `narrow_to_request` above to whichever bound this exact answer covers
-    /// (a narrower request's own bound, never a wider one — a request that
-    /// grew past what was cached always gets a fresh, wider-bounded scan
-    /// instead of a widened stand-in for one).
+    /// `narrow_to_request` above to whichever bound this exact answer
+    /// covers — usually the narrower bound a shrinking request asked for,
+    /// but occasionally a wider one than what was actually scanned, when the
+    /// soundness-gated polling fast path in `cached` served a widening
+    /// request without a rescan (see that function's doc comment). Either
+    /// way this field, not the request's own `until_ms`, is what a consumer
+    /// should trust.
     from_ms: i64,
     until_ms: i64,
     messages: Vec<Message>,
@@ -356,9 +419,17 @@ mod tests {
     // widen `entry.2` without ever rescanning — but the token only proves
     // storage is unchanged since the CACHED scan ran, and that scan was
     // itself bounded by its own (narrower) `until_ms`, so it says nothing
-    // about messages in [cached_until, until_ms) a wider request asks for.
-    // A widening request must always fall through to a real rescan, even
-    // with an unchanged source.
+    // about messages in [cached_until, until_ms) a wider request asks for,
+    // UNLESS that scan's own bound had already reached the wall clock it ran
+    // at (see `a_scan_whose_own_bound_reached_its_own_wall_clock_reuses_on_
+    // drift` below for that sound case). This fixture is genuinely
+    // historical, not just arithmetically wider: `from_ms` is a fixed 2023
+    // timestamp, so `compute`'s own `wall_clock_now_ms()` (the real clock,
+    // years later) always lands far past `cached_until` here — the scan's
+    // own bound never reaches its own wall clock, so the soundness gate
+    // must reject it and fall through to a rescan. Breaks if the widening
+    // path is ever entered without that gate (a return to round 10's
+    // over-broad first fix, or removing the gate entirely).
     #[test]
     fn widening_request_forces_a_rescan() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -379,8 +450,73 @@ mod tests {
         assert_eq!(
             scan_count(),
             before + 2,
-            "a request whose until_ms grew past what was cached must trigger a fresh, \
-             wider-bounded rescan, not a token-refresh stand-in for one"
+            "a historically-bounded request whose until_ms grew past what was cached must \
+             trigger a fresh, wider-bounded rescan, not a token-refresh stand-in for one"
+        );
+    }
+
+    // Restores the property `polling_drift_reuses_one_scan` protected before
+    // round 10's first fix deleted it along with the genuinely unsound case
+    // above — the coordinator's follow-up finding: that fix was correct but
+    // too broad, and this is the narrower, sound case it must not have
+    // regressed. A scan whose own bound already reached the wall clock it
+    // ran at (the ordinary `DashboardModel` polling shape, `until_ms = now`
+    // every 60s) can safely serve a later, drifted-wider request from the
+    // same unchanged-token cache entry: nothing past `cached_until` could
+    // have existed yet when that scan ran, so anything in the gap must have
+    // been written afterward — exactly what the token rules out. Manually
+    // fixtured (rather than calling `cached` twice for real) because a real
+    // scan's `scanned_at_ms` is the actual test-run wall clock, which is far
+    // ahead of any fixed 2023-era `from_ms`/`until_ms` literal — the fixture
+    // has to set `cached_until >= scanned_at_ms` explicitly to model "the
+    // request's own until_ms really was wall-clock now when the scan ran".
+    // Breaks if the widening fast path stops reusing here (round 10's
+    // over-broad first fix: no widening at all, ever) or if the soundness
+    // gate's comparison direction/field is wrong.
+    #[test]
+    fn a_scan_whose_own_bound_reached_its_own_wall_clock_reuses_on_drift() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let from_ms = 1_700_000_000_000;
+        let key = cache_key(from_ms);
+        let context = test_context("polling-drift-sound");
+        // The scan's own bound IS the wall clock it ran at — the polling
+        // shape (`until_ms = now`), modelled directly rather than measured.
+        let scanned_at_ms = from_ms + 60_000;
+        let token = tokscale_core::local_source_change_token_with_source_context(
+            context.resolved(),
+            &context.parse_options(None, None),
+        )
+        .unwrap_or(0);
+        let scanned = serde_json::json!({
+            "fromMs": from_ms,
+            "untilMs": scanned_at_ms,
+            "messages": [],
+            "undatedCount": 0,
+            "processingTimeMs": 0,
+        });
+        {
+            let mut cache =
+                WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(key, (Instant::now(), token, scanned_at_ms, scanned_at_ms, scanned));
+        }
+        let before = scan_count();
+
+        // Ordinary polling drift: until_ms grew a few seconds past what was
+        // scanned, source unchanged.
+        let result = cached(&context, from_ms, scanned_at_ms + 5_000)
+            .expect("drifted poll of a scan whose bound already reached its own wall clock");
+
+        assert_eq!(
+            scan_count(),
+            before,
+            "an unchanged source, polled past a scan whose own bound already reached the wall \
+             clock it ran at, must not trigger a rescan"
+        );
+        assert_eq!(
+            result["untilMs"].as_i64(),
+            Some(scanned_at_ms + 5_000),
+            "the widened payload's own untilMs must say what it now covers, not the stale, \
+             narrower bound the entry was actually scanned through"
         );
     }
 
@@ -404,7 +540,17 @@ mod tests {
                 WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.insert(
                 key,
-                (stale_at, /* token that cannot match the real source */ u64::MAX, from_ms + 60_000, sentinel),
+                (
+                    stale_at,
+                    /* token that cannot match the real source */ u64::MAX,
+                    from_ms + 60_000,
+                    // scanned_at_ms: irrelevant here — this is not a widen
+                    // (request until_ms == cached_until below), and the
+                    // mismatched token rejects the probe before the
+                    // widening-soundness check would ever be reached.
+                    from_ms,
+                    sentinel,
+                ),
             );
         }
         let before = scan_count();
@@ -475,7 +621,10 @@ mod tests {
         {
             let mut cache =
                 WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.insert(key, (Instant::now(), token, wide_until, wide));
+            // scanned_at_ms: irrelevant here too — narrow_until < wide_until,
+            // so this is a shrinking request, not a widen, and the
+            // soundness check never applies to it.
+            cache.insert(key, (Instant::now(), token, wide_until, from_ms, wide));
         }
         let before = scan_count();
 
@@ -540,7 +689,10 @@ mod tests {
         {
             let mut cache =
                 WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.insert(key, (Instant::now(), token, wide_until, wide));
+            // scanned_at_ms: irrelevant — `compute`'s own recheck-under-lock
+            // does not consult it at all (see the `_scanned_at_ms` in its
+            // destructuring above).
+            cache.insert(key, (Instant::now(), token, wide_until, from_ms, wide));
         }
         let before = scan_count();
 
