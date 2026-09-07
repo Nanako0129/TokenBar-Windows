@@ -254,7 +254,7 @@ public static class QuotaLensProjection
         if (selected?.Active is { IsPlaced: true } active)
         {
             var declared = QuotaEquivalenceFold.DeclaredSpan(
-                active.Samples[0].AtMs, active.Samples[^1].AtMs, messages, confirmed.Records);
+                active.Samples[0].AtMs, active.Samples[^1].AtMs, owner, messages, confirmed.Records);
             liveEquivalence = WindowCardText.LiveEquivalence(active.Samples, mine, declared, windowUsageOutcome);
         }
 
@@ -320,7 +320,7 @@ public static class QuotaLensProjection
         {
             WindowEquivalence.FetchOutcome.Succeeded => WindowHistoryText.Equivalence(
                 [.. displayRows.Select(row => byResetAt[row.ResetAtMs])],
-                declared: QuotaEquivalenceFold.Declared(cycles, messages, confirmed.Records)),
+                declared: QuotaEquivalenceFold.Declared(cycles, owner, messages, confirmed.Records)),
             WindowEquivalence.FetchOutcome.Failed => new WindowEquivalence.Row.ScanFailed(),
             _ => new WindowEquivalence.Row.Loading(),
         };

@@ -205,11 +205,12 @@ public class QuotaEquivalenceFoldTests
     }
 
     // Declared() itself: an EXCLUDED classification is still a declaration —
-    // the user reached this window's evidence and said "not this
-    // subscription" — and must count the same as Assigned, not fall through
-    // to "nothing was ever classified here". A check that only recognised
-    // Assigned would still pass every Build() fixture above (none of them
-    // exercise Excluded), so this is asserted directly against Declared.
+    // the user said "not any subscription" — and must count the same
+    // regardless of which subscription is asking, not fall through to
+    // "nothing was ever classified here". A check that only recognised
+    // Assigned-to-this-subscription would still pass every Build() fixture
+    // above (none of them exercise Excluded), so this is asserted directly
+    // against Declared.
     [Fact]
     public void DeclaredCountsAnExcludedClassificationAsADeclarationToo()
     {
@@ -220,7 +221,41 @@ public class QuotaEquivalenceFoldTests
         var cycles = new[] { Cycle(1000, 2000, 40) };
         var messages = new[] { Message(1500, "cursor", "anthropic", 1000, 5.0) };
 
-        Assert.True(QuotaEquivalenceFold.Declared(cycles, messages, confirmed));
+        Assert.True(QuotaEquivalenceFold.Declared(cycles, "claude", messages, confirmed));
+    }
+
+    // Round 11's P2 finding: a message assigned to a DIFFERENT subscription
+    // inside the shared span of two OVERLAPPING windows must not read as
+    // "declared" for the window being folded — every source actually
+    // relevant to this window is still unassigned. DeclaredIsPerWindowNotGlobal
+    // above already pins the per-window rule, but with two DISJOINT windows,
+    // so a Declared() that unscoped itself back to "anything classified in
+    // this time range" would still pass it; the fixture below deliberately
+    // overlaps the two windows' cycles so that only a subscription-scoped
+    // check can tell them apart.
+    [Fact]
+    public void DeclaredDoesNotCountAMessageAssignedToAnOverlappingSubscription()
+    {
+        var confirmed = new List<UsageAttribution.Record>
+        {
+            // Classifies the CURSOR client -> "cursor" subscription only.
+            // Nothing classifies "claude-code" against anything.
+            new("cursor", "anthropic", UsageAttribution.State.Assigned("cursor")),
+        };
+        var cycles = new[] { Cycle(1000, 5000, 40) }; // "claude" window's own cycle
+        var messages = new[]
+        {
+            // Falls inside the "claude" cycle's span (1000, 5000] and is
+            // classified — but assigned to "cursor", a different
+            // subscription whose own overlapping window shares this span.
+            // Nothing here says anything about "claude"'s own evidence.
+            Message(2000, "cursor", "anthropic", 1000, 5.0),
+        };
+
+        Assert.False(QuotaEquivalenceFold.Declared(cycles, "claude", messages, confirmed));
+        // The same message, asked from "cursor"'s own side, IS a declaration
+        // — it is assigned to cursor.
+        Assert.True(QuotaEquivalenceFold.Declared(cycles, "cursor", messages, confirmed));
     }
 
     [Fact]

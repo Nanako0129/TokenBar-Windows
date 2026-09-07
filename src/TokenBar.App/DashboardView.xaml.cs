@@ -1268,6 +1268,23 @@ public sealed partial class DashboardView : UserControl
         DashboardModel.Snapshot snapshot, string? clientId = null)
     {
         var panel = new StackPanel { Spacing = 10 };
+        // Round 11's P2 finding: this card used to collapse `snapshot.Quota`
+        // straight to an agent list, so a snapshot carrying
+        // QuotaOutcome == Failed rendered exactly like a genuinely empty
+        // answer (Quota null) or, when a prior fetch had succeeded and the
+        // agent-usage lane retains its last-good payload on failure
+        // (RefreshQuota's own comment on why it does not null Quota out),
+        // like the STALE payload were current. Checked first and
+        // unconditionally of `agents.Count`, so neither case reaches the
+        // list below. Reuses QuotaSummaryText.CouldNotCheckLimits() — the
+        // summary card's own string for this exact outcome — rather than a
+        // near-duplicate.
+        if (snapshot.QuotaOutcome == WindowEquivalence.FetchOutcome.Failed)
+        {
+            panel.Children.Add(Ui.Dim(QuotaSummaryText.CouldNotCheckLimits()));
+            return panel;
+        }
+
         var agents = snapshot.Quota?.Agents ?? [];
         if (clientId is not null)
         {
@@ -1697,7 +1714,14 @@ public sealed partial class DashboardView : UserControl
         var stack = new StackPanel { Spacing = 10 };
         if (snapshot.Hourly is not { } hourly)
         {
-            stack.Children.Add(Ui.Card("Hourly".Localized(), Ui.Dim("Loading hourly data…".Localized())));
+            // Round 11's P2 finding, same defect class as BuildLimits: a null
+            // Hourly used to render as "Loading" unconditionally, so a lane
+            // that asked and threw (HourlyOutcome == Failed) looked identical
+            // to a cold-start read still in flight.
+            var message = snapshot.HourlyOutcome == WindowEquivalence.FetchOutcome.Failed
+                ? "Hourly usage could not be read. It will be retried.".Localized()
+                : "Loading hourly data…".Localized();
+            stack.Children.Add(Ui.Card("Hourly".Localized(), Ui.Dim(message)));
             return stack;
         }
 
@@ -1842,7 +1866,12 @@ public sealed partial class DashboardView : UserControl
         var stack = new StackPanel { Spacing = 10 };
         if (snapshot.Agents is not { } agents)
         {
-            stack.Children.Add(Ui.Card("Agents".Localized(), Ui.Dim("Loading agent data…".Localized())));
+            // Same fix as BuildHourly, same reason: Failed and NotAttempted
+            // both used to render "Loading agent data…".
+            var message = snapshot.AgentsOutcome == WindowEquivalence.FetchOutcome.Failed
+                ? "Agent usage could not be read. It will be retried.".Localized()
+                : "Loading agent data…".Localized();
+            stack.Children.Add(Ui.Card("Agents".Localized(), Ui.Dim(message)));
             return stack;
         }
 
