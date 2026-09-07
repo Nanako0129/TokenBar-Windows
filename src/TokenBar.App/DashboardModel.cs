@@ -568,8 +568,7 @@ public sealed class DashboardModel
                 usage = TryFetch(
                     () => TbCore.WindowUsage(
                         QuotaEquivalenceFold.BoundFromMs(forBound, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
-                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                        boundIsNow: true),
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
                     "windowUsage");
             }
         }

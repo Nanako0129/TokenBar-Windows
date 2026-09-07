@@ -147,14 +147,10 @@ public static class TbCore
     /// <c>[fromMs, untilMs)</c>. Expensive — scans the whole local corpus when
     /// the cdylib's cache is cold — and must be called off the UI thread. The
     /// cache is keyed by <c>fromMs</c> alone; <c>untilMs</c> is not quantised
-    /// and is not part of the key. <paramref name="boundIsNow"/> declares
-    /// whether <c>untilMs</c> was this caller's own read of "now" at the
-    /// moment it was taken — the fact the cdylib's widening fast path needs
-    /// and can no longer infer on its own; pass <c>false</c> for a bounded
-    /// historical request. See <c>ctb.h</c>'s <c>tb_window_usage</c> for the
-    /// cache shape this is built on.</summary>
-    public static WindowUsage WindowUsage(long fromMs, long untilMs, bool boundIsNow) =>
-        Unwrap<WindowUsage>(NativeMethods.tb_window_usage(fromMs, untilMs, boundIsNow ? 1 : 0));
+    /// and is not part of the key. See <c>ctb.h</c>'s <c>tb_window_usage</c>
+    /// for the cache shape this is built on.</summary>
+    public static WindowUsage WindowUsage(long fromMs, long untilMs) =>
+        Unwrap<WindowUsage>(NativeMethods.tb_window_usage(fromMs, untilMs));
 
     /// <summary>
     /// Decodes the standard FFI envelope, returning the payload or throwing
