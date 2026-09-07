@@ -105,7 +105,7 @@ public sealed partial class DashboardView
             snapshot.Graph,
             snapshot.WindowUsage,
             snapshot.WindowUsageOutcome,
-            snapshot.QuotaHistoryAttempted,
+            snapshot.QuotaHistoryOutcome,
             UsageAttribution.Confirmed(AppSettings.Store),
             _model?.Year,
             new QuotaLensProjection.Selection(_activeClientTab, _windowCardTab));
@@ -122,9 +122,9 @@ public sealed partial class DashboardView
         // the two below it answer "where has the allowance gone".
         stack.Children.Add(BuildSubscriptionTrendCard(model.Trend, model.TrendPastYearSelected));
         stack.Children.Add(BuildQuotaStripCard(
-            model.Overview.Summaries, model.Overview.Attempted, model.Overview.Equivalences));
+            model.Overview.Summaries, model.Overview.Outcome, model.Overview.Equivalences));
         stack.Children.Add(BuildQuotaHeatmapCard(
-            model.Overview.Windows, model.Overview.Grids, model.Overview.Attempted, model.Overview.Equivalences));
+            model.Overview.Windows, model.Overview.Grids, model.Overview.Outcome, model.Overview.Equivalences));
         // The Agent-limits card closes the lens on macOS, below the heatmap.
         // The same builder the Overview uses, deliberately: this card answers
         // "where does the allowance stand right now" while the two above answer
@@ -390,7 +390,7 @@ public sealed partial class DashboardView
         DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client, string clientId)
     {
         var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(BuildWindowCard(snapshot, client));
+        stack.Children.Add(BuildWindowCard(client));
         // The same builder the Overview and the all-clients lens use, filtered
         // to this client. A second implementation of "where does the allowance
         // stand right now" would be free to disagree with the first.
@@ -403,11 +403,11 @@ public sealed partial class DashboardView
         return stack;
     }
 
-    private FrameworkElement BuildWindowCard(DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client)
+    private FrameworkElement BuildWindowCard(QuotaLensProjection.Client client)
     {
         var tabs = client.Tabs;
         var selected = client.Selected;
-        var state = WindowCardText.State(selected, snapshot.QuotaHistoryOutcome);
+        var state = WindowCardText.State(selected, client.QuotaHistoryOutcome);
         var body = new StackPanel { Spacing = 4 };
         if (tabs.Count > 1)
         {
@@ -454,8 +454,9 @@ public sealed partial class DashboardView
         // reasoning this comment used to carry inline — see that method's own
         // comments for why: an unclassified machine reads "classify your
         // usage" rather than "nothing was recorded", and the outcome is the
-        // quota-samples fetch's own, not the window-usage tab's
-        // QuotaHistoryAttempted, because the two are separate fetches. Never
+        // quota-samples fetch's own, not the card's QuotaHistoryOutcome
+        // (client.QuotaHistoryOutcome, used for `state` above), because the
+        // two are separate fetches. Never
         // null here: WindowCardText.State only reaches Chart when the
         // projection's own guard for LiveEquivalence (a placed active cycle)
         // already held.
@@ -767,7 +768,7 @@ public sealed partial class DashboardView
         var rows = history.DisplayRows;
 
         var body = new StackPanel { Spacing = 0 };
-        var state = WindowHistoryText.State(rows, snapshot.QuotaHistoryOutcome);
+        var state = WindowHistoryText.State(rows, client.QuotaHistoryOutcome);
         if (state != WindowHistoryState.Rows)
         {
             var line = Ui.Dim(WindowHistoryText.EmptyBody(state));
@@ -779,7 +780,7 @@ public sealed partial class DashboardView
         // "10% of quota ~ X tokens · $Y" — pooled over the rows actually
         // shown, above them, because a single row's ratio is dominated by
         // the 1-point reading quantisation. Gated on WindowUsageOutcome, not
-        // the card-level QuotaHistoryAttempted `state` above — see
+        // the card-level QuotaHistoryOutcome `state` above — see
         // QuotaLensProjection.BuildHistory's own comment for why (the quota
         // samples and the message export are two separate fetches).
         var equivalenceLine = Ui.Text(WindowEquivalenceText.Line(history.Equivalence), 9, 0.6);
@@ -1008,11 +1009,11 @@ public sealed partial class DashboardView
     // ── Strip card ───────────────────────────────────────────────────────
 
     private FrameworkElement BuildQuotaStripCard(
-        IReadOnlyList<QuotaWindowSummary> summaries, bool attempted,
+        IReadOnlyList<QuotaWindowSummary> summaries, WindowEquivalence.FetchOutcome outcome,
         IReadOnlyDictionary<QuotaWindowIdentity, WindowEquivalence.Row> equivalences)
     {
         var body = new StackPanel { Spacing = 10 };
-        switch (QuotaLensText.StripState(summaries, attempted))
+        switch (QuotaLensText.StripState(summaries, outcome))
         {
             case QuotaStripState.Rows:
                 foreach (var summary in summaries)
@@ -1023,6 +1024,9 @@ public sealed partial class DashboardView
                 break;
             case QuotaStripState.NoCompletedWindows:
                 body.Children.Add(Ui.Dim(QuotaLensText.NoCompletedWindows()));
+                break;
+            case QuotaStripState.Failed:
+                body.Children.Add(Ui.Dim(QuotaLensText.Failed()));
                 break;
             default:
                 body.Children.Add(Ui.Dim(QuotaLensText.Loading()));
@@ -1123,7 +1127,7 @@ public sealed partial class DashboardView
     private FrameworkElement BuildQuotaHeatmapCard(
         IReadOnlyList<QuotaHeatmapWindow> windows,
         IReadOnlyDictionary<QuotaWindowIdentity, QuotaHeatmap> grids,
-        bool attempted,
+        WindowEquivalence.FetchOutcome outcome,
         IReadOnlyDictionary<QuotaWindowIdentity, WindowEquivalence.Row> equivalences)
     {
         // The list already excludes windows with no movement and leads with the
@@ -1135,7 +1139,7 @@ public sealed partial class DashboardView
 
         var equivalence = selected is null ? null : equivalences.GetValueOrDefault(selected.Id);
         var body = new StackPanel { Spacing = 4 };
-        switch (QuotaLensText.HeatmapState(grid, attempted))
+        switch (QuotaLensText.HeatmapState(grid, outcome))
         {
             case QuotaHeatmapState.Grid:
                 body.Children.Add(Heatmap(grid!, equivalence));
@@ -1151,6 +1155,9 @@ public sealed partial class DashboardView
                 break;
             case QuotaHeatmapState.NoMovement:
                 body.Children.Add(Ui.Dim(QuotaLensText.NoMovement()));
+                break;
+            case QuotaHeatmapState.Failed:
+                body.Children.Add(Ui.Dim(QuotaLensText.Failed()));
                 break;
             default:
                 body.Children.Add(Ui.Dim(QuotaLensText.Loading()));

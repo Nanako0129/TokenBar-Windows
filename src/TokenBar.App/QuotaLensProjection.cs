@@ -60,7 +60,7 @@ public static class QuotaLensProjection
         IReadOnlyList<QuotaWindowSummary> Summaries,
         IReadOnlyList<QuotaHeatmapWindow> Windows,
         IReadOnlyDictionary<QuotaWindowIdentity, QuotaHeatmap> Grids,
-        bool Attempted,
+        WindowEquivalence.FetchOutcome Outcome,
         IReadOnlyDictionary<QuotaWindowIdentity, WindowEquivalence.Row> Equivalences);
 
     /// <summary>Sites 2, 4, 5 and 6 — the per-client lens.</summary>
@@ -72,7 +72,16 @@ public static class QuotaLensProjection
         IReadOnlyList<WindowMessage> Mine,
         WindowEquivalence.Row? LiveEquivalence,
         int UndatedCount,
-        WindowHistory History);
+        WindowHistory History,
+        // Round 9's second finding: DashboardView.Quota.cs read
+        // snapshot.QuotaHistoryOutcome directly at two call sites (the window
+        // card and the history card) instead of through this record — because
+        // this record had nowhere to put it. It is the same fetch's outcome
+        // the overview's own Outcome field above carries; a client lens needs
+        // its own copy because the two are built from different snapshot
+        // reads (BuildOverview vs BuildClient) and neither may read the
+        // other's field.
+        WindowEquivalence.FetchOutcome QuotaHistoryOutcome);
 
     /// <summary>Site 6 on its own: the window-history card's rows and its
     /// pooled ≈ line.</summary>
@@ -84,23 +93,37 @@ public static class QuotaLensProjection
         WindowEquivalence.Row Equivalence);
 
     /// <summary>
-    /// <paramref name="windowUsageOutcome"/> is the ONE fact every gate below
-    /// reads — never <paramref name="quotaHistoryAttempted"/>, and never
-    /// <c>windowUsage is null</c>. Round 7's first finding was three readings
-    /// of what should be one fact: the overview path (site 1) used to fold
-    /// equivalences behind a plain <c>WindowUsageAttempted</c> bool while the
-    /// live card and the history card (sites 4 and 6) already switched on the
-    /// outcome enum — so a fetch that had ATTEMPTED and FAILED still passed
-    /// the boolean gate at site 1 and computed equivalences from whatever
-    /// <paramref name="windowUsage"/> happened to be retaining, which is
-    /// exactly the data a failed fetch must not be trusted to have refreshed
-    /// (round 7's second finding, fixed upstream in
+    /// <paramref name="windowUsageOutcome"/> is the ONE fact every EQUIVALENCE
+    /// gate below reads — never <paramref name="quotaHistoryOutcome"/>, and
+    /// never <c>windowUsage is null</c>. Round 7's first finding was three
+    /// readings of what should be one fact: the overview path (site 1) used
+    /// to fold equivalences behind a plain <c>WindowUsageAttempted</c> bool
+    /// while the live card and the history card (sites 4 and 6) already
+    /// switched on the outcome enum — so a fetch that had ATTEMPTED and
+    /// FAILED still passed the boolean gate at site 1 and computed
+    /// equivalences from whatever <paramref name="windowUsage"/> happened to
+    /// be retaining, which is exactly the data a failed fetch must not be
+    /// trusted to have refreshed (round 7's second finding, fixed upstream in
     /// <c>DashboardModel.Snapshot.WindowUsageOutcome</c> — see that
     /// property's own doc comment for why a failed pass that retains stale
     /// data is not the same fact as <c>WindowUsage is not null</c>). Passed in
     /// as its own parameter for the same reason: this file cannot compute the
     /// distinction itself without the retained-vs-fresh signal
     /// <c>DashboardModel</c> alone has.
+    /// <para>
+    /// <paramref name="quotaHistoryOutcome"/> is a SEPARATE fetch's outcome
+    /// (the store lane, not the window-usage lane) and gates a separate
+    /// thing: whether the strip/heatmap/window/history cards themselves have
+    /// anything to draw at all (<see cref="QuotaLensText.HeatmapState"/>,
+    /// <see cref="QuotaLensText.StripState"/>, <see cref="WindowCardText.State"/>,
+    /// <see cref="WindowHistoryText.State"/>), independently of whether the
+    /// equivalence LINE those cards additionally print is available. Until
+    /// round 9 this parameter was a plain <c>bool quotaHistoryAttempted</c> —
+    /// asked-vs-not, with no room for "asked and it threw" — so a failed
+    /// history read rendered identically to a first cold-start read still in
+    /// flight on every card gated by it. It is now the same three-value
+    /// outcome as <paramref name="windowUsageOutcome"/>, for the same reason.
+    /// </para>
     /// </summary>
     public static Model Build(
         IReadOnlyList<QuotaHistorySeries>? history,
@@ -108,18 +131,18 @@ public static class QuotaLensProjection
         UsagePayload graph,
         Interop.WindowUsage? windowUsage,
         WindowEquivalence.FetchOutcome windowUsageOutcome,
-        bool quotaHistoryAttempted,
+        WindowEquivalence.FetchOutcome quotaHistoryOutcome,
         UsageAttribution.Table confirmed,
         string? year,
         Selection selection)
     {
-        var overview = BuildOverview(history, quota, windowUsage, windowUsageOutcome, quotaHistoryAttempted, confirmed);
+        var overview = BuildOverview(history, quota, windowUsage, windowUsageOutcome, quotaHistoryOutcome, confirmed);
         var (trend, pastYearSelected) = BuildTrend(graph, confirmed, year);
         var client = selection.ActiveClientTab == ClientRegistry.OverviewTab
             ? null
             : BuildClient(
                 selection.ActiveClientTab, selection.WindowCardTab,
-                history, quota, windowUsage, windowUsageOutcome, confirmed);
+                history, quota, windowUsage, windowUsageOutcome, quotaHistoryOutcome, confirmed);
         return new Model(overview, trend, pastYearSelected, client);
     }
 
@@ -128,7 +151,7 @@ public static class QuotaLensProjection
         AgentUsagePayload? quota,
         Interop.WindowUsage? windowUsage,
         WindowEquivalence.FetchOutcome windowUsageOutcome,
-        bool quotaHistoryAttempted,
+        WindowEquivalence.FetchOutcome quotaHistoryOutcome,
         UsageAttribution.Table confirmed)
     {
         var (summaries, windows, grids) = QuotaLensData.Build(history, quota);
@@ -140,7 +163,7 @@ public static class QuotaLensProjection
         var equivalences = windowUsageOutcome == WindowEquivalence.FetchOutcome.Succeeded
             ? QuotaEquivalenceFold.Build(history ?? [], windowUsage?.Messages ?? [], confirmed)
             : new Dictionary<QuotaWindowIdentity, WindowEquivalence.Row>();
-        return new Overview(summaries, windows, grids, quotaHistoryAttempted, equivalences);
+        return new Overview(summaries, windows, grids, quotaHistoryOutcome, equivalences);
     }
 
     /// <summary>
@@ -197,6 +220,7 @@ public static class QuotaLensProjection
         AgentUsagePayload? quota,
         Interop.WindowUsage? windowUsage,
         WindowEquivalence.FetchOutcome windowUsageOutcome,
+        WindowEquivalence.FetchOutcome quotaHistoryOutcome,
         UsageAttribution.Table confirmed)
     {
         // Every subscription-facing lookup below is keyed by the quota OWNER,
@@ -223,7 +247,7 @@ public static class QuotaLensProjection
         var windowHistory = BuildHistory(history, selected, messages, confirmed, owner, windowUsageOutcome);
         return new Client(
             owner, tabs, selected, messages, mine, liveEquivalence,
-            windowUsage?.UndatedCount ?? 0, windowHistory);
+            windowUsage?.UndatedCount ?? 0, windowHistory, quotaHistoryOutcome);
     }
 
     private static WindowHistory BuildHistory(

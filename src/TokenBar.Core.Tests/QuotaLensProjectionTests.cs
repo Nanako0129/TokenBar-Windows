@@ -87,11 +87,11 @@ public class QuotaLensProjectionTests
 
     // Round 7's first finding: the overview path used to gate its equivalence
     // fold on the plain WindowUsageAttempted bool while the live and history
-    // cards already switched on WindowUsageOutcome. `quotaHistoryAttempted`
-    // is deliberately TRUE here while `windowUsageOutcome` is Failed — the
-    // exact combination the boolean gate could not tell apart from a genuine
-    // success. If site 1 still read the boolean, this dictionary would come
-    // back populated.
+    // cards already switched on WindowUsageOutcome. `quotaHistoryOutcome`
+    // is deliberately Succeeded here while `windowUsageOutcome` is Failed —
+    // the exact combination the old boolean gate could not tell apart from a
+    // genuine success. If site 1 still read a plain boolean, this dictionary
+    // would come back populated.
     [Fact]
     public void OverviewEquivalencesAreEmptyWhenTheFetchFailedEvenThoughHistoryHasAttempted()
     {
@@ -104,7 +104,7 @@ public class QuotaLensProjectionTests
             EmptyGraph(),
             windowUsage: new WindowUsage(messages, 0, 0),
             windowUsageOutcome: WindowEquivalence.FetchOutcome.Failed,
-            quotaHistoryAttempted: true,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded,
             Confirmed(new UsageAttribution.Record("codex", "openai", UsageAttribution.State.Assigned("codex"))),
             year: null,
             new QuotaLensProjection.Selection(ClientRegistry.OverviewTab, string.Empty));
@@ -124,7 +124,7 @@ public class QuotaLensProjectionTests
             EmptyGraph(),
             windowUsage: new WindowUsage(messages, 0, 0),
             windowUsageOutcome: WindowEquivalence.FetchOutcome.Succeeded,
-            quotaHistoryAttempted: true,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded,
             Confirmed(new UsageAttribution.Record("codex", "openai", UsageAttribution.State.Assigned("codex"))),
             year: null,
             new QuotaLensProjection.Selection(ClientRegistry.OverviewTab, string.Empty));
@@ -165,7 +165,7 @@ public class QuotaLensProjectionTests
             history, quota, EmptyGraph(),
             windowUsage: new WindowUsage(staleMessages, 0, 0),
             windowUsageOutcome: WindowEquivalence.FetchOutcome.Failed,
-            quotaHistoryAttempted: true, confirmed, year: null,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded, confirmed, year: null,
             new QuotaLensProjection.Selection("codex", string.Empty));
 
         // Site 1 (overview): no key at all, not a row computed from stale data.
@@ -186,7 +186,7 @@ public class QuotaLensProjectionTests
             history, quota, EmptyGraph(),
             windowUsage: new WindowUsage(staleMessages, 0, 0),
             windowUsageOutcome: WindowEquivalence.FetchOutcome.Succeeded,
-            quotaHistoryAttempted: true, confirmed, year: null,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded, confirmed, year: null,
             new QuotaLensProjection.Selection("codex", string.Empty));
 
         Assert.NotEmpty(succeeded.Overview.Equivalences);
@@ -228,6 +228,53 @@ public class QuotaLensProjectionTests
         Assert.True(QuotaLensProjection.PastYearSelected("2026-03-05", "2024"));
     }
 
+    // ---- round 9 finding 1: a failed quota-history read renders as failed,
+    // not as loading or as empty -------------------------------------------
+
+    // Round 9's first finding: StripState/HeatmapState used to take a plain
+    // `bool attempted`, so a fetch that ATTEMPTED and FAILED read identically
+    // to one that succeeded and found nothing (NoMovement/NoCompletedWindows)
+    // — the strip and heatmap cards had no way to tell "we asked and it
+    // threw" from "we asked and there was nothing". Overview.Outcome now
+    // carries the FULL three-value outcome through, and this pins that the
+    // projection does not collapse Failed back down to a bool anywhere on the
+    // way.
+    [Fact]
+    public void OverviewOutcomeCarriesAFailedQuotaHistoryReadThrough()
+    {
+        var model = QuotaLensProjection.Build(
+            history: null, quota: null, EmptyGraph(), windowUsage: null,
+            windowUsageOutcome: WindowEquivalence.FetchOutcome.NotAttempted,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Failed,
+            UsageAttribution.Table.Empty, year: null,
+            new QuotaLensProjection.Selection(ClientRegistry.OverviewTab, string.Empty));
+
+        Assert.Equal(WindowEquivalence.FetchOutcome.Failed, model.Overview.Outcome);
+    }
+
+    // Round 9's second finding: DashboardView.Quota.cs's window card and
+    // history card read snapshot.QuotaHistoryOutcome directly, bypassing the
+    // projection entirely, because QuotaLensProjection.Client carried no such
+    // field. This pins that the field now exists and actually carries the
+    // outcome passed into Build — the fact a caller reading `client.
+    // QuotaHistoryOutcome` instead of `snapshot.QuotaHistoryOutcome` depends
+    // on.
+    [Fact]
+    public void ClientCarriesTheQuotaHistoryOutcomeSoTheViewNeverHasToReadThePassedSnapshot()
+    {
+        var quota = Quota("codex", Window("codex|weekly.v1", "Weekly", "weekly.v1"));
+
+        var model = QuotaLensProjection.Build(
+            history: null, quota, EmptyGraph(), windowUsage: null,
+            windowUsageOutcome: WindowEquivalence.FetchOutcome.NotAttempted,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Failed,
+            UsageAttribution.Table.Empty, year: null,
+            new QuotaLensProjection.Selection("codex", string.Empty));
+
+        Assert.NotNull(model.Client);
+        Assert.Equal(WindowEquivalence.FetchOutcome.Failed, model.Client!.QuotaHistoryOutcome);
+    }
+
     // ---- the seven sites, generally ---------------------------------------
 
     [Fact]
@@ -235,7 +282,7 @@ public class QuotaLensProjectionTests
     {
         var model = QuotaLensProjection.Build(
             [], quota: null, EmptyGraph(), windowUsage: null,
-            WindowEquivalence.FetchOutcome.NotAttempted, quotaHistoryAttempted: false,
+            WindowEquivalence.FetchOutcome.NotAttempted, quotaHistoryOutcome: WindowEquivalence.FetchOutcome.NotAttempted,
             UsageAttribution.Table.Empty, year: null,
             new QuotaLensProjection.Selection(ClientRegistry.OverviewTab, string.Empty));
 
@@ -257,7 +304,7 @@ public class QuotaLensProjectionTests
 
         var model = QuotaLensProjection.Build(
             [weekly, session], quota, EmptyGraph(), windowUsage: null,
-            WindowEquivalence.FetchOutcome.NotAttempted, quotaHistoryAttempted: true,
+            WindowEquivalence.FetchOutcome.NotAttempted, quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded,
             UsageAttribution.Table.Empty, year: null,
             // antigravity-cli, the raw client id — ClientRegistry.QuotaOwner
             // maps it to "antigravity", which is what Tabs() must be called
@@ -278,7 +325,7 @@ public class QuotaLensProjectionTests
         var model = QuotaLensProjection.Build(
             [TwoCycleSeries("codex", "primary", "weekly.v1")], quota: null, EmptyGraph(),
             windowUsage: new WindowUsage([], UndatedCount: 7, 0),
-            WindowEquivalence.FetchOutcome.Succeeded, quotaHistoryAttempted: true,
+            WindowEquivalence.FetchOutcome.Succeeded, quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded,
             UsageAttribution.Table.Empty, year: null,
             new QuotaLensProjection.Selection("codex", string.Empty));
 
@@ -297,7 +344,7 @@ public class QuotaLensProjectionTests
 
         var model = QuotaLensProjection.Build(
             [idleOnly], quota, EmptyGraph(), windowUsage: null,
-            WindowEquivalence.FetchOutcome.Succeeded, quotaHistoryAttempted: true,
+            WindowEquivalence.FetchOutcome.Succeeded, quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded,
             UsageAttribution.Table.Empty, year: null,
             new QuotaLensProjection.Selection("codex", string.Empty));
 
@@ -337,7 +384,7 @@ public class QuotaLensProjectionTests
         var model = QuotaLensProjection.Build(
             [series], quota, EmptyGraph(),
             windowUsage: new WindowUsage(messages, 0, 0),
-            WindowEquivalence.FetchOutcome.Succeeded, quotaHistoryAttempted: true,
+            WindowEquivalence.FetchOutcome.Succeeded, quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded,
             confirmed, year: null,
             new QuotaLensProjection.Selection("codex", string.Empty));
 

@@ -25,6 +25,13 @@ public enum QuotaHeatmapState
     /// exact moment the truth is "not asked yet" — the absence-versus-reason
     /// defect this repo already paid for on the Overview quota card.</summary>
     Loading,
+
+    /// <summary>Asked, and the most recent fetch threw. Distinct from
+    /// <see cref="NoMovement"/> ("asked and the answer was nothing") and from
+    /// <see cref="Loading"/> ("still waiting for a first answer") — a failed
+    /// read is neither, and collapsing it into either one states something
+    /// false about a request that never landed.</summary>
+    Failed,
 }
 
 /// <summary>The strip card's states. Same last two as the heatmap's, for the
@@ -34,6 +41,9 @@ public enum QuotaStripState
     Rows,
     NoCompletedWindows,
     Loading,
+
+    /// <summary>Same distinction as <see cref="QuotaHeatmapState.Failed"/>.</summary>
+    Failed,
 }
 
 /// <summary>
@@ -50,24 +60,33 @@ public enum QuotaStripState
 /// </summary>
 public static class QuotaLensText
 {
-    /// <summary>Which of the heatmap card's four states applies. Order matters:
-    /// a drawable grid, then movement that could not be placed, then an answered
-    /// request with nothing in it, then a request that has not been answered.
-    /// <para><paramref name="attempted"/> is a fact about the REQUEST, not about
-    /// the result — <c>grid is null</c> cannot tell "asked and empty" from "not
-    /// asked", because both leave it null.</para></summary>
-    public static QuotaHeatmapState HeatmapState(QuotaHeatmap? grid, bool attempted) =>
+    /// <summary>Which of the heatmap card's four-plus-one states applies.
+    /// Order matters: a drawable grid, then movement that could not be
+    /// placed, then whatever the fetch's own outcome says about the rest.
+    /// <para><paramref name="outcome"/> is a fact about the REQUEST, not about
+    /// the result — <c>grid is null</c> cannot tell "asked and empty" from
+    /// "not asked" from "asked and it threw", because all three leave it
+    /// null.</para></summary>
+    public static QuotaHeatmapState HeatmapState(QuotaHeatmap? grid, WindowEquivalence.FetchOutcome outcome) =>
         grid is { IsEmpty: false } ? QuotaHeatmapState.Grid
         : grid is { HasMovement: true } ? QuotaHeatmapState.Unplaced
-        : attempted ? QuotaHeatmapState.NoMovement
-        : QuotaHeatmapState.Loading;
+        : outcome switch
+        {
+            WindowEquivalence.FetchOutcome.Succeeded => QuotaHeatmapState.NoMovement,
+            WindowEquivalence.FetchOutcome.Failed => QuotaHeatmapState.Failed,
+            _ => QuotaHeatmapState.Loading,
+        };
 
-    /// <summary>The strip card's state. Same <paramref name="attempted"/>
+    /// <summary>The strip card's state. Same <paramref name="outcome"/>
     /// contract as the heatmap's: an empty list is not an answer.</summary>
-    public static QuotaStripState StripState(IReadOnlyList<QuotaWindowSummary> summaries, bool attempted) =>
+    public static QuotaStripState StripState(IReadOnlyList<QuotaWindowSummary> summaries, WindowEquivalence.FetchOutcome outcome) =>
         summaries.Count > 0 ? QuotaStripState.Rows
-        : attempted ? QuotaStripState.NoCompletedWindows
-        : QuotaStripState.Loading;
+        : outcome switch
+        {
+            WindowEquivalence.FetchOutcome.Succeeded => QuotaStripState.NoCompletedWindows,
+            WindowEquivalence.FetchOutcome.Failed => QuotaStripState.Failed,
+            _ => QuotaStripState.Loading,
+        };
 
     // ---- Strip card ----------------------------------------------------
 
@@ -146,6 +165,15 @@ public static class QuotaLensText
         "No allowance movement recorded yet. It accumulates as TokenBar runs.".Localized();
 
     public static string Loading() => "Reading quota history…".Localized();
+
+    /// <summary>Shared by the strip and the heatmap — both states resolve to
+    /// this on a failed quota-history fetch, and both drew "Reading quota
+    /// history…" instead for the two review rounds this was wrong: a scan
+    /// that threw is not a scan still running. Same string already shipped
+    /// for the window-history card's own failed read
+    /// (<see cref="WindowHistoryText"/>), reused rather than authored a
+    /// second time for the same fact.</summary>
+    public static string Failed() => "Quota history could not be read. It will be retried.".Localized();
 
     public static string SlotHeader(int weekday, int hour) =>
         $"{WeekdayLabels[weekday].Localized()} {hour:00}:00";

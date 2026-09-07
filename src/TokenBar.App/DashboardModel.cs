@@ -251,7 +251,51 @@ public sealed class DashboardModel
         // Lazily-loaded lenses (macOS ensureData parity): fetched on first
         // visit, then refreshed by the slow lane like everything else.
         public HourlyReport? Hourly { get; init; }
+
+        /// <summary>Whether the hourly READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaHistoryAttempted"/>, kept for the same reason:
+        /// <c>Hourly is not null</c> cannot tell a read that has not landed
+        /// yet from one that landed and found nothing.</summary>
+        public bool HourlyAttempted { get; init; }
+
+        /// <summary>Whether the MOST RECENT attempted hourly fetch threw,
+        /// kept separate from whether <see cref="Hourly"/> itself is null —
+        /// the same distinction <see cref="QuotaHistoryFetchFailed"/> carries
+        /// for its own lane, and for the same reason: round 9's finding was
+        /// that this lane had NEITHER field, so <c>FetchLazyWanted</c>
+        /// published <c>Hourly = hourly ? hourlyReport : s.Hourly</c> with no
+        /// retention at all — a transient failure overwrote a previously-good
+        /// report with null, and the view could not tell that apart from a
+        /// cold start still loading.</summary>
+        public bool HourlyFetchFailed { get; init; }
+
+        /// <summary>The three facts <see cref="HourlyAttempted"/> and
+        /// <see cref="HourlyFetchFailed"/> together carry, collapsed the same
+        /// way <see cref="QuotaHistoryOutcome"/> collapses its own pair.</summary>
+        public WindowEquivalence.FetchOutcome HourlyOutcome =>
+            !HourlyAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
+            : HourlyFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : WindowEquivalence.FetchOutcome.Succeeded;
+
         public AgentsReport? Agents { get; init; }
+
+        /// <summary>Same fact as <see cref="HourlyAttempted"/>, for the
+        /// Agents lane.</summary>
+        public bool AgentsAttempted { get; init; }
+
+        /// <summary>Same fact as <see cref="HourlyFetchFailed"/>, for the
+        /// Agents lane — round 9's finding applied equally to both: neither
+        /// lane retained on failure, and neither could distinguish "loading"
+        /// from "just failed".</summary>
+        public bool AgentsFetchFailed { get; init; }
+
+        /// <summary>Same collapse as <see cref="HourlyOutcome"/>, for the
+        /// Agents lane.</summary>
+        public WindowEquivalence.FetchOutcome AgentsOutcome =>
+            !AgentsAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
+            : AgentsFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : WindowEquivalence.FetchOutcome.Succeeded;
 
         /// <summary>Whether a quota fetch has finished, whatever it returned.
         ///
@@ -508,31 +552,47 @@ public sealed class DashboardModel
             return;
         }
 
-        Publish(s => s with
+        Publish(s =>
         {
-            Hourly = hourly ? hourlyReport : s.Hourly,
-            Agents = agents ? agentsReport : s.Agents,
-            // A failed read keeps whatever was already there rather than
-            // replacing a complete set with an empty one — the "absent because
-            // we could not ask" mistake, arriving as a partial result.
-            QuotaHistory = history ?? s.QuotaHistory,
-            // A failed read publishes completion with nothing to show, for the
-            // same reason the agent-usage lane does: a lens that reads null as
-            // "not yet" would wait forever for an answer that already came back.
-            QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
-            // This pass's own result, not derived from whether `history` ended
-            // up retained — same reasoning as WindowUsageFetchFailed below.
-            QuotaHistoryFetchFailed = quotaHistory ? history is null : s.QuotaHistoryFetchFailed,
-            // Same failed-read and same completion rules as QuotaHistory,
-            // immediately above, and for the same two reasons.
-            WindowUsage = usage ?? s.WindowUsage,
-            WindowUsageAttempted = windowUsage || s.WindowUsageAttempted,
-            // This pass's own result, not derived from whether `usage` ended
-            // up retained: a pass that did not ask this time (`windowUsage`
-            // false) leaves the flag exactly where the last attempt that DID
-            // ask left it, and a pass that did ask records `usage is null`
-            // directly — see WindowUsageFetchFailed's own doc comment.
-            WindowUsageFetchFailed = windowUsage ? usage is null : s.WindowUsageFetchFailed,
+            // Same retain-on-failure fold QuotaHistory/WindowUsage already
+            // apply below, given its own name now that a second pair of
+            // lanes needs it — see LazyLaneFold's own doc comment for the
+            // defect this closes (round 9: neither lane retained on
+            // failure, so a transient throw overwrote good cached data with
+            // null and the view could not tell that apart from a cold
+            // start).
+            var hourlyFold = LazyLaneFold.Apply(hourly, hourlyReport, s.Hourly, s.HourlyAttempted, s.HourlyFetchFailed);
+            var agentsFold = LazyLaneFold.Apply(agents, agentsReport, s.Agents, s.AgentsAttempted, s.AgentsFetchFailed);
+            return s with
+            {
+                Hourly = hourlyFold.Value,
+                HourlyAttempted = hourlyFold.Attempted,
+                HourlyFetchFailed = hourlyFold.FetchFailed,
+                Agents = agentsFold.Value,
+                AgentsAttempted = agentsFold.Attempted,
+                AgentsFetchFailed = agentsFold.FetchFailed,
+                // A failed read keeps whatever was already there rather than
+                // replacing a complete set with an empty one — the "absent because
+                // we could not ask" mistake, arriving as a partial result.
+                QuotaHistory = history ?? s.QuotaHistory,
+                // A failed read publishes completion with nothing to show, for the
+                // same reason the agent-usage lane does: a lens that reads null as
+                // "not yet" would wait forever for an answer that already came back.
+                QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
+                // This pass's own result, not derived from whether `history` ended
+                // up retained — same reasoning as WindowUsageFetchFailed below.
+                QuotaHistoryFetchFailed = quotaHistory ? history is null : s.QuotaHistoryFetchFailed,
+                // Same failed-read and same completion rules as QuotaHistory,
+                // immediately above, and for the same two reasons.
+                WindowUsage = usage ?? s.WindowUsage,
+                WindowUsageAttempted = windowUsage || s.WindowUsageAttempted,
+                // This pass's own result, not derived from whether `usage` ended
+                // up retained: a pass that did not ask this time (`windowUsage`
+                // false) leaves the flag exactly where the last attempt that DID
+                // ask left it, and a pass that did ask records `usage is null`
+                // directly — see WindowUsageFetchFailed's own doc comment.
+                WindowUsageFetchFailed = windowUsage ? usage is null : s.WindowUsageFetchFailed,
+            };
         }, graph: null, stillValid: () => SelectionStillValid(year, generation));
     }
 
