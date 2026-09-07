@@ -31,27 +31,42 @@ public enum QuotaSummaryState
     AllHidden,
     NoWindowReporting,
     Loading,
+
+    /// <summary>Asked, and the most recent agent-usage fetch threw. Distinct
+    /// from <see cref="NoWindowReporting"/> ("asked and nothing reported a
+    /// window") and from <see cref="Loading"/> ("still waiting for a first
+    /// answer") — collapsing a failed read into either states something false
+    /// about a request that never landed.</summary>
+    Failed,
 }
 
 public static class QuotaSummaryText
 {
-    /// <summary>Which of four things the card is looking at.
+    /// <summary>Which of five things the card is looking at.
     ///
-    /// <para><paramref name="attempted"/> must be a fact about the request, not
+    /// <para><paramref name="outcome"/> must be a fact about the request, not
     /// about the result. Derived from "a payload exists" it cannot separate
-    /// "still asking" from "asked and it failed", and a failed fetch publishes
-    /// no payload — so the loading line stayed on screen for a request that had
-    /// already come back empty.</para>
+    /// "still asking" from "asked and it failed" from "asked and it threw" —
+    /// a failed fetch publishes no payload either, so a bool-shaped signal
+    /// left the loading line on screen for a request that had already come
+    /// back with an error, indistinguishable from one that came back empty.
+    /// Three-value for the same reason <c>QuotaLensText.HeatmapState</c> and
+    /// <c>StripState</c> are: <c>NotAttempted</c>/<c>Succeeded</c>/<c>Failed</c>,
+    /// not a bool plus an inferred result.</para>
     ///
     /// <para><paramref name="allHidden"/> is checked before the reporting
     /// state, because a fold that returns null after every candidate was
     /// excluded looks exactly like one that returned null because nothing
     /// reported.</para></summary>
-    public static QuotaSummaryState State(QuotaSummary? summary, bool attempted, bool allHidden) =>
+    public static QuotaSummaryState State(QuotaSummary? summary, WindowEquivalence.FetchOutcome outcome, bool allHidden) =>
         summary is not null ? QuotaSummaryState.Ready
         : allHidden ? QuotaSummaryState.AllHidden
-        : attempted ? QuotaSummaryState.NoWindowReporting
-        : QuotaSummaryState.Loading;
+        : outcome switch
+        {
+            WindowEquivalence.FetchOutcome.Succeeded => QuotaSummaryState.NoWindowReporting,
+            WindowEquivalence.FetchOutcome.Failed => QuotaSummaryState.Failed,
+            _ => QuotaSummaryState.Loading,
+        };
 
 
     /// <summary>Who a window belongs to, qualified by account when the
@@ -162,4 +177,12 @@ public static class QuotaSummaryText
         "No subscription is reporting a usage window right now.".Localized();
 
     public static string CheckingLimits() => "Checking agent limits…".Localized();
+
+    /// <summary>Own wording rather than reusing <c>QuotaLensText.Failed</c>'s
+    /// "Quota history could not be read" — that string names the store lane
+    /// (quota-history, a persisted export), and this card's fetch is the
+    /// agent-usage/limits lane instead (the same one <see cref="CheckingLimits"/>
+    /// names above); the two are separate fetches with separate failure
+    /// causes, and this card should not claim the wrong one broke.</summary>
+    public static string CouldNotCheckLimits() => "Could not check agent limits. It will be retried.".Localized();
 }

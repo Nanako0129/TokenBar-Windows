@@ -1130,12 +1130,12 @@ public sealed partial class DashboardView : UserControl
         // Read from the snapshot rather than inferred from the payload: a
         // failed fetch publishes completion with no payload, and inferring
         // would render that as still-in-flight forever.
-        var attempted = snapshot.QuotaAttempted;
+        var outcome = snapshot.QuotaOutcome;
         var allHidden = QuotaResolver.ExcludedAllCandidates(
             snapshot.Quota, QuotaResolver.Auto, excluding);
 
         var stack = new StackPanel { Spacing = 7 };
-        switch (QuotaSummaryText.State(summary, attempted, allHidden))
+        switch (QuotaSummaryText.State(summary, outcome, allHidden))
         {
             case QuotaSummaryState.AllHidden:
                 // No card at all. The user hid these clients; saying so would
@@ -1146,6 +1146,9 @@ public sealed partial class DashboardView : UserControl
                 break;
             case QuotaSummaryState.NoWindowReporting:
                 stack.Children.Add(Ui.Dim(QuotaSummaryText.NoWindowReporting()));
+                break;
+            case QuotaSummaryState.Failed:
+                stack.Children.Add(Ui.Dim(QuotaSummaryText.CouldNotCheckLimits()));
                 break;
             default: // Loading
                 stack.Children.Add(Ui.Dim(QuotaSummaryText.CheckingLimits()));

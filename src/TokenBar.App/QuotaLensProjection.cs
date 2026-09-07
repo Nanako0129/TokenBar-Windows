@@ -124,6 +124,20 @@ public static class QuotaLensProjection
     /// flight on every card gated by it. It is now the same three-value
     /// outcome as <paramref name="windowUsageOutcome"/>, for the same reason.
     /// </para>
+    /// <para>
+    /// A known asymmetry, left as-is deliberately: below, the equivalence
+    /// fold this file builds for the Overview strip/heatmap collapses
+    /// <paramref name="windowUsageOutcome"/> to a two-way check
+    /// (<c>== Succeeded</c>), so <c>Failed</c> and <c>NotAttempted</c> both
+    /// produce an empty equivalences dictionary and the overview strip and
+    /// heatmap omit their <c>≈</c> line for both alike — they cannot tell a
+    /// broken read from one still in flight. The client lens's history card,
+    /// reading the very same fact, does distinguish them
+    /// (<c>Row.ScanFailed()</c> vs <c>Row.Loading()</c> in
+    /// <see cref="BuildHistory"/> below). Changing what the overview renders
+    /// is a product decision, not a defect to fix on sight — noted here so
+    /// the next reader finds it recorded rather than rediscovers it.
+    /// </para>
     /// </summary>
     public static Model Build(
         IReadOnlyList<QuotaHistorySeries>? history,

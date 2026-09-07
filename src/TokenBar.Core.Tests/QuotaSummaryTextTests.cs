@@ -40,23 +40,29 @@ public class QuotaSummaryTextTests
             PaceCheckedWindows: paceChecked);
 
     // 7. Every state is distinct — a fetch that has not returned must never
-    // render the same as one that returned and found nothing.
+    // render the same as one that returned and found nothing, and a fetch
+    // that threw must never render the same as either.
     //
-    // This was written as "three states" and shipped that way. There are four:
-    // review found that a payload hidden entirely by the user arrives as the
-    // same null summary as one nothing reported, and that a failed fetch
-    // arrives as the same null payload as one still in flight. Both collapses
-    // say something untrue — the first blames the provider for the user's
-    // setting, the second waits forever for an answer already returned.
+    // This was written as "three states", then "four": review found first
+    // that a payload hidden entirely by the user arrives as the same null
+    // summary as one nothing reported, then that a failed fetch arrives as
+    // the same null payload as one still in flight, and finally — the
+    // agent-usage lane conversion — that a failed fetch and one that landed
+    // empty both used to arrive as the same bool `attempted: true`. Every
+    // collapse says something untrue: the first blames the provider for the
+    // user's setting, the second waits forever for an answer already
+    // returned, the third tells the reader nothing reported when the actual
+    // fact is that the read itself broke.
     [Fact]
     public void EveryEmptyStateIsDistinct()
     {
         var states = new[]
         {
-            QuotaSummaryText.State(Summary(), attempted: true, allHidden: false),
-            QuotaSummaryText.State(null, attempted: true, allHidden: true),
-            QuotaSummaryText.State(null, attempted: true, allHidden: false),
-            QuotaSummaryText.State(null, attempted: false, allHidden: false),
+            QuotaSummaryText.State(Summary(), outcome: WindowEquivalence.FetchOutcome.Succeeded, allHidden: false),
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Succeeded, allHidden: true),
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Succeeded, allHidden: false),
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.NotAttempted, allHidden: false),
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Failed, allHidden: false),
         };
 
         Assert.Equal(
@@ -65,6 +71,7 @@ public class QuotaSummaryTextTests
                 QuotaSummaryState.AllHidden,
                 QuotaSummaryState.NoWindowReporting,
                 QuotaSummaryState.Loading,
+                QuotaSummaryState.Failed,
             ],
             states);
         Assert.Equal(states.Length, states.Distinct().Count());
@@ -79,7 +86,7 @@ public class QuotaSummaryTextTests
     public void ASummaryIsReadyWhateverTheAttemptSays() =>
         Assert.Equal(
             QuotaSummaryState.Ready,
-            QuotaSummaryText.State(Summary(), attempted: false, allHidden: false));
+            QuotaSummaryText.State(Summary(), outcome: WindowEquivalence.FetchOutcome.NotAttempted, allHidden: false));
 
     [Fact]
     public void TightestHeadlineNamesClientAndWindow() =>
@@ -170,6 +177,7 @@ public class QuotaSummaryTextTests
         Assert.Equal("已測量的時間窗都在預期步調之內", QuotaSummaryText.PaceReassurance());
         Assert.Equal("目前沒有訂閱回報使用時間窗。", QuotaSummaryText.NoWindowReporting());
         Assert.Equal("正在查詢 Agent 額度…", QuotaSummaryText.CheckingLimits());
+        Assert.Equal("無法查詢 Agent 額度，稍後會重試。", QuotaSummaryText.CouldNotCheckLimits());
     });
 
     // --- SecondRow ---------------------------------------------------------
@@ -245,27 +253,36 @@ public class QuotaSummaryTextTests
         Assert.Equal(
             QuotaSummaryState.Ready,
             QuotaSummaryText.State(SummaryWith(others: 1, paceChecked: 1, burning: false),
-                attempted: true, allHidden: false));
+                outcome: WindowEquivalence.FetchOutcome.Succeeded, allHidden: false));
 
     [Fact]
     public void StateIsLoadingBeforeTheFirstAttemptCompletes() =>
         Assert.Equal(
             QuotaSummaryState.Loading,
-            QuotaSummaryText.State(null, attempted: false, allHidden: false));
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.NotAttempted, allHidden: false));
 
     // The case that was indistinguishable: the fetch finished and produced
     // nothing. Rendered as Loading, this waited forever.
     [Fact]
-    public void StateIsNoWindowReportingAfterAFailedOrEmptyAttempt() =>
+    public void StateIsNoWindowReportingAfterASuccessfulEmptyAttempt() =>
         Assert.Equal(
             QuotaSummaryState.NoWindowReporting,
-            QuotaSummaryText.State(null, attempted: true, allHidden: false));
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Succeeded, allHidden: false));
+
+    // The defect this lane conversion closes: a failed agent-usage fetch used
+    // to publish `QuotaAttempted = true` with no way to say the read itself
+    // broke, so it rendered identically to NoWindowReporting above.
+    [Fact]
+    public void StateIsFailedAfterAFailedAttempt() =>
+        Assert.Equal(
+            QuotaSummaryState.Failed,
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Failed, allHidden: false));
 
     [Fact]
     public void StateIsAllHiddenWhenEveryCandidateIsExcluded() =>
         Assert.Equal(
             QuotaSummaryState.AllHidden,
-            QuotaSummaryText.State(null, attempted: true, allHidden: true));
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Succeeded, allHidden: true));
 
     // AllHidden outranks the reporting state: both arrive as a null summary,
     // and only one of them is the provider's doing.
@@ -273,7 +290,7 @@ public class QuotaSummaryTextTests
     public void AllHiddenIsNotReportedAsNothingReporting() =>
         Assert.NotEqual(
             QuotaSummaryState.NoWindowReporting,
-            QuotaSummaryText.State(null, attempted: true, allHidden: true));
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Succeeded, allHidden: true));
 
     // Hidden before the first answer is still hidden — the user's choice does
     // not become visible just because a fetch is outstanding.
@@ -281,7 +298,7 @@ public class QuotaSummaryTextTests
     public void AllHiddenOutranksLoading() =>
         Assert.Equal(
             QuotaSummaryState.AllHidden,
-            QuotaSummaryText.State(null, attempted: false, allHidden: true));
+            QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.NotAttempted, allHidden: true));
 
     // --- reset text precedence --------------------------------------------
     //
