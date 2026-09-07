@@ -1268,33 +1268,28 @@ public sealed partial class DashboardView : UserControl
         DashboardModel.Snapshot snapshot, string? clientId = null)
     {
         var panel = new StackPanel { Spacing = 10 };
-        // Round 11's P2 finding: this card used to collapse `snapshot.Quota`
-        // straight to an agent list, so a snapshot carrying
-        // QuotaOutcome == Failed rendered exactly like a genuinely empty
-        // answer (Quota null) or, when a prior fetch had succeeded and the
-        // agent-usage lane retains its last-good payload on failure
-        // (RefreshQuota's own comment on why it does not null Quota out),
-        // like the STALE payload were current. Checked first and
-        // unconditionally of `agents.Count`, so neither case reaches the
-        // list below. Reuses QuotaSummaryText.CouldNotCheckLimits() — the
-        // summary card's own string for this exact outcome — rather than a
-        // near-duplicate.
-        if (snapshot.QuotaOutcome == WindowEquivalence.FetchOutcome.Failed)
-        {
-            panel.Children.Add(Ui.Dim(QuotaSummaryText.CouldNotCheckLimits()));
-            return panel;
-        }
-
         var agents = snapshot.Quota?.Agents ?? [];
         if (clientId is not null)
         {
             agents = [.. agents.Where(agent => agent.ClientId == clientId)];
         }
 
-        if (agents.Count == 0)
+        // Round 11's P2 finding, corrected: retained data wins over a failed
+        // refetch — QuotaSummaryText.LimitsState checks `agents.Count > 0`
+        // before `snapshot.QuotaOutcome`, the same order this file's own
+        // BuildQuotaSummary already applies to the sibling summary card. See
+        // that method's own doc comment for why the earlier ordering (outcome
+        // checked first) was wrong.
+        switch (QuotaSummaryText.LimitsState(agents.Count > 0, snapshot.QuotaOutcome))
         {
-            panel.Children.Add(Ui.Dim("No quota data yet.".Localized()));
-            return panel;
+            case AgentLimitsState.Failed:
+                panel.Children.Add(Ui.Dim(QuotaSummaryText.CouldNotCheckLimits()));
+                return panel;
+            case AgentLimitsState.Loading:
+                panel.Children.Add(Ui.Dim("No quota data yet.".Localized()));
+                return panel;
+            case AgentLimitsState.Ready:
+                break;
         }
 
         // macOS windowRow settings: fill direction, density, pace policy.

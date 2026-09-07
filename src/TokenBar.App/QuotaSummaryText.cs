@@ -40,8 +40,47 @@ public enum QuotaSummaryState
     Failed,
 }
 
+/// <summary>The Agent-limits card's three states — same shape as
+/// <see cref="QuotaSummaryState"/>, one payload and one gate simpler because
+/// this card has no all-hidden case of its own.</summary>
+public enum AgentLimitsState
+{
+    Ready,
+    Loading,
+    Failed,
+}
+
 public static class QuotaSummaryText
 {
+    /// <summary>Which of the Agent-limits card's three states applies, given
+    /// whether it currently has a payload to draw from (<paramref name="hasAgents"/>
+    /// — the agent list after any per-client narrowing, since narrowing can
+    /// turn a non-empty snapshot into nothing to show for THIS client) and the
+    /// most recent quota fetch's own outcome.
+    /// <para>
+    /// <paramref name="hasAgents"/> is checked FIRST, before <paramref name="outcome"/>
+    /// — retained data wins. a3ea946 got this backwards: it checked
+    /// <c>outcome == Failed</c> before checking whether data existed, so a
+    /// failed retry after an earlier success replaced a populated card with a
+    /// failure message even though the retained payload (DashboardModel's
+    /// quota lane does not null <c>Quota</c> out on a failed refetch) was
+    /// still good — disagreeing with this same file's own <see cref="State"/>
+    /// above, which already checks <c>summary is not null</c> first for
+    /// exactly this reason, on the very same lane. This restores that order:
+    /// <c>Failed</c> now only replaces an EMPTY card, never a populated one.
+    /// </para>
+    /// <para>
+    /// ponytail: no staleness indicator. A card showing retained data after a
+    /// failed refetch carries no marker that the read behind it just failed —
+    /// preferring stale-but-present data over destroying it with an error was
+    /// the ask; a "last updated"/staleness UI was deliberately not built (no
+    /// macOS reference for it). Add one if this becomes a real complaint.
+    /// </para></summary>
+    public static AgentLimitsState LimitsState(bool hasAgents, WindowEquivalence.FetchOutcome outcome) =>
+        hasAgents ? AgentLimitsState.Ready
+        : outcome == WindowEquivalence.FetchOutcome.Failed ? AgentLimitsState.Failed
+        : AgentLimitsState.Loading;
+
     /// <summary>Which of five things the card is looking at.
     ///
     /// <para><paramref name="outcome"/> must be a fact about the request, not

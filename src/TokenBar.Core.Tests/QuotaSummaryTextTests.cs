@@ -278,6 +278,24 @@ public class QuotaSummaryTextTests
             QuotaSummaryState.Failed,
             QuotaSummaryText.State(null, outcome: WindowEquivalence.FetchOutcome.Failed, allHidden: false));
 
+    // The regression a3ea946 introduced and this pins: a Failed outcome must
+    // not replace a card that still has data to show. Retained data wins —
+    // the Agent-limits card must agree with State's own `summary is not
+    // null` precedence above, on the same lane.
+    [Fact]
+    public void LimitsStateIsReadyOnAFailedOutcomeWhenDataIsRetained() =>
+        Assert.Equal(
+            AgentLimitsState.Ready,
+            QuotaSummaryText.LimitsState(hasAgents: true, outcome: WindowEquivalence.FetchOutcome.Failed));
+
+    // The other half of the same rule: Failed only wins when there is
+    // nothing to show at all.
+    [Fact]
+    public void LimitsStateIsFailedOnAFailedOutcomeWithNoRetainedData() =>
+        Assert.Equal(
+            AgentLimitsState.Failed,
+            QuotaSummaryText.LimitsState(hasAgents: false, outcome: WindowEquivalence.FetchOutcome.Failed));
+
     [Fact]
     public void StateIsAllHiddenWhenEveryCandidateIsExcluded() =>
         Assert.Equal(
