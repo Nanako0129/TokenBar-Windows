@@ -275,6 +275,59 @@ public class WindowEquivalenceTests
         Assert.False(new WindowEquivalence.Row.Undeclared().IsRatio);
     }
 
+    // ── LiveRow guard ordering (round 13) ───────────────────────────────
+    //
+    // The acceptance case this P2 was filed for: a single sample right after
+    // a reset makes `declared` (computed by every real caller from the
+    // (first, last] span between the first and last sample) vacuously false,
+    // because that span is empty. This must read as "need another reading",
+    // not "classify your usage" — even for a caller that HAS confirmed a
+    // classification.
+
+    [Fact]
+    public void SingleSampleWithDeclaredIsUnavailableNotUndeclared()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
+            [new WindowEquivalence.Sample(0, 10)], []);
+        Assert.IsType<WindowEquivalence.Row.Unavailable>(row);
+    }
+
+    // The ordering itself, pinned directly: the samples-count guard must run
+    // BEFORE `!declared`, so a single sample reads Unavailable regardless of
+    // what `declared` says — the same shape as NotYetAttemptedWinsOverUndeclared
+    // above, one guard pair over. A future reorder that puts `!declared` back
+    // in front fails this, rather than shipping silently.
+    [Fact]
+    public void SingleSampleWinsOverUndeclaredEitherWay()
+    {
+        var declaredTrue = WindowEquivalence.LiveRow(
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
+            [new WindowEquivalence.Sample(0, 10)], []);
+        var declaredFalse = WindowEquivalence.LiveRow(
+            declared: false, attempt: WindowEquivalence.FetchOutcome.Succeeded,
+            [new WindowEquivalence.Sample(0, 10)], []);
+        Assert.IsType<WindowEquivalence.Row.Unavailable>(declaredTrue);
+        Assert.IsType<WindowEquivalence.Row.Unavailable>(declaredFalse);
+    }
+
+    // The remaining guard pair: with two-or-more samples, `declared` must
+    // still run BEFORE the delta<=0 (NotMoved) check — an undeclared window
+    // whose quota happens not to have moved must still read as "classify
+    // your usage", not "quota has not moved yet".
+    [Fact]
+    public void UndeclaredWinsOverNotMoved()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: false, attempt: WindowEquivalence.FetchOutcome.Succeeded,
+            [
+                new WindowEquivalence.Sample(0, 40),
+                new WindowEquivalence.Sample(1000, 40),
+            ],
+            []);
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
+    }
+
     // ── Aggregate ────────────────────────────────────────────────────────
 
     private static WindowEquivalence.Cycle Cycle(
@@ -294,6 +347,43 @@ public class WindowEquivalenceTests
     {
         var row = WindowEquivalence.Aggregate(declared: true, []);
         Assert.IsType<WindowEquivalence.Row.Unavailable>(row);
+    }
+
+    // Round 13's check for the sibling ordering hazard: `QuotaEquivalenceFold`
+    // computes `declared` as an OR over every cycle's own (first, last] span
+    // (DeclaredCore), and a one-sample cycle's span is empty by the same
+    // construction LiveRow's bug turned on — its own doc comment already
+    // names this (DeltaPercent and ObservedFraction both exactly zero for a
+    // one-sample cycle). When EVERY cycle here is that degenerate, `declared`
+    // is a vacuous false no matter what the caller confirmed, so it must not
+    // be trusted — the same "not enough data yet" answer the cascade below
+    // already gives, not "classify your usage".
+    [Fact]
+    public void AllDegenerateCyclesDoNotTrustAVacuousUndeclared()
+    {
+        var row = WindowEquivalence.Aggregate(declared: false, [Cycle(0, 0, 0, observed: 0)]);
+        Assert.IsType<WindowEquivalence.Row.NotMoved>(row);
+    }
+
+    // The zero-cycle edge of the same hazard: an empty list also makes the
+    // upstream OR vacuously false.
+    [Fact]
+    public void NoCyclesAtAllWithUndeclaredIsStillUnavailableNotUndeclared()
+    {
+        var row = WindowEquivalence.Aggregate(declared: false, []);
+        Assert.IsType<WindowEquivalence.Row.Unavailable>(row);
+    }
+
+    // The negative case: as soon as ONE cycle in the set has a real span
+    // (non-degenerate), `declared` is a reliable answer over that cycle and
+    // must be trusted again — this must still read Undeclared, not fall
+    // through to the cascade.
+    [Fact]
+    public void OneNonDegenerateCycleAmongDegenerateOnesStillTrustsUndeclared()
+    {
+        var row = WindowEquivalence.Aggregate(
+            declared: false, [Cycle(0, 0, 0, observed: 0), Cycle(50, 1000, 10)]);
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
     }
 
     [Fact]

@@ -605,7 +605,7 @@ public sealed class SettingsWindow : Window
             _quota(),
             UsageAttribution.Confirmed(store),
             UsageAttribution.Suggestions(store),
-            isLoading: !_attributionGate.Settled);
+            isLoading: _attributionGate.IsLoading);
 
         var panel = new StackPanel { Spacing = 16, MaxWidth = 380 };
         var body = new StackPanel { Spacing = 8 };

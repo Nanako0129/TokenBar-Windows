@@ -43,6 +43,47 @@ public sealed class AttributionReportGate
     /// checked with <see cref="IsCurrent"/>.</summary>
     public int Generation { get; private set; }
 
+    /// <summary>The generation <see cref="Settle"/> was last called for, or
+    /// -1 (never equal to a real <see cref="Generation"/>, which starts
+    /// counting from 1) before any fetch has ever settled. Backs
+    /// <see cref="IsLoading"/>: comparing this against <see cref="Generation"/>
+    /// is what tells "settled for THIS request" apart from "settled for a
+    /// stale one".</summary>
+    private int _settledGeneration = -1;
+
+    /// <summary>
+    /// What a caller with no retained report should actually show: the
+    /// spinner state, not <see cref="Settled"/> directly.
+    /// <para>
+    /// <see cref="Settled"/> alone cannot tell "failed, idle" apart from
+    /// "failed, retrying" (round 13's finding): <see cref="Reset"/> leaves
+    /// <see cref="Settled"/> untouched on purpose, so once a fetch has ever
+    /// failed with nothing to retain, <see cref="Settled"/> stays true
+    /// straight through the next hide/show — including the moment
+    /// <c>SettingsWindow.Rebuild()</c> builds the attribution page, which
+    /// happens BEFORE <c>ShowPage()</c> re-triggers the fetch, so no amount
+    /// of reordering the fetch call fixes it: the expression has to be right
+    /// even before the retry has started, and it has to stay right for the
+    /// whole time the retry is in flight, not only at that first instant.
+    /// </para>
+    /// <para>
+    /// Comparing <see cref="_settledGeneration"/> against <see cref="Generation"/>
+    /// answers both halves at once, the same way <see cref="IsCurrent"/>
+    /// already does for a fetch's own completion: <see cref="Reset"/> leaves
+    /// <see cref="Generation"/> alone, so immediately after a reset the last
+    /// settle (if any) still matches — <see cref="Requested"/> going false is
+    /// what marks that answer stale, hence the first disjunct. Once the retry
+    /// actually starts, <see cref="ShouldFetch"/> bumps <see cref="Generation"/>
+    /// past <see cref="_settledGeneration"/>, and the mismatch alone reads as
+    /// loading for as long as the retry is out — a plain <c>!Requested</c>
+    /// check would have gone false the instant <see cref="ShouldFetch"/> ran,
+    /// wrongly showing the stale answer again while the retry was still in
+    /// flight (e.g. a settings write during that window forces a rebuild that
+    /// reads this).
+    /// </para>
+    /// </summary>
+    public bool IsLoading => !Requested || _settledGeneration != Generation;
+
     /// <summary>Call before starting a fetch. Returns true the first time this
     /// is called after construction or after <see cref="Reset"/>, and false on
     /// every call in between — the caller starts a fetch only when this
@@ -70,7 +111,11 @@ public sealed class AttributionReportGate
     public bool IsCurrent(int generation) => generation == Generation;
 
     /// <summary>Call when the fetch this gate guarded has returned.</summary>
-    public void Settle() => Settled = true;
+    public void Settle()
+    {
+        Settled = true;
+        _settledGeneration = Generation;
+    }
 
     /// <summary>Call when the settings window hides. Clears the guard so the
     /// next page visit fetches again; <see cref="Settled"/> and whatever report

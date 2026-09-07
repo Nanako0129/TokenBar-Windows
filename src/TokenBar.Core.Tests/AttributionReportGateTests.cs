@@ -68,6 +68,52 @@ public class AttributionReportGateTests
         Assert.False(new AttributionReportGate().Settled);
     }
 
+    // Round 13's P2: SettingsWindow.cs:608 used to read `!Settled` directly,
+    // so once a fetch had ever failed with nothing to retain, Settled stayed
+    // true straight through the next hide/show (the fixture directly above
+    // this one pins that Reset() must not clear it) — and Rebuild() builds
+    // the attribution page BEFORE ShowPage() re-triggers the fetch, so the
+    // page rendered "could not be loaded" for the whole in-flight retry.
+    // IsLoading is the fix: it reads Requested too, and Reset() clears
+    // Requested immediately, well before the next build — not only once the
+    // retry's ShouldFetch() call actually lands.
+    [Fact]
+    public void IsLoadingIsTrueAfterResetEvenThoughSettledStaysTrue()
+    {
+        var gate = new AttributionReportGate();
+        gate.ShouldFetch();
+        gate.Settle();
+        Assert.False(gate.IsLoading);
+
+        gate.Reset();
+
+        Assert.True(gate.Settled); // unchanged, per ResetDoesNotClearSettled
+        Assert.True(gate.IsLoading); // but the retry state must read as loading
+    }
+
+    // Once the retry's own ShouldFetch() call actually lands (Requested true
+    // again) and it settles, IsLoading must go back to false — otherwise a
+    // second genuine failure would show "loading" forever instead of
+    // "could not be loaded".
+    [Fact]
+    public void IsLoadingGoesFalseAgainOnceTheRetrySettles()
+    {
+        var gate = new AttributionReportGate();
+        gate.ShouldFetch();
+        gate.Settle();
+        gate.Reset();
+
+        gate.ShouldFetch();
+        Assert.True(gate.IsLoading); // fetch started, not yet settled
+
+        gate.Settle();
+        Assert.False(gate.IsLoading);
+    }
+
+    [Fact]
+    public void ANewGateIsLoading() =>
+        Assert.True(new AttributionReportGate().IsLoading);
+
     // Round-3 P2 (a race the previous fix introduced): Reset() re-arms the
     // latch without knowing whether the fetch it is resetting has finished,
     // so a hide/show/hide can start a second fetch while the first is still

@@ -336,21 +336,49 @@ public static class WindowEquivalence
     /// a caller that skipped both, silently, because neither was asked for.
     /// </para>
     /// <para>
-    /// The <paramref name="attempt"/> switch runs BEFORE the
-    /// <paramref name="declared"/> check, not after. Every caller computes
-    /// <paramref name="declared"/> from <paramref name="messages"/>, and
-    /// <paramref name="messages"/> is itself the product of the very scan
-    /// <paramref name="attempt"/> reports on — so while the scan has not
-    /// landed or has failed, <paramref name="messages"/> is empty for a
-    /// reason that has nothing to do with declaration, and
-    /// <paramref name="declared"/> reads <see langword="false"/> regardless
-    /// of what the caller actually declared. A guard that treats that
-    /// coincidence as authoritative — checking <c>!declared</c> first —
-    /// collapses "still scanning" and "scan failed" into "nothing
-    /// declared", which is a wrong-lane read for the user. Ordering the
-    /// outcome switch first means a non-success outcome always wins before
-    /// the derived, currently-unreliable <paramref name="declared"/> is
-    /// consulted at all (round 10).
+    /// The four guards below run in one fixed total order, and the rule that
+    /// orders them is: <b>a guard runs only after every guard whose input it
+    /// depends on.</b> Read each guard's input back to what it is derived
+    /// from before adding, reordering, or inserting one — do not infer the
+    /// order from the sequence that happens to compile.
+    /// <list type="number">
+    /// <item><description><paramref name="attempt"/> depends on nothing —
+    /// it is the raw fetch outcome. Goes first.</description></item>
+    /// <item><description><c>samples.Count &lt; 2</c> depends only on
+    /// <paramref name="samples"/>, which is independent of
+    /// <paramref name="attempt"/> and <paramref name="declared"/>. It could
+    /// run first, but there is nothing to show for a window with no
+    /// classification AND no second reading, so ordering it right after
+    /// <paramref name="attempt"/> costs nothing and buys the next
+    /// point.</description></item>
+    /// <item><description><paramref name="declared"/> depends on BOTH of
+    /// the above, not on one. Every caller computes it from
+    /// <paramref name="messages"/> (meaningless until <paramref name="attempt"/>
+    /// has succeeded — round 10's finding) AND from the <c>(first, last]</c>
+    /// span between the first and last sample (meaningless — vacuously
+    /// empty — when there are fewer than two samples: with one sample,
+    /// first and last are the same reading, so the interval a caller such as
+    /// <see cref="QuotaEquivalenceFold.DeclaredSpan"/> searches for evidence
+    /// is empty and <paramref name="declared"/> reads <see langword="false"/>
+    /// regardless of what the user actually confirmed — round 13's finding).
+    /// Both prior guards must therefore run first, or <paramref name="declared"/>
+    /// is consulted while it is still unreliable.</description></item>
+    /// <item><description><c>delta &lt;= 0</c> (<see cref="Row.NotMoved"/>)
+    /// depends on <c>first</c>/<c>last</c>, i.e. on the samples guard above
+    /// having already established there are at least two. Everything past
+    /// this point — the token/cost scan, <see cref="Row.Insufficient"/> —
+    /// depends in turn on <c>delta</c>, so it stays last by the same
+    /// rule.</description></item>
+    /// </list>
+    /// This is the third time a guard here was found out of order: round 4/5
+    /// made <paramref name="declared"/>/<paramref name="attempt"/> required
+    /// parameters so neither could be silently omitted; round 10 moved the
+    /// <paramref name="attempt"/> switch above <c>!declared</c>; round 13 —
+    /// this fix — moved the samples-count guard above <c>!declared</c> too.
+    /// Each of the first two fixes swapped exactly one pair and left the
+    /// other orderings unexamined. The list above states the rule those two
+    /// fixes were each half of, so the next guard is checked against a
+    /// written principle instead of the current sequence.
     /// </para>
     /// </summary>
     public static Row LiveRow(
@@ -364,14 +392,14 @@ public static class WindowEquivalence
                 return new Row.ScanFailed();
         }
 
-        if (!declared)
-        {
-            return new Row.Undeclared();
-        }
-
         if (samples.Count < 2)
         {
             return new Row.Unavailable();
+        }
+
+        if (!declared)
+        {
+            return new Row.Undeclared();
         }
 
         var first = samples[0];
@@ -497,7 +525,24 @@ public static class WindowEquivalence
     /// </summary>
     public static Row Aggregate(bool declared, IReadOnlyList<Cycle> cycles)
     {
-        if (!declared)
+        // Same hazard as LiveRow's, checked per round 13: declared here is
+        // `QuotaEquivalenceFold.DeclaredCore`'s OR over every cycle's own
+        // (first, last] span, and a cycle built from a single sample has
+        // first == last — an empty span, structurally unable to hold
+        // evidence (the comment below on MinimumObservedFraction/MinimumCycles
+        // already names the same fact: DeltaPercent and ObservedFraction are
+        // BOTH exactly zero for a one-sample cycle). When every cycle here is
+        // that degenerate, `declared` is guaranteed false no matter what the
+        // user confirmed, for the same reason a single live sample forced
+        // `declared` false before round 13 — so it must not be trusted here
+        // either. In that state there is no reliable evidence one way or the
+        // other, and the cascade below already has the right answer for "not
+        // enough data yet" (Unavailable/NotMoved), so let it run instead of
+        // reporting Undeclared on a vacuous vote.
+        var noReliableEvidence = cycles.Count == 0
+            || cycles.All(cycle => cycle.DeltaPercent <= 0 && cycle.ObservedFraction <= 0);
+
+        if (!declared && !noReliableEvidence)
         {
             return new Row.Undeclared();
         }
