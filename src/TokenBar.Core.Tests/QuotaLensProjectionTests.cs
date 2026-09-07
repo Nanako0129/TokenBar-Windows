@@ -381,6 +381,56 @@ public class QuotaLensProjectionTests
         Assert.Null(model.Client.LiveEquivalence);
     }
 
+    // ---- round 19 finding 2: the live card and its footer must describe
+    // the same clipped interval -----------------------------------------
+
+    // A provider that shortens its reported duration mid-cycle moves StartMs
+    // forward past readings QuotaHistoryFold.Active deliberately still
+    // retains (see QuotaCycle.EvidenceStartMs's own doc comment for the same
+    // shape already fixed on the completed-cycle path). The chart above this
+    // line clips to [StartMs, now) — WindowCardGeometry.Chart's own
+    // windowStartMs filter — so the live equivalence line must clip its
+    // samples and its message span at that same StartMs, not the full active
+    // sample span, or the two disagree about which evidence counts.
+    [Fact]
+    public void LiveEquivalenceClipsToTheActiveCyclesOwnStartNotTheFullSampleSpan()
+    {
+        var history = new[]
+        {
+            Series(
+                "codex", "primary", "weekly.v1",
+                // Old active sample, taken before the newest sample's
+                // shorter duration moves StartMs forward past it.
+                Sample(5, sampledAt: 4_000, resetAt: 6_000, duration: 20 * 3_600),
+                // Sits exactly at the new StartMs (6_000 - 1_000 = 5_000) —
+                // the earliest reading the clip should still keep.
+                Sample(10, sampledAt: 5_000, resetAt: 6_000, duration: 20 * 3_600),
+                // Newest sample: its own short duration is what places
+                // StartMs at 5_000_000ms, past the first sample above.
+                Sample(15, sampledAt: 5_900, resetAt: 6_000, duration: 1_000)),
+        };
+        // The only evidence, and it sits strictly before the clipped start
+        // (5_000_000ms) though inside the old, unclipped span
+        // (4_000_000ms onward) — exactly the gap this finding closes.
+        var messages = new[] { Message(4_500_000, "codex", "openai", 5_000, 25.0) };
+        var confirmed = Confirmed(
+            new UsageAttribution.Record("codex", "openai", UsageAttribution.State.Assigned("codex")));
+        var quota = Quota("codex", Window("codex|weekly.v1", "Weekly", "weekly.v1"));
+
+        var model = QuotaLensProjection.Build(
+            history, quota, EmptyGraph(),
+            windowUsage: new WindowUsage(messages, 0, 0),
+            windowUsageOutcome: WindowEquivalence.FetchOutcome.Succeeded,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded, confirmed, year: null,
+            new QuotaLensProjection.Selection("codex", string.Empty));
+
+        Assert.NotNull(model.Client);
+        // Undeclared, not a computed ratio: once clipped, the message before
+        // the new StartMs is no longer evidence for this window at all — the
+        // same span the chart above this line draws nothing over either.
+        Assert.IsType<WindowEquivalence.Row.Undeclared>(model.Client!.LiveEquivalence);
+    }
+
     // ---- round 8 finding 2: the collapsed row must show the WHOLE-WINDOW
     // total, not the sample-span-restricted one -----------------------------
 

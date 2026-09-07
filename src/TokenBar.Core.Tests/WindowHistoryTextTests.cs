@@ -156,6 +156,19 @@ public class WindowHistoryTextTests
         Assert.Contains("not what the subscription charged", text);
     }
 
+    // Round 19's finding: the antigravity-cli tab spends the antigravity
+    // subscription (ClientRegistry.QuotaOwner), so its disclaimer must name
+    // "Antigravity" — the subscription actually summarized — not the raw
+    // tab id's own display name "Antigravity CLI".
+    [Fact]
+    public void TheDisclaimerNamesTheOwningSubscriptionNotTheRawTabId()
+    {
+        var text = WindowHistoryText.Disclaimer(ClientRegistry.QuotaOwner("antigravity-cli"));
+
+        Assert.Contains("Antigravity", text);
+        Assert.DoesNotContain("Antigravity CLI", text);
+    }
+
     [Fact]
     public void SubtitleCountsTheRowsShownAndIsAbsentWithNone()
     {

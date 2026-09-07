@@ -157,9 +157,15 @@ public static class WindowHistoryText
     /// list-price equivalents for usage the user themselves declared as this
     /// subscription's, not what the subscription charged. Not noise — without
     /// it the column reads as a bill.</summary>
-    public static string Disclaimer(string clientId) =>
+    /// <param name="owner">The quota OWNER (<c>ClientRegistry.QuotaOwner</c>),
+    /// not the raw tab id: antigravity-cli's rows are folded against
+    /// <c>client.Owner == "antigravity"</c> and confirmed against that same
+    /// subscription, so the disclaimer must name the subscription actually
+    /// summarized — "Antigravity" — rather than the tab's own display name
+    /// ("Antigravity CLI"), which the raw id would have produced.</param>
+    public static string Disclaimer(string owner) =>
         "Amounts are API list-price equivalents for usage you declared as {0} — not what the subscription charged."
-            .Localized(ClientRegistry.Style(clientId).DisplayName);
+            .Localized(ClientRegistry.Style(owner).DisplayName);
 
     /// <summary>The row's own numbers, formatted the way the rest of the app
     /// already does.</summary>

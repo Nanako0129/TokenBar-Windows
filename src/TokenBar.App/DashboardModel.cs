@@ -416,29 +416,18 @@ public sealed class DashboardModel
     private volatile bool _quotaHistoryWanted;
     private volatile bool _windowUsageWanted;
 
-    /// <summary>Marks a lazy lens as needed and fetches it once; later slow
-    /// refreshes keep it current.</summary>
-    public void EnsureHourly()
+    /// <summary>Tells the model which lens is now open, so its lazy lanes
+    /// track the currently-active lens instead of accumulating forever — see
+    /// <see cref="LazyLaneActivation"/>'s own doc comment. Fetches once for
+    /// whichever lanes the new lens wants; later slow refreshes keep them
+    /// current for as long as the lens stays open.</summary>
+    public void SetActiveView(AppView view)
     {
-        _hourlyWanted = true;
-        RequestLazyRefresh();
-    }
-
-    public void EnsureAgents()
-    {
-        _agentsWanted = true;
-        RequestLazyRefresh();
-    }
-
-    public void EnsureQuotaHistory()
-    {
-        _quotaHistoryWanted = true;
-        RequestLazyRefresh();
-    }
-
-    public void EnsureWindowUsage()
-    {
-        _windowUsageWanted = true;
+        var wanted = LazyLaneActivation.For(view);
+        _hourlyWanted = wanted.Hourly;
+        _agentsWanted = wanted.Agents;
+        _quotaHistoryWanted = wanted.QuotaHistory;
+        _windowUsageWanted = wanted.WindowUsage;
         RequestLazyRefresh();
     }
 

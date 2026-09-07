@@ -97,6 +97,29 @@ public class GraphConsumerStateTests
         Assert.True(GraphLazyRefreshPolicy.ShouldRequest(first, otherQuery));
     }
 
+    // Round 19's finding 1: the model's lazy lanes used to accumulate
+    // ("ensure") with no way back to unwanted, so a Quota visit left
+    // WindowUsage's expensive scan wanted for the model's lifetime even
+    // after switching away. LazyLaneActivation.For is the single answer
+    // DashboardModel.SetActiveView now reads: exactly the currently-open
+    // lens's own lanes wanted, every sibling lane explicitly off.
+    [Fact]
+    public void OnlyTheOpenLenssOwnLanesAreWanted()
+    {
+        Assert.Equal(new LazyLaneActivation.Wanted(true, false, false, false), LazyLaneActivation.For(AppView.Hourly));
+        Assert.Equal(new LazyLaneActivation.Wanted(false, true, false, false), LazyLaneActivation.For(AppView.Agents));
+        Assert.Equal(new LazyLaneActivation.Wanted(false, false, true, true), LazyLaneActivation.For(AppView.Quota));
+        // Every other lens — Overview included — wants none of the four
+        // lazy lanes: this is what actually stops the leak, since the model
+        // reads this fresh on every SwitchTo rather than only ever setting
+        // flags true.
+        Assert.Equal(default, LazyLaneActivation.For(AppView.Overview));
+        Assert.Equal(default, LazyLaneActivation.For(AppView.Models));
+        Assert.Equal(default, LazyLaneActivation.For(AppView.Monthly));
+        Assert.Equal(default, LazyLaneActivation.For(AppView.Daily));
+        Assert.Equal(default, LazyLaneActivation.For(AppView.Stats));
+    }
+
     [Fact]
     public void BeginRevokesOldGraphAndRejectsDelayedCallback()
     {

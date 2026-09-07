@@ -381,7 +381,8 @@ public sealed partial class DashboardView : UserControl
         RefreshSpinner.IsActive = spinning;
     }
 
-    /// <summary>The model powers lazy lens loading (hourly/agents).</summary>
+    /// <summary>The model powers lazy lens loading, told which lens is
+    /// active by <see cref="SwitchTo"/>.</summary>
     public void Bind(DashboardModel model) => _model = model;
 
     /// <summary>Persist a requested client tab. The next selection pass validates
@@ -407,21 +408,7 @@ public sealed partial class DashboardView : UserControl
         }
 
         _view = view;
-        if (view == AppView.Hourly)
-        {
-            _model?.EnsureHourly();
-        }
-
-        if (view == AppView.Agents)
-        {
-            _model?.EnsureAgents();
-        }
-
-        if (view == AppView.Quota)
-        {
-            _model?.EnsureQuotaHistory();
-            _model?.EnsureWindowUsage();
-        }
+        _model?.SetActiveView(view);
 
         UpdateTabChrome();
         RenderContent(animated: true);

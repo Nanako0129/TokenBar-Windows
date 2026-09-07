@@ -135,8 +135,20 @@ public static class WindowCardText
     /// deprioritised. When the live scope itself could not be resolved (an
     /// <see cref="AccountScopeStatus.Error"/>, or an older payload that
     /// predates the field) there is no account signal to filter by at all, so
-    /// this falls back to the pre-fix first-wins behaviour — the same
-    /// information the app has always had in that case, not worse.
+    /// every scope-matching series is kept rather than filtered by scope.
+    /// </para>
+    /// <para>
+    /// Round 19's finding: that "no account signal" case still went through
+    /// <c>byWindowKey</c> — keyed on <c>WindowKey</c> alone — for the
+    /// no-live-windows fallback below, so two accounts' series sharing one
+    /// <c>WindowKey</c> collapsed into whichever <c>TryAdd</c> saw first, the
+    /// same first-wins bug this doc comment used to describe as fixed. The
+    /// fallback now enumerates the scope-filtered set directly
+    /// (<c>matching</c>) instead of going through that collapsed dictionary,
+    /// which stays reserved for the live join below, where joining by
+    /// <c>WindowKey</c> alone is the live payload's own limitation
+    /// (<c>PaceStatus</c> carries no <c>AccountScope</c>), not a shortcut
+    /// taken here.
     /// </para>
     /// </summary>
     ///
@@ -203,13 +215,14 @@ public static class WindowCardText
         var agent = quota?.Agents.FirstOrDefault(a => a.ClientId == clientId);
         var liveScope = agent?.AccountScope?.Scope;
 
-        // Keyed by the store's WindowKey — the join PaceStatus.WindowKey can
-        // reach — so a live window finds its own running cycle without
-        // needing to know the store's AccountScope half up front. Restricted
-        // to the live account's own scope first (see the doc comment above);
-        // TryAdd's first-wins only matters within that filtered set, or as a
-        // last resort when no live scope is available to filter by at all.
-        var byWindowKey = new Dictionary<string, QuotaHistorySeries>();
+        // Every stored series this client's own scope-filtered set contains —
+        // restricted to the live account's own scope first (see the doc
+        // comment above), but every (AccountScope, WindowKey) pair inside
+        // that filtered set kept, not collapsed. The fallback loop below
+        // needs exactly this: with no live window to join against, it has no
+        // reason to drop a second account's distinct history for the same
+        // WindowKey.
+        var matching = new List<QuotaHistorySeries>();
         foreach (var series in history ?? [])
         {
             if (series.ProviderId != clientId)
@@ -222,6 +235,23 @@ public static class WindowCardText
                 continue;
             }
 
+            matching.Add(series);
+        }
+
+        // Keyed by the store's WindowKey alone — the join PaceStatus.WindowKey
+        // can reach — so a live window finds its own running cycle without
+        // needing to know the store's AccountScope half up front. When
+        // liveScope was resolved, `matching` already holds only that one
+        // account's series, so no two entries can share a WindowKey and
+        // TryAdd never actually discards anything; when it was not, this
+        // collapse is the live payload's own limitation (PaceStatus carries
+        // no AccountScope to join by), not a shortcut taken here. Either
+        // way, this dictionary stays reserved for the live join below — the
+        // fallback path has no live scope to join against and must not go
+        // through this collapsed view.
+        var byWindowKey = new Dictionary<string, QuotaHistorySeries>();
+        foreach (var series in matching)
+        {
             byWindowKey.TryAdd(series.WindowKey, series);
         }
 
@@ -231,14 +261,18 @@ public static class WindowCardText
             // Either shape of "this client's own live windows are not there
             // to enumerate" — see LiveWindowsUnavailable's doc comment. That
             // must not mean this client's own stored history goes
-            // undisplayed too: fall back to the store's own window keys
-            // directly (already scope-filtered above, same as the live path
-            // would have been). No live label exists for these, so `Title`
-            // falls back to the window key, and there is no `PaceStatus` to
-            // read a running cycle off — `Active` comes from the stored
-            // samples alone, same as the live path already does for a window
-            // the store has a series for.
-            foreach (var series in byWindowKey.Values)
+            // undisplayed too: fall back to the store's own series directly
+            // (already scope-filtered above, same as the live path would
+            // have been) — `matching`, not `byWindowKey.Values`, so two
+            // stored series for the same WindowKey under different accounts
+            // both still produce a tab instead of the second silently losing
+            // to dictionary iteration order (round 19's finding). No live
+            // label exists for these, so `Title` falls back to the window
+            // key, and there is no `PaceStatus` to read a running cycle off
+            // — `Active` comes from the stored samples alone, same as the
+            // live path already does for a window the store has a series
+            // for.
+            foreach (var series in matching)
             {
                 tabs.Add(new WindowCardTab(
                     new QuotaWindowIdentity(clientId, series.AccountScope, series.WindowKey),

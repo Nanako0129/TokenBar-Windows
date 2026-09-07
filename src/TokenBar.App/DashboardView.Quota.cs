@@ -114,7 +114,7 @@ public sealed partial class DashboardView
         // subscription's own three cards rather than the all-clients four.
         if (_activeClientTab != ClientRegistry.OverviewTab)
         {
-            return BuildClientQuota(snapshot, model.Client!, _activeClientTab);
+            return BuildClientQuota(snapshot, model.Client!);
         }
 
         var stack = new StackPanel { Spacing = 10 };
@@ -395,7 +395,7 @@ public sealed partial class DashboardView
     /// <summary>One subscription's own three cards: the window it is in now,
     /// where its allowance stands, and the windows before this one.</summary>
     private UIElement BuildClientQuota(
-        DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client, string clientId)
+        DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client)
     {
         var stack = new StackPanel { Spacing = 10 };
         stack.Children.Add(BuildWindowCard(client));
@@ -403,11 +403,12 @@ public sealed partial class DashboardView
         // to this client. A second implementation of "where does the allowance
         // stand right now" would be free to disagree with the first.
         stack.Children.Add(Ui.Card("Agent limits".Localized(), BuildLimits(snapshot, client.Owner)));
-        // clientId (not client.Owner) is passed only for the history card's
-        // own display identity (WindowHistoryText.Disclaimer) — every
-        // subscription-facing lookup already happened in the projection,
-        // keyed by the owner.
-        stack.Children.Add(BuildWindowHistoryCard(snapshot, client, clientId));
+        // Every subscription-facing lookup, including the history card's
+        // disclaimer (WindowHistoryText.Disclaimer), reads client.Owner —
+        // the confirmed attribution target these rows were folded against
+        // (round 19's finding: antigravity-cli's rows are declared as
+        // "Antigravity", not the raw tab id's own "Antigravity CLI").
+        stack.Children.Add(BuildWindowHistoryCard(snapshot, client));
         return stack;
     }
 
@@ -770,7 +771,7 @@ public sealed partial class DashboardView
     private const double HistoryThinOpacity = 0.35;
 
     private FrameworkElement BuildWindowHistoryCard(
-        DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client, string clientId)
+        DashboardModel.Snapshot snapshot, QuotaLensProjection.Client client)
     {
         var history = client.History;
         var rows = history.DisplayRows;
@@ -803,7 +804,8 @@ public sealed partial class DashboardView
         }
 
         // The line that keeps the money column from reading as a bill.
-        var disclaimer = Ui.Text(WindowHistoryText.Disclaimer(clientId), 9, 0.45);
+        // client.Owner, not clientId — see BuildClientQuota's own comment.
+        var disclaimer = Ui.Text(WindowHistoryText.Disclaimer(client.Owner), 9, 0.45);
         disclaimer.TextWrapping = TextWrapping.Wrap;
         disclaimer.Margin = new Thickness(0, 6, 0, 0);
         body.Children.Add(disclaimer);

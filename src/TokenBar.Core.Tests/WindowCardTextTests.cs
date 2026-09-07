@@ -313,6 +313,32 @@ public class WindowCardTextTests
         Assert.Equal("account-a", tab.Id.AccountScope);
     }
 
+    // Round 19's finding: the store-only fallback (no live windows to
+    // enumerate) used to join through `byWindowKey` — keyed on WindowKey
+    // alone — so two accounts' series sharing one WindowKey collapsed into
+    // whichever TryAdd saw first, the same bug already fixed for the live
+    // join above but left standing in this second path. There is no live
+    // window here to join against at all, so both accounts' distinct
+    // history must surface as two tabs, not one chosen by input order.
+    [Fact]
+    public void FallbackTabsKeepBothAccountsSeriesForTheSameWindowKey()
+    {
+        var tabs = WindowCardText.Tabs(
+            [
+                Series("claude", "account-a", "session.v1", Sample(40, ResetAt - 600)),
+                Series("claude", "account-b", "session.v1", Sample(90, ResetAt - 600)),
+            ],
+            quota: null,
+            clientId: "claude");
+
+        Assert.Equal(2, tabs.Count);
+        Assert.Equal(
+            new[] { "account-a", "account-b" }.OrderBy(s => s),
+            tabs.Select(tab => tab.Id.AccountScope).OrderBy(s => s));
+        Assert.Contains(tabs, tab => tab.Id.AccountScope == "account-a" && tab.Active!.Samples[^1].UsedPercent == 40);
+        Assert.Contains(tabs, tab => tab.Id.AccountScope == "account-b" && tab.Active!.Samples[^1].UsedPercent == 90);
+    }
+
     // The window key is the store's own, and ProviderId is already a registered
     // CLIENT id (QuotaEquivalenceFold states this and relies on it), so the
     // filter is that equality and nothing else.

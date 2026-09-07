@@ -253,9 +253,22 @@ public static class QuotaLensProjection
         WindowEquivalence.Row? liveEquivalence = null;
         if (selected?.Active is { IsPlaced: true } active)
         {
+            // The card and this line must describe the same interval:
+            // WindowCardGeometry.Chart already clips its bars and curve to
+            // [active.StartMs, now), because a provider that shortens its
+            // reported duration mid-cycle moves StartMs past readings
+            // QuotaHistoryFold.Active deliberately still carries (see that
+            // method's own doc comment). Declared() and LiveEquivalence()
+            // used to run over the full unclipped Samples, so this line
+            // could count quota movement and messages from before the
+            // window the chart above it actually draws. One clip here feeds
+            // both calls, rather than each re-deriving its own bound.
+            var clipped = active.Samples.Where(sample => sample.AtMs >= active.StartMs!.Value).ToList();
+            IReadOnlyList<QuotaSample> clippedSamples = clipped.Count == 0 ? active.Samples : clipped;
+
             var declared = QuotaEquivalenceFold.DeclaredSpan(
-                active.Samples[0].AtMs, active.Samples[^1].AtMs, owner, messages, confirmed.Records);
-            liveEquivalence = WindowCardText.LiveEquivalence(active.Samples, mine, declared, windowUsageOutcome);
+                clippedSamples[0].AtMs, clippedSamples[^1].AtMs, owner, messages, confirmed.Records);
+            liveEquivalence = WindowCardText.LiveEquivalence(clippedSamples, mine, declared, windowUsageOutcome);
         }
 
         var windowHistory = BuildHistory(history, selected, messages, confirmed, owner, windowUsageOutcome);

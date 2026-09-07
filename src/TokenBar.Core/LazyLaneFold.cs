@@ -56,12 +56,12 @@ public static class LazyLaneFold
     /// <param name="previous">The snapshot's own already-published value,
     /// kept when this pass has nothing newer to report.</param>
     /// <param name="previousAttempted">Whether an earlier pass ever
-    /// requested this lane. Every caller in this codebase requests a lane on
-    /// every pass once it has ever requested it once (there is no "un-want"
-    /// operation), so <paramref name="requested"/> alone already carries this
-    /// once true — kept as an explicit input rather than folded away so a
-    /// lane that resets its own "requested" flag independently (none does
-    /// today) is not silently mishandled.</param>
+    /// requested this lane. <c>LazyLaneActivation</c> (App) un-wants a lane
+    /// once its lens is no longer the active one, so <paramref name="requested"/>
+    /// alone can go back to false on a later pass — this input is what keeps
+    /// Attempted (and therefore the lane's outcome) true for the lens's
+    /// lifetime rather than reverting to NotAttempted the moment the user
+    /// looks away.</param>
     public static Result<T> Apply<T>(
         bool requested, T? fetched, T? previous, bool previousAttempted)
         where T : class =>
