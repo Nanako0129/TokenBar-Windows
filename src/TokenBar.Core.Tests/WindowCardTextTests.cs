@@ -182,6 +182,79 @@ public class WindowCardTextTests
         Assert.Empty(tabs);
     }
 
+    // Round 17's finding: a non-null payload is not the same fact as this
+    // client's own live windows being usable. Rust's `empty_error_snapshot`
+    // (Error set, Windows empty — an identity-verification failure, a
+    // terminal fetch failure, or a transient one with no last-good cache to
+    // fall back to) must fall back to the stored series the same way a null
+    // `quota` already does, or a per-provider failure discards a series this
+    // client's own history read had already retrieved successfully.
+    [Fact]
+    public void AnErrorSnapshotWithNoLiveWindowsFallsBackToTheStoredSeries()
+    {
+        var quota = new AgentUsagePayload(
+            "2026-01-01T00:00:00Z",
+            [new AgentUsageSnapshot(
+                "codex", "oauth", "2026-01-01T00:00:00Z", Windows: [], Error: "Codex could not be reached.")]);
+
+        var tabs = WindowCardText.Tabs(
+            [Series("codex", "session.v1", Sample(40, ResetAt - 600))],
+            quota,
+            "codex");
+
+        var tab = Assert.Single(tabs);
+        Assert.True(tab.HasHistory);
+        Assert.NotNull(tab.Active);
+        Assert.Equal(40, tab.Active!.Samples[^1].UsedPercent);
+        Assert.Equal(
+            WindowCardState.Chart,
+            WindowCardText.State(tab, WindowEquivalence.FetchOutcome.Succeeded));
+    }
+
+    // The sibling shape that must NOT fall back: a transient failure that DID
+    // find a last-good cache entry keeps that entry's non-empty Windows and
+    // stamps the new failure's Error onto it as a staleness note. That is
+    // real, previously-live data — not the empty-windows placeholder — so the
+    // live enumeration must still draw it rather than discarding it for a
+    // store fallback that would be a step backward.
+    [Fact]
+    public void AnErrorSnapshotThatStillCarriesWindowsStaysOnTheLivePath()
+    {
+        var quota = new AgentUsagePayload(
+            "2026-01-01T00:00:00Z",
+            [new AgentUsageSnapshot(
+                "codex", "oauth", "2026-01-01T00:00:00Z",
+                Windows: [Window("codex|session.v1", "Session", "session.v1")],
+                Error: "Codex could not be reached; showing the last known values.")]);
+
+        var tabs = WindowCardText.Tabs([], quota, "codex");
+
+        var tab = Assert.Single(tabs);
+        Assert.Equal("Session", tab.Label);
+    }
+
+    // Distinct from both shapes above: this client has no entry in
+    // quota.Agents at all (Rust's ProviderFetchOutcome::Absent — no
+    // credential found). Deliberately left as pre-existing behaviour: unlike
+    // an error snapshot, Absent carries no Error string to swallow, and it
+    // does not mean "attempted and failed" — it means "not authenticated for
+    // this provider right now". Falling back to old stored tabs here would
+    // present retired history as if it were still an active subscription.
+    [Fact]
+    public void AnAgentAbsentFromThePayloadEntirelyStillProducesNoTabs()
+    {
+        var quota = new AgentUsagePayload(
+            "2026-01-01T00:00:00Z",
+            [new AgentUsageSnapshot("claude", "oauth", "2026-01-01T00:00:00Z", Windows: [])]);
+
+        var tabs = WindowCardText.Tabs(
+            [Series("codex", "session.v1", Sample(40, ResetAt - 600))],
+            quota,
+            "codex");
+
+        Assert.Empty(tabs);
+    }
+
     // The account dimension (PR #81 structural review, P2): the store can
     // hold two series under one (providerId, windowKey) that differ only in
     // AccountScope — an account switch leaves the previous account's series
