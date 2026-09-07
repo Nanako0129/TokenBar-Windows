@@ -275,6 +275,31 @@ public class QuotaLensProjectionTests
         Assert.Equal(WindowEquivalence.FetchOutcome.Failed, model.Client!.QuotaHistoryOutcome);
     }
 
+    // Codex round 16, finding 2: `quota` null (the agent-usage fetch pending
+    // or failed) while `history` holds this client's own successfully-read
+    // series used to make `Tabs` return no candidates, so `Selected` went
+    // null and both the Session-window and Window-history cards claimed
+    // there was nothing recorded — discarding data `history` had already
+    // retrieved. `Selected` (and its history) must survive a null `quota`.
+    [Fact]
+    public void SelectedTabSurvivesANullQuotaWhenHistoryHasThisClientsSeries()
+    {
+        var history = new[] { TwoCycleSeries("codex", "primary", "weekly.v1") };
+
+        var model = QuotaLensProjection.Build(
+            history, quota: null, EmptyGraph(), windowUsage: null,
+            windowUsageOutcome: WindowEquivalence.FetchOutcome.NotAttempted,
+            quotaHistoryOutcome: WindowEquivalence.FetchOutcome.Succeeded,
+            UsageAttribution.Table.Empty, year: null,
+            new QuotaLensProjection.Selection("codex", string.Empty));
+
+        Assert.NotNull(model.Client);
+        Assert.NotEmpty(model.Client!.Tabs);
+        Assert.NotNull(model.Client.Selected);
+        Assert.True(model.Client.Selected!.HasHistory);
+        Assert.NotEmpty(model.Client.History.Cycles);
+    }
+
     // ---- the seven sites, generally ---------------------------------------
 
     [Fact]

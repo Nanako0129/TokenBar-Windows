@@ -144,6 +144,44 @@ public class WindowCardTextTests
         Assert.Equal("Session", tabs[0].Label);
     }
 
+    // Codex round 16, finding 2: when the agent-usage fetch that would supply
+    // `quota` is still pending or just failed, `quota` is null and there is no
+    // `agent?.UniqueCardWindows` to enumerate — but that must not throw away a
+    // series this client's own history read already retrieved successfully.
+    // No live payload at all here, only a stored series.
+    [Fact]
+    public void ANullQuotaFallsBackToTheStoredSeriesInsteadOfDiscardingThem()
+    {
+        var tabs = WindowCardText.Tabs(
+            [Series("codex", "session.v1", Sample(40, ResetAt - 600))],
+            quota: null,
+            clientId: "codex");
+
+        var tab = Assert.Single(tabs);
+        Assert.True(tab.HasHistory);
+        Assert.NotNull(tab.Active);
+        Assert.Equal(40, tab.Active!.Samples[^1].UsedPercent);
+        // Both cards this feeds must see real data, not the false "nothing
+        // recorded" claim `selected is null` used to produce upstream.
+        Assert.Equal(
+            WindowCardState.Chart,
+            WindowCardText.State(tab, WindowEquivalence.FetchOutcome.Succeeded));
+    }
+
+    // A client with no stored series at all AND no live payload still
+    // produces no tab — the fallback surfaces retained data, it does not
+    // invent data that was never read.
+    [Fact]
+    public void ANullQuotaWithNoStoredSeriesStillProducesNoTabs()
+    {
+        var tabs = WindowCardText.Tabs(
+            [Series("claude", "session.v1", Sample(40, ResetAt - 600))],
+            quota: null,
+            clientId: "codex");
+
+        Assert.Empty(tabs);
+    }
+
     // The account dimension (PR #81 structural review, P2): the store can
     // hold two series under one (providerId, windowKey) that differ only in
     // AccountScope — an account switch leaves the previous account's series

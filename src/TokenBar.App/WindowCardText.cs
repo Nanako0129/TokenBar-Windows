@@ -101,7 +101,18 @@ public static class WindowCardText
     /// A stored series with no live window (the provider stopped reporting
     /// it) deliberately produces no tab: macOS cannot show a window its own
     /// live payload no longer offers either, and a history-only tab would
-    /// have no live label to show.
+    /// have no live label to show. That rule assumes <paramref name="quota"/>
+    /// itself landed, though: when it did not (the agent-usage fetch is still
+    /// pending or just failed, so <paramref name="quota"/> is null),
+    /// enumerating the live side finds nothing to enumerate regardless of
+    /// what the store holds, which used to mean an unrelated lane's failure
+    /// threw away a series this client's own history read had already
+    /// retrieved successfully. In that case only, this falls back to
+    /// enumerating the store's own window keys directly — one tab per stored
+    /// series, no live label, its running cycle read purely off the stored
+    /// samples — so a successfully-read series stays visible while the live
+    /// lane is down. A window the store has nothing under either still
+    /// produces no tab, exactly as it does today.
     /// </para>
     /// <para>
     /// <see cref="QuotaHistorySeries.ProviderId"/> is — despite the field name
@@ -163,28 +174,53 @@ public static class WindowCardText
         }
 
         var tabs = new List<WindowCardTab>();
-        foreach (var window in agent?.UniqueCardWindows ?? [])
+        if (quota is null)
         {
-            var series = window.PaceStatus.WindowKey is { } key
-                ? byWindowKey.GetValueOrDefault(key)
-                : null;
-            tabs.Add(new WindowCardTab(
-                // The store's own WindowKey when a series was found — that is
-                // what BuildWindowHistoryCard joins back against to find this
-                // window's past cycles — and the live CardId only as a
-                // fallback identity for a window the store has nothing under,
-                // where no such join is possible anyway. The account half
-                // prefers the matched series' own scope, then the live scope
-                // (a window the store has nothing under yet, yet the live
-                // agent still names an account), then the last-resort
-                // placeholder.
-                new QuotaWindowIdentity(
-                    clientId,
-                    series?.AccountScope ?? liveScope ?? PrimaryAccountScope,
-                    series?.WindowKey ?? window.CardId),
-                window.Label,
-                series is null ? null : QuotaHistoryFold.Active(series.Samples),
-                HasHistory: series is not null));
+            // The agent-usage fetch that would enumerate this client's live
+            // windows has not produced a payload yet (still pending, or its
+            // last attempt threw) — there is no `agent?.UniqueCardWindows` to
+            // walk. That must not mean this client's own stored history goes
+            // undisplayed too: fall back to the store's own window keys
+            // directly (already scope-filtered above, same as the live path
+            // would have been). No live label exists for these, so `Title`
+            // falls back to the window key, and there is no `PaceStatus` to
+            // read a running cycle off — `Active` comes from the stored
+            // samples alone, same as the live path already does for a window
+            // the store has a series for.
+            foreach (var series in byWindowKey.Values)
+            {
+                tabs.Add(new WindowCardTab(
+                    new QuotaWindowIdentity(clientId, series.AccountScope, series.WindowKey),
+                    Label: null,
+                    QuotaHistoryFold.Active(series.Samples),
+                    HasHistory: true));
+            }
+        }
+        else
+        {
+            foreach (var window in agent?.UniqueCardWindows ?? [])
+            {
+                var series = window.PaceStatus.WindowKey is { } key
+                    ? byWindowKey.GetValueOrDefault(key)
+                    : null;
+                tabs.Add(new WindowCardTab(
+                    // The store's own WindowKey when a series was found — that is
+                    // what BuildWindowHistoryCard joins back against to find this
+                    // window's past cycles — and the live CardId only as a
+                    // fallback identity for a window the store has nothing under,
+                    // where no such join is possible anyway. The account half
+                    // prefers the matched series' own scope, then the live scope
+                    // (a window the store has nothing under yet, yet the live
+                    // agent still names an account), then the last-resort
+                    // placeholder.
+                    new QuotaWindowIdentity(
+                        clientId,
+                        series?.AccountScope ?? liveScope ?? PrimaryAccountScope,
+                        series?.WindowKey ?? window.CardId),
+                    window.Label,
+                    series is null ? null : QuotaHistoryFold.Active(series.Samples),
+                    HasHistory: series is not null));
+            }
         }
 
         // A running window leads: it is the one the card exists to draw, and on
