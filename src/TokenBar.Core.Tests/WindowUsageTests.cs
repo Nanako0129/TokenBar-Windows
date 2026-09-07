@@ -13,7 +13,7 @@ public class WindowUsageTests
     [Fact]
     public void WindowUsageLoadsNativeLibraryAndDecodes()
     {
-        var usage = TbCore.WindowUsage(0, long.MaxValue);
+        var usage = TbCore.WindowUsage(0, long.MaxValue, boundIsNow: false);
 
         Assert.NotNull(usage.Messages);
         Assert.True(usage.UndatedCount >= 0);
@@ -29,7 +29,7 @@ public class WindowUsageTests
     {
         // from > until: no message's timestamp can ever satisfy the window,
         // so this must decode as an empty list rather than an error.
-        var usage = TbCore.WindowUsage(1_700_000_060_000, 1_700_000_000_000);
+        var usage = TbCore.WindowUsage(1_700_000_060_000, 1_700_000_000_000, boundIsNow: false);
 
         Assert.Empty(usage.Messages);
     }

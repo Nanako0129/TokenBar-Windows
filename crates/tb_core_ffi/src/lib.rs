@@ -698,13 +698,25 @@ pub extern "C" fn tb_quota_history() -> *mut c_char {
 /// hit on every call after the first through a source-change-token probe,
 /// with a soundness-gated fast path for `until_ms` growing past what was
 /// scanned. See `window_usage::cached` for the full cache shape.
+///
+/// `bound_is_now` is the caller's own declaration that `until_ms` was the
+/// present at the moment the caller read it (in the one production caller,
+/// `DashboardModel.cs:570`'s `DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()`)
+/// — the fact the widening fast path's soundness rests on, and which this
+/// module used to try to reconstruct from a Rust-side wall-clock read
+/// instead of asking for it directly; that reconstruction measured
+/// intermittent end-to-end against a real store and was replaced (see the
+/// `window_usage` module doc for the measurements). Pass `0` for a bounded
+/// historical request, or when the caller has no opinion — that is the safe
+/// default: it disables the widening fast path for that request rather than
+/// enabling it.
 #[no_mangle]
-pub extern "C" fn tb_window_usage(from_ms: i64, until_ms: i64) -> *mut c_char {
+pub extern "C" fn tb_window_usage(from_ms: i64, until_ms: i64, bound_is_now: i32) -> *mut c_char {
     guarded("tb_window_usage", || {
         envelope(
             LocalSourceContext::process()
                 .map_err(|error| error.to_string())
-                .and_then(|context| window_usage::cached(&context, from_ms, until_ms)),
+                .and_then(|context| window_usage::cached(&context, from_ms, until_ms, bound_is_now != 0)),
         )
     })
 }

@@ -49,13 +49,57 @@
 //! to a real rescan bounded by the new, wider `until_ms`. See the
 //! widening-soundness comment on `cached` below for the full argument,
 //! including why this is decided once at publish time and stored as a bool
-//! rather than compared live from two independently-read clocks (round 11's
-//! finding: the gate used to compare `cached_until` against a wall clock
-//! read inside `compute`, after the token probe — measurably 136-188ms later
-//! than the caller's own `now` read, against a real store, because the token
-//! probe stats every source path — which no cache entry `compute` itself
-//! produces could ever satisfy; the gate silently never fired). A shrinking
-//! `until_ms` (no production caller produces one today) does NOT trigger a
+//! rather than compared live from two independently-read clocks.
+//!
+//! That bool is `bound_was_present`, and what feeds it changed in this
+//! commit — the fifth on this gate, after four rounds (`9918d7e`,
+//! `f019fe5`, `39553f5`, and the one that landed
+//! `WIDENING_ENTRY_SLACK_MS = 25`) that each refined a clock-comparison
+//! guess without ever measuring it end-to-end across the FFI boundary. A
+//! P/Invoke harness against the real 5.3 GB store on the x64 host measured
+//! it: at `39553f5` and at the slack-tuned HEAD it replaced, a widening call
+//! that hit the fast path cost ~1450-1740ms and one that fell through to a
+//! rescan cost ~6300-6500ms, and which one happened was intermittent between
+//! runs of the very same binary — the first process run of a pair typically
+//! missed the fast path, the second typically hit it. The likely mechanism
+//! is OS file-cache warmth changing the latency the slack constant was
+//! trying to outlast, which means the gate was least reliable exactly on a
+//! cold start — backwards from what it exists to protect, on a branch that
+//! already had an open cold-start complaint. No constant closes that gap: it
+//! spans P/Invoke marshalling plus however long `LocalSourceContext::process`
+//! takes on a disk state this module cannot see coming.
+//!
+//! So this module stopped inferring `bound_was_present` from a clock
+//! comparison and started reading it from the caller. `until_ms` reaching
+//! this module already began life as `DateTimeOffset.UtcNow` on the C# side
+//! (`DashboardModel.cs:570`) — the caller always knew whether its own bound
+//! was "now"; the previous design threw that fact away at the FFI boundary
+//! and tried to reconstruct an approximation of it from two independently
+//! read clocks. `tb_window_usage` now takes that fact as an explicit
+//! `bound_is_now` parameter instead. A caller that does not pass it gets
+//! `false` — the safe, no-widening-reuse behaviour — never the fast path by
+//! default.
+//!
+//! A caller's claim is not the whole story, though: the finding that killed
+//! the clock-comparison design's contended case (a caller queued behind
+//! another's in-progress scan reads "now" before it waits, so by the time
+//! its own scan actually runs, that "now" is stale) still applies to a
+//! caller-declared flag exactly as it applied to a caller-computed
+//! timestamp — `bound_is_now = true` says the bound was current when the
+//! caller read it, not when this module's scan actually executes, and those
+//! can drift apart by however long the caller waited on `COMPUTE`. Fixing
+//! that no longer needs a clock read at all: `compute` below distinguishes
+//! an immediate `COMPUTE.try_lock()` (nothing was in progress; the scan runs
+//! essentially when the caller asked) from one that had to block, and
+//! downgrades a contended acquisition's `bound_was_present` to `false`
+//! regardless of what the caller declared — the caller's claim was made
+//! before an indeterminate wait, so it is no longer trusted once that wait
+//! actually happened. This is a strictly cheaper and more precise test than
+//! any slack constant could be: it asks whether a wait occurred at all,
+//! never how long, and needs no wall-clock read anywhere in this path (the
+//! module's remaining `SystemTime` use is test scaffolding only — see the
+//! `#[cfg(test)]` block below). A shrinking `until_ms` (no production caller
+//! produces one today) does NOT trigger a
 //! rescan — the wider cached scan already covers it — but it must never hand
 //! back messages past its own narrower bound either, so a cache hit whose
 //! entry was scanned further than the request is asking for is trimmed to
@@ -86,17 +130,17 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 pub(crate) type CacheKey = i64;
 /// (published-at [`Instant`, an immutable anchor set once by `publish` and
 /// never refreshed on a later hit — see `WINDOW_USAGE_STALE_CEILING_SECS`
 /// below for why it must stay immutable], source token, the `until_ms` this
-/// entry was scanned through, whether that scan's own bound had already
-/// reached the wall clock at the moment the FFI call that produced it
-/// started [decided once by `compute`, not compared live against a second
-/// clock read later — see the widening-soundness comment on `cached`
-/// below], mapped window payload).
+/// entry was scanned through, whether the caller declared that bound to be
+/// "now" AND this scan ran without waiting behind another caller's
+/// [`bound_was_present`, decided once by `compute` from the FFI-supplied
+/// `bound_is_now` flag and its own lock-contention check — see the
+/// widening-soundness comment on `cached` below], mapped window payload).
 type CacheEntry = (Instant, u64, i64, bool, Value);
 
 /// A single scan result served by the token-verified fast path (the `cached`
@@ -112,61 +156,6 @@ type CacheEntry = (Instant, u64, i64, bool, Value);
 /// outlast many consecutive polls while still guaranteeing a scan is never
 /// served indefinitely.
 const WINDOW_USAGE_STALE_CEILING_SECS: u64 = 900;
-
-/// Slack the widening-soundness gate in `cached` below allows between the
-/// C# caller's own `DateTimeOffset.UtcNow` read (`DashboardModel.cs:570`)
-/// and `call_entry_ms` — the wall-clock read taken in `compute`, immediately
-/// after this caller actually acquires `COMPUTE`, before the recheck-under-
-/// lock and before the token probe. Third capture point tried on this flag,
-/// not the first two:
-///
-/// - Reading it after the token probe (`f019fe5`) measured 136-188ms later
-///   than the caller's own read against a real store — the probe stats
-///   every source path — so a gate with zero tolerance never fired.
-/// - Reading it at the top of `cached`, before the cache lookup (`39553f5`,
-///   what shipped next) removed the probe from the delta, but reads it
-///   BEFORE a caller queues behind another's in-progress scan on `COMPUTE`.
-///   A caller that waits tens of seconds there captures a `call_entry_ms`
-///   tens of seconds stale, so a stale `until_ms` wrongly looked like it had
-///   already reached the wall clock its own scan actually ran at.
-///
-/// Reading it here, post-lock, folds the wait itself into the delta this
-/// gate is comparing — the safe direction: a contended caller's `until_ms`
-/// now correctly falls behind and `bound_was_present` comes out `false`
-/// (losing the fast path for that one entry, not serving wrong data).
-/// `WIDENING_ENTRY_SLACK_MS` itself only needs to cover the UNCONTENDED
-/// remainder — marshalling and the few non-scanning steps ahead of this
-/// point (`LocalSourceContext::process`, the cache lookup, an uncontended
-/// `COMPUTE.lock()`). Measured 2026-09-07, in-process (no P/Invoke boundary
-/// — this task has no C# test harness available to a leaf executor) against
-/// a synthetic near-empty store: three uncontended `cached()` round trips
-/// showed 0ms of measured delta at millisecond resolution between an
-/// equivalent "caller reads now" moment and this capture point — moving the
-/// point past the cache lookup and lock acquisition added nothing
-/// measurable over the 1-4ms recorded for the shallower `39553f5` capture
-/// point. That figure excludes real cross-language marshalling, which was
-/// not measured end-to-end in this environment; 25ms remains a conservative
-/// margin over it, not itself an end-to-end measurement.
-const WIDENING_ENTRY_SLACK_MS: i64 = 25;
-
-/// Real (unix-ms) wall clock, distinct from the monotonic `Instant` the entry
-/// also carries. Needed to tell a scan whose own bound already reached "now"
-/// when it started (an ordinary poll) from one bounded to a fixed point in
-/// the past (a historical request) — see the widening-soundness comment in
-/// `cached` below. Fails CLOSED: an unreadable clock returns `i64::MAX`
-/// rather than `0`. The only call site compares the incoming `until_ms`
-/// against this reading (`until_ms >= call_entry_ms - slack`); `0` used to
-/// make that comparison trivially true for every request whenever
-/// `SystemTime::now()` errored, silently re-enabling round 10's original
-/// unconditional-widen defect. `i64::MAX` makes the comparison false
-/// instead, so an unreadable clock refuses the widening fast path rather
-/// than admitting it.
-fn wall_clock_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(i64::MAX)
-}
 
 static SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -193,6 +182,7 @@ pub(crate) fn cached(
     context: &crate::LocalSourceContext,
     from_ms: i64,
     until_ms: i64,
+    bound_is_now: bool,
 ) -> Result<Value, String> {
     let key = cache_key(from_ms);
     let cached = {
@@ -216,7 +206,7 @@ pub(crate) fn cached(
     };
     let Some((fresh_enough_and_covers, age, token, cached_until, bound_was_present, data)) = cached
     else {
-        return compute(context, from_ms, until_ms, key);
+        return compute(context, from_ms, until_ms, key, bound_is_now);
     };
     if fresh_enough_and_covers {
         return Ok(narrow_to_request(data, until_ms, cached_until));
@@ -240,27 +230,25 @@ pub(crate) fn cached(
     //   requested bound, not past what the source contained — UNLESS that
     //   earlier scan's own bound had already reached the real wall clock at
     //   the moment this caller actually acquired `COMPUTE` and began its own
-    //   scan (`bound_was_present`, decided once by `compute` — see
-    //   `WIDENING_ENTRY_SLACK_MS` above): then nothing past `cached_until`
-    //   could have existed yet when that scan started (a message cannot be
-    //   written before the clock reaches its own timestamp), so anything in
-    //   the gap must have been written AFTER — exactly what the unchanged
-    //   token already rules out. That is the ordinary polling caller
-    //   (`DashboardModel` requests `until_ms = now` every 60s). A bounded
-    //   historical request has `until_ms` fixed far below the real clock, so
-    //   `compute` stores `bound_was_present = false` for it, and it always
-    //   falls through to a real rescan below. This has gone through two
-    //   prior, both-wrong capture points for the clock read `compute`
-    //   compares `until_ms` against: first read after the token probe (a
-    //   gate with zero tolerance for the probe's own 136-188ms latency
-    //   against a real store, round 11's finding, never fired); then read at
-    //   the top of `cached`, before the cache lookup — correct for the probe
-    //   cost, but read BEFORE a caller queues behind another's in-progress
-    //   scan on `COMPUTE`, so a contended caller's stale pre-wait read wrongly
-    //   looked like it reached the wall clock its scan actually ran at.
-    //   Reading it in `compute`, immediately post-lock, fixes both: it is
-    //   the earliest point a caller can read that reflects when its own scan
-    //   truly starts, contended or not.
+    //   scan (`bound_was_present`, decided once by `compute`). That fact is
+    //   now supplied by the caller as `bound_is_now` rather than inferred
+    //   from a clock comparison at all — `until_ms` reaching this module was
+    //   always `DateTimeOffset.UtcNow` on the C# side, so the caller already
+    //   knows whether its own bound is "now"; asking it to say so directly
+    //   removed a P/Invoke-boundary clock race that a Rust-side reading of
+    //   its own wall clock could never fully account for (measured
+    //   end-to-end: intermittent between successive runs of the very same
+    //   binary against a real store — see the module doc comment). A bounded
+    //   historical request declares `bound_is_now = false`, and it always
+    //   falls through to a real rescan below. A caller's `true` is still not
+    //   the whole story: it was read before this caller ever waited on
+    //   `COMPUTE`, so `compute` also checks whether this scan's own
+    //   `COMPUTE.try_lock()` was immediate — a caller that had to queue
+    //   behind another's in-progress scan has its declared "now" go stale
+    //   during the wait, and `compute` downgrades `bound_was_present` to
+    //   `false` for it regardless of what was declared. That needs no clock
+    //   read either: whether an acquisition blocked is a fact about the lock,
+    //   not the clock.
     //
     // Bounded independently of both: `age` alone would let a token match
     // keep this branch reachable forever (nothing here refreshes
@@ -280,7 +268,7 @@ pub(crate) fn cached(
         }
     }
 
-    compute(context, from_ms, until_ms, key)
+    compute(context, from_ms, until_ms, key, bound_is_now)
 }
 
 /// Trims a cache hit's messages to the caller's own `until_ms` when the
@@ -328,39 +316,24 @@ fn compute(
     from_ms: i64,
     until_ms: i64,
     key: CacheKey,
+    bound_is_now: bool,
 ) -> Result<Value, String> {
-    let _serialised = COMPUTE.lock().unwrap_or_else(|p| p.into_inner());
-    // Captured HERE — immediately after acquiring `COMPUTE`, before the
-    // recheck-under-lock and before the token probe below — not by the
-    // caller before it ever waited on this lock. Third capture point tried
-    // on this flag; the first two both failed under measurement:
-    //
-    // - Reading it after the token probe (the probe stats every source
-    //   path) measured 136-188ms later than an equivalent caller-side read
-    //   against a real store (round 11's finding): a gate with zero
-    //   tolerance never fired for any entry `compute` itself produced.
-    // - Reading it at the top of `cached`, before the cache lookup — what
-    //   shipped next — removed the probe from the delta, but a caller that
-    //   queues behind another's in-progress scan reads its `now` BEFORE
-    //   waiting on `COMPUTE`, not when its own scan actually starts. A
-    //   caller that waits behind a 30s scan captures a `call_entry_ms`
-    //   tens of seconds stale, so `until_ms` (fixed at that stale "now")
-    //   can look like it already reached the wall clock when the real scan
-    //   — which sees a source current as of the moment it actually runs —
-    //   starts long after that. A message written during the wait lands
-    //   inside the freshly-read token but outside `until_ms`, and the
-    //   caller published `bound_was_present = true` for it anyway: every
-    //   later widening request then trusts the flag and silently serves an
-    //   incomplete payload for as long as the token holds.
-    //
-    // Reading it here — after the wait, immediately once this caller
-    // actually holds `COMPUTE` — fixes that: a caller that waited a long
-    // time now reads a `call_entry_ms` that reflects when its scan truly
-    // starts, so a stale `until_ms` correctly compares behind it and
-    // `bound_was_present` comes out `false`. See `WIDENING_ENTRY_SLACK_MS`
-    // below for what the remaining (uncontended) delta between an
-    // equivalent caller-side read and this point was measured at.
-    let call_entry_ms = wall_clock_now_ms();
+    // `try_lock` first, not `lock`, so this caller learns whether it had to
+    // wait for another caller's scan already in progress — the fact
+    // `bound_was_present` below needs and, unlike the clock-comparison design
+    // this replaced, the ONLY fact it needs: no wall-clock read is taken
+    // anywhere in this function. `Poisoned` here means the mutex was free
+    // (nobody else was holding it) but marked poisoned by an earlier panic —
+    // an immediate, uncontended acquisition exactly like `Ok`, just carrying
+    // stale interior state from that panic, which this cache tolerates the
+    // same way every other lock in this module does (`unwrap_or_else`).
+    let (contended, _serialised) = match COMPUTE.try_lock() {
+        Ok(guard) => (false, guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => (false, poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            (true, COMPUTE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+        }
+    };
     // Re-check under the lock. A caller that queued behind another's scan is
     // asking a question that scan may have just answered; running a second one
     // to produce the same bytes is the duplicate this lock exists to remove.
@@ -401,21 +374,27 @@ fn compute(
             let data = run(context, from_ms, until_ms)?;
             // Whether this scan's own bound had already reached the wall
             // clock at the moment the FFI call that produced it started —
-            // decided once, here, rather than compared live later against a
-            // second clock read (round 11's finding: comparing `cached_until`
-            // against a clock read taken after the token probe above, which
-            // stats every source path, gave the gate zero tolerance for that
-            // probe's own latency — measured 136-188ms against a real store
-            // — so no entry this branch produced could ever satisfy it).
-            // `call_entry_ms` is read immediately after acquiring `COMPUTE`,
-            // above — after any wait behind another caller's scan, not
-            // before it — so a caller that queued a long time correctly
-            // sees its own stale `until_ms` fall behind `call_entry_ms` here
-            // and comes out `false`. See `WIDENING_ENTRY_SLACK_MS` for what
-            // the remaining (uncontended) delta between an equivalent
-            // caller-side read and this point was measured at.
-            let bound_was_present =
-                until_ms >= call_entry_ms.saturating_sub(WIDENING_ENTRY_SLACK_MS);
+            // decided once, here, from two facts, neither of them a clock
+            // read: `bound_is_now`, the caller's own declaration that
+            // `until_ms` was "now" when the caller read it (`until_ms`
+            // reaching this module began life as `DateTimeOffset.UtcNow` on
+            // the C# side, so the caller already knows this — see the module
+            // doc comment for why inferring it here instead, from two
+            // independently read clocks either side of the FFI boundary,
+            // measured intermittent end-to-end and was abandoned); and
+            // `contended`, whether this call's own `COMPUTE.try_lock()`
+            // above had to wait. A caller's declaration was made before it
+            // ever queued on `COMPUTE`, so it goes stale during a wait behind
+            // another caller's in-progress scan exactly the way a captured
+            // clock reading used to — a message written during the wait
+            // lands inside the freshly-read token but outside `until_ms`,
+            // and trusting the declaration anyway would let a later widening
+            // request silently serve an incomplete payload for as long as
+            // the token holds. `contended` catches that with no timing
+            // measurement at all: an uncontended acquisition means this
+            // scan ran essentially when the caller asked, so its declaration
+            // still describes the scan that actually ran.
+            let bound_was_present = bound_is_now && !contended;
             publish(key, (Instant::now(), token, until_ms, bound_was_present, data.clone()));
             (data, until_ms)
         }
@@ -522,6 +501,18 @@ mod tests {
 
     static TEST_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
+    // Test scaffolding only — production code takes no wall-clock reading
+    // anywhere in this module (see the module doc comment for why). Tests
+    // still need a genuine "now" to build realistic historical-vs-present
+    // fixtures and to exercise `compute`'s own lock-contention path with a
+    // caller-declared `bound_is_now` that is actually true when declared.
+    fn wall_clock_now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(i64::MAX)
+    }
+
     fn test_context(label: &str) -> crate::LocalSourceContext {
         let home = std::env::temp_dir().join(format!(
             "tokenbar-window-usage-{label}-{}-{}",
@@ -554,8 +545,9 @@ mod tests {
         let before = scan_count();
         let context = test_context("polling-drift");
 
-        cached(&context, from_ms, from_ms + 60_000).expect("first window scan");
-        cached(&context, from_ms, from_ms + 60_000).expect("second request, same bound, cache reused");
+        cached(&context, from_ms, from_ms + 60_000, false).expect("first window scan");
+        cached(&context, from_ms, from_ms + 60_000, false)
+            .expect("second request, same bound, cache reused");
 
         assert_eq!(
             scan_count(),
@@ -574,12 +566,11 @@ mod tests {
     // at (see `a_scan_whose_own_bound_reached_its_own_wall_clock_reuses_on_
     // drift` below for that sound case). This fixture is genuinely
     // historical, not just arithmetically wider: `from_ms` is a fixed 2023
-    // timestamp, so `compute`'s own `wall_clock_now_ms()` (the real clock,
-    // years later) always lands far past `cached_until` here — the scan's
-    // own bound never reaches its own wall clock, so the soundness gate
-    // must reject it and fall through to a rescan. Breaks if the widening
-    // path is ever entered without that gate (a return to round 10's
-    // over-broad first fix, or removing the gate entirely).
+    // timestamp and both calls below declare `bound_is_now = false`, so the
+    // soundness gate must reject the widen and fall through to a rescan
+    // regardless of what the real wall clock reads years later. Breaks if
+    // the widening path is ever entered without that gate (a return to
+    // round 10's over-broad first fix, or removing the gate entirely).
     #[test]
     fn widening_request_forces_a_rescan() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -592,10 +583,12 @@ mod tests {
         let before = scan_count();
         let context = test_context("widening-request");
 
-        cached(&context, from_ms, from_ms + 60_000).expect("first window scan, cache [from, A)");
+        cached(&context, from_ms, from_ms + 60_000, false).expect("first window scan, cache [from, A)");
         // Same (unchanged) source, but the request's until_ms grew past what
-        // was scanned — B > A.
-        cached(&context, from_ms, from_ms + 65_000).expect("widened request, unchanged source");
+        // was scanned — B > A. Both fixed 2023 timestamps, not real "now"
+        // reads, so bound_is_now is false — this is the genuinely historical
+        // case the soundness gate must always reject regardless.
+        cached(&context, from_ms, from_ms + 65_000, false).expect("widened request, unchanged source");
 
         assert_eq!(
             scan_count(),
@@ -655,8 +648,11 @@ mod tests {
         let before = scan_count();
 
         // Ordinary polling drift: until_ms grew a few seconds past what was
-        // scanned, source unchanged.
-        let result = cached(&context, from_ms, cached_until + 5_000)
+        // scanned, source unchanged. bound_is_now here is irrelevant to the
+        // outcome — the fixtured entry's own bound_was_present=true already
+        // grants the fast path, so this call must never reach compute()
+        // (and therefore never consult its own bound_is_now) at all.
+        let result = cached(&context, from_ms, cached_until + 5_000, true)
             .expect("drifted poll of a scan whose bound already reached its own wall clock");
 
         assert_eq!(
@@ -675,33 +671,25 @@ mod tests {
 
     // Task 1's production-shaped test: two REAL `cached()` calls against a
     // REAL `compute()`, both passing `until_ms = wall_clock_now_ms()` at
-    // their own call moment (exactly the `DashboardModel` polling shape),
-    // source unchanged, with a deliberate drift between them. No hand-set
-    // `CacheEntry` field anywhere — this is the only test in this module
-    // that exercises `bound_was_present` as `compute` itself sets it, not as
-    // a fixture asserts it should be set.
+    // their own call moment and `bound_is_now = true` (exactly the
+    // `DashboardModel` polling shape), source unchanged, with a deliberate
+    // drift between them. No hand-set `CacheEntry` field anywhere — this is
+    // the only test in this module that exercises `bound_was_present` as
+    // `compute` itself sets it, not as a fixture asserts it should be set.
     //
-    // This is what both prior fixes lacked. `9918d7e` deleted the widening
-    // fast path outright — a real correctness fix — but broke the
-    // then-unconditional widen for the only production caller: every lazy
-    // refresh became a full rescan (this module's own doc: "tens of seconds
-    // on a large store"). `f019fe5` tried to restore the fast path by gating
-    // on `cached_until >= scanned_at_ms`, where `scanned_at_ms` was read
-    // inside `compute` AFTER the source-token probe — which stats every
-    // source path. Measured against a real store: 136-188ms later than the
-    // caller's own `now` read. That gate had zero tolerance, so it rejected
-    // every entry `compute` could ever produce, and the regression stayed
-    // live under a green test suite: every existing test at that commit
-    // hand-fixtured the entry's fields directly (this file's own
-    // `a_scan_whose_own_bound_reached_its_own_wall_clock_reuses_on_drift`,
-    // among others), which is a correct unit test of the gate's arithmetic
-    // and zero evidence about the behaviour it exists to protect — a real
-    // `compute()` call was never in the loop.
-    //
-    // Watched this fail at f019fe5's gate before the round-11 fix below
-    // (moving the capture point ahead of the token probe and storing the
-    // decision as a bool) landed; see the commit message for the exact
-    // observed failure.
+    // This is what every prior fix lacked, all the way through the
+    // slack-constant design this file's own history describes: each was
+    // either a correct unit test of a gate's arithmetic on a hand-set entry
+    // (zero evidence about the behaviour the gate exists to protect — a real
+    // `compute()` call was never in the loop) or, in the slack-constant
+    // version, unmeasurable end-to-end from inside this crate at all — the
+    // intermittency that finally killed it only showed up in a P/Invoke
+    // harness against a real store, outside what any test in this module can
+    // reach. This test still cannot measure across that boundary, but it
+    // remains the one exercise of the real `compute()` path with a genuine,
+    // undeclared-by-fixture `bound_is_now`, and it must keep passing under
+    // the caller-declared design the same way it did under every design
+    // before it.
     #[test]
     fn production_widening_drift_reuses_one_scan() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -714,8 +702,10 @@ mod tests {
         let context = test_context("production-widening-drift");
         let before = scan_count();
 
-        // First poll: until_ms = now, exactly DashboardModel.cs:570's shape.
-        cached(&context, from_ms, wall_clock_now_ms()).expect("first poll");
+        // First poll: until_ms = now, exactly DashboardModel.cs:570's shape,
+        // and bound_is_now = true because it genuinely is: this is a real
+        // caller declaring a real "now" read, not a fixture.
+        cached(&context, from_ms, wall_clock_now_ms(), true).expect("first poll");
 
         // The smallest sleep that buys a real, measurable drift between two
         // wall-clock reads a real caller a moment apart would also see — not
@@ -725,8 +715,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         // Second poll: until_ms grew past what was cached (ordinary drift),
-        // same unchanged source.
-        cached(&context, from_ms, wall_clock_now_ms()).expect("second poll, drifted wider");
+        // same unchanged source, again a real "now" read.
+        cached(&context, from_ms, wall_clock_now_ms(), true).expect("second poll, drifted wider");
 
         assert_eq!(
             scan_count(),
@@ -740,17 +730,20 @@ mod tests {
     // The finding this round fixes: a caller queued behind another's
     // in-progress scan must not publish `bound_was_present = true` for a
     // `until_ms` that was only "now" back when it first called, not when its
-    // scan actually ran. Drives REAL contention on the private `COMPUTE`
-    // mutex (reachable directly — this test is in the same module) rather
-    // than faking the property by construction: caller A holds `COMPUTE`
-    // itself (standing in for a long scan in progress); caller B reads its
-    // `until_ms = now` BEFORE A releases, then blocks on `COMPUTE`; A
-    // releases only after B is provably queued. If `call_entry_ms` were
-    // still captured before the wait (the `39553f5` placement this round
-    // replaces), B's stale pre-wait `until_ms` would look like it reached
-    // the wall clock its own scan actually ran at, `bound_was_present` would
-    // publish `true`, and the immediate post-B widen below would wrongly
-    // reuse B's cache entry instead of rescanning.
+    // scan actually ran — the same property the clock-comparison design used
+    // to protect with `call_entry_ms`, now protected with no clock read at
+    // all by `compute`'s own `COMPUTE.try_lock()` contention check. Drives
+    // REAL contention on the private `COMPUTE` mutex (reachable directly —
+    // this test is in the same module) rather than faking the property by
+    // construction: caller A holds `COMPUTE` itself (standing in for a long
+    // scan in progress); caller B declares `bound_is_now = true` — genuinely
+    // true when it calls, exactly `DashboardModel.cs:570`'s shape — BEFORE A
+    // releases, then blocks on `COMPUTE`; A releases only after B is provably
+    // queued. If `compute` trusted a caller's declaration without checking
+    // whether its own `try_lock()` was contended, B's stale pre-wait
+    // declaration would still publish `bound_was_present = true`, and the
+    // immediate post-B widen below would wrongly reuse B's cache entry
+    // instead of rescanning.
     #[test]
     fn contended_caller_does_not_publish_bound_was_present_for_a_stale_until_ms() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -767,30 +760,31 @@ mod tests {
         // already in progress when B calls in.
         let hold = COMPUTE.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Caller B: reads until_ms = now HERE, before it has any idea A is
-        // holding the lock — exactly DashboardModel.cs:570's shape, and
-        // exactly the read the finding says must not be trusted once B has
-        // to wait behind A.
+        // Caller B: reads until_ms = now and declares bound_is_now = true
+        // HERE, before it has any idea A is holding the lock — exactly
+        // DashboardModel.cs:570's shape, and exactly the declaration the
+        // finding says must not be trusted once B has to wait behind A.
         let stale_until_ms = wall_clock_now_ms();
         let context_b = context.clone();
-        let b = std::thread::spawn(move || cached(&context_b, from_ms, stale_until_ms));
+        let b = std::thread::spawn(move || cached(&context_b, from_ms, stale_until_ms, true));
 
         // Give B time to actually reach and block on COMPUTE.lock() before A
-        // releases — long enough that, if call_entry_ms were read before the
-        // wait, stale_until_ms would clearly no longer be "now" by the time
-        // B's scan really starts.
+        // releases — proving this holds for a genuine, non-instantaneous
+        // contended wait, not just a `try_lock()` that happens to fail and
+        // immediately succeed.
         std::thread::sleep(Duration::from_millis(200));
         drop(hold);
 
         b.join().expect("caller B thread").expect("caller B's scan");
 
-        // Immediately widen past stale_until_ms, source unchanged. If B
-        // published bound_was_present = true for a call_entry_ms read before
-        // it waited, this reuses B's entry with no rescan — the silent
-        // incomplete-payload bug the finding describes. Correct behaviour is
-        // a rescan, because B's own scan genuinely started well after
-        // stale_until_ms.
-        cached(&context, from_ms, stale_until_ms + 1_000).expect("widen after contended publish");
+        // Immediately widen past stale_until_ms, source unchanged. If B's
+        // entry published bound_was_present = true despite B's own
+        // COMPUTE.try_lock() having been contended, this reuses B's entry
+        // with no rescan — the silent incomplete-payload bug the finding
+        // describes. Correct behaviour is a rescan, because B's own scan
+        // genuinely started well after stale_until_ms.
+        cached(&context, from_ms, stale_until_ms + 1_000, true)
+            .expect("widen after contended publish");
 
         assert_eq!(
             scan_count(),
@@ -836,7 +830,8 @@ mod tests {
         }
         let before = scan_count();
 
-        let result = cached(&context, from_ms, from_ms + 60_000).expect("rescan after stale mismatched token");
+        let result = cached(&context, from_ms, from_ms + 60_000, false)
+            .expect("rescan after stale mismatched token");
 
         assert_eq!(
             scan_count(),
@@ -909,8 +904,8 @@ mod tests {
         }
         let before = scan_count();
 
-        let result =
-            cached(&context, from_ms, narrow_until).expect("narrower request served from cache");
+        let result = cached(&context, from_ms, narrow_until, false)
+            .expect("narrower request served from cache");
 
         assert_eq!(
             scan_count(),
@@ -981,10 +976,9 @@ mod tests {
         // narrower of two concurrent callers makes once it decides there is
         // no covering entry yet (`cached`'s own two exits already narrow
         // correctly and are not what this test is asserting about).
-        // `call_entry_ms` is irrelevant here too — the recheck-under-lock hit
-        // branch returns before `bound_was_present` would ever be computed,
-        // and `compute` now reads it itself, post-lock.
-        let result = compute(&context, from_ms, narrow_until, key)
+        // `bound_is_now` is irrelevant here too — the recheck-under-lock hit
+        // branch returns before `bound_was_present` would ever be computed.
+        let result = compute(&context, from_ms, narrow_until, key, false)
             .expect("recheck hit, narrowed");
 
         assert_eq!(

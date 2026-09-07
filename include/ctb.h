@@ -127,7 +127,14 @@ char *tb_quota_history(void);
 // call after the first through a source-change-token probe, with a
 // soundness-gated fast path for until_ms growing past what was scanned — see
 // the tb_core_ffi window_usage module.
-char *tb_window_usage(int64_t from_ms, int64_t until_ms);
+// bound_is_now: nonzero when until_ms was the caller's own read of "now" at
+// the moment it was taken (the production shape: DateTimeOffset.UtcNow).
+// Zero for a bounded historical request, or when the caller has no opinion —
+// that is the safe default and disables the widening fast path rather than
+// enabling it. This is the caller's own declaration, not a hint the library
+// double-checks against a clock of its own: the library still refuses to
+// trust it when this call had to wait behind another in-progress scan.
+char *tb_window_usage(int64_t from_ms, int64_t until_ms, int32_t bound_is_now);
 
 // Release a string returned by any tb_* entry point.
 void tb_free(char *p);
