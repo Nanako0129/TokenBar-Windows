@@ -117,6 +117,22 @@ public sealed class AttributionReportGate
         _settledGeneration = Generation;
     }
 
+    /// <summary>Whether a settled fetch's completion may call back into
+    /// <c>SettingsWindow.ShowPage</c>. Round 14's finding: <see cref="Reset"/>
+    /// clears only <see cref="Requested"/>, so if a completion calls
+    /// <c>ShowPage</c> while the window is hidden, that call's own
+    /// <c>EnsureAttributionReport</c> re-enters <see cref="ShouldFetch"/>,
+    /// which sees <see cref="Requested"/> already false (from the hide's
+    /// <see cref="Reset"/>) and starts a second fetch right there — consuming
+    /// the very reset the hide performed. That second fetch then settles with
+    /// <see cref="Requested"/> true again, so the next reopen's own
+    /// <see cref="ShouldFetch"/> call finds the guard already armed and skips
+    /// its refetch, serving a stale report until another close. A hidden
+    /// completion must not call back in at all; this is the predicate the
+    /// completion checks first.</summary>
+    public static bool ShouldNotifyOnCompletion(bool isAttributionPageSelected, bool isWindowVisible) =>
+        isAttributionPageSelected && isWindowVisible;
+
     /// <summary>Call when the settings window hides. Clears the guard so the
     /// next page visit fetches again; <see cref="Settled"/> and whatever report
     /// the caller cached are left untouched, so the page has real data to show

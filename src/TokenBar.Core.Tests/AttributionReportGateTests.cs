@@ -178,4 +178,53 @@ public class AttributionReportGateTests
 
         Assert.Equal("second (fresh)", cache);
     }
+
+    // Round 14's finding: a hidden completion must not notify at all, so it
+    // never re-enters ShowPage -> EnsureAttributionReport -> ShouldFetch and
+    // consumes the reset a hide performed.
+    [Theory]
+    [InlineData(true, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(false, false, false)]
+    public void ShouldNotifyOnCompletionRequiresBothTheAttributionTagAndVisibility(
+        bool isAttributionPageSelected, bool isWindowVisible, bool expected) =>
+        Assert.Equal(
+            expected,
+            AttributionReportGate.ShouldNotifyOnCompletion(isAttributionPageSelected, isWindowVisible));
+
+    // Round 14's regression, pinned end to end at the gate level (confirmed
+    // by hand-mutation: reverting ShouldNotifyOnCompletion's body to `return
+    // isAttributionPageSelected;` — dropping the isWindowVisible operand —
+    // makes this fail, because the completion below would then be told to
+    // notify while hidden). A close mid-fetch resets the guard; the fetch
+    // then completes while the window is still hidden. The completion must
+    // see ShouldNotifyOnCompletion return false (so SettingsWindow never
+    // calls back into ShowPage/EnsureAttributionReport/ShouldFetch), and the
+    // guard must therefore still read as unarmed — exactly what the next
+    // reopen's own ShouldFetch() call needs to see true.
+    [Fact]
+    public void ACompletionWhileHiddenLeavesTheGuardUnarmedForTheNextReopen()
+    {
+        var gate = new AttributionReportGate();
+        Assert.True(gate.ShouldFetch());
+        var generation = gate.Generation;
+
+        // Settings window closes while the fetch is still in flight.
+        gate.Reset();
+
+        // The fetch lands while the window is still hidden.
+        Assert.True(gate.IsCurrent(generation));
+        gate.Settle();
+        Assert.False(AttributionReportGate.ShouldNotifyOnCompletion(
+            isAttributionPageSelected: true, isWindowVisible: false));
+
+        // Nothing above called ShouldFetch() again, so the guard the hide
+        // reset is still unarmed.
+        Assert.False(gate.Requested);
+
+        // The next reopen's ShowPage -> EnsureAttributionReport call must
+        // therefore refetch rather than silently serving the stale report.
+        Assert.True(gate.ShouldFetch());
+    }
 }

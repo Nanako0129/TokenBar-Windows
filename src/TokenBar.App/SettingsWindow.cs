@@ -557,7 +557,15 @@ public sealed class SettingsWindow : Window
                         previousFetchFailed: false).Value;
                     _attributionGate.Settle();
                     _pages["attribution"] = BuildAttributionPage(AppSettings.Store);
-                    if (_selectedTag == "attribution")
+                    // Never call ShowPage from here while hidden: ShowPage's
+                    // own tag check re-enters EnsureAttributionReport, which
+                    // would re-arm the just-reset guard on a fetch nobody
+                    // asked for (see AttributionReportGate.
+                    // ShouldNotifyOnCompletion, round 14). A closed window
+                    // gets its refetch from the next Present() -> Rebuild() ->
+                    // ShowPage() instead, once Reset() has actually stuck.
+                    if (AttributionReportGate.ShouldNotifyOnCompletion(
+                        _selectedTag == "attribution", AppWindow.IsVisible))
                     {
                         ShowPage(_selectedTag);
                     }
