@@ -146,10 +146,53 @@ public static class WindowCardGeometry
         return zones;
     }
 
-    /// <summary>The metric-free half: bars and hit zones. Split out because it
-    /// is the expensive half — O(zones × messages) — and because a function
-    /// that cannot see the metric cannot leak it into the usage
-    /// geometry.</summary>
+    /// <summary>The metric-free half: bars and hit zones. Split out because a
+    /// function that cannot see the metric cannot leak it into the usage
+    /// geometry.
+    /// <para>
+    /// Round 12's P2 finding: a comment here used to claim "one pass over the
+    /// messages", but the loop it described was O(zones × messages) — for
+    /// every message it walked every zone in order until one matched. The
+    /// <paramref name="messages"/> list is the full bounded history, not just
+    /// the active window, so an older client with a large attributed history
+    /// and dozens of active quota readings could put this on the UI thread
+    /// (the Quota lens rebuilds on the 10-second fast-lane tick,
+    /// QuotaLensProjection.Build -&gt; ... -&gt; <c>Chart</c> -&gt; here) doing
+    /// millions of comparisons.
+    /// </para>
+    /// <para>
+    /// First attempt followed <c>QuotaEquivalenceFold.CyclesCore</c>'s shape
+    /// (a3ea946) literally: sort <paramref name="messages"/> once, then slice
+    /// each zone out of the sorted array by binary search. Measured it
+    /// end-to-end (scratchpad/bench, git-stash A/B, 100k messages / 40
+    /// samples / 5 warmed-up calls) and it was SLOWER than the code it
+    /// replaced — 13-14 ms/call against the naive loop's 3-4 ms/call — because
+    /// the shapes are inverted. <c>CyclesCore</c> amortizes ONE sort of the
+    /// message list across every series' cycles in the same <c>Build()</c>
+    /// call (8 series × 32 cycles in that benchmark); here there is only ever
+    /// one zone list per call, so the O(m log m) sort of the LARGE side
+    /// (messages, ~10^5) paid for a binary search over the SMALL side (zones,
+    /// tens) and never earned its cost back.
+    /// </para>
+    /// <para>
+    /// Fixed instead by inverting which side gets sorted: the zones' own
+    /// upper bounds (one per zone — tens of entries) are collected into
+    /// <c>upperBounds</c>, and each message binary-searches THAT array
+    /// (<see cref="LowerBound"/>, O(log zones)) instead of walking it
+    /// linearly. No message list is copied or sorted. Zones already tile
+    /// <c>[windowStart, now]</c> with no gap and no overlap (<see cref="Zones"/>'s
+    /// own doc comment), so "first upperBound ≥ timestamp" is exactly the
+    /// zone that owns it, INCLUDING the <c>(lo, hi]</c> vs zone-0's own
+    /// <c>[lo, hi]</c> distinction the old loop special-cased: a timestamp
+    /// sitting exactly on the boundary between two zones equals the earlier
+    /// zone's own <c>HiMs</c>, so it resolves to that zone with no extra
+    /// check, and zone 0's <c>LoMs</c> is never any zone's boundary value, so
+    /// it is never at risk of resolving to a "previous" zone that does not
+    /// exist. This is a genuine single pass over <paramref name="messages"/>
+    /// (each message costs one <c>O(log zones)</c> lookup, not one sort),
+    /// re-measured at 0.4-0.5 ms/call on the same payload — faster than both
+    /// the code this fixes AND the sort-based first attempt.
+    /// </para></summary>
     public static (IReadOnlyList<BarRect> Bars, IReadOnlyList<HitZone> Hits) UsageGeometry(
         long windowStartMs,
         long windowEndMs,
@@ -161,26 +204,31 @@ public static class WindowCardGeometry
         // Bars are sized by every token class except cache read. Cache read is
         // 200x the volume at a tenth the price, so including it decouples the
         // bars from the line; cache WRITE costs 1.25x base input and must stay.
-        //
-        // One pass over the messages instead of one per zone. Each zone is
-        // closed by the sample that ends it, hence `(lo, hi]` — except the
-        // first, which owns its own lower bound: for an inferred window the
-        // message landing exactly on the window start IS the start, and leaving
-        // zone 0 exclusive put it in the card's totals and in no bar at all.
         var weights = new long[hits.Count];
-        foreach (var message in messages)
+        if (hits.Count > 0)
         {
+            var upperBounds = new long[hits.Count];
             for (var i = 0; i < hits.Count; i++)
             {
-                var zone = hits[i];
-                var insideStart = i == 0
-                    ? message.Timestamp >= zone.LoMs
-                    : message.Timestamp > zone.LoMs;
-                if (insideStart && message.Timestamp <= zone.HiMs)
+                upperBounds[i] = hits[i].HiMs;
+            }
+
+            var windowStart = hits[0].LoMs;
+            foreach (var message in messages)
+            {
+                var timestamp = message.Timestamp;
+                if (timestamp < windowStart)
                 {
-                    weights[i] = weights[i].SaturatingAdd(message.TokensExCacheRead);
-                    break;
+                    continue;
                 }
+
+                var index = LowerBound(upperBounds, timestamp);
+                if (index >= hits.Count)
+                {
+                    continue;
+                }
+
+                weights[index] = weights[index].SaturatingAdd(message.TokensExCacheRead);
             }
         }
 
@@ -193,6 +241,33 @@ public static class WindowCardGeometry
         }
 
         return (bars, hits);
+    }
+
+    /// <summary>First index whose value is &gt;= <paramref name="value"/>. Own
+    /// copy of <c>QuotaEquivalenceFold</c>'s private helper of the same name
+    /// and shape (itself a copy of <c>QuotaHistoryFold</c>'s) — neither is
+    /// reachable from here, and each fold over a sorted list owns this the
+    /// same way. <see cref="UsageGeometry"/> searches it over a zone's own
+    /// upper bounds rather than over the message list — see that method's own
+    /// doc comment for why the two shapes are not interchangeable.</summary>
+    private static int LowerBound(IReadOnlyList<long> values, long value)
+    {
+        var low = 0;
+        var high = values.Count;
+        while (low < high)
+        {
+            var mid = (low + high) / 2;
+            if (values[mid] < value)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        return low;
     }
 
     /// <summary>The metric-dependent half: cheap, O(samples).</summary>

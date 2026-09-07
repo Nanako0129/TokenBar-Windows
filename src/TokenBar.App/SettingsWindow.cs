@@ -532,9 +532,29 @@ public sealed class SettingsWindow : Window
                         return;
                     }
 
-                    _attributionReport = completed.Status == TaskStatus.RanToCompletion
+                    // Third instance of the retained-data rule on this branch
+                    // (7dc44b8: hourly/agents lanes via LazyLaneFold; fdaf728:
+                    // the Agent-limits card's display-layer form). This
+                    // completion is always for a request this call itself
+                    // made (EnsureAttributionReport only reaches here after
+                    // AttributionReportGate.ShouldFetch), so `requested` is
+                    // unconditionally true and the Attempted/FetchFailed
+                    // outputs collapse to facts about THIS completion alone —
+                    // previousAttempted/previousFetchFailed are unused inputs
+                    // in that case, so their values here are arbitrary. Only
+                    // .Value (fetched ?? previous) is consulted: a transient
+                    // null must not erase a previously-good report, or the
+                    // rebuilt page below reads as "Unavailable" and hides
+                    // every classification row it was already showing.
+                    var fetched = completed.Status == TaskStatus.RanToCompletion
                         ? completed.Result
                         : null;
+                    _attributionReport = LazyLaneFold.Apply(
+                        requested: true,
+                        fetched,
+                        _attributionReport,
+                        previousAttempted: true,
+                        previousFetchFailed: false).Value;
                     _attributionGate.Settle();
                     _pages["attribution"] = BuildAttributionPage(AppSettings.Store);
                     if (_selectedTag == "attribution")

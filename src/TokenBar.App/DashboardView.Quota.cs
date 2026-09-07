@@ -376,7 +376,15 @@ public sealed partial class DashboardView
     private string _windowCardTab =
         AppSettings.Store.GetString(WindowCardText.TabKey) ?? string.Empty;
 
-    private QuotaMetric _windowMetric =
+    /// <summary>Read fresh every time, not cached: it shares the store key
+    /// (<see cref="WindowCardText.AsUsedKey"/>) with the Agent-limits card's
+    /// own "Show as used" toggle (<c>BuildLimits</c>, which already reads the
+    /// key directly), and a cached copy here drifted from that card's live
+    /// reads until the control was recreated. Called once per render, not
+    /// per cell — round 11's fold work (a3ea946) made the whole lens rebuild
+    /// cost 68-75ms on a 100k-message synthetic payload, so one more
+    /// dictionary lookup in that pass is not the part that matters.</summary>
+    private static QuotaMetric _windowMetric =>
         AppSettings.Store.GetBool(WindowCardText.AsUsedKey, false)
             ? QuotaMetric.Used : QuotaMetric.Remaining;
 
@@ -512,9 +520,9 @@ public sealed partial class DashboardView
             var pill = LensPill(WindowCardText.MetricLabel(metric), _windowMetric == metric);
             pill.Click += (_, _) =>
             {
-                _windowMetric = metric;
                 // The Agent-limits card's own key: one preference, so the two
                 // cards on this page cannot count in opposite directions.
+                // No local field to set — _windowMetric reads this key live.
                 AppSettings.Store.SetBool(WindowCardText.AsUsedKey, metric == QuotaMetric.Used);
                 RenderContent(animated: false);
             };

@@ -103,6 +103,66 @@ public class WindowCardGeometryTests
         Assert.Equal(1, bars[1].Height);
     }
 
+    // Round 12's P2 finding: UsageGeometry now sorts messages once and takes a
+    // binary-search slice per zone instead of walking every zone per message.
+    // The sort must not be load-bearing on the CALLER already handing messages
+    // in time order — this pins that an out-of-order list still lands every
+    // message in its correct zone.
+    [Fact]
+    public void MessagesOutOfChronologicalOrderStillLandInTheirCorrectZone()
+    {
+        var now = Start + 1_800_000;
+        QuotaSample[] samples = [new(Start + 600_000, 10), new(Start + 1_200_000, 30)];
+        WindowMessage[] messages =
+        [
+            Message(Start + 1_300_000, 40), // zone 2: (1_200_000, now]
+            Message(Start + 700_000, 10),   // zone 1: (600_000, 1_200_000]
+            Message(Start + 100_000, 5),    // zone 0: [Start, 600_000]
+        ];
+
+        var (bars, _) = WindowCardGeometry.UsageGeometry(Start, End, now, samples, messages);
+
+        Assert.Equal(3, bars.Count);
+        Assert.False(bars[0].IsEmpty);
+        Assert.False(bars[1].IsEmpty);
+        Assert.False(bars[2].IsEmpty);
+        // Zone 2 carried the heaviest message (40), so it is the tallest bar.
+        Assert.Equal(1, bars[2].Height);
+        Assert.True(bars[0].Height < bars[2].Height);
+    }
+
+    // The binary-search bounds must exclude a message that falls before the
+    // window start or after `now` exactly as the old per-message zone scan
+    // did (neither zone's `insideStart`/`<= HiMs` check ever matched it). Two
+    // real in-window messages of different weight (not just one) so a stray
+    // inclusion at either end shows up as a changed HEIGHT, not just a bar
+    // losing its IsEmpty flag — the earlier draft of this test used a single
+    // non-empty bar, whose height normalizes to 1 regardless of how much
+    // extra weight leaks in, and missed that the "after now" bound had no
+    // coverage at all (confirmed by hand-mutation, see the commit body).
+    [Fact]
+    public void AMessageOutsideEveryZoneContributesToNoBar()
+    {
+        var now = Start + 1_800_000;
+        QuotaSample[] samples = [new(Start + 600_000, 10), new(Start + 1_200_000, 30)];
+        WindowMessage[] messages =
+        [
+            Message(Start - 1, 500),       // before the window: outside every zone
+            Message(now + 1, 500),         // after now: outside every zone
+            Message(Start + 700_000, 1000), // zone 1: the tallest legitimate bar
+            Message(Start + 1_300_000, 100), // zone 2: the reference for the assertion below
+        ];
+
+        var (bars, _) = WindowCardGeometry.UsageGeometry(Start, End, now, samples, messages);
+
+        Assert.Equal(3, bars.Count);
+        Assert.True(bars[0].IsEmpty); // zone 0: the before-window message must not land here
+        Assert.Equal(1, bars[1].Height); // zone 1 is the tallest: 1000 / 1000
+        // zone 2 is exactly 100/1000 — 0.15 (600/1000) would mean the
+        // after-`now` message leaked into the last zone.
+        Assert.Equal(0.1, bars[2].Height);
+    }
+
     [Fact]
     public void ConsumedIsNullWhenEitherEndHasNoReading()
     {
