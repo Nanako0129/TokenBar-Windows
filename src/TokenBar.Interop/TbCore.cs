@@ -145,9 +145,10 @@ public static class TbCore
 
     /// <summary>Per-message usage rows inside the absolute interval
     /// <c>[fromMs, untilMs)</c>. Expensive — scans the whole local corpus when
-    /// the cdylib's cache is cold — and must be called off the UI thread. See
-    /// <c>ctb.h</c>'s <c>tb_window_usage</c> for the cache and minute-quantised
-    /// end-of-window trade this is built on.</summary>
+    /// the cdylib's cache is cold — and must be called off the UI thread. The
+    /// cache is keyed by <c>fromMs</c> alone; <c>untilMs</c> is not quantised
+    /// and is not part of the key. See <c>ctb.h</c>'s <c>tb_window_usage</c>
+    /// for the cache shape this is built on.</summary>
     public static WindowUsage WindowUsage(long fromMs, long untilMs) =>
         Unwrap<WindowUsage>(NativeMethods.tb_window_usage(fromMs, untilMs));
 

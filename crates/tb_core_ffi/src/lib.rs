@@ -691,11 +691,13 @@ pub extern "C" fn tb_quota_history() -> *mut c_char {
 ///
 /// Expensive and deliberately not throttled to the UI thread: an unbounded
 /// window scans the whole local corpus (macOS's own probe: 14.93 days /
-/// 109,278 messages / 67 seconds). `until_ms` is quantised to the minute
-/// before it becomes the cache key, so the answer can be up to a minute short
-/// of the requested end — the trade that buys a poll-every-60s caller a cache
-/// hit on every call after the first. See `window_usage::cached` for the
-/// full cache shape.
+/// 109,278 messages / 67 seconds). Cached by `from_ms` alone — `until_ms` is
+/// NOT quantised and is NOT part of the cache key (that is macOS's own
+/// module's defect; this port deliberately abandons it, see the
+/// `window_usage` module doc). A poll-every-60s caller instead gets a cache
+/// hit on every call after the first through a source-change-token probe,
+/// with a soundness-gated fast path for `until_ms` growing past what was
+/// scanned. See `window_usage::cached` for the full cache shape.
 #[no_mangle]
 pub extern "C" fn tb_window_usage(from_ms: i64, until_ms: i64) -> *mut c_char {
     guarded("tb_window_usage", || {

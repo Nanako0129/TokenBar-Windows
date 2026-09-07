@@ -122,10 +122,11 @@ char *tb_quota_history(void);
 // (HourlyReport's hour buckets and tb_usage_trace's trailing live window can't
 // slice an arbitrary five-hour cycle). Expensive: an unbounded window scans
 // the whole local corpus, so this is never a call the UI thread should make
-// directly. `until_ms` is quantised to the minute before it becomes the cache
-// key, so the answer can be up to a minute short of the requested end — the
-// trade that gives a poll-every-60s caller a cache hit on every call after the
-// first.
+// directly. Cached by from_ms alone; until_ms is NOT quantised and is NOT
+// part of the cache key. A poll-every-60s caller gets a cache hit on every
+// call after the first through a source-change-token probe, with a
+// soundness-gated fast path for until_ms growing past what was scanned — see
+// the tb_core_ffi window_usage module.
 char *tb_window_usage(int64_t from_ms, int64_t until_ms);
 
 // Release a string returned by any tb_* entry point.
