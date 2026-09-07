@@ -214,11 +214,15 @@ public class WindowEquivalenceTests
         Assert.IsType<WindowEquivalence.Row.Loading>(row);
     }
 
-    // declared is checked before attempted: an undeclared user with no scan
-    // yet still gets the actionable "classify your usage" sentence, not the
-    // passive "still reading" one.
+    // attempted is checked before declared, not the other way around
+    // (round 10): `declared` is computed by every real caller from
+    // `messages`, which is itself the product of this same scan, so while
+    // the scan has not landed `declared` reads false for a reason that has
+    // nothing to do with whether the user actually declared anything. The
+    // undeclared-looking `false` here must not win — the user still gets
+    // "still reading", not the wrong-lane "classify your usage" sentence.
     [Fact]
-    public void UndeclaredWinsOverNotYetAttempted()
+    public void NotYetAttemptedWinsOverUndeclared()
     {
         var row = WindowEquivalence.LiveRow(
             declared: false, attempt: WindowEquivalence.FetchOutcome.NotAttempted,
@@ -227,7 +231,7 @@ public class WindowEquivalenceTests
                 new WindowEquivalence.Sample(1000, 30),
             ],
             []);
-        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
+        Assert.IsType<WindowEquivalence.Row.Loading>(row);
     }
 
     // The third fact a plain `bool attempted` could not carry: the fetch was
@@ -248,10 +252,11 @@ public class WindowEquivalenceTests
         Assert.IsType<WindowEquivalence.Row.ScanFailed>(row);
     }
 
-    // declared is still checked first for the failed outcome too — same rule
-    // as NotAttempted, same reason.
+    // attempted is still checked first for the failed outcome too — same rule
+    // as NotAttempted, same reason: `declared` derived from the same failed
+    // scan's empty `messages` must not masquerade as "nothing declared".
     [Fact]
-    public void UndeclaredWinsOverFailedFetch()
+    public void FailedFetchWinsOverUndeclared()
     {
         var row = WindowEquivalence.LiveRow(
             declared: false, attempt: WindowEquivalence.FetchOutcome.Failed,
@@ -260,7 +265,7 @@ public class WindowEquivalenceTests
                 new WindowEquivalence.Sample(1000, 30),
             ],
             []);
-        Assert.IsType<WindowEquivalence.Row.Undeclared>(row);
+        Assert.IsType<WindowEquivalence.Row.ScanFailed>(row);
     }
 
     [Fact]

@@ -22,15 +22,22 @@
 //! a minute-floored key changes on almost every poll (a poll rarely lands
 //! exactly on the boundary the previous one floored to), each miss bypasses
 //! the source-token check entirely, and `compute` re-runs the full scan.
-//! Keying by `from_ms` and trusting the source-change token instead fixes
-//! this on both counts: a request whose `until_ms` grew past what is cached
-//! reuses that scan's data when the source token is unchanged — nothing new
-//! can have been written to storage without it changing — and a genuine
-//! source change still falls through to a fresh scan. A shrinking `until_ms`
-//! (no production caller produces one today) does NOT trigger a rescan — the
-//! wider cached scan already covers it — but it must never hand back
-//! messages past its own narrower bound either, so a cache hit whose entry
-//! was scanned further than the request is asking for is trimmed to
+//! Keying by `from_ms` instead fixes the miss-every-poll half of that: an
+//! ordinary poll whose `until_ms` did NOT grow past what is already cached
+//! reuses that scan's data once the source-change token confirms storage is
+//! unchanged. It does NOT fix the other half — the token proves only that
+//! storage has not changed since the cached scan ran, and that scan was
+//! itself bounded by its own `until_ms` (`run` passes it straight into
+//! `tokscale_core::get_window_usage_with_source_context`), so it says
+//! nothing about messages in `[cached_until, until_ms)` a WIDER request asks
+//! for; those could have been on disk the whole time, simply past the
+//! earlier scan's own requested bound. A request whose `until_ms` grew past
+//! what is cached must always fall through to a real rescan bounded by the
+//! new, wider `until_ms` — the token cannot stand in for that. A shrinking
+//! `until_ms` (no production caller produces one today) does NOT trigger a
+//! rescan — the wider cached scan already covers it — but it must never hand
+//! back messages past its own narrower bound either, so a cache hit whose
+//! entry was scanned further than the request is asking for is trimmed to
 //! `[from_ms, until_ms)` before it is returned (see `narrow_to_request`).
 
 use serde::Serialize;
@@ -97,25 +104,31 @@ pub(crate) fn cached(
     }
 
     // Either the cache is stale, or the request grew past what was scanned.
-    // Probe with the cache lock released, matching graph_cached: an unchanged
-    // source cannot have produced messages in [cached_until, until_ms) that a
-    // rescan would find, so the already-scanned data still answers a wider
-    // request too, and the probe only refreshes the timestamp (and, when the
-    // request grew, the covered bound) rather than re-running the scan.
-    if let Ok(probe_token) = tokscale_core::local_source_change_token_with_source_context(
-        context.resolved(),
-        &context.parse_options(None, None),
-    ) {
-        if probe_token == token {
-            let mut cache =
-                WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(entry) = cache.get_mut(&key) {
-                entry.0 = Instant::now();
-                if until_ms > entry.2 {
-                    entry.2 = until_ms;
+    // Probe with the cache lock released, matching graph_cached: the token
+    // only proves storage has not changed since THIS entry's scan ran — it
+    // says nothing about what a scan bounded by a wider `until_ms` would
+    // have found, because `run` passes `until_ms` straight into
+    // `tokscale_core::get_window_usage_with_source_context` as the scan's own
+    // upper bound. A message timestamped in `[cached_until, until_ms)` can
+    // have been on disk the whole time, simply past the earlier scan's
+    // requested bound, not past what the source contained. So the fast path
+    // is only valid when the cached entry already covers the request; an
+    // unchanged source still refreshes the timestamp (nothing to rescan for
+    // freshness), but a request that grew past what was scanned always falls
+    // through to a real rescan below.
+    if cached_until >= until_ms {
+        if let Ok(probe_token) = tokscale_core::local_source_change_token_with_source_context(
+            context.resolved(),
+            &context.parse_options(None, None),
+        ) {
+            if probe_token == token {
+                let mut cache =
+                    WINDOW_USAGE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(entry) = cache.get_mut(&key) {
+                    entry.0 = Instant::now();
                 }
+                return Ok(narrow_to_request(data, until_ms, cached_until));
             }
-            return Ok(narrow_to_request(data, until_ms, cached_until));
         }
     }
 
@@ -233,8 +246,10 @@ struct WindowData {
     /// — so a consumer can check what it got against what it asked for
     /// instead of trusting the request echoed the response. `from_ms` never
     /// changes after a scan (it is the cache key); `until_ms` is rewritten by
-    /// `narrow_to_request`/the growing-request branch above to whichever
-    /// bound this exact answer covers.
+    /// `narrow_to_request` above to whichever bound this exact answer covers
+    /// (a narrower request's own bound, never a wider one — a request that
+    /// grew past what was cached always gets a fresh, wider-bounded scan
+    /// instead of a widened stand-in for one).
     from_ms: i64,
     until_ms: i64,
     messages: Vec<Message>,
@@ -307,12 +322,15 @@ mod tests {
             .unwrap()
     }
 
-    // The bug this module exists to fix: DashboardModel polls every 60s with
-    // `until_ms = now` for a fixed `from_ms`, so two consecutive requests
-    // differ only by ordinary polling drift (a few seconds to a minute, not a
-    // source change). Both must be answered from one scan.
+    // The half of the original bug that keying by `from_ms` alone still
+    // fixes: macOS's minute-floored key changes key on almost every 60s poll
+    // even when `until_ms` did not move past what was already scanned, so
+    // every such poll bypassed the source-token check and rescanned. Keying
+    // by `from_ms` means a repeated request for the SAME already-covered
+    // `until_ms` (a poll landing on an unchanged window, or the source-token
+    // probe path when nothing grew) is answered from the one scan.
     #[test]
-    fn polling_drift_reuses_one_scan() {
+    fn repeated_identical_request_reuses_one_scan() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let from_ms = 1_700_000_000_000;
         let key = cache_key(from_ms);
@@ -324,15 +342,45 @@ mod tests {
         let context = test_context("polling-drift");
 
         cached(&context, from_ms, from_ms + 60_000).expect("first window scan");
-        // A later poll's until_ms grew past what was scanned, unlike the old
-        // minute-floored key where this landed inside the same bucket by
-        // coincidence — this is the case the fix has to cover.
-        cached(&context, from_ms, from_ms + 65_000).expect("drifted poll, cache reused");
+        cached(&context, from_ms, from_ms + 60_000).expect("second request, same bound, cache reused");
 
         assert_eq!(
             scan_count(),
             before + 1,
-            "an unchanged source between two ordinary polls must not re-run the scan"
+            "a repeated request for an already-covered until_ms must not re-run the scan"
+        );
+    }
+
+    // Round-10 finding: a request whose `until_ms` grew past what the cached
+    // entry was scanned through used to take the source-token fast path and
+    // widen `entry.2` without ever rescanning — but the token only proves
+    // storage is unchanged since the CACHED scan ran, and that scan was
+    // itself bounded by its own (narrower) `until_ms`, so it says nothing
+    // about messages in [cached_until, until_ms) a wider request asks for.
+    // A widening request must always fall through to a real rescan, even
+    // with an unchanged source.
+    #[test]
+    fn widening_request_forces_a_rescan() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let from_ms = 1_700_000_000_000;
+        let key = cache_key(from_ms);
+        WINDOW_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        let before = scan_count();
+        let context = test_context("widening-request");
+
+        cached(&context, from_ms, from_ms + 60_000).expect("first window scan, cache [from, A)");
+        // Same (unchanged) source, but the request's until_ms grew past what
+        // was scanned — B > A.
+        cached(&context, from_ms, from_ms + 65_000).expect("widened request, unchanged source");
+
+        assert_eq!(
+            scan_count(),
+            before + 2,
+            "a request whose until_ms grew past what was cached must trigger a fresh, \
+             wider-bounded rescan, not a token-refresh stand-in for one"
         );
     }
 

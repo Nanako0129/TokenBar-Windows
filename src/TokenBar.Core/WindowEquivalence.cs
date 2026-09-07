@@ -335,21 +335,38 @@ public static class WindowEquivalence
     /// either parameter does not compile, which is the point: round 4 added
     /// a caller that skipped both, silently, because neither was asked for.
     /// </para>
+    /// <para>
+    /// The <paramref name="attempt"/> switch runs BEFORE the
+    /// <paramref name="declared"/> check, not after. Every caller computes
+    /// <paramref name="declared"/> from <paramref name="messages"/>, and
+    /// <paramref name="messages"/> is itself the product of the very scan
+    /// <paramref name="attempt"/> reports on — so while the scan has not
+    /// landed or has failed, <paramref name="messages"/> is empty for a
+    /// reason that has nothing to do with declaration, and
+    /// <paramref name="declared"/> reads <see langword="false"/> regardless
+    /// of what the caller actually declared. A guard that treats that
+    /// coincidence as authoritative — checking <c>!declared</c> first —
+    /// collapses "still scanning" and "scan failed" into "nothing
+    /// declared", which is a wrong-lane read for the user. Ordering the
+    /// outcome switch first means a non-success outcome always wins before
+    /// the derived, currently-unreliable <paramref name="declared"/> is
+    /// consulted at all (round 10).
+    /// </para>
     /// </summary>
     public static Row LiveRow(
         bool declared, FetchOutcome attempt, IReadOnlyList<Sample> samples, IReadOnlyList<WindowMessage> messages)
     {
-        if (!declared)
-        {
-            return new Row.Undeclared();
-        }
-
         switch (attempt)
         {
             case FetchOutcome.NotAttempted:
                 return new Row.Loading();
             case FetchOutcome.Failed:
                 return new Row.ScanFailed();
+        }
+
+        if (!declared)
+        {
+            return new Row.Undeclared();
         }
 
         if (samples.Count < 2)
