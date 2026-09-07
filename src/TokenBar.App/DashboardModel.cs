@@ -44,19 +44,6 @@ public sealed class DashboardModel
     /// the baseline below.</para></summary>
     private volatile bool _quotaAttempted;
 
-    /// <summary>Whether the MOST RECENT completed quota fetch threw, held
-    /// outside the snapshot for the same cold-start reason
-    /// <see cref="_quotaAttempted"/> is — see that field's own doc comment.
-    /// Kept separate from <c>Quota is null</c>, unlike the equivalent flags
-    /// this branch once carried for the hourly/agents/quota-history/window-
-    /// usage lanes (deleted — see <see cref="Snapshot.HourlyOutcome"/>'s own
-    /// doc comment for why those four were redundant with their payload's
-    /// nullness): this lane's Overview quota-summary card is not one of the
-    /// equivalence-path readers that made the other four moot, so a failed
-    /// read here still needs to render differently from "asked, and there is
-    /// nothing to report".</summary>
-    private volatile bool _quotaFetchFailed;
-
     // Year filter for every lens (macOS DashboardModel.year); null = all
     // time. Fetch lanes capture it per pass and drop slices fetched for a
     // stale filter, so a late old-year payload can never overwrite the new
@@ -316,27 +303,24 @@ public sealed class DashboardModel
         /// derivation.</para></summary>
         public bool QuotaAttempted { get; init; }
 
-        /// <summary>Whether the MOST RECENT attempted quota fetch threw, kept
-        /// separate from whether <see cref="Quota"/> itself is null: a failed
-        /// agent-usage read used to publish <c>QuotaAttempted = true</c> with
-        /// <see cref="Quota"/> left null, which is exactly what a
-        /// completed-and-empty read also looks like, so the Overview
-        /// quota-summary card rendered a failed scan identically to "asked,
-        /// and nothing reported a window". The equivalent flag the
-        /// quota-history/window-usage/hourly/agents lanes once carried was
-        /// deleted (see <see cref="HourlyOutcome"/>'s own doc comment) because
-        /// every reader in the equivalence path already checked its payload
-        /// for data before ever consulting the flag; this lane's own readers
-        /// (<see cref="QuotaSummaryText"/>) are outside that path and were not
-        /// part of this change, so this flag is untouched.</summary>
-        public bool QuotaFetchFailed { get; init; }
-
-        /// <summary>The three facts <see cref="QuotaAttempted"/> and
-        /// <see cref="QuotaFetchFailed"/> together carry, collapsed the same
-        /// way <see cref="QuotaHistoryOutcome"/> collapses its own pair.</summary>
+        /// <summary>The three states this lane can be in, derived the same way
+        /// <see cref="HourlyOutcome"/> is — see that property's doc comment for
+        /// why a separate <c>QuotaFetchFailed</c> flag carried no information.
+        /// <para>The reason it holds for this lane too, which is the one the
+        /// deleted flag's own comment doubted: <see cref="Quota"/> is null
+        /// exactly when there is nothing retained to show. A first fetch that
+        /// throws leaves it null, so the card renders the failure rather than
+        /// "asked, and nothing reported a window"; a completed-and-empty read
+        /// publishes a non-null payload, so that case still reads as
+        /// Succeeded; and a failed retry after a success keeps the earlier
+        /// payload, which is the one case where this derivation deliberately
+        /// answers Succeeded — retained data wins, the same rule
+        /// <see cref="QuotaSummaryText.State"/> and
+        /// <c>QuotaSummaryText.LimitsState</c> already apply by checking their
+        /// payload before ever consulting this.</para></summary>
         public WindowEquivalence.FetchOutcome QuotaOutcome =>
             !QuotaAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : QuotaFetchFailed ? WindowEquivalence.FetchOutcome.Failed
+            : Quota is null ? WindowEquivalence.FetchOutcome.Failed
             : WindowEquivalence.FetchOutcome.Succeeded;
 
         /// <summary>The persisted quota curves, for the Quota lens's two
@@ -989,11 +973,10 @@ public sealed class DashboardModel
                 // seeded Current yet, and this is the only thing that survives
                 // that window.
                 _quotaAttempted = true;
-                _quotaFetchFailed = quota is null;
                 if (quota is not null)
                 {
                     _latestQuota = quota;
-                    Publish(s => s with { Quota = quota, QuotaAttempted = true, QuotaFetchFailed = false }, graph: null);
+                    Publish(s => s with { Quota = quota, QuotaAttempted = true }, graph: null);
                 }
                 else
                 {
@@ -1002,7 +985,7 @@ public sealed class DashboardModel
                     // way that matters: Quota stays null, and a surface that
                     // reads null as "not yet" waits forever for an answer that
                     // already came back.
-                    Publish(s => s with { QuotaAttempted = true, QuotaFetchFailed = true }, graph: null);
+                    Publish(s => s with { QuotaAttempted = true }, graph: null);
                 }
             }
             finally
@@ -1073,7 +1056,6 @@ public sealed class DashboardModel
         new(graph, null, _latestQuota, 0, [], DateTimeOffset.Now, _graphState.CostAuthoritative)
         {
             QuotaAttempted = _quotaAttempted,
-            QuotaFetchFailed = _quotaFetchFailed,
         };
 
     private void Publish(
