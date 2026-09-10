@@ -273,9 +273,7 @@ public sealed class DashboardModel
         /// to draw (retained data wins), so once <see cref="Hourly"/> is
         /// non-null the distinction that flag drew was never read.</summary>
         public WindowEquivalence.FetchOutcome HourlyOutcome =>
-            !HourlyAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : Hourly is null ? WindowEquivalence.FetchOutcome.Failed
-            : WindowEquivalence.FetchOutcome.Succeeded;
+            LazyLaneFold.Outcome(HourlyAttempted, Hourly);
 
         public AgentsReport? Agents { get; init; }
 
@@ -286,9 +284,7 @@ public sealed class DashboardModel
         /// <summary>Same collapse as <see cref="HourlyOutcome"/>, for the
         /// Agents lane, for the same reason.</summary>
         public WindowEquivalence.FetchOutcome AgentsOutcome =>
-            !AgentsAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : Agents is null ? WindowEquivalence.FetchOutcome.Failed
-            : WindowEquivalence.FetchOutcome.Succeeded;
+            LazyLaneFold.Outcome(AgentsAttempted, Agents);
 
         /// <summary>Whether a quota fetch has finished, whatever it returned.
         ///
@@ -319,9 +315,7 @@ public sealed class DashboardModel
         /// <c>QuotaSummaryText.LimitsState</c> already apply by checking their
         /// payload before ever consulting this.</para></summary>
         public WindowEquivalence.FetchOutcome QuotaOutcome =>
-            !QuotaAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : Quota is null ? WindowEquivalence.FetchOutcome.Failed
-            : WindowEquivalence.FetchOutcome.Succeeded;
+            LazyLaneFold.Outcome(QuotaAttempted, Quota);
 
         /// <summary>The persisted quota curves, for the Quota lens's two
         /// cards. A third lazy lens, read straight from the store — it does not
@@ -353,9 +347,7 @@ public sealed class DashboardModel
         /// checks for retained data before ever falling back to this
         /// enum.</summary>
         public WindowEquivalence.FetchOutcome QuotaHistoryOutcome =>
-            !QuotaHistoryAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : QuotaHistory is null ? WindowEquivalence.FetchOutcome.Failed
-            : WindowEquivalence.FetchOutcome.Succeeded;
+            LazyLaneFold.Outcome(QuotaHistoryAttempted, QuotaHistory);
 
         /// <summary>The per-message rows behind the Quota lens's ≈ lines
         /// (5d-1's export). A fourth lazy lens, fetched only once
@@ -406,9 +398,7 @@ public sealed class DashboardModel
         /// </para>
         /// </summary>
         public WindowEquivalence.FetchOutcome WindowUsageOutcome =>
-            !WindowUsageAttempted ? WindowEquivalence.FetchOutcome.NotAttempted
-            : WindowUsage is null ? WindowEquivalence.FetchOutcome.Failed
-            : WindowEquivalence.FetchOutcome.Succeeded;
+            LazyLaneFold.Outcome(WindowUsageAttempted, WindowUsage);
     }
 
     private volatile bool _hourlyWanted;

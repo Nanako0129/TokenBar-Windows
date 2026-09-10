@@ -78,3 +78,94 @@ public class LazyLaneFoldTests
         Assert.False(result.Attempted);
     }
 }
+
+// The retained-data rule, pinned where CI can fail on it.
+//
+// Four commits on this branch replaced "a failed fetch wins over retained
+// data" with "retained data wins, and a failure shows only when there is
+// nothing to show" — the last of them by deleting five per-lane FetchFailed
+// flags and deriving each lane's outcome from `Attempted` plus the payload's
+// nullness instead. That rule then lived in five byte-identical ternaries
+// inside DashboardModel.Snapshot, which no test project compiles, so the
+// only way to check it was to drop a real network connection on a real
+// machine and look at the screen.
+//
+// LazyLaneFold.Outcome is the same rule with a name, in a place a build can
+// reach. These tests are the automated form of that manual check.
+public class LazyLaneOutcomeTests
+{
+    private sealed record Payload(int Rows);
+
+    [Fact]
+    public void ALaneNobodyAskedForIsNotAttemptedWhicheverWayItsPayloadReads()
+    {
+        Assert.Equal(
+            WindowEquivalence.FetchOutcome.NotAttempted,
+            LazyLaneFold.Outcome<Payload>(attempted: false, value: null));
+        Assert.Equal(
+            WindowEquivalence.FetchOutcome.NotAttempted,
+            LazyLaneFold.Outcome(attempted: false, value: new Payload(3)));
+    }
+
+    [Fact]
+    public void AskedWithNothingRetainedIsFailedRatherThanEmpty()
+    {
+        // Sound only because of the invariant either side of this call:
+        // TryFetch returns null solely on a throw, and a completed-and-empty
+        // read publishes a non-null empty payload. So "attempted and null"
+        // cannot mean "asked, and there was genuinely nothing".
+        Assert.Equal(
+            WindowEquivalence.FetchOutcome.Failed,
+            LazyLaneFold.Outcome<Payload>(attempted: true, value: null));
+    }
+
+    [Fact]
+    public void AFailedRetryThatKeptEarlierDataReportsSucceededSoTheCardKeepsDrawingIt()
+    {
+        // This is the case a human could previously only reach by pulling the
+        // network cable: one good fetch, then a throw. Apply retains the
+        // earlier payload; Outcome must then answer Succeeded, because a card
+        // that checks its data first has data to draw and must not be handed a
+        // failure state that blanks it.
+        var good = new Payload(7);
+        var afterThrow = LazyLaneFold.Apply(
+            requested: true, fetched: (Payload?)null, previous: good, previousAttempted: true);
+
+        Assert.Equal(good, afterThrow.Value);
+        Assert.True(afterThrow.Attempted);
+        Assert.Equal(
+            WindowEquivalence.FetchOutcome.Succeeded,
+            LazyLaneFold.Outcome(afterThrow.Attempted, afterThrow.Value));
+    }
+
+    [Fact]
+    public void AColdStartWhoseVeryFirstFetchThrowsIsTheOneCaseThatRendersTheFailure()
+    {
+        // The counterpart of the test above, and the reason Failed still has to
+        // exist: nothing was ever retained, so there is nothing to prefer over
+        // the failure message.
+        var afterThrow = LazyLaneFold.Apply(
+            requested: true, fetched: (Payload?)null, previous: null, previousAttempted: false);
+
+        Assert.Null(afterThrow.Value);
+        Assert.Equal(
+            WindowEquivalence.FetchOutcome.Failed,
+            LazyLaneFold.Outcome(afterThrow.Attempted, afterThrow.Value));
+    }
+
+    [Fact]
+    public void LookingAwayFromALensDoesNotRevertItsOutcomeToNotAttempted()
+    {
+        // LazyLaneActivation un-wants a lane when its lens stops being active,
+        // so `requested` goes back to false on later passes. Attempted has to
+        // survive that, or a lane that already answered would start claiming it
+        // had never been asked.
+        var afterLookingAway = LazyLaneFold.Apply(
+            requested: false, fetched: (Payload?)null, previous: new Payload(2),
+            previousAttempted: true);
+
+        Assert.Equal(
+            WindowEquivalence.FetchOutcome.Succeeded,
+            LazyLaneFold.Outcome(afterLookingAway.Attempted, afterLookingAway.Value));
+    }
+}

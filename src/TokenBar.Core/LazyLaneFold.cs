@@ -66,4 +66,34 @@ public static class LazyLaneFold
         bool requested, T? fetched, T? previous, bool previousAttempted)
         where T : class =>
         new(fetched ?? previous, requested || previousAttempted);
+
+    /// <summary>The three states a lazy lane can be in, derived from the two
+    /// facts a snapshot actually holds. Every <c>DashboardModel.Snapshot</c>
+    /// lane property — Hourly, Agents, Quota, QuotaHistory, WindowUsage —
+    /// answers with this; they carried five byte-identical copies of the
+    /// ternary before it had a name.
+    /// <para>
+    /// <paramref name="value"/> being null is what distinguishes Failed from
+    /// Succeeded, and that is sound because of the two invariants either side
+    /// of this function: <c>TryFetch</c> returns null only when the fetch
+    /// threw, and every lane's legitimately-empty result publishes a non-null
+    /// empty payload rather than null. So "attempted, and nothing is
+    /// retained" is exactly "the most recent attempt threw and no earlier one
+    /// had succeeded". A separate per-lane <c>FetchFailed</c> flag used to
+    /// carry the most recent attempt's own outcome independently of what was
+    /// retained; it was deleted because a failed retry that keeps earlier data
+    /// must render that data, not a failure — the rule every reader on this
+    /// path applies by checking its payload first.
+    /// </para>
+    /// <para>
+    /// Here rather than in <c>DashboardModel</c> for the same reason
+    /// <see cref="Apply"/> is: that file is compiled by no test project, so a
+    /// rule left inline in it can only ever be verified by reading. This is
+    /// the seam that lets the retained-data rule fail a build instead.
+    /// </para></summary>
+    public static WindowEquivalence.FetchOutcome Outcome<T>(bool attempted, T? value)
+        where T : class =>
+        !attempted ? WindowEquivalence.FetchOutcome.NotAttempted
+        : value is null ? WindowEquivalence.FetchOutcome.Failed
+        : WindowEquivalence.FetchOutcome.Succeeded;
 }
