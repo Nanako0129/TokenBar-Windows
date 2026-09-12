@@ -142,7 +142,7 @@ debt is tracked separately.
 
 ### Before the next release
 
-Everything remaining on the blocking list is the same shape: **a number is on screen and it is wrong**, rather than a feature being absent.
+Everything remaining on the blocking list is the same shape: **the app displays something and it is not true** — a figure, a label, or a control — rather than a feature being absent. That distinction is the line, not whether the wrong thing happens to be numeric: two identically-named entries in a menu and a row labelled for a surface it does not cover mislead exactly as a wrong total does, and neither can be filed as a limitation.
 
 | Item | Why it blocks |
 |---|---|
