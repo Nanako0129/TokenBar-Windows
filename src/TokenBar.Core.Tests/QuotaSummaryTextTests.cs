@@ -127,7 +127,7 @@ public class QuotaSummaryTextTests
     public void BurnHeadlineAndDetailPreferRiskOverEta()
     {
         var burn = new BurnWarning("codex", null, "Session", 18.4, "Projected empty in 2h", "≈ 30% run-out risk");
-        Assert.Equal("Codex CLI · Session", QuotaSummaryText.BurnHeadline(burn));
+        Assert.Equal("Codex · Session", QuotaSummaryText.BurnHeadline(burn));
         Assert.Equal("18% ahead of pace · ≈ 30% run-out risk", QuotaSummaryText.BurnDetail(burn));
     }
 

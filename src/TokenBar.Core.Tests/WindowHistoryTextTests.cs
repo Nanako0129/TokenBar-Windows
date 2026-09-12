@@ -41,6 +41,22 @@ public class WindowHistoryTextTests
         Assert.Matches(@"^\d{2}-\d{2} \d{2}:\d{2}$", row.Stamp);
     }
 
+    // The money/tokens dash rule (item 1): a row with real tokens and no price
+    // must say so with a dash, not a false "$0.00" — before this fix Cost() was
+    // bare Format.Usd and printed "$0.00" for exactly this row, contradicting
+    // the same row's own expanded model breakdown a few pixels below it.
+    [Fact]
+    public void TheRowsOwnTotalsDashTheMetricTheyDoNotCarry()
+    {
+        var pricedRow = Assert.Single(WindowHistoryText.Rows([Cycle(10 * Hour, 1)], [Span(1_000, 2.5)]));
+        Assert.Equal("1K", WindowHistoryText.Tokens(pricedRow));
+        Assert.Equal("$2.50", WindowHistoryText.Cost(pricedRow));
+
+        var unpricedRow = Assert.Single(WindowHistoryText.Rows([Cycle(20 * Hour, 1)], [Span(1_000, 0)]));
+        Assert.Equal("1K", WindowHistoryText.Tokens(unpricedRow));
+        Assert.Equal("—", WindowHistoryText.Cost(unpricedRow));
+    }
+
     // Fixed 0…100 on the quota bar, like the window card above it: rescaling to
     // the largest row would make a 3% window and a 58% one look alike, and
     // comparing cycles to each other and to the ceiling is what the bar is for.
@@ -309,14 +325,17 @@ public class WindowHistoryTextTests
     }
 
     // The dash rule: a model attributed by cost alone carries no token count,
-    // and the mirror for a model with tokens and no price.
+    // and the mirror for a model with tokens and no price. "—", not "·" —
+    // ModelTokens/ModelCost now share Format.Tokens/Format.Money with the
+    // collapsed row above them (WindowHistoryText.Tokens/Cost), so the two
+    // can no longer disagree about which placeholder a missing metric gets.
     [Fact]
     public void AModelRowDashesTheMetricItDoesNotCarry()
     {
-        Assert.Equal("·", WindowHistoryText.ModelTokens(Model("cost-only", 0, 5)));
+        Assert.Equal("—", WindowHistoryText.ModelTokens(Model("cost-only", 0, 5)));
         Assert.Equal("$5.00", WindowHistoryText.ModelCost(Model("cost-only", 0, 5)));
         Assert.Equal("1.5K", WindowHistoryText.ModelTokens(Model("token-only", 1_500, 0)));
-        Assert.Equal("·", WindowHistoryText.ModelCost(Model("token-only", 1_500, 0)));
+        Assert.Equal("—", WindowHistoryText.ModelCost(Model("token-only", 1_500, 0)));
     }
 
     // Segments are proportioned by tokens against THIS ROW's own MineTokens,

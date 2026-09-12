@@ -552,7 +552,7 @@ public static class WindowCardText
             cost += message.Cost;
         }
 
-        return ("{0} tokens".Localized(Format.CompactTokens(tokens)), Format.Usd(cost), null);
+        return ("{0} tokens".Localized(Format.Tokens(tokens, cost)), Format.Money(tokens, cost), null);
     }
 
     /// <summary>The messages inside one zone. Zone 0 owns its own lower bound,

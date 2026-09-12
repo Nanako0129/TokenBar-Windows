@@ -1,3 +1,5 @@
+using TokenBar.Core;
+
 namespace TokenBar.App;
 
 /// <summary>The pieces the Overview lens shows, in render order.
@@ -31,6 +33,37 @@ internal enum OverviewCard
     Trace,
     Models,
     Streaks,
+}
+
+/// <summary>
+/// What the Overview lens shows for a given client tab (port of the decision
+/// macOS's <c>OverviewView.card(_:)</c> makes inline). Extracted to a pure
+/// function for the same reason <see cref="OverviewCards"/>'s render order is:
+/// <c>DashboardView.xaml.cs</c>, where the lens is actually built, is WinUI
+/// and compiled by no test project.
+/// <para>
+/// Selecting a single client's tab (rather than Overview) scopes the lens to
+/// that one client: the quota summary headline and the live-session card both
+/// answer "across everything right now", which is not what a single-client
+/// tab asked, so both are suppressed there; the Agent-limits card instead
+/// narrows to that one client's own window rather than showing every agent's
+/// bars underneath a tab that named one of them.
+/// </para>
+/// </summary>
+internal static class OverviewScope
+{
+    /// <summary>The client this Overview render is scoped to, or null for the
+    /// Overview tab itself (every client).</summary>
+    internal static string? SingleClient(string activeClientTab) =>
+        activeClientTab == ClientRegistry.OverviewTab ? null : activeClientTab;
+
+    internal static bool ShowsQuotaSummary(string? singleClient) => singleClient is null;
+
+    internal static bool ShowsTrace(string? singleClient) => singleClient is null;
+
+    /// <summary>The clientId <c>BuildLimits</c> should restrict its rows to,
+    /// or null to show every agent (Overview tab).</summary>
+    internal static string? LimitsClientId(string? singleClient) => singleClient;
 }
 
 internal static class OverviewCards

@@ -786,6 +786,12 @@ public sealed partial class DashboardView : UserControl
     private UIElement BuildOverview(DashboardModel.Snapshot snapshot)
     {
         var stack = new StackPanel { Spacing = 10 };
+        // Which client tab this render answers for — null on the Overview tab
+        // itself, a client id on that client's own tab. See OverviewScope's
+        // own doc comment for why that changes what below renders.
+        var singleClient = OverviewScope.SingleClient(_activeClientTab);
+        var limitsClientId = OverviewScope.LimitsClientId(singleClient);
+
         // Order comes from OverviewCards.RenderOrder, not from the sequence of
         // these calls, so a test can see it. macOS got this same sequence wrong
         // once and its pinned order is what caught it; this arrived at the same
@@ -795,11 +801,20 @@ public sealed partial class DashboardView : UserControl
         {
             var element = card switch
             {
-                OverviewCard.QuotaSummary => BuildQuotaSummary(snapshot),
+                OverviewCard.QuotaSummary => OverviewScope.ShowsQuotaSummary(singleClient)
+                    ? BuildQuotaSummary(snapshot)
+                    : null,
                 OverviewCard.Chart => BuildUsageChartCard(snapshot),
-                OverviewCard.Limits => Ui.Card("Agent limits".Localized(), BuildLimits(snapshot)),
-                // The only optional one: absent when there is no live session.
-                OverviewCard.Trace => BuildTrace(snapshot) is { } trace
+                OverviewCard.Limits => Ui.Card(
+                    limitsClientId is { } cid
+                        ? "{0} limits".Localized(ClientRegistry.ShortName(cid))
+                        : "Agent limits".Localized(),
+                    BuildLimits(snapshot, limitsClientId)),
+                // Absent when there is no live session, or when this tab is
+                // scoped to one client — the trace answers "across everything
+                // right now", which a single-client tab did not ask.
+                OverviewCard.Trace => OverviewScope.ShowsTrace(singleClient)
+                    && BuildTrace(snapshot) is { } trace
                     ? Ui.Card("Live session".Localized(), trace)
                     : null,
                 OverviewCard.Models => Ui.Card("Models".Localized(), BuildModelRows(snapshot, maxRows: 8)),
@@ -1386,8 +1401,14 @@ public sealed partial class DashboardView : UserControl
         return stack;
     }
 
+    /// <summary>Model rows for the current client selection, folded to one row
+    /// per <c>(client, model)</c> first (<see cref="ModelReportFold.ModelLevelEntries"/>)
+    /// — tokscale groups by <c>(client, provider, model)</c>, so a model used
+    /// through two providers would otherwise show twice, inflate the "N
+    /// models" count, and let the larger provider-split component win
+    /// "Favorite model" on Stats instead of the model itself.</summary>
     private List<ModelReportEntry> SelectedModelEntries(DashboardModel.Snapshot snapshot) =>
-        (snapshot.Models?.Entries ?? [])
+        (snapshot.Models?.ModelLevelEntries() ?? [])
             .Where(e => _selectedSet.Contains(ClientRegistry.CanonicalClient(e.Client)))
             .ToList();
 

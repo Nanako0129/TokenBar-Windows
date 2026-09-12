@@ -169,9 +169,9 @@ public static class WindowHistoryText
 
     /// <summary>The row's own numbers, formatted the way the rest of the app
     /// already does.</summary>
-    public static string Tokens(WindowHistoryRow row) => Format.CompactTokens(row.Tokens);
+    public static string Tokens(WindowHistoryRow row) => Format.Tokens(row.Tokens, row.Cost);
 
-    public static string Cost(WindowHistoryRow row) => Format.Usd(row.Cost);
+    public static string Cost(WindowHistoryRow row) => Format.Money(row.Tokens, row.Cost);
 
     public static string Percent(WindowHistoryRow row) =>
         ((int)Math.Round(row.UsedPercent, MidpointRounding.AwayFromZero))
@@ -204,14 +204,15 @@ public static class WindowHistoryText
     /// <summary>A model row's own token figure. Dash, not "0", when the
     /// metric itself is absent — the mirror of <see cref="ModelCost"/>: a
     /// model attributed by cost alone carries no token count, and printing
-    /// "0" states a measurement nobody took.</summary>
-    public static string ModelTokens(QuotaHistoryModel model) =>
-        model.Tokens > 0 ? Format.CompactTokens(model.Tokens) : "·";
+    /// "0" states a measurement nobody took. Shares <see cref="Format.Tokens"/>
+    /// with the collapsed row above it (<see cref="Tokens"/>) rather than its
+    /// own ad hoc rule, so the two never disagree about the same missing
+    /// metric.</summary>
+    public static string ModelTokens(QuotaHistoryModel model) => Format.Tokens(model.Tokens, model.Cost);
 
     /// <summary>The mirror of <see cref="ModelTokens"/>: dash when this model
     /// carried no price.</summary>
-    public static string ModelCost(QuotaHistoryModel model) =>
-        model.Cost > 0 ? Format.Usd(model.Cost) : "·";
+    public static string ModelCost(QuotaHistoryModel model) => Format.Money(model.Tokens, model.Cost);
 
     /// <summary>Shown in place of the model rows when every message this
     /// window's messages resolved out of this subscription — declared
@@ -250,8 +251,8 @@ public static class WindowHistoryText
         // here as a single combined value rather than two dashed fields
         // because this line is prose, not a table column.
         var value = row.OtherTokens > 0 && row.OtherCost > 0
-            ? Format.CompactTokens(row.OtherTokens) + " · " + Format.Usd(row.OtherCost)
-            : row.OtherTokens > 0 ? Format.CompactTokens(row.OtherTokens) : Format.Usd(row.OtherCost);
+            ? Format.CompactTokens(row.OtherTokens) + " · " + Format.UsdOrBelowCent(row.OtherCost)
+            : row.OtherTokens > 0 ? Format.CompactTokens(row.OtherTokens) : Format.UsdOrBelowCent(row.OtherCost);
 
         if (row.OtherHasUnattributed)
         {

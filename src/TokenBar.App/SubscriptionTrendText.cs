@@ -166,6 +166,6 @@ public static class SubscriptionTrendText
     /// price, in the order the selected metric asks for.</summary>
     public static string Amount(long tokens, double cost, ChartMetric metric) =>
         metric == ChartMetric.Cost
-            ? $"{Format.Usd(cost)} · {Format.CompactTokens(tokens)}"
-            : $"{Format.CompactTokens(tokens)} · {Format.Usd(cost)}";
+            ? $"{Format.Money(tokens, cost)} · {Format.Tokens(tokens, cost)}"
+            : $"{Format.Tokens(tokens, cost)} · {Format.Money(tokens, cost)}";
 }

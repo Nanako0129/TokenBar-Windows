@@ -317,7 +317,7 @@ public class UsageAttributionPageTests : IDisposable
     public void TheSuggestionLabelFollowsTheProposedState()
     {
         Assert.Equal(
-            "Suggested: counts toward Codex CLI",
+            "Suggested: counts toward Codex",
             UsageAttributionPage.SuggestionLabel(UsageAttribution.State.Assigned("codex")));
         Assert.Equal(
             "Suggested: not a subscription",

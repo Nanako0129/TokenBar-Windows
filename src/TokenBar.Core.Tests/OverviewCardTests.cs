@@ -51,3 +51,35 @@ public class OverviewCardTests
     public void QuotaSummaryComesFirst() =>
         Assert.Equal(OverviewCard.QuotaSummary, OverviewCards.RenderOrder[0]);
 }
+
+// OverviewScope (item 3): selecting a single client's tab must scope the
+// Overview lens to that client — the quota summary headline and the
+// live-session card both answer "across everything right now", not what a
+// single-client tab asked, and the Agent-limits card must narrow to that one
+// client instead of showing every agent's bars underneath a tab naming one.
+public class OverviewScopeTests
+{
+    [Fact]
+    public void TheOverviewTabItselfIsNotASingleClient() =>
+        Assert.Null(OverviewScope.SingleClient(ClientRegistry.OverviewTab));
+
+    [Fact]
+    public void AClientTabIsItsOwnSingleClient() =>
+        Assert.Equal("gemini", OverviewScope.SingleClient("gemini"));
+
+    [Fact]
+    public void QuotaSummaryAndTraceShowOnlyOnTheOverviewTab()
+    {
+        Assert.True(OverviewScope.ShowsQuotaSummary(null));
+        Assert.False(OverviewScope.ShowsQuotaSummary("gemini"));
+        Assert.True(OverviewScope.ShowsTrace(null));
+        Assert.False(OverviewScope.ShowsTrace("gemini"));
+    }
+
+    [Fact]
+    public void LimitsAreUnrestrictedOnOverviewAndScopedOnAClientTab()
+    {
+        Assert.Null(OverviewScope.LimitsClientId(null));
+        Assert.Equal("gemini", OverviewScope.LimitsClientId("gemini"));
+    }
+}

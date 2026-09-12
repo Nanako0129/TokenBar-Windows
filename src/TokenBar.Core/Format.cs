@@ -49,6 +49,47 @@ public static class Format
     public static string Usd(double amount) =>
         "$" + amount.ToString("F2", CultureInfo.InvariantCulture);
 
+    /// <summary><see cref="Usd"/>, except that a real amount too small to show
+    /// is said to be small rather than rendered as nothing (port of
+    /// Format.swift's usdOrBelowCent).
+    ///
+    /// "$%.2f" turns anything under half a cent into "$0.00", which reads as
+    /// "we measured zero" when the truth is "we measured something below the
+    /// resolution of this format". The sub-cent case ONLY — an exact zero
+    /// still renders "$0.00", which is right for a total and wrong for a
+    /// price nobody could compute; where a token count sits beside the
+    /// amount, use <see cref="Money"/> instead.</summary>
+    public static string UsdOrBelowCent(double amount)
+    {
+        // amount == 0 catches -0.0 too (IEEE equality), which Usd alone
+        // would render "$-0.00".
+        if (amount == 0) { return Usd(0); }
+        return amount is > 0 and < 0.005 ? "<$0.01" : Usd(amount);
+    }
+
+    /// <summary>An amount shown beside a token count (port of Format.swift's
+    /// money(tokens:cost:)).
+    ///
+    /// "$%.2f" cannot distinguish "nothing" from "nothing we could price"
+    /// from "less than half a cent" — all three render "$0.00", and only the
+    /// first is true, so a line reading "5.2M tokens · $0.00" states a price
+    /// nobody has. Usage with no price at all gets a dash; priced usage below
+    /// the format's resolution is said to be small; an exact zero beside no
+    /// tokens is a real total and keeps its "$0.00".</summary>
+    public static string Money(long tokens, double cost) =>
+        cost <= 0 && tokens > 0 ? "—" : UsdOrBelowCent(cost);
+
+    /// <summary>A token count shown beside an amount — the mirror of
+    /// <see cref="Money"/> (port of Format.swift's tokens(tokens:cost:)), and
+    /// the reason it is a function rather than a ternary at each site.
+    ///
+    /// A supported cost-only source reports a price with no token counts, so
+    /// <see cref="CompactTokens"/> renders "0" for usage that certainly
+    /// happened and simply was not measured in tokens. An exact zero beside
+    /// no cost is a real total and keeps its "0".</summary>
+    public static string Tokens(long tokens, double cost) =>
+        tokens <= 0 && cost > 0 ? "—" : CompactTokens(tokens);
+
     /// <summary>Today's contribution-graph day key. tokscale-core buckets days
     /// in the local timezone as %Y-%m-%d, so this must match exactly.</summary>
     public static string TodayKey(DateTime? now = null) =>

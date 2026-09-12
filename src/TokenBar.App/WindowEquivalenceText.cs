@@ -20,7 +20,7 @@ public static class WindowEquivalenceText
     /// <summary>The strip card's single line, tokens and money formatted the
     /// way the rest of the app already does.</summary>
     public static string Line(WindowEquivalence.Row row) =>
-        WindowEquivalence.Text(row, Format.CompactTokens, Format.Usd);
+        WindowEquivalence.Text(row, Format.CompactTokens, Format.UsdOrBelowCent);
 
     /// <summary>The heatmap hover's equivalence lines for one slot.
     /// <para><see cref="Primary"/> is either the <c>≈ token</c> figure (never
@@ -66,13 +66,13 @@ public static class WindowEquivalenceText
                 // sufficient, and the money estimate is the part of the
                 // answer that exists.
                 return new SlotEquivalent(
-                    "~ " + Format.Usd(r.CostPerTenth * share),
+                    "~ " + Format.UsdOrBelowCent(r.CostPerTenth * share),
                     "tokens unavailable, ±{0}%".Localized(r.ErrorPercent));
 
             case WindowEquivalence.Row.Ratio r:
                 return new SlotEquivalent(
                     "≈ " + Format.CompactTokens(ScaledTokens(r.TokensPerTenth, share)),
-                    "~ {0} API-equivalent, ±{1}%".Localized(Format.Usd(r.CostPerTenth * share), r.ErrorPercent));
+                    "~ {0} API-equivalent, ±{1}%".Localized(Format.UsdOrBelowCent(r.CostPerTenth * share), r.ErrorPercent));
 
             case WindowEquivalence.Row.Spread r:
                 // The third sibling of the two branches above, missed when
@@ -86,7 +86,7 @@ public static class WindowEquivalenceText
                     "≈ " + Format.CompactTokens(ScaledTokens(r.LowPerTenth, share))
                         + "–" + Format.CompactTokens(ScaledTokens(r.HighPerTenth, share)),
                     "~ {0} – {1} API-equivalent".Localized(
-                        Format.Usd(r.LowCostPerTenth * share), Format.Usd(r.HighCostPerTenth * share)));
+                        Format.UsdOrBelowCent(r.LowCostPerTenth * share), Format.UsdOrBelowCent(r.HighCostPerTenth * share)));
 
             default:
                 return new SlotEquivalent(NoFigureReason(row), null);
