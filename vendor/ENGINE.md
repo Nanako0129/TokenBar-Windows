@@ -10,12 +10,12 @@ app consumer advances its reviewed pin.
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `6a9de8ca5b35ed96e5c56e219e9b95a98633372d` |
-| TokenBar alignment | `v1.12.0` → `v1.13.1` |
-| Engine alignment | `84e0d66413d4e0d87b734f66f7a848b3bc323258` → `6a9de8ca5b35ed96e5c56e219e9b95a98633372d` |
+| Reviewed pin | `d6512f5ae62c2be6751ed93adb9391ffe3f91579` |
+| TokenBar alignment | `v1.17.0` (engine `8a88602b`) → ahead of it; macOS `main` pins `3eec5846`, both ancestors of this pin |
+| Engine alignment | `4dd3533f15874711283a415db1febf2a60629b12` → `d6512f5ae62c2be6751ed93adb9391ffe3f91579` |
 | Native consumer baseline | `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea` |
 | Windows pre-migration baseline | `68e2541c5e9adb14a47433f8b25e26b0be84d1fc` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/6a9de8ca5b35ed96e5c56e219e9b95a98633372d/UPSTREAM.md) |
+| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/d6512f5ae62c2be6751ed93adb9391ffe3f91579/UPSTREAM.md) |
 
 > **Warning:** Do not edit shared source on a consumer branch. Engine changes
 > must pass review in `tokscale-core`; this repository then advances only the
