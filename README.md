@@ -4,11 +4,16 @@ Windows port of [TokenBar](https://github.com/Nanako0129/TokenBar) — the
 menu-bar/tray AI coding-agent token-usage monitor. Same Rust parsing core,
 a native WinUI 3 shell.
 
-> **Status: v0.1.0 stable released.** Phase 10 completed the unsigned portable
-> release transaction. Download the
-> [`v0.1.0` stable release](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0),
-> or see the [`release contract`](docs/release.md) and
-> [`v0.1.0-preview.1` prerelease history](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0-preview.1).
+> **Status: [`v0.2.2`](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.2.2) is the
+> latest release** — the first installed build produced by CI, across four channels.
+> See [`docs/release-velopack.md`](docs/release-velopack.md) for the packaging contract,
+> [`docs/release.md`](docs/release.md) for the earlier portable one, and the
+> [release list](https://github.com/Nanako0129/TokenBar-Windows/releases) for history.
+>
+> **Unreleased since v0.2.2:** the Quota lens and the usage-attribution subsystem, the
+> equivalence denominator fix, and an engine pin advance that corrects every cost and
+> token figure in the app. Phase 13 below records what shipped into `main` and what is
+> still open before the next release.
 
 ## Architecture
 
@@ -130,6 +135,22 @@ debt is tracked separately.
 | 10 | v0.1.0 stable portable release transaction | ✅ 2026-07-29 — [`v0.1.0`](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0) published as the unsigned portable x64/ARM64 stable release from `aa671e0`, with eight checksum/evidence/smoke/package assets and native `tray-ready` startup evidence under the explicitly approved non-disposable active-profile boundary. See [`docs/release.md`](docs/release.md). |
 | 11 | Velopack/signing/installer/updater | ✅ 2026-08-09 — [`v0.2.2`](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.2.2) published as the first installed release built by CI rather than on a personal machine. Four channels (`win-x64`, `win-x64-lite`, `win-arm64`, `win-arm64-lite`) from a tag-triggered workflow producing a draft plus `SHA256SUMS.txt`; symbols archives retained as workflow artifacts. Verified by installing on clean Windows 11 hosts carrying neither .NET nor the VC++ Redistributable, on x64 and ARM64 — which is how `v0.2.1`'s native-load failure was found (#36). Code signing remains out of scope. See [`docs/release-velopack.md`](docs/release-velopack.md). |
 | 12 | winget/Scoop | ⏭️ Unopened. Blocked on a delivery-form decision for Scoop: it manages `~/scoop/apps/<name>/<version>` with its own `current` junction while Velopack installs into `%LocalAppData%\<packId>`, and neither winget nor Scoop has an equivalent of Homebrew's `auto_updates true`. See [`docs/lite-distribution.md`](docs/lite-distribution.md). |
+
+| 13 | Quota lens, attribution, and the engine reconciliation | 🔶 In `main`, unreleased — **the Quota lens** (overview strip, heatmap, per-client window and history cards, Agent-limits) and the **usage-attribution subsystem** it runs on, merged as [#81](https://github.com/Nanako0129/TokenBar-Windows/pull/81) after a 19-round review that an architecture review ended by deleting a bounded-scan cache rather than tuning it again (net −379 lines across four commits). **The equivalence denominator** ([#85](https://github.com/Nanako0129/TokenBar-Windows/pull/85), issue #82) divided by displacement and range where macOS divides by distance travelled — measured **12x wrong** on real data, and visibly contradicting the heatmap card on the same lens. Ported as one commit with `Consumed`/`RisingRuns`/`DeltaQualifies` and both known-imperfect edges documented; zero existing assertions changed, which is the monotone-rise invariant proving itself. **The engine pin** ([#86](https://github.com/Nanako0129/TokenBar-Windows/pull/86)) had been stranded on a branch 60 commits behind `main`, because `crates/tb_core_ffi` calls `get_window_usage_with_source_context` and that entry point did not exist upstream; [tokscale-core#27](https://github.com/Nanako0129/tokscale-core/pull/27) reconciled two divergent implementations and unblocked it. Six fixes that move displayed figures arrived with it — Codex reasoning tokens were priced twice, Claude `tool_result` input was char-estimated, 1-hour cache writes were billed at the 5-minute rate, and a fallback-priced model returned different costs on two runs of the same data. Measured on one fixed five-hour window: 42 rows / `cost=9.684641` → **26 / `12.186039`**. Existing installs take a one-time cache migration (`CACHE_FORMAT_VERSION` 3→4; Codex parser 4→6, Claude 2→4), migrated rather than discarded — for Claude the cache is the only copy of turns a compacting rewrite removed from the transcript. |
+
+### Before the next release
+
+Everything remaining on the blocking list is the same shape: **a number is on screen and it is wrong**, rather than a feature being absent.
+
+| Item | Why it blocks |
+|---|---|
+| Codex Spark duplicate window labels ([#87](https://github.com/Nanako0129/TokenBar-Windows/pull/87), macOS #286) | two identically-named entries in the tray's quota-source menu is a broken control, not a cosmetic defect |
+| The money/tokens rule | four quota cards print `$0.00` for usage that has no price; the rule exists in one place and not the others, so two columns of one row can contradict each other |
+| Provider-split model rows never folded | the model count is inflated and Stats' "Favorite model" can name a provider shard rather than the model — a superlative users repeat to other people |
+| Client-tab scoping of the Overview lens | selecting one client still shows another's headline and every agent's limit bars |
+| Stale client display names | macOS dropped the form-factor suffix; `Cursor IDE` is factually wrong about what the row covers |
+
+Known limitations that are honest to ship with, because the feature is **absent** rather than lying: no Discord Rich Presence, no per-client tray items, no Simplified Chinese, no menu-bar font colour, no flat-heatmap chart mode, no agent brand icons, no Agent-limits sparkline or chart layout, no Stats attribution-breakdown card, and no multi-account Claude.
 
 ### Provider runtime validation
 
