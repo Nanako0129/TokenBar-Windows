@@ -76,4 +76,42 @@ public class ModelReportFoldTests
                 TotalMessages: 3, TotalCost: 0.3)
                 .ModelLevelEntries()
                 .Select(e => e.Model));
+
+    // The engine emits a bare model key alongside prefixed ones — the
+    // `same-model` case in model_report.rs's own fixture — which arrives as an
+    // empty provider. Kept in the merge it sorts first and renders as a leading
+    // separator, ", nvidia, openai", which ModelTip displays verbatim.
+    [Fact]
+    public void AnUnspecifiedProviderDoesNotBecomeALeadingSeparator()
+    {
+        var folded = new ModelReport(
+            Entries:
+            [
+                Entry("claude", "openai", "same-model", 1, 2, 0.1),
+                Entry("claude", "nvidia", "same-model", 3, 4, 0.2),
+                Entry("claude", "", "same-model", 5, 6, 0.3),
+            ],
+            TotalInput: 9, TotalOutput: 12, TotalCacheRead: 0, TotalCacheWrite: 0,
+            TotalMessages: 3, TotalCost: 0.6).ModelLevelEntries();
+
+        var row = Assert.Single(folded);
+        Assert.Equal("nvidia, openai", row.Provider);
+    }
+
+    // ...but an all-unspecified merge stays empty. The fold must not invent a
+    // provider name for usage the engine did not attribute to one.
+    [Fact]
+    public void ProvidersStayEmptyWhenNoRowNamesOne()
+    {
+        var folded = new ModelReport(
+            Entries:
+            [
+                Entry("claude", "", "same-model", 1, 2, 0.1),
+                Entry("claude", "", "same-model", 3, 4, 0.2),
+            ],
+            TotalInput: 4, TotalOutput: 6, TotalCacheRead: 0, TotalCacheWrite: 0,
+            TotalMessages: 2, TotalCost: 0.3).ModelLevelEntries();
+
+        Assert.Equal(string.Empty, Assert.Single(folded).Provider);
+    }
 }

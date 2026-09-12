@@ -69,8 +69,28 @@ public static class ModelReportFold
         return folded;
     }
 
-    private static string MergedProviders(string first, string second) =>
-        string.Join(
-            ", ",
-            first.Split(", ").Concat(second.Split(", ")).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal));
+    /// <summary>The union of two rows' provider labels, as one sorted list.
+    /// <para>
+    /// Unspecified providers are dropped when any named one survives. The
+    /// engine emits a bare model key alongside prefixed ones — see the
+    /// `same-model` case in <c>crates/tb_core_ffi/src/model_report.rs</c>'s own
+    /// fixture — which reaches here as an empty component. Kept, it sorts
+    /// first and `string.Join` renders it as a leading separator:
+    /// <c>", nvidia, openai"</c>, displayed verbatim by
+    /// <c>DashboardView.ModelTip</c>.
+    /// </para>
+    /// <para>
+    /// An all-unspecified merge still yields the empty string, because that is
+    /// a true statement about those rows — the fold must not invent a provider
+    /// name for usage the engine did not attribute to one.
+    /// </para></summary>
+    private static string MergedProviders(string first, string second)
+    {
+        var parts = first.Split(", ")
+            .Concat(second.Split(", "))
+            .Where(part => !string.IsNullOrWhiteSpace(part))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal);
+        return string.Join(", ", parts);
+    }
 }
