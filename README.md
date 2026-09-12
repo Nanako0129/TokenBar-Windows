@@ -11,9 +11,12 @@ a native WinUI 3 shell.
 > [release list](https://github.com/Nanako0129/TokenBar-Windows/releases) for history.
 >
 > **Unreleased since v0.2.2:** the Quota lens and the usage-attribution subsystem, the
-> equivalence denominator fix, and an engine pin advance that corrects every cost and
-> token figure in the app. Phase 13 below records what shipped into `main` and what is
-> still open before the next release.
+> equivalence denominator fix, and an engine pin advance that corrects the engine's own
+> cost and token calculations — Codex reasoning tokens were priced twice, Claude
+> `tool_result` input was char-estimated, and 1-hour cache writes were billed at the
+> 5-minute rate. Presentation defects above that layer are **not** all fixed; Phase 13
+> below records what shipped into `main`, and "Before the next release" lists the
+> figures still wrong on screen.
 
 ## Architecture
 
@@ -135,7 +138,6 @@ debt is tracked separately.
 | 10 | v0.1.0 stable portable release transaction | ✅ 2026-07-29 — [`v0.1.0`](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0) published as the unsigned portable x64/ARM64 stable release from `aa671e0`, with eight checksum/evidence/smoke/package assets and native `tray-ready` startup evidence under the explicitly approved non-disposable active-profile boundary. See [`docs/release.md`](docs/release.md). |
 | 11 | Velopack/signing/installer/updater | ✅ 2026-08-09 — [`v0.2.2`](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.2.2) published as the first installed release built by CI rather than on a personal machine. Four channels (`win-x64`, `win-x64-lite`, `win-arm64`, `win-arm64-lite`) from a tag-triggered workflow producing a draft plus `SHA256SUMS.txt`; symbols archives retained as workflow artifacts. Verified by installing on clean Windows 11 hosts carrying neither .NET nor the VC++ Redistributable, on x64 and ARM64 — which is how `v0.2.1`'s native-load failure was found (#36). Code signing remains out of scope. See [`docs/release-velopack.md`](docs/release-velopack.md). |
 | 12 | winget/Scoop | ⏭️ Unopened. Blocked on a delivery-form decision for Scoop: it manages `~/scoop/apps/<name>/<version>` with its own `current` junction while Velopack installs into `%LocalAppData%\<packId>`, and neither winget nor Scoop has an equivalent of Homebrew's `auto_updates true`. See [`docs/lite-distribution.md`](docs/lite-distribution.md). |
-
 | 13 | Quota lens, attribution, and the engine reconciliation | 🔶 In `main`, unreleased — **the Quota lens** (overview strip, heatmap, per-client window and history cards, Agent-limits) and the **usage-attribution subsystem** it runs on, merged as [#81](https://github.com/Nanako0129/TokenBar-Windows/pull/81) after a 19-round review that an architecture review ended by deleting a bounded-scan cache rather than tuning it again (net −379 lines across four commits). **The equivalence denominator** ([#85](https://github.com/Nanako0129/TokenBar-Windows/pull/85), issue #82) divided by displacement and range where macOS divides by distance travelled — measured **12x wrong** on real data, and visibly contradicting the heatmap card on the same lens. Ported as one commit with `Consumed`/`RisingRuns`/`DeltaQualifies` and both known-imperfect edges documented; zero existing assertions changed, which is the monotone-rise invariant proving itself. **The engine pin** ([#86](https://github.com/Nanako0129/TokenBar-Windows/pull/86)) had been stranded on a branch 60 commits behind `main`, because `crates/tb_core_ffi` calls `get_window_usage_with_source_context` and that entry point did not exist upstream; [tokscale-core#27](https://github.com/Nanako0129/tokscale-core/pull/27) reconciled two divergent implementations and unblocked it. Six fixes that move displayed figures arrived with it — Codex reasoning tokens were priced twice, Claude `tool_result` input was char-estimated, 1-hour cache writes were billed at the 5-minute rate, and a fallback-priced model returned different costs on two runs of the same data. Measured on one fixed five-hour window: 42 rows / `cost=9.684641` → **26 / `12.186039`**. Existing installs take a one-time cache migration (`CACHE_FORMAT_VERSION` 3→4; Codex parser 4→6, Claude 2→4), migrated rather than discarded — for Claude the cache is the only copy of turns a compacting rewrite removed from the transcript. |
 
 ### Before the next release
