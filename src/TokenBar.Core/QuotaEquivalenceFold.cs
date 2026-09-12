@@ -122,7 +122,8 @@ public static class QuotaEquivalenceFold
                 DeltaPercent: cycle.UsedPercent,
                 SpanTokens: tokens,
                 SpanCost: cost,
-                ObservedFraction: cycle.ObservedFraction));
+                ObservedFraction: cycle.ObservedFraction,
+                RisingRuns: cycle.RisingRuns));
         }
 
         return result;

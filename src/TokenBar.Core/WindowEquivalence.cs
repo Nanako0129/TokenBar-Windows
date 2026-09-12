@@ -89,8 +89,45 @@ public static class WindowEquivalence
     /// <summary>How much relative error the displayed ratio may carry.</summary>
     public const double Tolerance = 0.10;
 
-    /// <summary>Derived, not chosen: ±0.5/Δ ≤ tolerance ⇒ Δ ≥ 5.</summary>
-    public static double MinimumDelta => QuantisationHalfStep / Tolerance;
+    /// <summary>
+    /// Derived, not chosen: ±0.5/Δ ≤ tolerance ⇒ Δ ≥ 5.
+    /// <para>
+    /// Internal on purpose. <see cref="DeltaQualifies"/> is the whole
+    /// admission rule and this is only its single-rise half; a caller
+    /// holding the bare number can write <c>delta &gt;= MinimumDelta</c> and
+    /// silently drop the run scaling, which is exactly what happened at two
+    /// sites in this file (<see cref="LiveRow"/> and <see cref="Aggregate"/>)
+    /// and took a review round to find on macOS. Keeping it internal makes
+    /// that comparison fail to compile outside this assembly rather than
+    /// fail review.
+    /// </para>
+    /// </summary>
+    internal static double MinimumDelta => QuantisationHalfStep / Tolerance;
+
+    /// <summary>
+    /// The one statement of whether a measured consumption is large enough
+    /// to divide by. <see cref="MinimumDelta"/> is the single-rise delta at
+    /// which the ±0.5 quantisation reaches <see cref="Tolerance"/>; a delta
+    /// summed over several rises carries that uncertainty once per rise, so
+    /// it has to clear the bar once per rise to make the same claim.
+    /// <para>
+    /// Two sites admit cycles — <see cref="LiveRow"/> and
+    /// <see cref="Aggregate"/> — and this rule used to be written out at
+    /// each of them. Scaling it at one and not the other is how
+    /// <c>[0, 3, 0, 3]</c> came to be rejected by the live row as two
+    /// sub-threshold rises and admitted by the pooled path as one 6-point
+    /// cycle in the same build. It lives here so that cannot recur.
+    /// </para>
+    /// <para>
+    /// <paramref name="delta"/> &gt; 0 is load-bearing, not defensive:
+    /// <see cref="QuotaHistoryFold.Consumed"/> returns a positive value
+    /// only when at least one rise exists, so a positive delta implies
+    /// <paramref name="runs"/> &gt;= 1 and the product below cannot be
+    /// zero. Without the guard, <paramref name="runs"/> == 0 would make the
+    /// threshold zero and admit a cycle that never moved.
+    /// </para>
+    /// </summary>
+    public static bool DeltaQualifies(double delta, int runs) => delta > 0 && delta >= MinimumDelta * runs;
 
     /// <summary>
     /// One row as displayed. An abstract record with sealed nested cases —
@@ -404,15 +441,36 @@ public static class WindowEquivalence
 
         var first = samples[0];
         var last = samples[^1];
-        var delta = last.UsedPercent - first.UsedPercent;
+
+        // The distance the readings travelled, not `last - first`. A reset
+        // inside the span returns them to zero, and the displacement then
+        // collapses while the numerator below keeps every message from both
+        // sides of it — which is how a window that consumed 93 points came
+        // to divide by 8 and report eleven times the true rate. One
+        // statement of the rule, shared with the pooled path in
+        // QuotaHistoryFold.Consumed.
+        var readings = samples.Select(sample => sample.UsedPercent).ToList();
+        var delta = QuotaHistoryFold.Consumed(readings);
         if (delta <= 0)
         {
             return new Row.NotMoved();
         }
 
+        // Every rise `Consumed` summed was quantised on its own, so both the
+        // error quoted below and the admission bar scale with how many
+        // there were. MinimumDelta is the single-rise delta at which the
+        // error reaches Tolerance; a group that crossed a reset has to
+        // clear it once per rise to make the same claim. Without this,
+        // `[0, 3, 0, 3]` read as a 6-point measurement at ±8% — two rises
+        // of 3 that each fell short, presented as one that did not.
+        var runs = QuotaHistoryFold.RisingRuns(readings);
+
         // Numerator and denominator must cover the same interval or the ratio
         // means nothing — hence the span between samples, not the whole
-        // window.
+        // window. Held exactly at the ends and approximately in the middle:
+        // a declining interval inside the span contributes to the numerator
+        // and not to Consumed — see QuotaHistoryFold.Consumed for why that
+        // is not fixed here.
         long tokens = 0;
         var cost = 0.0;
         foreach (var message in messages)
@@ -426,7 +484,7 @@ public static class WindowEquivalence
             cost += message.Cost;
         }
 
-        var error = RoundedInt(QuantisationHalfStep / delta * 100);
+        var error = RoundedInt(QuantisationHalfStep * runs / delta * 100);
 
         // "Recorded" means either kind of evidence. A provider row can carry a
         // cost with no token components, and the pooled path already admits
@@ -438,7 +496,7 @@ public static class WindowEquivalence
             return new Row.Unaccounted(delta);
         }
 
-        if (delta < MinimumDelta)
+        if (!DeltaQualifies(delta, runs))
         {
             return new Row.Insufficient(delta, error);
         }
@@ -473,7 +531,13 @@ public static class WindowEquivalence
     /// <param name="SpanCost">Same restriction as <paramref name="SpanTokens"/>.</param>
     /// <param name="ObservedFraction">The cycle's own
     /// <see cref="QuotaCycle.ObservedFraction"/>.</param>
-    public sealed record Cycle(double DeltaPercent, long SpanTokens, double SpanCost, double ObservedFraction);
+    /// <param name="RisingRuns">How many separately measured rises
+    /// <paramref name="DeltaPercent"/> sums; <see cref="DeltaQualifies"/>
+    /// scales its admission bar by it. Defaults to 1 so every existing
+    /// caller — a cycle whose readings only rise is exactly one run — still
+    /// compiles and still gets the right answer.</param>
+    public sealed record Cycle(
+        double DeltaPercent, long SpanTokens, double SpanCost, double ObservedFraction, int RisingRuns = 1);
 
     /// <summary>Below this the cycle was barely witnessed, so its delta
     /// describes a stretch the app mostly missed. <see cref="QuotaCycle"/>
@@ -553,7 +617,7 @@ public static class WindowEquivalence
         // that as "none of it recorded on this machine", which is false about
         // the one thing it could see.
         var admitted = cycles.Where(cycle =>
-            cycle.DeltaPercent >= MinimumDelta
+            DeltaQualifies(cycle.DeltaPercent, cycle.RisingRuns)
             && cycle.ObservedFraction >= MinimumObservedFraction
             && (cycle.SpanCost > 0 || cycle.SpanTokens > 0)).ToList();
 
@@ -582,9 +646,14 @@ public static class WindowEquivalence
                 return new Row.Unaccounted(anyMovement);
             }
 
+            // One half-step per RISE, summed over every cycle offered — not
+            // per cycle. A merged cycle carries several quantised rises and
+            // its error is that many half-steps wide. Over `cycles`, not
+            // `admitted`: inside this branch `admitted` is empty by
+            // construction, and a sum over it would quote ±0%.
             return new Row.Insufficient(
                 anyMovement,
-                RoundedInt(QuantisationHalfStep * cycles.Count / anyMovement * 100));
+                RoundedInt(QuantisationHalfStep * cycles.Sum(cycle => cycle.RisingRuns) / anyMovement * 100));
         }
 
         // Count, not size: these cycles each cleared `MinimumDelta` on their

@@ -485,4 +485,95 @@ public class QuotaHistoryFoldTests
         Assert.Null(active.ResetAtMs);
         Assert.Single(active.Samples);
     }
+
+    // ── Consumed / RisingRuns (distance travelled, not range or displacement) ──
+
+    // The invariant that makes this whole change safe: a cycle whose readings
+    // only rise has runs = 1, and Consumed equals both the range (max - min)
+    // and the displacement (last - first). SpanAndPeakAreNotInterchangeable
+    // above already pins this — [40, 70, 100] still reads 60 — this states it
+    // directly for readings alone.
+    [Fact]
+    public void ConsumedOnAPurelyRisingSeriesEqualsRangeAndDisplacement()
+    {
+        double[] readings = [40, 70, 100];
+        Assert.Equal(60, QuotaHistoryFold.Consumed(readings));
+        Assert.Equal(1, QuotaHistoryFold.RisingRuns(readings));
+    }
+
+    // The doc comment's own worked example: a rise that only undoes a
+    // provider's downward correction still counts in full. Known
+    // overstatement — 45 where 40 was actually consumed — and not fixable
+    // from the readings alone.
+    [Fact]
+    public void ConsumedOverstatesWhenARiseUndoesADownwardCorrection()
+    {
+        double[] readings = [0, 40, 35, 40];
+        Assert.Equal(45, QuotaHistoryFold.Consumed(readings));
+        Assert.Equal(2, QuotaHistoryFold.RisingRuns(readings)); // 0->40, then 35->40
+    }
+
+    // The distinguishing case that disagreed between the live row and the
+    // pooled aggregate on macOS before this fix: two 3-point rises separated
+    // by a decline back to zero. Consumed sums both rises (6), but each rise
+    // is separately quantised, so RisingRuns must report 2, not 1 — a single
+    // 6-point measurement at +/-0.5 is a materially different claim from two
+    // 3-point measurements at +/-0.5 each.
+    [Fact]
+    public void TwoSeparatedRisesCountAsTwoRunsNotOne()
+    {
+        double[] readings = [0, 3, 0, 3];
+        Assert.Equal(6, QuotaHistoryFold.Consumed(readings));
+        Assert.Equal(2, QuotaHistoryFold.RisingRuns(readings));
+    }
+
+    // A plateau inside a rise is transparent: it neither starts nor ends a
+    // run. Deltas here are +3, 0, 0, +3 — one continuous rise, not two.
+    [Fact]
+    public void APlateauInsideARiseIsOneRunNotTwo()
+    {
+        double[] readings = [0, 3, 3, 3, 6];
+        Assert.Equal(6, QuotaHistoryFold.Consumed(readings));
+        Assert.Equal(1, QuotaHistoryFold.RisingRuns(readings));
+    }
+
+    // RisingRuns is NOT `1 + declines`. A single rise followed by a trailing
+    // decline is one run that contributed a rise, not two — macOS's first
+    // cut counted declines instead and got this case wrong.
+    [Fact]
+    public void RisingRunsIsNotOnePlusDeclines()
+    {
+        double[] readings = [0, 10, 5];
+        Assert.Equal(10, QuotaHistoryFold.Consumed(readings));
+        Assert.Equal(1, QuotaHistoryFold.RisingRuns(readings));
+    }
+
+    [Fact]
+    public void ReadingsThatNeverRiseHaveZeroRisingRuns()
+    {
+        double[] readings = [10, 10, 5, 5];
+        Assert.Equal(0, QuotaHistoryFold.Consumed(readings));
+        Assert.Equal(0, QuotaHistoryFold.RisingRuns(readings));
+    }
+
+    // Cycles() itself, not just the standalone functions: a cycle whose
+    // middle reading dips (a correction, not a reset) must report the
+    // travelled distance and the run count Consumed/RisingRuns compute, not
+    // the old range (40) or displacement (40) — both of which this exact
+    // reading sequence would have agreed on before this change.
+    [Fact]
+    public void CyclesReportsTravelledDistanceAndRunsAcrossADecline()
+    {
+        var cycle = Assert.Single(QuotaHistoryFold.Cycles(
+        [
+            Sample(ResetAt, ResetAt - FiveHours + 600, 0),
+            Sample(ResetAt, ResetAt - FiveHours + 1_200, 40),
+            Sample(ResetAt, ResetAt - FiveHours + 1_800, 35),
+            Sample(ResetAt, ResetAt - 600, 40),
+        ]));
+
+        Assert.Equal(45, cycle.UsedPercent); // 40 + max(0, -5) + 5 = 45, not 40
+        Assert.Equal(2, cycle.RisingRuns);
+        Assert.Equal(40, cycle.PeakUsedPercent); // peak is untouched by this change
+    }
 }
