@@ -749,9 +749,24 @@ public sealed record AgentUsageSnapshot(
         }
     }
 
-    /// <summary>Order-preserving unique card view; first duplicate wins.</summary>
+    /// <summary>
+    /// Order-preserving card view with the provider's labels exactly as they
+    /// arrived; first duplicate card ID wins.
+    ///
+    /// For the pre-v3 label migration in <c>QuotaResolver</c>, and only for it
+    /// — everything else wants <c>UniqueCardWindows</c> (the qualified view,
+    /// an extension property in <c>TokenBar.Core</c> because it needs the
+    /// localization vocabulary this project does not depend on). That
+    /// migration accepts a persisted label only when ONE window carries it,
+    /// and qualification can break a tie it is supposed to refuse: two windows
+    /// sharing a label where only one has duration evidence — a sibling still
+    /// in <c>learningDuration</c> — leave exactly one raw label behind, so a
+    /// persisted label that matched both before would now migrate to whichever
+    /// window happened to lack a duration. Ambiguity is a property of what the
+    /// provider sent, so it has to be read from what the provider sent.
+    /// </summary>
     [JsonIgnore]
-    public IReadOnlyList<UsageWindow> UniqueCardWindows
+    public IReadOnlyList<UsageWindow> RawCardWindows
     {
         get
         {

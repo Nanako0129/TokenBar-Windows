@@ -42,7 +42,15 @@ public static class QuotaResolver
             return selection;
         }
 
-        var windows = agent.UniqueCardWindows;
+        // The RAW card view: a persisted pre-v3 selection holds the label the
+        // provider sent, and whether that label was ambiguous is a fact about
+        // what the provider sent. UniqueCardWindows qualifies a repeated
+        // label with its window's duration, which can leave exactly one
+        // window still carrying the raw text and migrate a selection that
+        // used to match two. Card IDs are identical in both views, so the
+        // value this returns is unchanged for every selection that was
+        // already unique.
+        var windows = agent.RawCardWindows;
         var exact = windows.FirstOrDefault(w => w.CardId == parsed.Value.Value);
         if (exact is not null)
         {

@@ -121,18 +121,37 @@ public sealed record UsagePace(
     /// lookup key.</summary>
     public static string NowText => "duration.now".LocalizedKey("now");
 
+    /// <summary>How long until <paramref name="reset"/>, under the countdown's
+    /// own rounding: seconds are floored, then minutes are taken UP. Null once
+    /// the reset has passed.
+    ///
+    /// Not inlined into <see cref="ResetText"/>, because a second caller names
+    /// a window by the same span — the qualifier for a repeated card label in
+    /// <c>AgentUsageQualifier</c>. <see cref="DurationText"/> alone rounds to
+    /// the NEAREST minute, so deriving the span twice put "4h 59m" in a row's
+    /// name beside "Resets in 5h" in the same row for the first half of every
+    /// minute. One contract, one implementation.</summary>
+    public static string? SpanText(DateTimeOffset reset, DateTimeOffset now)
+    {
+        var seconds = Math.Floor(UnixSeconds(reset) - UnixSeconds(now));
+        if (seconds <= 0)
+        {
+            return null;
+        }
+
+        // Truncation toward zero is the ceiling here because seconds > 0,
+        // matching Swift's Int((seconds + 59) / 60) on a positive Double.
+        var minutes = (int)((seconds + 59) / 60);
+        return DurationText(minutes * 60d);
+    }
+
     /// <summary>Localized countdown matching the Rust <c>resetText</c> rounding
     /// contract, ported from Format.swift's resetText(for:now:). The payload's
     /// own <c>resetText</c> is a compatibility field the engine renders in
     /// English; deriving the visible text from the structured timestamp instead
     /// is what lets the quota card follow the selected UI language. Returns
     /// null when the timestamp will not parse, so provider metadata that is not
-    /// a countdown keeps its own text.
-    ///
-    /// Two roundings, both load-bearing: floor on the raw seconds, then a
-    /// ceiling to whole minutes before DurationText applies its own
-    /// away-from-zero rounding. One second remaining must read as a minute, not
-    /// as "now".</summary>
+    /// a countdown keeps its own text.</summary>
     public static string? ResetText(string resetsAt, DateTimeOffset now)
     {
         if (ParseRfc3339(resetsAt) is not { } reset)
@@ -140,16 +159,9 @@ public sealed record UsagePace(
             return null;
         }
 
-        var seconds = Math.Floor(UnixSeconds(reset) - UnixSeconds(now));
-        if (seconds <= 0)
-        {
-            return "Resets now".Localized();
-        }
-
-        // Truncation toward zero is the ceiling here because seconds > 0,
-        // matching Swift's Int((seconds + 59) / 60) on a positive Double.
-        var minutes = (int)((seconds + 59) / 60);
-        return "Resets in {0}".Localized(DurationText(minutes * 60d));
+        return SpanText(reset, now) is { } span
+            ? "Resets in {0}".Localized(span)
+            : "Resets now".Localized();
     }
 
     /// <summary>The countdown to show for a window: derived from the
