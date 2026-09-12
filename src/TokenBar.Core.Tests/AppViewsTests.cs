@@ -15,7 +15,8 @@ public class AppViewsTests
         Assert.Contains(AppView.Agents, AppViews.Toggleable);
     }
 
-    // Declaration order is tab order, and it is also the Ctrl+1..9 order:
+    // Declaration order is tab order, and it is also the numeric accelerator
+    // order (Ctrl+1..N for N values, eight today):
     // DashboardView binds one accelerator per value of the enum at
     // construction, so the two can only agree while this holds. Pinned for the
     // same reason OverviewCards.RenderOrder is.

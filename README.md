@@ -1,22 +1,62 @@
-# TokenBar for Windows
+# Syrtis
 
 Windows port of [TokenBar](https://github.com/Nanako0129/TokenBar) — the
 menu-bar/tray AI coding-agent token-usage monitor. Same Rust parsing core,
 a native WinUI 3 shell.
 
-> **Status: [`v0.2.2`](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.2.2) is the
-> latest release** — the first installed build produced by CI, across four channels.
-> See [`docs/release-velopack.md`](docs/release-velopack.md) for the packaging contract,
-> [`docs/release.md`](docs/release.md) for the earlier portable one, and the
-> [release list](https://github.com/Nanako0129/Syrtis-Windows/releases) for history.
->
-> **Unreleased since v0.2.2:** the Quota lens and the usage-attribution subsystem, the
-> equivalence denominator fix, and an engine pin advance that corrects the engine's own
-> cost and token calculations — Codex reasoning tokens were priced twice, Claude
-> `tool_result` input was char-estimated, and 1-hour cache writes were billed at the
-> 5-minute rate. Presentation defects above that layer are **not** all fixed; Phase 13
-> below records what shipped into `main`, and "Before the next release" lists the
-> figures still wrong on screen.
+Syrtis is the name this port ships under; the macOS build is still called
+TokenBar. Solution and namespace identifiers remain `TokenBar.*` — they are
+internal, and the Velopack package id `Nyanako.Syrtis` is deliberately
+independent of both so a rename cannot move an installed app.
+
+> **Status: [`v0.3.0`](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.3.0) is the
+> latest release.** See the [release list](https://github.com/Nanako0129/Syrtis-Windows/releases)
+> for history, [`docs/release-velopack.md`](docs/release-velopack.md) for the current packaging
+> contract, and [`docs/release.md`](docs/release.md) for the earlier portable one.
+
+## Features
+
+- **Eight lenses** in the flyout: Overview, Quota, Models, Monthly, Daily, Hourly, Stats, Agents —
+  each hideable except Overview and Models, with Ctrl+1..8 accelerators.
+- **Quota lens** — overview strip, heatmap, per-client window and history cards, and an
+  Agent-limits view, backed by a usage-attribution subsystem that resolves which client
+  consumed which window.
+- **Tray icon**, seven display modes (today/total tokens, today/total cost, tokens-per-minute,
+  quota-remaining, hidden), drawn directly into the icon with bars/ring/popsicle gauge styles.
+- **3D contribution graph** — a real-time D3D11-rendered activity grid with orbit/pan/zoom.
+- **In-app updates** — a Sparkle-style update dialog backed by Velopack.
+- **Traditional Chinese** UI, alongside English.
+
+## Install
+
+Download the installer for your architecture from the
+[releases page](https://github.com/Nanako0129/Syrtis-Windows/releases). Four channels, permanent
+and non-interchangeable once installed:
+
+| Channel | .NET runtime |
+|---|---|
+| `win-x64` | Bundled (Full) |
+| `win-x64-lite` | Acquired at install time |
+| `win-arm64` | Bundled (Full) |
+| `win-arm64-lite` | Acquired at install time |
+
+Full is the safe default; Lite is smaller to download but only wins on a machine that already has
+.NET 10 installed. See [`docs/lite-distribution.md`](docs/lite-distribution.md) for the full
+channel/package-identity contract.
+
+## Supported providers
+
+The app reads quota for five agent CLIs, using credentials already written to disk by a login
+you have performed. That is usually the provider's own CLI — with one exception worth knowing
+before you go looking for a missing card:
+
+| Provider | Mechanism |
+|---|---|
+| Claude | OAuth via the OS keychain / Claude Code login credentials |
+| Codex | OAuth via `~/.codex/auth.json` (`$CODEX_HOME` honored) |
+| GitHub Copilot | OAuth via **opencode's** `auth.json` — signing into the GitHub Copilot CLI alone is not enough, and the card is omitted rather than shown as an error |
+| Grok | OAuth via `~/.grok/auth.json` |
+| Antigravity | OAuth or local IDE credentials, whichever the installed client itself uses |
 
 ## Architecture
 
@@ -36,6 +76,8 @@ Windows native packaging is opt-in for `TokenBar.App`, `TokenBar.Smoke`, and
 `target/release` DLL.
 
 ## Build
+
+Prereqs: Rust `1.96.1`, .NET SDK `10.0.301`, PowerShell `7.0+`; on Windows the MSVC toolchain.
 
 ```bash
 git submodule update --init --recursive
@@ -71,8 +113,8 @@ build, publish, ZIP creation, and structure/version/PE/hash checks. Use a clean
 Git checkout and a new empty output root on a Windows host or CI runner:
 
 ```powershell
-.\scripts\build-app-artifact.ps1 -Rid win-x64 -OutputRoot "$env:RUNNER_TEMP\tokenbar-phase10-x64"
-.\scripts\build-app-artifact.ps1 -Rid win-arm64 -OutputRoot "$env:RUNNER_TEMP\tokenbar-phase10-arm64"
+.\scripts\build-app-artifact.ps1 -Rid win-x64 -OutputRoot "$env:RUNNER_TEMP\tokenbar-x64"
+.\scripts\build-app-artifact.ps1 -Rid win-arm64 -OutputRoot "$env:RUNNER_TEMP\tokenbar-arm64"
 ```
 
 The cross-language CrossCheck stays platform-neutral and has no Platform/RID:
@@ -86,92 +128,20 @@ TZ=Asia/Taipei dotnet run \
 ```
 
 CI publishes only short-retention Smoke test-harness artifacts and sanitized
-Phase 10 App evidence/checksums. Hosted CI never uploads App ZIP/EXE/DLL files.
-The hosted runners perform structure, version, PE, and hash checks; they do not
-claim an interactive WinUI startup gate.
+App evidence/checksums. Hosted CI never uploads App ZIP/EXE/DLL files. The
+hosted runners perform structure, version, PE, and hash checks; they do not
+claim an interactive WinUI startup gate. `cargo fmt` is not currently a
+repository CI gate.
 
-The M19-B1 real-ARM64 result is historical evidence from a separate Windows
-ARM64 gate on 2026-07-27: 351 Rust tests, 12 provider-v3 CrossCheck cases, PE
-checks, and synthetic WinUI startup were recorded in [the public issue
-comment](https://github.com/Nanako0129/TokenBar/issues/45#issuecomment-5091092629).
-That result does not satisfy or replace the Phase 10 published-artifact x64 and
-ARM64 gates. The published `v0.1.0-preview.1` x64/ARM64 startup-smoke used the
-active `Nanako` profile with outbound blocked under explicit approval; it was a
-non-disposable exception, not disposable isolation. For stable, the default is
-a disposable Windows VM/account with production credentials absent and outbound
-blocked; a non-disposable exception needs separate explicit authorization, must
-be labelled, and must never be called isolated. The published `v0.1.0` stable
-x64/ARM64 startup-smoke used the separately authorized active `Nanako` profile
-with executable-specific outbound blocking under those non-disposable terms;
-both runs reached `tray-ready` and exited with task result `0`.
+See [`docs/verification-history.md`](docs/verification-history.md) for the
+historical gate records (which specific runs proved which claim, and when).
 
-Prereqs: Rust `1.96.1`, .NET SDK `10.0.301`, PowerShell `7.0+`; on Windows the
-MSVC toolchain.
+## Known limitations
 
-Windows CI runs the x64 Rust workspace tests, Core.Tests, WinUI App, and Smoke
-from their project roots (the solution has no x64 configuration), then executes
-both the all-entry-point and strict relocated-`CODEX_HOME` Smoke checks with
-network and host-profile isolation. It runs the no-Platform/RID CrossCheck,
-publishes and executes the self-contained `smoke-win-x64` bundle, and uploads
-that test-harness artifact. The `arm64-cross` job only cross-builds and packages
-the native DLL and Smoke bundle, and uploads the test-harness artifact plus
-sanitized Phase 10 evidence/checksums; it is not an ARM64 runtime test. The provider-pace branch
-passed local command-equivalent x64 and ARM64 gates plus fresh review on
-2026-07-19; GitHub PR #3 preserves its remote CI and review record. `cargo fmt`
-is not currently a repository CI gate; its existing workspace-wide formatting
-debt is tracked separately.
-
-## Progress
-
-| Phase | Scope | Status |
-|---|---|---|
-| 0 | Repo bootstrap + P/Invoke smoke | ✅ 2026-07-02 — C# ↔ Rust cdylib seam verified on macOS (`tb_probe` → 84k messages), CI on windows-latest |
-| 1 | Rust Windows fixes (HOME→dirs, TLS, antigravity) | ✅ 2026-07-02 — all 10 entry points verified on a real x64 Windows box against real session data (271 msgs parsed, pricing fetched over rustls, quota windows decoded) |
-| 2 | 3D contribution graph spike | ✅ 2026-07-02 — GO (Vortice/D3D11 instancing verified on real hardware, ~0.2ms/frame; the product SwapChainPanel lifecycle was completed in Phase 8). See `spike/RESULTS.md` |
-| 3 | TokenBar.Core C# port + cross-check vs Swift | ✅ 2026-07-19 — all modules ported (incl. the v1.4.0 delta and provider pace v3), 270 unit tests green; **fixture cross-check vs Swift done** (`crosscheck/`: 116 legacy cases plus 12 provider-v3 cases, zero material difference; the original Format pass caught 4 real printf-rounding divergences — pre-round deleted, .NET Core F-formats are IEEE-correct) |
-| 4 | Tray skeleton + flyout window | ✅ 2026-07-02 — tray icon + Open/Quit menu, borderless rounded Acrylic flyout (translucent while unfocused, topmost), PerMonitorV2 DPI, show/hide slide, single instance, taskbar-edge placement, polling engine. SwapChainPanel lifecycle was completed in Phase 8; compositor-native animation remains in the polish backlog |
-| 5 | Overview lens + polling engine | ✅ 2026-07-02 — five cards (stacked chart + wrap legend, agent limits with live pace markers, trace, models, streaks), instant styled hover tooltips, WH_MOUSE_LL wheel path |
-| 6 | Remaining five lenses | ✅ 2026-07-02 — lens router with 160ms crossfade transitions; Models (full list + pricing hint), Daily (tap drill-down), Hourly (Timeline/Profile + show-more), Stats, Agents; lazy report loading. Verified by the user against the full synced history (5.6B tokens / 70 days). Cold first paint 11.1s → **3.8s** (warm 3.2s) after the EcoQoS/priority fix + mac-parity slow lane: schtasks-launched processes inherit BELOW_NORMAL and Windows 11 throttles tray apps (EcoQoS) — the app now parses at normal QoS and returns to power-friendly throttling when idle; graph ∥ modelReport run concurrently and agentUsage no longer gates the first snapshot (both mirror the macOS DashboardModel) |
-| 7 | Settings + tray extras | 🔶 feature-complete (macOS parity) — settings store (`%APPDATA%\TokenBar\settings.json`, atomic, unit-tested) with the year filter, chart persistence, manual-refresh spinner; tray: seven modes with the value drawn into the icon (tooltip carries the full string), bars/ring/popsicle gauges (macOS geometry verbatim), cat/parrot animation (HICON-cached, ~0.5% of a core at idle), full context menu with live quota sources; Mica settings window (ten sections, live keys, autostart via HKCU Run honoring StartupApproved); flyout footer gear+Quit; in-flyout Ctrl-shortcut set. Global `RegisterHotKey` dropped: the macOS reference ships no global shortcut, so it's not a parity gap (parked as an optional Windows-only nicety in Phase 9). Verification: icon gallery + live tray screenshots + synthesized input on the x64 box; the non-quota Settings flow passed the 125% DPI interactive gate on 2026-07-17, including live 520→600 DIP flyout resizing, persistence, singleton hide/reopen, autostart restoration, and the 48ms entrance-animation race. The separate 150% pass also passed on 2026-07-17 in an isolated RDP session: both windows reported 144 DPI, 520→600 DIP mapped immediately to 780→900 physical px, and the persisted height survived a process restart. A 33-active-day synthetic fixture supported user-checked 3D hover/orbit/zoom/Fit/Reset, and the Flyout Acrylic was subsequently verified with loaded 3D content in both light and dark themes at 200% DPI |
-| 8 | 3D integration | ✅ 2026-07-17 — product card renders the real contribution grid with macOS-parity colors/lighting (sRGB-correct opaque faces), 4× MSAA, render-on-demand orbit/pan/zoom, persisted `tokenbar.orbit.v1`, Fit/Reset, custom ray-picked tooltip, and a persisted 2D/3D toggle. Real x64 checks include corrected pointer/DPI alignment, 2D↔3D in 6.7–20.1ms, a 241-frame drag trace, idle no-present, the 50-cycle lifecycle gate, and a retained 60-minute soak: 8230 cycles, `created=8230 released=8230 removed=0 errors=0`, 3600.7s elapsed, with private-memory and handle thresholds passing. Fresh review confirmed the lifecycle and cleanup result |
-| 9 | Polish + parity + shared-core sync | ⏸️ **Paused.** Shared-engine consumer migration pins the reviewed public `tokscale-core` commit used by Native; non-quota client tabs remain complete (2026-07-17). **Provider pace v3 reconciliation completed 2026-07-19** against the exact macOS `1e00e7b` tree: Codex, Claude, Grok, Antigravity, and Copilot recurring percentage cards use stable `cardId`, opaque account scope, exact/observed duration, typed lifecycle states, and backend-owned coherent history; Windows adds CNG-backed installation identity, protected DACLs, reparse/file-ID checks, locking, capacity bounds, and atomic replacement. Strict C# decoding, `clientId|cardId` selection retention/migration, shared Dashboard/Settings row semantics, responsive Full layout, Classic/Off suppression, and typed learning/unavailable previews are active. Verification includes 275 .NET tests; the latest Windows x64 `tb_core_ffi` release suite with 300 tests; macOS and Windows x64 workspace/App/synthetic-smoke gates; ARM64 release build, 15 native security/history tests, 12 provider cases, and WinUI startup; Swift↔C# zero-difference checks across 12 provider-v3 and 116 legacy cases; light/dark responsive UI checks at 100%, 150%, and 200% DPI; sanitized production-profile preservation; and fresh focused/end-to-end verifiers. Windows runtime follow-ups resolve provider homes without `HOME`, hide and cache the Claude version probe, and discover/probe every Antigravity language server without visible console windows. Provider compatibility closure on 2026-07-20 adds Windows Antigravity OAuth-client artifact discovery, proves the installed scanner against Antigravity 2.3.1, accepts Grok's unified-billing schema as a separate non-recurring financial cap, and completes sanitized Codex/Grok/Antigravity live gates. Final review fixes unify Antigravity local/remote history scope through verified Google Email and bind the tray last-good gauge to its effective selection. This completes the pace contract only; broader quota-source ordering/visibility and new Agent-limits feature scope remain unopened · backlog: demo mode; optional Windows-only global hotkey to toggle the flyout (no macOS equivalent — needs a key-binding UI) |
-| 10 | v0.1.0 stable portable release transaction | ✅ 2026-07-29 — [`v0.1.0`](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.1.0) published as the unsigned portable x64/ARM64 stable release from `aa671e0`, with eight checksum/evidence/smoke/package assets and native `tray-ready` startup evidence under the explicitly approved non-disposable active-profile boundary. See [`docs/release.md`](docs/release.md). |
-| 11 | Velopack/signing/installer/updater | ✅ 2026-08-09 — [`v0.2.2`](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.2.2) published as the first installed release built by CI rather than on a personal machine. Four channels (`win-x64`, `win-x64-lite`, `win-arm64`, `win-arm64-lite`) from a tag-triggered workflow producing a draft plus `SHA256SUMS.txt`; symbols archives retained as workflow artifacts. Verified by installing on clean Windows 11 hosts carrying neither .NET nor the VC++ Redistributable, on x64 and ARM64 — which is how `v0.2.1`'s native-load failure was found (#36). Code signing remains out of scope. See [`docs/release-velopack.md`](docs/release-velopack.md). |
-| 12 | winget/Scoop | ⏭️ Unopened. Blocked on a delivery-form decision for Scoop: it manages `~/scoop/apps/<name>/<version>` with its own `current` junction while Velopack installs into `%LocalAppData%\<packId>`, and neither winget nor Scoop has an equivalent of Homebrew's `auto_updates true`. See [`docs/lite-distribution.md`](docs/lite-distribution.md). |
-| 13 | Quota lens, attribution, and the engine reconciliation | 🔶 In `main`, unreleased — **the Quota lens** (overview strip, heatmap, per-client window and history cards, Agent-limits) and the **usage-attribution subsystem** it runs on, merged as [#81](https://github.com/Nanako0129/Syrtis-Windows/pull/81) after a 19-round review that an architecture review ended by deleting a bounded-scan cache rather than tuning it again (net −379 lines across four commits). **The equivalence denominator** ([#85](https://github.com/Nanako0129/Syrtis-Windows/pull/85), issue #82) divided by displacement and range where macOS divides by distance travelled — measured **12x wrong** on real data, and visibly contradicting the heatmap card on the same lens. Ported as one commit with `Consumed`/`RisingRuns`/`DeltaQualifies` and both known-imperfect edges documented; zero existing assertions changed, which is the monotone-rise invariant proving itself. **The engine pin** ([#86](https://github.com/Nanako0129/Syrtis-Windows/pull/86)) had been stranded on a branch 60 commits behind `main`, because `crates/tb_core_ffi` calls `get_window_usage_with_source_context` and that entry point did not exist upstream; [tokscale-core#27](https://github.com/Nanako0129/tokscale-core/pull/27) reconciled two divergent implementations and unblocked it. Six fixes that move displayed figures arrived with it — Codex reasoning tokens were priced twice, Claude `tool_result` input was char-estimated, 1-hour cache writes were billed at the 5-minute rate, and a fallback-priced model returned different costs on two runs of the same data. Measured on one fixed five-hour window: 42 rows / `cost=9.684641` → **26 / `12.186039`**. Existing installs take a one-time cache migration (`CACHE_FORMAT_VERSION` 3→4; Codex parser 4→6, Claude 2→4), migrated rather than discarded — for Claude the cache is the only copy of turns a compacting rewrite removed from the transcript. |
-
-### Before the next release
-
-Everything remaining on the blocking list is the same shape: **the app displays something and it is not true** — a figure, a label, or a control — rather than a feature being absent. That distinction is the line, not whether the wrong thing happens to be numeric: two identically-named entries in a menu and a row labelled for a surface it does not cover mislead exactly as a wrong total does, and neither can be filed as a limitation.
-
-| Item | Why it blocks |
-|---|---|
-| Codex Spark duplicate window labels ([#87](https://github.com/Nanako0129/Syrtis-Windows/pull/87), macOS #286) | two identically-named entries in the tray's quota-source menu is a broken control, not a cosmetic defect |
-| The money/tokens rule | four quota cards print `$0.00` for usage that has no price; the rule exists in one place and not the others, so two columns of one row can contradict each other |
-| Provider-split model rows never folded | the model count is inflated and Stats' "Favorite model" can name a provider shard rather than the model — a superlative users repeat to other people |
-| Client-tab scoping of the Overview lens | selecting one client still shows another's headline and every agent's limit bars |
-| Stale client display names | macOS dropped the form-factor suffix; `Cursor IDE` is factually wrong about what the row covers |
-
-Known limitations that are honest to ship with, because the feature is **absent** rather than lying: no Discord Rich Presence, no per-client tray items, no Simplified Chinese, no menu-bar font colour, no flat-heatmap chart mode, no agent brand icons, no Agent-limits sparkline or chart layout, no Stats attribution-breakdown card, and no multi-account Claude.
-
-### Provider runtime validation
-
-| Provider | Windows live status |
-|---|---|
-| Claude | Exact-head live Smoke passed from the signed-in Windows profile with source `oauth` and 2 quota cards. |
-| Copilot | Exact-head live Smoke passed from the signed-in Windows profile with source `oauth` and 2 quota cards. |
-| Antigravity | Exact-head local IDE path passed with `HOME` absent and source `cli`: 8 quota cards with no provider error. Windows 2.3.1 installed-client discovery also paired the expected `resources/bin/language_server.exe` artifact without exposing or persisting embedded client values. Remote OAuth live coverage remains unavailable because this profile has no `~/.gemini/oauth_creds.json`; that path remains covered hermetically. |
-| Codex | Logout/login restored the Windows credential; exact-head live Smoke passed with source `oauth` and 2 quota cards. |
-| Grok | Exact-head live Smoke accepted the unified-billing response with source `oauth`. The account currently produces 0 active quota windows, replacing the former `response_shape` failure with a successful recognized-disabled result; raw billing values were not logged. |
-
-Fixture cross-checks, synthetic session smokes, and path-only checks are kept
-separate from credential-bound live coverage. The final live gate retained the
-same exists/hash state across all 7 monitored credential and account-scope
-paths; normal secure v3 pace-history writes remain permitted. Session-parser
-environment-root overrides now flow through one shared FFI source context and
-have strict relocated-`CODEX_HOME` coverage. RID-aware native-DLL selection and
-freshness are complete through the shared `BuildTbNative`/`Directory.Build.targets`
-path.
+Windows does not yet have macOS parity on: Discord Rich Presence, per-client tray items,
+Simplified Chinese, menu-bar font colour, a flat-heatmap chart mode, agent brand icons, an
+Agent-limits sparkline/chart layout, a Stats attribution-breakdown card, and multi-account
+Claude.
 
 ## Credits
 
@@ -183,4 +153,3 @@ junhoyeo. Original menu-bar concept by
 ## Lite channel (framework-dependent)
 
 Optional **Lite** builds omit the bundled .NET 10 runtime. See [docs/lite-distribution.md](docs/lite-distribution.md) for channels, package identity, and the per-surface default policy (README/GitHub default Full; Scoop default Lite; winget Full + Lite package).
-

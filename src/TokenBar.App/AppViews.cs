@@ -7,10 +7,14 @@ namespace TokenBar.App;
 public enum AppView
 {
     Overview,
-    // Second, as on macOS. Declaration order IS tab order and IS the Ctrl+1..9
-    // order (DashboardView binds one accelerator per value of this enum at
+    // Second, as on macOS. Declaration order IS tab order and IS the numeric
+    // accelerator order (DashboardView binds one per value of this enum at
     // construction), so inserting here moves every later lens's number key by
     // one — deliberately, because the two must keep naming the same lenses.
+    // The range is Ctrl+1..N for N values, not a fixed Ctrl+1..9: eight values
+    // today means Ctrl+9 is bound to nothing. This comment said 1..9 and the
+    // README repeated it, which is how a reader learns a shortcut that does
+    // not exist.
     Quota,
     Models,
     Monthly,
@@ -53,7 +57,7 @@ public static class AppViews
     }
 
     /// <summary>The lens to actually render. A hidden lens never survives, so
-    /// callers that carry a stale selection — the Ctrl+1..9 accelerators bind
+    /// callers that carry a stale selection — the numeric accelerators bind
     /// one fixed lens each at construction — cannot land on a tab that is not
     /// in the row. Guarded to Toggleable for the same tamper-resistance reason
     /// as <see cref="Visible"/>.</summary>
