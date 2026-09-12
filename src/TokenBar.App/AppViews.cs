@@ -7,6 +7,11 @@ namespace TokenBar.App;
 public enum AppView
 {
     Overview,
+    // Second, as on macOS. Declaration order IS tab order and IS the Ctrl+1..9
+    // order (DashboardView binds one accelerator per value of this enum at
+    // construction), so inserting here moves every later lens's number key by
+    // one — deliberately, because the two must keep naming the same lenses.
+    Quota,
     Models,
     Monthly,
     Daily,

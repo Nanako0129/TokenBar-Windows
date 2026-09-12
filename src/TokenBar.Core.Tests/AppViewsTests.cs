@@ -15,6 +15,20 @@ public class AppViewsTests
         Assert.Contains(AppView.Agents, AppViews.Toggleable);
     }
 
+    // Declaration order is tab order, and it is also the Ctrl+1..9 order:
+    // DashboardView binds one accelerator per value of the enum at
+    // construction, so the two can only agree while this holds. Pinned for the
+    // same reason OverviewCards.RenderOrder is.
+    [Fact]
+    public void QuotaIsTheSecondLens()
+    {
+        Assert.Equal(AppView.Quota, Enum.GetValues<AppView>()[1]);
+        Assert.Equal(AppView.Quota, AppViews.Visible(string.Empty)[1]);
+        // Still second once an earlier-hidden lens is gone; only Overview
+        // precedes it and Overview cannot be hidden.
+        Assert.Equal(AppView.Quota, AppViews.Visible("daily,stats")[1]);
+    }
+
     [Fact]
     public void HiddenLensLeavesTheRow()
     {

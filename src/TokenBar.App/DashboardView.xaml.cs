@@ -119,7 +119,7 @@ public sealed partial class DashboardView : UserControl
         };
 
         // In-flyout shortcuts, the macOS ⌘ set on Ctrl: Esc/Ctrl+W close,
-        // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..6 lenses,
+        // Ctrl+R refresh, Ctrl+, settings, Ctrl+Q quit, Ctrl+1..8 lenses,
         // Ctrl+[ / Ctrl+] cycle.
         // Esc yields to an open transient (the year menu): light-dismiss
         // should collapse the popup, not slide the whole flyout away.
@@ -381,7 +381,8 @@ public sealed partial class DashboardView : UserControl
         RefreshSpinner.IsActive = spinning;
     }
 
-    /// <summary>The model powers lazy lens loading (hourly/agents).</summary>
+    /// <summary>The model powers lazy lens loading, told which lens is
+    /// active by <see cref="SwitchTo"/>.</summary>
     public void Bind(DashboardModel model) => _model = model;
 
     /// <summary>Persist a requested client tab. The next selection pass validates
@@ -407,15 +408,7 @@ public sealed partial class DashboardView : UserControl
         }
 
         _view = view;
-        if (view == AppView.Hourly)
-        {
-            _model?.EnsureHourly();
-        }
-
-        if (view == AppView.Agents)
-        {
-            _model?.EnsureAgents();
-        }
+        _model?.SetActiveView(view);
 
         UpdateTabChrome();
         RenderContent(animated: true);
@@ -750,6 +743,7 @@ public sealed partial class DashboardView : UserControl
         DetachGraph3DContentHost();
         UIElement content = _view switch
         {
+            AppView.Quota => BuildQuota(_snapshot),
             AppView.Models => BuildModels(_snapshot),
             AppView.Monthly => BuildMonthly(_snapshot),
             AppView.Daily => BuildDaily(_snapshot),
@@ -1123,12 +1117,12 @@ public sealed partial class DashboardView : UserControl
         // Read from the snapshot rather than inferred from the payload: a
         // failed fetch publishes completion with no payload, and inferring
         // would render that as still-in-flight forever.
-        var attempted = snapshot.QuotaAttempted;
+        var outcome = snapshot.QuotaOutcome;
         var allHidden = QuotaResolver.ExcludedAllCandidates(
             snapshot.Quota, QuotaResolver.Auto, excluding);
 
         var stack = new StackPanel { Spacing = 7 };
-        switch (QuotaSummaryText.State(summary, attempted, allHidden))
+        switch (QuotaSummaryText.State(summary, outcome, allHidden))
         {
             case QuotaSummaryState.AllHidden:
                 // No card at all. The user hid these clients; saying so would
@@ -1139,6 +1133,9 @@ public sealed partial class DashboardView : UserControl
                 break;
             case QuotaSummaryState.NoWindowReporting:
                 stack.Children.Add(Ui.Dim(QuotaSummaryText.NoWindowReporting()));
+                break;
+            case QuotaSummaryState.Failed:
+                stack.Children.Add(Ui.Dim(QuotaSummaryText.CouldNotCheckLimits()));
                 break;
             default: // Loading
                 stack.Children.Add(Ui.Dim(QuotaSummaryText.CheckingLimits()));
@@ -1249,14 +1246,37 @@ public sealed partial class DashboardView : UserControl
             _ => PaceMode.Historical,
         };
 
-    private static FrameworkElement BuildLimits(DashboardModel.Snapshot snapshot)
+    /// <summary><paramref name="clientId"/> narrows the card to one
+    /// subscription for the per-client Quota lens (5e). A parameter rather than
+    /// a second builder: this card answers "where does the allowance stand
+    /// right now", and a copy of it would be free to disagree with the original
+    /// on the same window.</summary>
+    private static FrameworkElement BuildLimits(
+        DashboardModel.Snapshot snapshot, string? clientId = null)
     {
         var panel = new StackPanel { Spacing = 10 };
         var agents = snapshot.Quota?.Agents ?? [];
-        if (agents.Count == 0)
+        if (clientId is not null)
         {
-            panel.Children.Add(Ui.Dim("No quota data yet.".Localized()));
-            return panel;
+            agents = [.. agents.Where(agent => agent.ClientId == clientId)];
+        }
+
+        // Round 11's P2 finding, corrected: retained data wins over a failed
+        // refetch — QuotaSummaryText.LimitsState checks `agents.Count > 0`
+        // before `snapshot.QuotaOutcome`, the same order this file's own
+        // BuildQuotaSummary already applies to the sibling summary card. See
+        // that method's own doc comment for why the earlier ordering (outcome
+        // checked first) was wrong.
+        switch (QuotaSummaryText.LimitsState(agents.Count > 0, snapshot.QuotaOutcome))
+        {
+            case AgentLimitsState.Failed:
+                panel.Children.Add(Ui.Dim(QuotaSummaryText.CouldNotCheckLimits()));
+                return panel;
+            case AgentLimitsState.Loading:
+                panel.Children.Add(Ui.Dim("No quota data yet.".Localized()));
+                return panel;
+            case AgentLimitsState.Ready:
+                break;
         }
 
         // macOS windowRow settings: fill direction, density, pace policy.
@@ -1676,7 +1696,14 @@ public sealed partial class DashboardView : UserControl
         var stack = new StackPanel { Spacing = 10 };
         if (snapshot.Hourly is not { } hourly)
         {
-            stack.Children.Add(Ui.Card("Hourly".Localized(), Ui.Dim("Loading hourly data…".Localized())));
+            // Round 11's P2 finding, same defect class as BuildLimits: a null
+            // Hourly used to render as "Loading" unconditionally, so a lane
+            // that asked and threw (HourlyOutcome == Failed) looked identical
+            // to a cold-start read still in flight.
+            var message = snapshot.HourlyOutcome == WindowEquivalence.FetchOutcome.Failed
+                ? "Hourly usage could not be read. It will be retried.".Localized()
+                : "Loading hourly data…".Localized();
+            stack.Children.Add(Ui.Card("Hourly".Localized(), Ui.Dim(message)));
             return stack;
         }
 
@@ -1821,7 +1848,12 @@ public sealed partial class DashboardView : UserControl
         var stack = new StackPanel { Spacing = 10 };
         if (snapshot.Agents is not { } agents)
         {
-            stack.Children.Add(Ui.Card("Agents".Localized(), Ui.Dim("Loading agent data…".Localized())));
+            // Same fix as BuildHourly, same reason: Failed and NotAttempted
+            // both used to render "Loading agent data…".
+            var message = snapshot.AgentsOutcome == WindowEquivalence.FetchOutcome.Failed
+                ? "Agent usage could not be read. It will be retried.".Localized()
+                : "Loading agent data…".Localized();
+            stack.Children.Add(Ui.Card("Agents".Localized(), Ui.Dim(message)));
             return stack;
         }
 

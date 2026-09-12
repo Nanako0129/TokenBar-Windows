@@ -31,27 +31,81 @@ public enum QuotaSummaryState
     AllHidden,
     NoWindowReporting,
     Loading,
+
+    /// <summary>Asked, and the most recent agent-usage fetch threw. Distinct
+    /// from <see cref="NoWindowReporting"/> ("asked and nothing reported a
+    /// window") and from <see cref="Loading"/> ("still waiting for a first
+    /// answer") — collapsing a failed read into either states something false
+    /// about a request that never landed.</summary>
+    Failed,
+}
+
+/// <summary>The Agent-limits card's three states — same shape as
+/// <see cref="QuotaSummaryState"/>, one payload and one gate simpler because
+/// this card has no all-hidden case of its own.</summary>
+public enum AgentLimitsState
+{
+    Ready,
+    Loading,
+    Failed,
 }
 
 public static class QuotaSummaryText
 {
-    /// <summary>Which of four things the card is looking at.
+    /// <summary>Which of the Agent-limits card's three states applies, given
+    /// whether it currently has a payload to draw from (<paramref name="hasAgents"/>
+    /// — the agent list after any per-client narrowing, since narrowing can
+    /// turn a non-empty snapshot into nothing to show for THIS client) and the
+    /// most recent quota fetch's own outcome.
+    /// <para>
+    /// <paramref name="hasAgents"/> is checked FIRST, before <paramref name="outcome"/>
+    /// — retained data wins. a3ea946 got this backwards: it checked
+    /// <c>outcome == Failed</c> before checking whether data existed, so a
+    /// failed retry after an earlier success replaced a populated card with a
+    /// failure message even though the retained payload (DashboardModel's
+    /// quota lane does not null <c>Quota</c> out on a failed refetch) was
+    /// still good — disagreeing with this same file's own <see cref="State"/>
+    /// above, which already checks <c>summary is not null</c> first for
+    /// exactly this reason, on the very same lane. This restores that order:
+    /// <c>Failed</c> now only replaces an EMPTY card, never a populated one.
+    /// </para>
+    /// <para>
+    /// ponytail: no staleness indicator. A card showing retained data after a
+    /// failed refetch carries no marker that the read behind it just failed —
+    /// preferring stale-but-present data over destroying it with an error was
+    /// the ask; a "last updated"/staleness UI was deliberately not built (no
+    /// macOS reference for it). Add one if this becomes a real complaint.
+    /// </para></summary>
+    public static AgentLimitsState LimitsState(bool hasAgents, WindowEquivalence.FetchOutcome outcome) =>
+        hasAgents ? AgentLimitsState.Ready
+        : outcome == WindowEquivalence.FetchOutcome.Failed ? AgentLimitsState.Failed
+        : AgentLimitsState.Loading;
+
+    /// <summary>Which of five things the card is looking at.
     ///
-    /// <para><paramref name="attempted"/> must be a fact about the request, not
+    /// <para><paramref name="outcome"/> must be a fact about the request, not
     /// about the result. Derived from "a payload exists" it cannot separate
-    /// "still asking" from "asked and it failed", and a failed fetch publishes
-    /// no payload — so the loading line stayed on screen for a request that had
-    /// already come back empty.</para>
+    /// "still asking" from "asked and it failed" from "asked and it threw" —
+    /// a failed fetch publishes no payload either, so a bool-shaped signal
+    /// left the loading line on screen for a request that had already come
+    /// back with an error, indistinguishable from one that came back empty.
+    /// Three-value for the same reason <c>QuotaLensText.HeatmapState</c> and
+    /// <c>StripState</c> are: <c>NotAttempted</c>/<c>Succeeded</c>/<c>Failed</c>,
+    /// not a bool plus an inferred result.</para>
     ///
     /// <para><paramref name="allHidden"/> is checked before the reporting
     /// state, because a fold that returns null after every candidate was
     /// excluded looks exactly like one that returned null because nothing
     /// reported.</para></summary>
-    public static QuotaSummaryState State(QuotaSummary? summary, bool attempted, bool allHidden) =>
+    public static QuotaSummaryState State(QuotaSummary? summary, WindowEquivalence.FetchOutcome outcome, bool allHidden) =>
         summary is not null ? QuotaSummaryState.Ready
         : allHidden ? QuotaSummaryState.AllHidden
-        : attempted ? QuotaSummaryState.NoWindowReporting
-        : QuotaSummaryState.Loading;
+        : outcome switch
+        {
+            WindowEquivalence.FetchOutcome.Succeeded => QuotaSummaryState.NoWindowReporting,
+            WindowEquivalence.FetchOutcome.Failed => QuotaSummaryState.Failed,
+            _ => QuotaSummaryState.Loading,
+        };
 
 
     /// <summary>Who a window belongs to, qualified by account when the
@@ -162,4 +216,12 @@ public static class QuotaSummaryText
         "No subscription is reporting a usage window right now.".Localized();
 
     public static string CheckingLimits() => "Checking agent limits…".Localized();
+
+    /// <summary>Own wording rather than reusing <c>QuotaLensText.Failed</c>'s
+    /// "Quota history could not be read" — that string names the store lane
+    /// (quota-history, a persisted export), and this card's fetch is the
+    /// agent-usage/limits lane instead (the same one <see cref="CheckingLimits"/>
+    /// names above); the two are separate fetches with separate failure
+    /// causes, and this card should not claim the wrong one broke.</summary>
+    public static string CouldNotCheckLimits() => "Could not check agent limits. It will be retried.".Localized();
 }

@@ -45,6 +45,37 @@ public static class GraphLazyRefreshPolicy
         scheduledRequestId != requestId;
 }
 
+/// <summary>Which lazy lanes the currently-open lens wants, told by the view
+/// switch rather than accumulated by "ensure" calls that never un-want.
+/// <para>
+/// Round-10 finding: <c>DashboardModel</c> exposed one <c>EnsureX</c> method
+/// per lane, each only ever setting its own flag true, with no path back to
+/// false — a user who visited Quota once left <c>_windowUsageWanted</c> (and
+/// its siblings, same shape) true for the model's lifetime, so every later
+/// graph publication's <see cref="GraphLazyRefreshPolicy"/> request repeated
+/// the window-usage export even with Quota no longer visible, serialized
+/// ahead of whichever lens actually was. <c>DashboardView.SwitchTo</c> is the
+/// only place that already knows which lens is active — every "ensure" call
+/// site derives from it — so the model is now told that fact directly
+/// instead of being told to want lanes one at a time with no way to stop
+/// wanting them.
+/// </para></summary>
+public static class LazyLaneActivation
+{
+    public readonly record struct Wanted(
+        bool Hourly, bool Agents, bool QuotaHistory, bool WindowUsage);
+
+    /// <summary>Quota's card and its window-usage export open together, the
+    /// same pairing <c>DashboardView.SwitchTo</c> already fetches together.</summary>
+    public static Wanted For(AppView view) => view switch
+    {
+        AppView.Hourly => new Wanted(true, false, false, false),
+        AppView.Agents => new Wanted(false, true, false, false),
+        AppView.Quota => new Wanted(false, false, true, true),
+        _ => default,
+    };
+}
+
 /// <summary>Pure consumer gate for one retained graph pipeline. UI-facing
 /// properties may only change after these exact request/generation checks.</summary>
 public sealed class GraphConsumerState : IDisposable

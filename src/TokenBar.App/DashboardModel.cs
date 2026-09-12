@@ -251,7 +251,40 @@ public sealed class DashboardModel
         // Lazily-loaded lenses (macOS ensureData parity): fetched on first
         // visit, then refreshed by the slow lane like everything else.
         public HourlyReport? Hourly { get; init; }
+
+        /// <summary>Whether the hourly READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaHistoryAttempted"/>, kept for the same reason:
+        /// <c>Hourly is not null</c> cannot tell a read that has not landed
+        /// yet from one that landed and found nothing.</summary>
+        public bool HourlyAttempted { get; init; }
+
+        /// <summary>The two facts <see cref="HourlyAttempted"/> and
+        /// <see cref="Hourly"/> collapse to: not attempted yet, attempted and
+        /// nothing is retained (the only way <see cref="Hourly"/> can still be
+        /// null once attempted, since a completed-and-empty read always
+        /// publishes a non-null empty report), or attempted with something to
+        /// show. A separate <c>HourlyFetchFailed</c> flag used to carry "the
+        /// MOST RECENT attempt threw" independently of <see cref="Hourly"/>'s
+        /// own nullness, on the theory that a failed retry retaining a prior
+        /// good report needed to render as failed rather than succeeded. It
+        /// does not: every reader of this outcome checks <see cref="Hourly"/>
+        /// for data first and falls back to this enum only when there is none
+        /// to draw (retained data wins), so once <see cref="Hourly"/> is
+        /// non-null the distinction that flag drew was never read.</summary>
+        public WindowEquivalence.FetchOutcome HourlyOutcome =>
+            LazyLaneFold.Outcome(HourlyAttempted, Hourly);
+
         public AgentsReport? Agents { get; init; }
+
+        /// <summary>Same fact as <see cref="HourlyAttempted"/>, for the
+        /// Agents lane.</summary>
+        public bool AgentsAttempted { get; init; }
+
+        /// <summary>Same collapse as <see cref="HourlyOutcome"/>, for the
+        /// Agents lane, for the same reason.</summary>
+        public WindowEquivalence.FetchOutcome AgentsOutcome =>
+            LazyLaneFold.Outcome(AgentsAttempted, Agents);
 
         /// <summary>Whether a quota fetch has finished, whatever it returned.
         ///
@@ -265,28 +298,132 @@ public sealed class DashboardModel
         /// than deriving it; this port had let it degrade into a
         /// derivation.</para></summary>
         public bool QuotaAttempted { get; init; }
+
+        /// <summary>The three states this lane can be in, derived the same way
+        /// <see cref="HourlyOutcome"/> is — see that property's doc comment for
+        /// why a separate <c>QuotaFetchFailed</c> flag carried no information.
+        /// <para>The reason it holds for this lane too, which is the one the
+        /// deleted flag's own comment doubted: <see cref="Quota"/> is null
+        /// exactly when there is nothing retained to show. A first fetch that
+        /// throws leaves it null, so the card renders the failure rather than
+        /// "asked, and nothing reported a window"; a completed-and-empty read
+        /// publishes a non-null payload, so that case still reads as
+        /// Succeeded; and a failed retry after a success keeps the earlier
+        /// payload, which is the one case where this derivation deliberately
+        /// answers Succeeded — retained data wins, the same rule
+        /// <see cref="QuotaSummaryText.State"/> and
+        /// <c>QuotaSummaryText.LimitsState</c> already apply by checking their
+        /// payload before ever consulting this.</para></summary>
+        public WindowEquivalence.FetchOutcome QuotaOutcome =>
+            LazyLaneFold.Outcome(QuotaAttempted, Quota);
+
+        /// <summary>The persisted quota curves, for the Quota lens's two
+        /// cards. A third lazy lens, read straight from the store — it does not
+        /// depend on the client selection the way Hourly/Agents do.</summary>
+        public IReadOnlyList<QuotaHistorySeries>? QuotaHistory { get; init; }
+
+        /// <summary>Whether the history READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaAttempted"/>, and a separate one: that flag reports
+        /// the agent-usage lane, this one the store lane, and a lens that read
+        /// the wrong lane's progress would announce "nothing recorded yet"
+        /// while its own fetch was still in flight.
+        ///
+        /// <para><c>QuotaHistory is not null</c> cannot answer it: a read that
+        /// returned no series and a read that has not happened both leave it
+        /// null.</para></summary>
+        public bool QuotaHistoryAttempted { get; init; }
+
+        /// <summary>The two facts <see cref="QuotaHistoryAttempted"/> and
+        /// <see cref="QuotaHistory"/> collapse to, the same way
+        /// <see cref="HourlyOutcome"/> collapses its own pair (see that
+        /// property's own doc comment for why the separate
+        /// <c>QuotaHistoryFetchFailed</c> flag this used to also read was
+        /// redundant and has been deleted): not attempted yet, attempted with
+        /// nothing retained, or attempted with something to show. A failed
+        /// read keeps the prior <see cref="QuotaHistory"/> so a card still has
+        /// something to draw, which is exactly why <c>QuotaHistory is null</c>
+        /// alone is sufficient here — every reader on the equivalence path
+        /// checks for retained data before ever falling back to this
+        /// enum.</summary>
+        public WindowEquivalence.FetchOutcome QuotaHistoryOutcome =>
+            LazyLaneFold.Outcome(QuotaHistoryAttempted, QuotaHistory);
+
+        /// <summary>The per-message rows behind the Quota lens's ≈ lines
+        /// (5d-1's export). A fourth lazy lens, fetched only once
+        /// <see cref="QuotaHistory"/> has told this lane how far back to ask —
+        /// the export is expensive enough (macOS's own probe: 67s over 15
+        /// days) that it must never be called with an unbounded range.</summary>
+        public Interop.WindowUsage? WindowUsage { get; init; }
+
+        /// <summary>Whether the window-usage READ has finished, whatever it
+        /// returned — the same fact-about-the-request as
+        /// <see cref="QuotaHistoryAttempted"/>, and a separate one: a fetch
+        /// that found no window to bound itself against still has to report
+        /// completion, or the equivalence lines wait forever for an answer
+        /// that was never going to come.</summary>
+        public bool WindowUsageAttempted { get; init; }
+
+        /// <summary>
+        /// The two facts <see cref="WindowUsageAttempted"/> and
+        /// <see cref="WindowUsage"/> collapse to, so a call site reads one
+        /// signal instead of re-deriving it: not attempted yet, attempted
+        /// with nothing retained (the no-bound-window path still publishes a
+        /// non-null empty payload, so this can only mean the fetch threw), or
+        /// attempted with something to show.
+        /// <para>
+        /// A caller that instead read <c>WindowUsageAttempted</c> alone and
+        /// defaulted <c>WindowUsage?.Messages</c> to <c>[]</c> could not tell
+        /// a completed empty scan from a scan that never ran — the exact
+        /// ambiguity <see cref="WindowEquivalence.FetchOutcome"/> exists to
+        /// remove. That ambiguity is what <see cref="WindowUsage"/>'s own
+        /// nullness resolves; a separate <c>WindowUsageFetchFailed</c> flag
+        /// used to also distinguish a failed retry that RETAINS a prior
+        /// success's data from a fresh success, on the theory that stale
+        /// retained messages must not be read as current evidence. Every
+        /// reader on the equivalence path (<see cref="WindowEquivalence.LiveRow"/>,
+        /// <see cref="QuotaLensProjection.BuildHistory"/>,
+        /// <see cref="QuotaLensProjection.BuildOverview"/>) instead checks
+        /// this outcome and only falls back to the retained payload once it
+        /// reads <see cref="WindowEquivalence.FetchOutcome.Succeeded"/> — so
+        /// with the flag gone, a failed refetch that retains messages now
+        /// reads as <c>Succeeded</c> and those three sites render from the
+        /// retained data, the same data the card drawing the bars right above
+        /// the equivalence line already draws from unconditionally (see
+        /// <c>DashboardView.Quota.cs</c>'s own <c>BuildClientQuota</c>/
+        /// <c>BuildHistory</c> use of <see cref="QuotaLensProjection.Client.Mine"/>).
+        /// Staleness is not flagged anywhere else on these cards either, so
+        /// this stops being a distinction the model can afford to keep making
+        /// on its own.
+        /// </para>
+        /// </summary>
+        public WindowEquivalence.FetchOutcome WindowUsageOutcome =>
+            LazyLaneFold.Outcome(WindowUsageAttempted, WindowUsage);
     }
 
     private volatile bool _hourlyWanted;
     private volatile bool _agentsWanted;
+    private volatile bool _quotaHistoryWanted;
+    private volatile bool _windowUsageWanted;
 
-    /// <summary>Marks a lazy lens as needed and fetches it once; later slow
-    /// refreshes keep it current.</summary>
-    public void EnsureHourly()
+    /// <summary>Tells the model which lens is now open, so its lazy lanes
+    /// track the currently-active lens instead of accumulating forever — see
+    /// <see cref="LazyLaneActivation"/>'s own doc comment. Fetches once for
+    /// whichever lanes the new lens wants; later slow refreshes keep them
+    /// current for as long as the lens stays open.</summary>
+    public void SetActiveView(AppView view)
     {
-        _hourlyWanted = true;
-        RequestLazyRefresh();
-    }
-
-    public void EnsureAgents()
-    {
-        _agentsWanted = true;
+        var wanted = LazyLaneActivation.For(view);
+        _hourlyWanted = wanted.Hourly;
+        _agentsWanted = wanted.Agents;
+        _quotaHistoryWanted = wanted.QuotaHistory;
+        _windowUsageWanted = wanted.WindowUsage;
         RequestLazyRefresh();
     }
 
     private void RequestLazyRefresh()
     {
-        if (!_hourlyWanted && !_agentsWanted)
+        if (!_hourlyWanted && !_agentsWanted && !_quotaHistoryWanted && !_windowUsageWanted)
         {
             return;
         }
@@ -321,6 +458,8 @@ public sealed class DashboardModel
     {
         var hourly = _hourlyWanted;
         var agents = _agentsWanted;
+        var quotaHistory = _quotaHistoryWanted;
+        var windowUsage = _windowUsageWanted;
         string[] clients;
         long generation;
         lock (_selectionGate)
@@ -351,16 +490,77 @@ public sealed class DashboardModel
                 ? TryFetch(() => TbCore.AgentsReport(year, clients), "agents") : null;
         }
 
+        // Selection-independent: the store is keyed by provider/account/window,
+        // not by the client tabs, so this is read outside the branch above and
+        // survives the staleness check below.
+        var history = quotaHistory
+            ? TryFetch(TbCore.QuotaHistory, "quotaHistory")
+            : null;
+
+        // Bounded by whichever history is freshest: this pass's own read when
+        // one was taken, the last-published one otherwise. Never unbounded —
+        // 5d-1's export scans the whole local corpus when its cache is cold,
+        // which macOS's own probe measured at 67s over 15 days.
+        Interop.WindowUsage? usage = null;
+        if (windowUsage)
+        {
+            var forBound = history ?? Current?.QuotaHistory ?? [];
+            if (forBound.Count == 0)
+            {
+                usage = new Interop.WindowUsage([], 0, 0);
+            }
+            else
+            {
+                // The scan this export can trigger is CPU-bound, not I/O-bound
+                // like the quota-history read above — the same reason the
+                // hourly/agents fetch above it boosts.
+                using var boost = ProcessPower.Boost();
+                usage = TryFetch(
+                    () => TbCore.WindowUsage(
+                        QuotaEquivalenceFold.BoundFromMs(forBound, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                    "windowUsage");
+            }
+        }
+
         if (!SelectionStillValid(year, generation))
         {
             RequestLazyRefresh();
             return;
         }
 
-        Publish(s => s with
+        Publish(s =>
         {
-            Hourly = hourly ? hourlyReport : s.Hourly,
-            Agents = agents ? agentsReport : s.Agents,
+            // Same retain-on-failure fold QuotaHistory/WindowUsage already
+            // apply below, given its own name now that a second pair of
+            // lanes needs it — see LazyLaneFold's own doc comment for the
+            // defect this closes (round 9: neither lane retained on
+            // failure, so a transient throw overwrote good cached data with
+            // null and the view could not tell that apart from a cold
+            // start).
+            var hourlyFold = LazyLaneFold.Apply(hourly, hourlyReport, s.Hourly, s.HourlyAttempted);
+            var agentsFold = LazyLaneFold.Apply(agents, agentsReport, s.Agents, s.AgentsAttempted);
+            return s with
+            {
+                Hourly = hourlyFold.Value,
+                HourlyAttempted = hourlyFold.Attempted,
+                Agents = agentsFold.Value,
+                AgentsAttempted = agentsFold.Attempted,
+                // A failed read keeps whatever was already there rather than
+                // replacing a complete set with an empty one — the "absent because
+                // we could not ask" mistake, arriving as a partial result. Whether
+                // THIS pass's own read failed no longer needs a field of its own:
+                // see Snapshot.WindowUsageOutcome's own doc comment.
+                QuotaHistory = history ?? s.QuotaHistory,
+                // A failed read publishes completion with nothing to show, for the
+                // same reason the agent-usage lane does: a lens that reads null as
+                // "not yet" would wait forever for an answer that already came back.
+                QuotaHistoryAttempted = quotaHistory || s.QuotaHistoryAttempted,
+                // Same failed-read and same completion rules as QuotaHistory,
+                // immediately above, and for the same reason.
+                WindowUsage = usage ?? s.WindowUsage,
+                WindowUsageAttempted = windowUsage || s.WindowUsageAttempted,
+            };
         }, graph: null, stillValid: () => SelectionStillValid(year, generation));
     }
 
@@ -387,10 +587,25 @@ public sealed class DashboardModel
             return;
         }
 
+        // QuotaHistory is deliberately untouched: it is not filtered by the
+        // client selection, so clearing it here would drop a valid read and
+        // send the Quota lens back to its loading line for no reason.
+        //
+        // Hourly/AgentsAttempted reset alongside the reports themselves: this
+        // path means "this lane's data is for the wrong selection now", which
+        // is a fact about the OLD selection's fetch, not the new one — the
+        // new selection has not been asked about yet, attempted or
+        // otherwise. Left alone (as round 9 deliberately did, since nothing
+        // read HourlyOutcome/AgentsOutcome yet), a prior successful attempt
+        // would survive the clear and HourlyOutcome would keep reporting
+        // Succeeded about a lane that now holds either a synthesized empty
+        // placeholder or null.
         Current = current with
         {
             Hourly = emptySelection ? new HourlyReport([], 0) : null,
+            HourlyAttempted = false,
             Agents = emptySelection ? new AgentsReport([], 0, 0) : null,
+            AgentsAttempted = false,
         };
         _lastSnapshot = Current;
     }
