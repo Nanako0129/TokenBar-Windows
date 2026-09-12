@@ -72,7 +72,7 @@ public class UpdateFlowTests : IDisposable
         Assert.Equal(1, fixture.Downloader.DownloadBytesCalls);
         Assert.Equal(0, fixture.Downloader.DownloadFileCalls);
         Assert.Equal(
-            "https://api.github.com/repos/Nanako0129/TokenBar-Windows/releases?per_page=10&page=1",
+            "https://api.github.com/repos/Nanako0129/Syrtis-Windows/releases?per_page=10&page=1",
             fixture.Downloader.Requests[0].Url);
         Assert.DoesNotContain(
             fixture.Downloader.Requests,

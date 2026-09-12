@@ -927,7 +927,7 @@ public sealed class SettingsWindow : Window
             Margin = new Thickness(12, 4, 12, 12),
         };
         footer.Children.Add(FooterLink(
-            "GitHub", "https://github.com/Nanako0129/TokenBar-Windows"));
+            "GitHub", "https://github.com/Nanako0129/Syrtis-Windows"));
         footer.Children.Add(FooterLink(
             "Sponsor".Localized(), "https://www.patreon.com/cw/Nanako0129/membership"));
         return footer;
