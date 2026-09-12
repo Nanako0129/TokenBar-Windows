@@ -14,7 +14,7 @@ diagnostic only because serializer formatting and line endings differ by host.
 |---|---|
 | Legacy `usage-pace.json` and `format.json` | macOS commit `2ed256ee` |
 | Provider quota pace v3 | CORE-X1N Native consumer baseline `704426e8df9acfb8e82fe4bf3b7ed3e5adbc2fea` |
-| Swift oracle actually run | macOS `63084b2addad85a90763a6ef7226763dfda90640` (the `ref:` in `crosscheck-swift`) |
+| Swift oracle actually run | macOS `6e7a4fbc924b9c639d16b041eeedb4de019fe42e` (the `ref:` in `crosscheck-swift`) |
 
 The first two rows are where each fixture was authored. The third is the macOS
 commit whose shipping Swift produces the expected outputs, and it advances
@@ -191,7 +191,7 @@ projection differences.
 
 Set `TOKENBAR_MAC_CANONICAL` to a clean recursive clone or worktree at the
 Swift oracle SHA
-`63084b2addad85a90763a6ef7226763dfda90640`. A Git archive is insufficient
+`6e7a4fbc924b9c639d16b041eeedb4de019fe42e`. A Git archive is insufficient
 because it does not contain submodule contents.
 
 `Package.swift` links `target/release/libtb_core_ffi.a` by a path relative to
@@ -201,7 +201,7 @@ unrelated checkout's `target/` artifact.
 
 ```bash
 export TOKENBAR_WINDOWS="$(pwd)"
-export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-63084b2a"
+export TOKENBAR_MAC_CANONICAL="${TMPDIR:-/tmp}/tokenbar-mac-6e7a4fbc"
 
 (
   cd "$TOKENBAR_MAC_CANONICAL"
