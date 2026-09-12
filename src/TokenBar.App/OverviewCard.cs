@@ -1,3 +1,5 @@
+using TokenBar.Core;
+
 namespace TokenBar.App;
 
 /// <summary>The pieces the Overview lens shows, in render order.
@@ -31,6 +33,51 @@ internal enum OverviewCard
     Trace,
     Models,
     Streaks,
+}
+
+/// <summary>
+/// What the Overview lens shows for a given client tab (port of the decision
+/// macOS's <c>OverviewView.card(_:)</c> makes inline). Extracted to a pure
+/// function for the same reason <see cref="OverviewCards"/>'s render order is:
+/// <c>DashboardView.xaml.cs</c>, where the lens is actually built, is WinUI
+/// and compiled by no test project.
+/// <para>
+/// Selecting a single client's tab (rather than Overview) scopes the lens to
+/// that one client: the quota summary headline and the live-session card both
+/// answer "across everything right now", which is not what a single-client
+/// tab asked, so both are suppressed there; the Agent-limits card instead
+/// narrows to that one client's own window rather than showing every agent's
+/// bars underneath a tab that named one of them.
+/// </para>
+/// </summary>
+internal static class OverviewScope
+{
+    /// <summary>The client this Overview render is scoped to, or null for the
+    /// Overview tab itself (every client).</summary>
+    internal static string? SingleClient(string activeClientTab) =>
+        activeClientTab == ClientRegistry.OverviewTab ? null : activeClientTab;
+
+    internal static bool ShowsQuotaSummary(string? singleClient) => singleClient is null;
+
+    internal static bool ShowsTrace(string? singleClient) => singleClient is null;
+
+    /// <summary>The clientId <c>BuildLimits</c> should restrict its rows to,
+    /// or null to show every agent (Overview tab).
+    /// <para>
+    /// Mapped through <see cref="ClientRegistry.QuotaOwner"/>, not the raw tab
+    /// id: <c>BuildLimits</c> filters on <c>agent.ClientId == clientId</c>
+    /// against the quota payload, and a client that spends another
+    /// subscription's allowance is keyed there under the owner.
+    /// <c>antigravity-cli</c> is the one such client today — its rows arrive as
+    /// <c>antigravity</c>, so passing the tab id straight through matched
+    /// nothing and the card said "No quota data yet" while the quota was
+    /// sitting in the payload. Every other subscription-facing lookup already
+    /// keys by owner (see <c>QuotaLensProjection.BuildClient</c>); this is the
+    /// same rule, and it belongs here rather than at the call site so the
+    /// Overview cannot apply it differently from the Quota lens.
+    /// </para></summary>
+    internal static string? LimitsClientId(string? singleClient) =>
+        singleClient is null ? null : ClientRegistry.QuotaOwner(singleClient);
 }
 
 internal static class OverviewCards

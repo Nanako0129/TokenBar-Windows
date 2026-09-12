@@ -51,3 +51,53 @@ public class OverviewCardTests
     public void QuotaSummaryComesFirst() =>
         Assert.Equal(OverviewCard.QuotaSummary, OverviewCards.RenderOrder[0]);
 }
+
+// OverviewScope (item 3): selecting a single client's tab must scope the
+// Overview lens to that client — the quota summary headline and the
+// live-session card both answer "across everything right now", not what a
+// single-client tab asked, and the Agent-limits card must narrow to that one
+// client instead of showing every agent's bars underneath a tab naming one.
+public class OverviewScopeTests
+{
+    [Fact]
+    public void TheOverviewTabItselfIsNotASingleClient() =>
+        Assert.Null(OverviewScope.SingleClient(ClientRegistry.OverviewTab));
+
+    [Fact]
+    public void AClientTabIsItsOwnSingleClient() =>
+        Assert.Equal("gemini", OverviewScope.SingleClient("gemini"));
+
+    [Fact]
+    public void QuotaSummaryAndTraceShowOnlyOnTheOverviewTab()
+    {
+        Assert.True(OverviewScope.ShowsQuotaSummary(null));
+        Assert.False(OverviewScope.ShowsQuotaSummary("gemini"));
+        Assert.True(OverviewScope.ShowsTrace(null));
+        Assert.False(OverviewScope.ShowsTrace("gemini"));
+    }
+
+    [Fact]
+    public void LimitsAreUnrestrictedOnOverviewAndScopedOnAClientTab()
+    {
+        Assert.Null(OverviewScope.LimitsClientId(null));
+        Assert.Equal("gemini", OverviewScope.LimitsClientId("gemini"));
+    }
+
+    // A client that spends another subscription's allowance reaches BuildLimits
+    // under the OWNER, because that is how the quota payload keys it. Passing
+    // the raw tab id through matched nothing and the card claimed there was no
+    // quota data while the quota sat in the payload. Codex review found this on
+    // PR #89; nothing pinned the rule, which is why it was missed.
+    [Fact]
+    public void LimitsClientIdResolvesTheQuotaOwnerRatherThanTheRawTabId()
+    {
+        Assert.Equal("antigravity", OverviewScope.LimitsClientId("antigravity-cli"));
+    }
+
+    [Fact]
+    public void LimitsClientIdLeavesAClientThatOwnsItsOwnQuotaAlone()
+    {
+        Assert.Equal("claude", OverviewScope.LimitsClientId("claude"));
+        Assert.Null(OverviewScope.LimitsClientId(null));
+    }
+}

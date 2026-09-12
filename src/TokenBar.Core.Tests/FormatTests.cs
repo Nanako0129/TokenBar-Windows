@@ -39,6 +39,36 @@ public class FormatTests
         Assert.Equal(expected, Format.Usd(amount));
 
     [Theory]
+    [InlineData(0.0, "$0.00")] // a real zero total, not "below resolution"
+    [InlineData(0.003, "<$0.01")] // priced, but below the format's half-cent resolution
+    [InlineData(0.5, "$0.50")]
+    public void UsdOrBelowCentSaysSmallRatherThanNothing(double amount, string expected) =>
+        Assert.Equal(expected, Format.UsdOrBelowCent(amount));
+
+    // -0.0 == 0.0 in IEEE comparison, but Usd alone formats it as "$-0.00" —
+    // a distinct Fact because InlineData(-0.0, ...) collapses to a duplicate
+    // of the 0.0 case above under xUnit's theory-data equality check.
+    [Fact]
+    public void UsdOrBelowCentCatchesNegativeZero() =>
+        Assert.Equal("$0.00", Format.UsdOrBelowCent(-0.0));
+
+    // Format.money(tokens:cost:) / Format.tokens(tokens:cost:) — ported from
+    // Format.swift's own SelfTest expectations (item 1).
+    [Theory]
+    [InlineData(2_100_000, 0, "—")] // real usage, nothing priced — not "$0.00"
+    [InlineData(0, 0, "$0.00")] // a real zero total keeps its zero
+    [InlineData(2_100_000, 0.003, "<$0.01")] // priced below resolution
+    public void MoneyDashesAPriceNobodyHas(long tokens, double cost, string expected) =>
+        Assert.Equal(expected, Format.Money(tokens, cost));
+
+    [Theory]
+    [InlineData(0, 4.10, "—")] // cost-only source, no token count measured
+    [InlineData(0, 0, "0")] // a real zero total keeps its zero
+    [InlineData(2_100_000, 0, "2.1M")]
+    public void TokensDashesACountNobodyMeasured(long tokens, double cost, string expected) =>
+        Assert.Equal(expected, Format.Tokens(tokens, cost));
+
+    [Theory]
     [InlineData("2026-06-10", "Jun 10")]
     [InlineData("2026-12-01", "Dec 1")]
     [InlineData("garbage", "garbage")]

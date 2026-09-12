@@ -19,14 +19,23 @@ public static class ClientRegistry
         ["openclaw"] = ("OpenClaw", "#dc2626"),
         ["gemini"] = ("Gemini CLI", "#60a5fa"),
         ["opencode"] = ("OpenCode", "#1f2937"),
-        ["codex"] = ("Codex CLI", "#9ca3af"),
-        ["copilot"] = ("Copilot CLI", "#1f2937"),
-        ["cursor"] = ("Cursor IDE", "#0ea5e9"),
+        // No form-factor suffix on these three: their sources are not
+        // surface-scoped. `codex` reads ~/.codex/sessions, written by Codex
+        // Desktop / the IDE extension / the CLI alike (a 1733-file sample was
+        // 70% "Codex Desktop", 4% CLI). `copilot` merges the CLI/VS Code OTel
+        // export with the desktop app's ~/.copilot/data.db. `cursor` is not a
+        // session parser at all — it reads Cursor's account usage export CSV,
+        // which bills IDE, cursor-agent and cloud agents into one
+        // undifferentiated ledger. Ported from macOS ClientRegistry.swift,
+        // which dropped these suffixes in v1.13.3 for the same reason.
+        ["codex"] = ("Codex", "#9ca3af"),
+        ["copilot"] = ("Copilot", "#1f2937"),
+        ["cursor"] = ("Cursor", "#0ea5e9"),
         ["amp"] = ("Amp", "#10b981"),
         ["droid"] = ("Droid", "#22c55e"),
         ["hermes"] = ("Hermes", "#a78bfa"),
         ["pi"] = ("Pi", "#f472b6"),
-        ["kimi"] = ("Kimi CLI", "#fbbf24"),
+        ["kimi"] = ("Kimi", "#fbbf24"),
         // Both take the same neutral grey the unregistered fallback uses, so
         // "junie" already rendered correctly by accident. Registering them is
         // still not a no-op: AllIds is the canonical universe demo fixtures

@@ -38,8 +38,8 @@ public class ClientRegistryTests : IDisposable
 
     [Theory]
     [InlineData("claude", "Claude")]       // " Code" dropped
-    [InlineData("codex", "Codex")]         // " CLI" dropped
-    [InlineData("cursor", "Cursor")]       // " IDE" dropped
+    [InlineData("codex", "Codex")]         // no suffix to drop (not surface-scoped)
+    [InlineData("cursor", "Cursor")]       // no suffix to drop (not surface-scoped)
     [InlineData("amp", "Amp")]             // no suffix
     [InlineData("antigravity-cli", "Antigravity CLI")] // base collides with the IDE client
     public void ShortNameDropsFormFactorSafely(string id, string expected) =>
