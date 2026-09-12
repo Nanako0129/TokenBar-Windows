@@ -62,8 +62,22 @@ internal static class OverviewScope
     internal static bool ShowsTrace(string? singleClient) => singleClient is null;
 
     /// <summary>The clientId <c>BuildLimits</c> should restrict its rows to,
-    /// or null to show every agent (Overview tab).</summary>
-    internal static string? LimitsClientId(string? singleClient) => singleClient;
+    /// or null to show every agent (Overview tab).
+    /// <para>
+    /// Mapped through <see cref="ClientRegistry.QuotaOwner"/>, not the raw tab
+    /// id: <c>BuildLimits</c> filters on <c>agent.ClientId == clientId</c>
+    /// against the quota payload, and a client that spends another
+    /// subscription's allowance is keyed there under the owner.
+    /// <c>antigravity-cli</c> is the one such client today — its rows arrive as
+    /// <c>antigravity</c>, so passing the tab id straight through matched
+    /// nothing and the card said "No quota data yet" while the quota was
+    /// sitting in the payload. Every other subscription-facing lookup already
+    /// keys by owner (see <c>QuotaLensProjection.BuildClient</c>); this is the
+    /// same rule, and it belongs here rather than at the call site so the
+    /// Overview cannot apply it differently from the Quota lens.
+    /// </para></summary>
+    internal static string? LimitsClientId(string? singleClient) =>
+        singleClient is null ? null : ClientRegistry.QuotaOwner(singleClient);
 }
 
 internal static class OverviewCards

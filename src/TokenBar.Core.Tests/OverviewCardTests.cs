@@ -82,4 +82,22 @@ public class OverviewScopeTests
         Assert.Null(OverviewScope.LimitsClientId(null));
         Assert.Equal("gemini", OverviewScope.LimitsClientId("gemini"));
     }
+
+    // A client that spends another subscription's allowance reaches BuildLimits
+    // under the OWNER, because that is how the quota payload keys it. Passing
+    // the raw tab id through matched nothing and the card claimed there was no
+    // quota data while the quota sat in the payload. Codex review found this on
+    // PR #89; nothing pinned the rule, which is why it was missed.
+    [Fact]
+    public void LimitsClientIdResolvesTheQuotaOwnerRatherThanTheRawTabId()
+    {
+        Assert.Equal("antigravity", OverviewScope.LimitsClientId("antigravity-cli"));
+    }
+
+    [Fact]
+    public void LimitsClientIdLeavesAClientThatOwnsItsOwnQuotaAlone()
+    {
+        Assert.Equal("claude", OverviewScope.LimitsClientId("claude"));
+        Assert.Null(OverviewScope.LimitsClientId(null));
+    }
 }
