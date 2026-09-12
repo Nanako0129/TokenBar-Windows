@@ -177,7 +177,7 @@ S4 排在 S5 之前，因為 i18n 會碰到每一個字串；先做 Discord 等�
 
 | 連結 | URL |
 |---|---|
-| GitHub | `https://github.com/Nanako0129/TokenBar-Windows` |
+| GitHub | `https://github.com/Nanako0129/Syrtis-Windows` |
 | 贊助 | `https://www.patreon.com/cw/Nanako0129/membership` |
 
 > **注意：** GitHub 指向 Windows repo（macOS 版指向的是 `Nanako0129/TokenBar`，兩邊各自指自己）。贊助連結兩平台共用同一個，因為那是作者個人的贊助頁，不分平台。

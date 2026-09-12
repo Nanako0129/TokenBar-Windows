@@ -61,7 +61,7 @@ internal readonly record struct UpdateCheckResult(UpdateCheckState State, string
 internal class UpdateFlow
 {
     internal const string RepositoryUrl =
-        "https://github.com/Nanako0129/TokenBar-Windows";
+        "https://github.com/Nanako0129/Syrtis-Windows";
     /// <summary>Durable Velopack package identity. Independent of
     /// $(TbProductName): a future product rename must not move it by
     /// accident. PackageIdMatchesPackagingScript pins the two together.</summary>

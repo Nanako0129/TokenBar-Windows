@@ -29,7 +29,7 @@ dependency/toolchain、產物、evidence，以及哪些檢查必須在 Windows �
 > Phase 11（Velopack installer/updater），其 release contract 是
 > [`docs/release-velopack.md`](release-velopack.md)；本文件不再更新為當前命名。
 
-Preview history: [`v0.1.0-preview.1` published prerelease](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0-preview.1).
+Preview history: [`v0.1.0-preview.1` published prerelease](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.1.0-preview.1).
 
 > **核心原則：** Hosted CI 可以證明結構、版本、PE architecture 與 hash，
 > 但不能把 x64 runner 上的 cross-build 說成 ARM64 runtime 或互動式 WinUI
@@ -37,7 +37,7 @@ Preview history: [`v0.1.0-preview.1` published prerelease](https://github.com/Na
 
 ## Published stable outcome
 
-[`v0.1.0`](https://github.com/Nanako0129/TokenBar-Windows/releases/tag/v0.1.0)
+[`v0.1.0`](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.1.0)
 was published on 2026-07-29 as the public, non-prerelease Latest release. Its
 lightweight tag points directly to
 `aa671e0730ecb2581415e6571842ad086ab06e47`. The release has eight assets: one
