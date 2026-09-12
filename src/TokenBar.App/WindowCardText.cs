@@ -87,7 +87,7 @@ public static class WindowCardText
     /// One tab per window the client is CURRENTLY reporting, each carrying
     /// the running cycle a stored series has for it.
     /// <para>
-    /// Enumerated from the live side — <see cref="AgentUsageSnapshot.UniqueCardWindows"/>
+    /// Enumerated from the live side — <c>AgentUsageSnapshot.UniqueCardWindows</c>
     /// — the same shape as macOS's <c>uniqueCardWindows</c>-driven
     /// <c>candidates</c> list, and for the same reason: the live payload names
     /// each window once, with the provider's own label, while the store can
