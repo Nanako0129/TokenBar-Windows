@@ -12,7 +12,7 @@ a native WinUI 3 shell.
 ## Features
 
 - **Eight lenses** in the flyout: Overview, Quota, Models, Monthly, Daily, Hourly, Stats, Agents —
-  each hideable except Overview and Models, with Ctrl+1..9 accelerators.
+  each hideable except Overview and Models, with Ctrl+1..8 accelerators.
 - **Quota lens** — overview strip, heatmap, per-client window and history cards, and an
   Agent-limits view, backed by a usage-attribution subsystem that resolves which client
   consumed which window.
@@ -41,14 +41,15 @@ channel/package-identity contract.
 
 ## Supported providers
 
-The app reads quota for five agent CLIs, each through the credentials that CLI's own login
-already wrote to disk:
+The app reads quota for five agent CLIs, using credentials already written to disk by a login
+you have performed. That is usually the provider's own CLI — with one exception worth knowing
+before you go looking for a missing card:
 
 | Provider | Mechanism |
 |---|---|
 | Claude | OAuth via the OS keychain / Claude Code login credentials |
 | Codex | OAuth via `~/.codex/auth.json` (`$CODEX_HOME` honored) |
-| GitHub Copilot | OAuth via opencode's `auth.json` |
+| GitHub Copilot | OAuth via **opencode's** `auth.json` — signing into the GitHub Copilot CLI alone is not enough, and the card is omitted rather than shown as an error |
 | Grok | OAuth via `~/.grok/auth.json` |
 | Antigravity | OAuth or local IDE credentials, whichever the installed client itself uses |
 

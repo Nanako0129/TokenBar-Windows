@@ -165,7 +165,7 @@ public sealed partial class DashboardView : UserControl
 
         // WinRT's VirtualKey enum has no OEM members, so casting VK_OEM_4 /
         // VK_OEM_6 / VK_OEM_COMMA into it hands KeyboardAccelerator a value it
-        // never matches — which is exactly why Ctrl+1..9 worked (Number1 is a
+        // never matches — which is exactly why the numeric accelerators worked (Number1 is a
         // real member) while Ctrl+[ , Ctrl+] and Ctrl+, silently did nothing.
         // KeyDown carries the raw Win32 virtual-key code, so compare the
         // underlying integer instead. handledEventsToo keeps this working even
@@ -398,7 +398,7 @@ public sealed partial class DashboardView : UserControl
 
     public void SwitchTo(AppView view)
     {
-        // One guard for every caller: the Ctrl+1..9 accelerators each bind a
+        // One guard for every caller: the numeric accelerators each bind a
         // fixed lens at construction, so a hidden lens would otherwise stay
         // reachable by shortcut even though its tab is gone.
         view = AppViews.Effective(view, AppSettings.Store);
