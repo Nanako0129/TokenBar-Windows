@@ -283,5 +283,6 @@ public static class WindowHistoryText
         WindowEquivalence.Aggregate(
             declared,
             [.. shown.Select(row => new WindowEquivalence.Cycle(
-                row.Cycle.UsedPercent, row.SpanTokens, row.SpanCost, row.Cycle.ObservedFraction))]);
+                row.Cycle.UsedPercent, row.SpanTokens, row.SpanCost, row.Cycle.ObservedFraction,
+                row.Cycle.RisingRuns))]);
 }

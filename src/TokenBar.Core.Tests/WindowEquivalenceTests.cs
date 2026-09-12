@@ -268,6 +268,30 @@ public class WindowEquivalenceTests
         Assert.IsType<WindowEquivalence.Row.ScanFailed>(row);
     }
 
+    // The distinguishing case that disagreed between LiveRow and Aggregate on
+    // macOS before runs-scaling existed: two 3-point rises separated by a
+    // decline back to zero. Consumed sums both rises to 6 (>= the un-scaled
+    // MinimumDelta of 5), but each rise is separately quantised — 6 points
+    // measured as two 3-point rises does not clear the bar the way one
+    // undivided 6-point rise would. Must read Insufficient, not Ratio.
+    [Fact]
+    public void TwoSeparatedSubThresholdRisesAreRejectedAsInsufficientNotAdmitted()
+    {
+        var row = WindowEquivalence.LiveRow(
+            declared: true, attempt: WindowEquivalence.FetchOutcome.Succeeded,
+            [
+                new WindowEquivalence.Sample(0, 0),
+                new WindowEquivalence.Sample(1000, 3),
+                new WindowEquivalence.Sample(2000, 0),
+                new WindowEquivalence.Sample(3000, 3),
+            ],
+            [Message(500, 1000, 4.0)]);
+        var insufficient = Assert.IsType<WindowEquivalence.Row.Insufficient>(row);
+        Assert.Equal(6, insufficient.DeltaPercent);
+        // error = round(0.5 * 2 / 6 * 100) = 17, not round(0.5 * 1 / 6 * 100) = 8
+        Assert.Equal(17, insufficient.ErrorPercent);
+    }
+
     [Fact]
     public void IsRatioIsFalseForEveryOtherCase()
     {
@@ -331,8 +355,8 @@ public class WindowEquivalenceTests
     // ── Aggregate ────────────────────────────────────────────────────────
 
     private static WindowEquivalence.Cycle Cycle(
-        double delta, long tokens, double cost, double observed = 1.0) =>
-        new(DeltaPercent: delta, SpanTokens: tokens, SpanCost: cost, ObservedFraction: observed);
+        double delta, long tokens, double cost, double observed = 1.0, int runs = 1) =>
+        new(DeltaPercent: delta, SpanTokens: tokens, SpanCost: cost, ObservedFraction: observed, RisingRuns: runs);
 
     [Fact]
     public void UndeclaredWinsBeforeAnyCycleIsExamined()
@@ -403,6 +427,46 @@ public class WindowEquivalenceTests
         Assert.Equal(3, insufficient.DeltaPercent);
         // round(0.5 * 1 / 3 * 100) = 17
         Assert.Equal(17, insufficient.ErrorPercent);
+    }
+
+    // The mirror of TwoSeparatedSubThresholdRisesAreRejectedAsInsufficientNotAdmitted
+    // above, at the pooled site: the same [0, 3, 0, 3] shape, folded into one
+    // QuotaCycle with RisingRuns = 2. Before DeltaQualifies existed, the
+    // pooled admission filter compared only cycle.DeltaPercent >=
+    // MinimumDelta (6 >= 5, true) and admitted it as a 6-point cycle — the
+    // exact disagreement with the live row this port exists to close. Must
+    // fall through to the not-admitted branch here too.
+    [Fact]
+    public void PooledPathRejectsTheSameTwoSeparatedSubThresholdRisesTheLiveRowRejects()
+    {
+        var row = WindowEquivalence.Aggregate(declared: true, [Cycle(6, 500, 2.5, runs: 2)]);
+        var insufficient = Assert.IsType<WindowEquivalence.Row.Insufficient>(row);
+        Assert.Equal(6, insufficient.DeltaPercent);
+        // round(0.5 * 2 / 6 * 100) = 17, over `cycles` (this one, runs=2),
+        // not `admitted` (empty here by construction).
+        Assert.Equal(17, insufficient.ErrorPercent);
+    }
+
+    // DeltaQualifies directly: the single-rise half (runs=1) is unaffected —
+    // 5 is exactly MinimumDelta, so it clears; 4 does not. The scaled half:
+    // a 10-point delta over 2 runs needs 10 (2 * MinimumDelta) to clear, so 9
+    // fails where a single-run 9 would pass.
+    [Fact]
+    public void DeltaQualifiesScalesTheBarByRunsNotJustByDelta()
+    {
+        Assert.True(WindowEquivalence.DeltaQualifies(5, 1));
+        Assert.False(WindowEquivalence.DeltaQualifies(4, 1));
+        Assert.True(WindowEquivalence.DeltaQualifies(9, 1));
+        Assert.False(WindowEquivalence.DeltaQualifies(9, 2));
+        Assert.True(WindowEquivalence.DeltaQualifies(10, 2));
+    }
+
+    // delta > 0 is load-bearing: without it, runs == 0 would make the
+    // threshold zero and admit a cycle that never moved.
+    [Fact]
+    public void DeltaQualifiesRejectsZeroDeltaEvenWithZeroRuns()
+    {
+        Assert.False(WindowEquivalence.DeltaQualifies(0, 0));
     }
 
     // The distinction the plan calls out for the pooled path too: movement

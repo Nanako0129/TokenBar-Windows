@@ -320,7 +320,8 @@ public static class QuotaLensProjection
         var displayRows = WindowHistoryText.Rows(
             cycles,
             [.. rows.Select(row => new WindowEquivalence.Cycle(
-                row.Cycle.UsedPercent, row.MineTokens, row.MineCost, row.Cycle.ObservedFraction))]);
+                row.Cycle.UsedPercent, row.MineTokens, row.MineCost, row.Cycle.ObservedFraction,
+                row.Cycle.RisingRuns))]);
 
         // Gated on the fetch's own outcome, not on whether QuotaHistory
         // itself landed: `declared` is computed from `messages`, which come
