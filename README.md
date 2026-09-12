@@ -1,10 +1,15 @@
-# TokenBar for Windows
+# Syrtis
 
 Windows port of [TokenBar](https://github.com/Nanako0129/TokenBar) — the
 menu-bar/tray AI coding-agent token-usage monitor. Same Rust parsing core,
 a native WinUI 3 shell.
 
-> **Status: [`v0.2.2`](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.2.2) is the
+Syrtis is the name this port ships under; the macOS build is still called
+TokenBar. Solution and namespace identifiers remain `TokenBar.*` — they are
+internal, and the Velopack package id `Nyanako.Syrtis` is deliberately
+independent of both so a rename cannot move an installed app.
+
+> **Status: [`v0.3.0`](https://github.com/Nanako0129/Syrtis-Windows/releases/tag/v0.3.0) is the
 > latest release.** See the [release list](https://github.com/Nanako0129/Syrtis-Windows/releases)
 > for history, [`docs/release-velopack.md`](docs/release-velopack.md) for the current packaging
 > contract, and [`docs/release.md`](docs/release.md) for the earlier portable one.
